@@ -65,6 +65,10 @@ pub fn classify_error(err: &anyhow::Error) -> ErrorKind {
         || message.contains("no default server configured")
         || message.contains("failed to load config")
         || message.contains("failed to save config")
+        || message.contains("profile '")
+        || message.contains("cannot use --home and --profile")
+        || message.contains("not present in the registry")
+        || message.contains("profile add requires")
     {
         return ErrorKind::Config;
     }

@@ -53,6 +53,21 @@ fn classifies_ssh_connection_errors_for_stable_exit_codes() {
 }
 
 #[test]
+fn classifies_profile_and_registry_errors_as_config() {
+    for message in [
+        "cannot use --home and --profile together",
+        "unknown profile 'prod'",
+        "profile 'prod' already exists; pass --force to overwrite",
+        "profile add requires --home <path>",
+        "default profile 'prod' is not present in the registry",
+    ] {
+        let kind = classify_error(&anyhow::anyhow!("{message}"));
+        assert_eq!(kind, ErrorKind::Config, "message: {message}");
+        assert_eq!(kind.exit_code(), 3);
+    }
+}
+
+#[test]
 fn filters_known_noninteractive_stty_startup_noise() {
     let stderr = "stty: 'standard input': Inappropriate ioctl for device\nactual warning\n";
 

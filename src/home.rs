@@ -2,6 +2,7 @@ use anyhow::Result;
 use directories::BaseDirs;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Keyring namespace for a resolved home/profile.
 ///
@@ -126,8 +127,32 @@ pub fn resolve_home(
         let path = Path::new(env);
         return ResolvedHome::ad_hoc(path, format!("SSHW_HOME {}", path.display()));
     }
+    builtin_default_home(sshw_base)
+}
+
+/// Built-in default profile home: `<sshw_base>/profiles/default`.
+pub fn builtin_default_home(sshw_base: &Path) -> ResolvedHome {
     let root = sshw_base.join("profiles").join("default");
     ResolvedHome::profile(root, "default", "default profile".to_string())
+}
+
+/// Path to the global profile registry: `<config_dir>/sshw/profiles.json`.
+pub fn registry_path() -> Result<PathBuf> {
+    Ok(sshw_base_dir()?.join("profiles.json"))
+}
+
+/// Generate a stable, persisted profile id from the profile name and home path.
+/// The current time is mixed in so re-adding a removed name yields a fresh
+/// namespace; the id is persisted in the registry and never recomputed.
+pub fn generate_profile_id(name: &str, home: &Path) -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!(
+        "p_{}",
+        fnv1a_hex(&format!("{}|{}|{}", canonical_key(home), name, nanos))
+    )
 }
 
 /// Logical absolute path used as a stable hashing key. Does not require the

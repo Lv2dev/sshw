@@ -3,5 +3,7 @@ pub mod config;
 pub mod credentials;
 pub mod home;
 pub mod output;
+pub mod profile;
 pub mod safety;
 pub mod ssh;
+pub mod storage;

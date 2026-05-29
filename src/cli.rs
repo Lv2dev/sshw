@@ -1,9 +1,12 @@
 use crate::config::{AuthConfig, ServerConfig, SshwConfig, load_config, save_config};
 use crate::credentials::keyring_store::KeyringCredentialStore;
 use crate::credentials::{AuthMaterial, CredentialStore, CredentialStoreHealth};
-use crate::home::{CredentialNamespace, ResolvedHome, resolve_home, sshw_base_dir};
+use crate::home::{CredentialNamespace, ResolvedHome, generate_profile_id, sshw_base_dir};
 use crate::output::{
     ErrorKind, ErrorResponse, RunOutput, ServerOutput, filter_startup_stderr_noise,
+};
+use crate::profile::{
+    ProfileEntry, ProfileRegistry, load_registry, resolve_home_with_registry, save_registry,
 };
 use crate::safety::{SafetyDecision, classify_command, classify_remote_write_path};
 use crate::ssh::SshClient;
@@ -22,9 +25,13 @@ use std::path::{Path, PathBuf};
 )]
 pub struct Cli {
     /// Use an explicit sshw home directory for this invocation (config,
-    /// known_hosts, policy, audit). Overrides `SSHW_HOME`.
+    /// known_hosts, policy, audit). Overrides `SSHW_HOME` and `--profile`.
     #[arg(long, global = true, value_name = "PATH")]
     pub home: Option<PathBuf>,
+    /// Select a registered profile by name (see `sshw profile`). Cannot be
+    /// combined with `--home`.
+    #[arg(long, global = true, value_name = "NAME")]
+    pub profile: Option<String>,
     #[command(subcommand)]
     pub command: Command,
 }
@@ -41,6 +48,8 @@ pub enum Command {
     Get(GetArgs),
     Remove(RemoveArgs),
     Doctor(DoctorArgs),
+    /// Manage named sshw profiles (each maps a name to a home directory).
+    Profile(ProfileArgs),
 }
 
 impl Command {
@@ -50,6 +59,13 @@ impl Command {
             Self::Show(args) => args.json,
             Self::Run(args) => args.json,
             Self::Doctor(args) => args.json,
+            Self::Profile(args) => match &args.command {
+                ProfileCommand::List(a) => a.json,
+                ProfileCommand::Show(a) => a.json,
+                ProfileCommand::Add(_) | ProfileCommand::Default(_) | ProfileCommand::Remove(_) => {
+                    false
+                }
+            },
             Self::Add(_)
             | Self::Default(_)
             | Self::Trust(_)
@@ -58,6 +74,53 @@ impl Command {
             | Self::Remove(_) => false,
         }
     }
+}
+
+#[derive(Debug, Args)]
+pub struct ProfileArgs {
+    #[command(subcommand)]
+    pub command: ProfileCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ProfileCommand {
+    /// Register a profile. The home directory is taken from the global
+    /// `--home <path>` flag, e.g. `sshw profile add prod --home /srv/prod`.
+    Add(ProfileAddArgs),
+    List(ProfileListArgs),
+    Show(ProfileShowArgs),
+    Default(ProfileDefaultArgs),
+    Remove(ProfileRemoveArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ProfileAddArgs {
+    pub name: String,
+    #[arg(long)]
+    pub force: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ProfileListArgs {
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ProfileShowArgs {
+    pub name: String,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ProfileDefaultArgs {
+    pub name: String,
+}
+
+#[derive(Debug, Args)]
+pub struct ProfileRemoveArgs {
+    pub name: String,
 }
 
 #[derive(Debug, Args)]
@@ -157,40 +220,57 @@ pub trait Prompter {
     fn password(&mut self, prompt: &str) -> anyhow::Result<String>;
 }
 
-/// Runtime context resolved from the active sshw home/profile. Grows in later
-/// milestones (policy, audit); for now it carries the resolved home layout.
+/// Runtime context resolved from the active sshw home/profile plus the global
+/// profile registry. Grows in later milestones (policy, audit).
 pub struct ExecContext<'a> {
     pub home: &'a ResolvedHome,
+    pub registry_path: &'a Path,
 }
 
 pub fn run() -> i32 {
     let cli = Cli::parse();
     let json_errors = cli.command.wants_json_errors();
-    let home = match resolve_runtime_home(&cli) {
-        Ok(home) => home,
+    let (home, registry_path) = match resolve_runtime(&cli) {
+        Ok(resolved) => resolved,
         Err(err) => return print_output(error_output(&err, json_errors)),
     };
     let credentials = KeyringCredentialStore;
     let ssh = Ssh2Client::default().with_known_hosts(home.known_hosts_path.clone());
     let mut prompter = TerminalPrompter;
-    let ctx = ExecContext { home: &home };
+    let ctx = ExecContext {
+        home: &home,
+        registry_path: &registry_path,
+    };
     let output = execute_for_runtime_with(cli, &ctx, &credentials, &ssh, &mut prompter);
 
     print_output(output)
 }
 
-fn resolve_runtime_home(cli: &Cli) -> anyhow::Result<ResolvedHome> {
+fn resolve_runtime(cli: &Cli) -> anyhow::Result<(ResolvedHome, PathBuf)> {
     let sshw_base = sshw_base_dir()?;
+    let registry_path = sshw_base.join("profiles.json");
+    let registry = load_registry(&registry_path)?;
     let env_home = std::env::var_os("SSHW_HOME").filter(|value| !value.is_empty());
-    Ok(resolve_home(
+    let home = resolve_home_with_registry(
         cli.home.as_deref(),
         env_home.as_deref(),
+        cli.profile.as_deref(),
+        &registry,
         &sshw_base,
-    ))
+    )?;
+    Ok((home, registry_path))
+}
+
+fn sibling_registry_path(config_path: &Path) -> PathBuf {
+    config_path
+        .parent()
+        .map(|parent| parent.join("profiles.json"))
+        .unwrap_or_else(|| PathBuf::from("profiles.json"))
 }
 
 /// Backward-compatible facade: treat the parent of `config_path` as an ad-hoc
-/// home. Used by tests and callers that pass a config path directly.
+/// home, with the profile registry as its sibling. Used by tests and callers
+/// that pass a config path directly.
 pub fn execute<C, S, P>(
     cli: Cli,
     config_path: &Path,
@@ -204,7 +284,11 @@ where
     P: Prompter,
 {
     let home = ResolvedHome::from_config_path(config_path);
-    let ctx = ExecContext { home: &home };
+    let registry_path = sibling_registry_path(config_path);
+    let ctx = ExecContext {
+        home: &home,
+        registry_path: &registry_path,
+    };
     execute_with(cli, &ctx, credentials, ssh, prompter)
 }
 
@@ -221,7 +305,11 @@ where
     P: Prompter,
 {
     let home = ResolvedHome::from_config_path(config_path);
-    let ctx = ExecContext { home: &home };
+    let registry_path = sibling_registry_path(config_path);
+    let ctx = ExecContext {
+        home: &home,
+        registry_path: &registry_path,
+    };
     execute_for_runtime_with(cli, &ctx, credentials, ssh, prompter)
 }
 
@@ -256,10 +344,16 @@ where
     S: SshClient,
     P: Prompter,
 {
+    let Cli {
+        home: home_flag,
+        profile: _,
+        command,
+    } = cli;
+
     let config_path = ctx.home.config_path.as_path();
     let mut config = load_config(config_path)?;
 
-    match cli.command {
+    match command {
         Command::Add(args) => add_server(
             args,
             config_path,
@@ -278,7 +372,8 @@ where
         Command::Remove(args) => {
             remove_server(args, config_path, credentials, prompter, &mut config)
         }
-        Command::Doctor(args) => doctor(args, ctx.home, credentials, &config),
+        Command::Doctor(args) => doctor(args, ctx.home, ctx.registry_path, credentials, &config),
+        Command::Profile(args) => run_profile(args, ctx.registry_path, home_flag.as_deref()),
     }
 }
 
@@ -571,6 +666,7 @@ where
 fn doctor<C>(
     args: DoctorArgs,
     home: &ResolvedHome,
+    registry_path: &Path,
     credentials: &C,
     config: &SshwConfig,
 ) -> anyhow::Result<CommandOutput>
@@ -591,6 +687,7 @@ where
         let output = json!({
             "home": home.root,
             "home_source": home.description,
+            "registry_path": registry_path,
             "config_path": config_path,
             "config_exists": config_path.exists(),
             "known_hosts_path": home.known_hosts_path,
@@ -607,9 +704,10 @@ where
     }
 
     let mut stdout = format!(
-        "home: {}\nhome source: {}\nconfig path: {}\nconfig exists: {}\nknown_hosts path: {}\npolicy path: {}\naudit path: {}\ncredential namespace: {}\nos: {}\ncredential backend: {}\ncredential available: {}\ncredential message: {}\n",
+        "home: {}\nhome source: {}\nregistry path: {}\nconfig path: {}\nconfig exists: {}\nknown_hosts path: {}\npolicy path: {}\naudit path: {}\ncredential namespace: {}\nos: {}\ncredential backend: {}\ncredential available: {}\ncredential message: {}\n",
         home.root.display(),
         home.description,
+        registry_path.display(),
         config_path.display(),
         config_path.exists(),
         home.known_hosts_path.display(),
@@ -628,6 +726,153 @@ where
         ));
     }
     Ok(ok(stdout))
+}
+
+fn run_profile(
+    args: ProfileArgs,
+    registry_path: &Path,
+    home_flag: Option<&Path>,
+) -> anyhow::Result<CommandOutput> {
+    let mut registry = load_registry(registry_path)?;
+    match args.command {
+        ProfileCommand::Add(a) => profile_add(a, home_flag, registry_path, &mut registry),
+        ProfileCommand::List(a) => profile_list(a, &registry),
+        ProfileCommand::Show(a) => profile_show(a, &registry),
+        ProfileCommand::Default(a) => profile_default(a, registry_path, &mut registry),
+        ProfileCommand::Remove(a) => profile_remove(a, registry_path, &mut registry),
+    }
+}
+
+fn profile_add(
+    args: ProfileAddArgs,
+    home_flag: Option<&Path>,
+    registry_path: &Path,
+    registry: &mut ProfileRegistry,
+) -> anyhow::Result<CommandOutput> {
+    let home = home_flag.ok_or_else(|| anyhow::anyhow!("profile add requires --home <path>"))?;
+    if registry.profiles.contains_key(&args.name) && !args.force {
+        return Err(anyhow::anyhow!(
+            "profile '{}' already exists; pass --force to overwrite",
+            args.name
+        ));
+    }
+
+    let id = generate_profile_id(&args.name, home);
+    registry.profiles.insert(
+        args.name.clone(),
+        ProfileEntry {
+            id,
+            home: home.to_path_buf(),
+        },
+    );
+    if registry.default.is_none() {
+        registry.default = Some(args.name.clone());
+    }
+
+    save_registry(registry_path, registry)?;
+    Ok(ok(format!(
+        "added profile {} -> {}\n",
+        args.name,
+        home.display()
+    )))
+}
+
+fn profile_list(
+    args: ProfileListArgs,
+    registry: &ProfileRegistry,
+) -> anyhow::Result<CommandOutput> {
+    if args.json {
+        let entries: Vec<_> = registry
+            .profiles
+            .iter()
+            .map(|(name, entry)| {
+                json!({
+                    "name": name,
+                    "id": entry.id,
+                    "home": entry.home,
+                    "is_default": registry.default.as_deref() == Some(name),
+                })
+            })
+            .collect();
+        return Ok(ok(format!("{}\n", serde_json::to_string(&entries)?)));
+    }
+
+    let mut stdout = String::new();
+    for (name, entry) in &registry.profiles {
+        let marker = if registry.default.as_deref() == Some(name) {
+            "*"
+        } else {
+            " "
+        };
+        stdout.push_str(&format!(
+            "{marker} {name} id={} home={}\n",
+            entry.id,
+            entry.home.display()
+        ));
+    }
+    Ok(ok(stdout))
+}
+
+fn profile_show(
+    args: ProfileShowArgs,
+    registry: &ProfileRegistry,
+) -> anyhow::Result<CommandOutput> {
+    let entry = registry
+        .profiles
+        .get(&args.name)
+        .ok_or_else(|| anyhow::anyhow!("unknown profile '{}'", args.name))?;
+    let is_default = registry.default.as_deref() == Some(args.name.as_str());
+
+    if args.json {
+        let output = json!({
+            "name": args.name,
+            "id": entry.id,
+            "home": entry.home,
+            "is_default": is_default,
+        });
+        return Ok(ok(format!("{}\n", serde_json::to_string(&output)?)));
+    }
+
+    Ok(ok(format!(
+        "{}\n  id: {}\n  home: {}\n  default: {}\n",
+        args.name,
+        entry.id,
+        entry.home.display(),
+        is_default
+    )))
+}
+
+fn profile_default(
+    args: ProfileDefaultArgs,
+    registry_path: &Path,
+    registry: &mut ProfileRegistry,
+) -> anyhow::Result<CommandOutput> {
+    if !registry.profiles.contains_key(&args.name) {
+        return Err(anyhow::anyhow!("unknown profile '{}'", args.name));
+    }
+
+    registry.default = Some(args.name.clone());
+    save_registry(registry_path, registry)?;
+    Ok(ok(format!("default profile set to {}\n", args.name)))
+}
+
+fn profile_remove(
+    args: ProfileRemoveArgs,
+    registry_path: &Path,
+    registry: &mut ProfileRegistry,
+) -> anyhow::Result<CommandOutput> {
+    if registry.profiles.remove(&args.name).is_none() {
+        return Err(anyhow::anyhow!("unknown profile '{}'", args.name));
+    }
+    if registry.default.as_deref() == Some(args.name.as_str()) {
+        registry.default = registry.profiles.keys().next().cloned();
+    }
+
+    save_registry(registry_path, registry)?;
+    Ok(ok(format!(
+        "removed profile {} (home directory and credentials left intact)\n",
+        args.name
+    )))
 }
 
 fn resolve_auth<C>(server: &ServerConfig, credentials: &C) -> anyhow::Result<AuthMaterial>

@@ -850,6 +850,99 @@ fn add_password_stores_namespaced_credential_key() {
     assert_ne!(credential.as_str(), "sshw:web");
 }
 
+#[test]
+fn parses_global_profile_flag() {
+    let cli = Cli::try_parse_from(["sshw", "--profile", "prod", "list"]).unwrap();
+
+    assert_eq!(cli.profile.as_deref(), Some("prod"));
+    assert!(matches!(cli.command, Command::List(_)));
+}
+
+#[test]
+fn profile_add_list_show_default_remove_round_trip() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &SshwConfig::default()).unwrap();
+    let store = FakeCredentialStore::default();
+    let ssh = FakeSshClient::default();
+    let prod_home = temp.path().join("prod-home");
+    let prod_home = prod_home.to_str().unwrap();
+
+    let added = execute(
+        Cli::try_parse_from(["sshw", "profile", "add", "prod", "--home", prod_home]).unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut FakePrompter::default(),
+    )
+    .unwrap();
+    assert!(added.stdout.contains("added profile prod"));
+
+    let listed = execute(
+        Cli::try_parse_from(["sshw", "profile", "list"]).unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut FakePrompter::default(),
+    )
+    .unwrap();
+    assert!(listed.stdout.contains("prod"));
+    assert!(listed.stdout.contains("id=p_"));
+    // first profile added becomes the registry default
+    assert!(listed.stdout.contains("* prod"));
+
+    let shown = execute(
+        Cli::try_parse_from(["sshw", "profile", "show", "prod"]).unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut FakePrompter::default(),
+    )
+    .unwrap();
+    assert!(shown.stdout.contains("id: p_"));
+    assert!(shown.stdout.contains("default: true"));
+
+    let removed = execute(
+        Cli::try_parse_from(["sshw", "profile", "remove", "prod"]).unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut FakePrompter::default(),
+    )
+    .unwrap();
+    assert!(removed.stdout.contains("removed profile prod"));
+
+    let empty = execute(
+        Cli::try_parse_from(["sshw", "profile", "list"]).unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut FakePrompter::default(),
+    )
+    .unwrap();
+    assert_eq!(empty.stdout, "");
+}
+
+#[test]
+fn profile_add_requires_home() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &SshwConfig::default()).unwrap();
+    let store = FakeCredentialStore::default();
+    let ssh = FakeSshClient::default();
+
+    let err = execute(
+        Cli::try_parse_from(["sshw", "profile", "add", "prod"]).unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut FakePrompter::default(),
+    )
+    .unwrap_err();
+
+    assert!(err.to_string().contains("requires --home"));
+}
+
 fn sample_config() -> SshwConfig {
     let mut servers = BTreeMap::new();
     servers.insert(
