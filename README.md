@@ -10,15 +10,25 @@ Languages: [English](#english) | [한국어](#한국어)
 
 `sshw` is a cross-platform Rust CLI for operating known SSH servers without placing SSH passwords, private keys, passphrases, or tokens in prompts, shell history, or plaintext config files.
 
-It is designed for local coding agents that need delegated server access for simple deployment and maintenance tasks.
+It is designed for local coding agents that need delegated server access for simple deployment and maintenance tasks. It is a **sandbox-aware SSH wrapper**: it provides per-project profile isolation, an optional command/transfer policy, an audit log, and output redaction.
 
 ### Security Boundary
 
-`sshw` prevents accidental secret exposure in chat, command lines, shell history, JSON config, and normal command output.
+`sshw` reduces accidental secret exposure in chat, command lines, shell history, JSON config, and normal command output. It also provides:
 
-It is delegated access, not a sandbox. If a local coding agent is allowed to run `sshw run`, that agent has the server authority exposed by the configured account. A fully privileged local process running as the same OS user may still try to access the operating system credential store directly.
+- **Profile/home isolation** — config, `known_hosts`, policy, audit, and credential namespace are scoped per home.
+- **Optional policy** — an allowlist for commands and file-transfer paths (off by default).
+- **Audit log** — an append-only JSONL record of mutating/active operations.
+- **Output redaction** — best-effort masking of secret-looking strings in `run` output.
 
-`sshw` never stores passwords, private keys, passphrases, or tokens in its config file. Password auth stores the password only through the native OS credential store. Agent auth stores no secret and uses the user's active SSH agent.
+It is **not a strong OS sandbox**. Specifically:
+
+- It is delegated access. If an agent may run `sshw run`, it has the server authority of the configured account.
+- A fully privileged local process running as the same OS user may access the OS credential store directly.
+- The policy `allow_commands` list matches by **program name**, so allowlisting a program grants its full capability *including its arguments and any files it can read or write*. `allow_commands` is therefore a strictly stronger grant than `allow_get_paths`/`allow_put_paths`; only allowlist programs you trust with arbitrary arguments.
+- Redaction and audit redaction are **best-effort**. They catch common forms (PEM keys, `keyword=value`, bearer tokens) but not every secret passed inline as a flag (`-p`, `-a`, positional tokens) or split across lines. Do not pass secrets inline on the command line; use stored credentials.
+
+`sshw` never stores passwords, private keys, passphrases, or tokens in its config files. Password auth stores the password only through the native OS credential store (or, opt-in, a session-only in-memory backend). Agent auth stores no secret and uses the user's active SSH agent.
 
 ### Install From Source
 
@@ -26,42 +36,75 @@ It is delegated access, not a sandbox. If a local coding agent is allowed to run
 cargo build --locked --release
 ```
 
-The binary will be at:
-
-```text
-target/release/sshw
-target/release/sshw.exe
-```
+The binary will be at `target/release/sshw` (`sshw.exe` on Windows).
 
 ### Release Builds
 
-Tagged releases build GitHub release artifacts for:
-
-- `x86_64-unknown-linux-gnu`
-- `x86_64-pc-windows-msvc`
-- `x86_64-apple-darwin`
-- `aarch64-apple-darwin`
-
-Each release also includes a `SHA256SUMS` file for artifact integrity checks. Release workflows pin GitHub Actions by commit SHA; review those SHAs when updating action major versions.
-
-Create a release by pushing a version tag:
+Tagged releases build GitHub release artifacts for `x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`, `x86_64-apple-darwin`, and `aarch64-apple-darwin`. Each release includes a `SHA256SUMS` file. Release workflows pin GitHub Actions by commit SHA.
 
 ```bash
 git tag vX.Y.Z
 git push origin vX.Y.Z
 ```
 
-### Config
+### Storage Layout And Profiles
 
-`sshw` stores non-secret server metadata in the per-user config directory:
+All state lives under per-project **homes**. A home directory contains:
 
 ```text
-Windows: C:\Users\<user>\AppData\Roaming\sshw\servers.json
-macOS:   /Users/<user>/Library/Application Support/sshw/servers.json
-Linux:   /home/<user>/.config/sshw/servers.json
+<home>/servers.json    server metadata (host, port, user, auth type, credential key)
+<home>/known_hosts      trusted SSH host keys (OpenSSH format)
+<home>/policy.json      optional policy (see Policy Enforcement)
+<home>/audit.jsonl      append-only audit log
 ```
 
-The config contains server host, port, user, auth type, and credential key names only.
+The global profile registry maps profile names to homes:
+
+```text
+<config_dir>/sshw/profiles.json            registry
+<config_dir>/sshw/profiles/default/         built-in default profile home
+```
+
+`<config_dir>` is `%AppData%\sshw` on Windows, `~/Library/Application Support/sshw` on macOS, and `~/.config/sshw` on Linux.
+
+Credential keyring entries are always namespaced so the same server name in different homes never collides:
+
+```text
+sshw:<profile-id>:<server>     for registered/built-in profiles
+sshw:home_<hash>:<server>      for ad-hoc --home / SSHW_HOME
+```
+
+### Selecting A Home
+
+Home selection priority, highest first:
+
+1. `--home <path>` — a one-off / project-local home for this invocation.
+2. `SSHW_HOME` — same, from the environment.
+3. `--profile <name>` — a registered profile (errors if unknown).
+4. the registry's default profile.
+5. the built-in default profile home (`<config_dir>/sshw/profiles/default`).
+
+`--home` and `--profile` cannot be combined (exit code 3).
+
+```bash
+sshw --home ./.sshw list
+SSHW_HOME=./.sshw sshw list
+sshw --profile prod run web "uptime"
+```
+
+### Managing Profiles
+
+```bash
+sshw profile add prod --home /srv/prod    # the home comes from the global --home flag
+sshw profile list
+sshw profile list --json
+sshw profile show prod
+sshw profile show prod --json
+sshw profile default prod
+sshw profile remove prod                  # removes the registry entry only; home dir and credentials are left intact
+```
+
+Each profile stores a stable id and its home path. The first profile added becomes the default.
 
 ### Password Auth
 
@@ -69,9 +112,9 @@ The config contains server host, port, user, auth type, and credential key names
 sshw add server-alpha --host 192.0.2.10 --port 2222 --user deploy
 ```
 
-Password auth is the default. `sshw` prompts for the password using hidden input and stores it in the native OS credential store under a key like `sshw:server-alpha`.
+Password auth is the default. `sshw` prompts for the password with hidden input and stores it in the active credential backend under the home's namespace.
 
-On Linux, password auth requires a working Secret Service provider such as GNOME Keyring or KWallet. Headless Linux systems often do not have one. `sshw doctor` reports this clearly; `sshw` does not fall back to plaintext password storage.
+On Linux the native backend requires a working Secret Service provider (GNOME Keyring, KWallet). `sshw doctor` reports availability; `sshw` never falls back to plaintext storage.
 
 ### SSH Agent Auth
 
@@ -79,89 +122,123 @@ On Linux, password auth requires a working Secret Service provider such as GNOME
 sshw add server-beta --host 192.0.2.11 --port 2222 --user deploy --auth agent
 ```
 
-Agent auth stores no secret in `sshw`. It relies on your active SSH agent and loaded identities.
+Agent auth stores no secret; it uses the active SSH agent.
+
+### Credential Backends
+
+The home's `servers.json` selects the credential backend via `credential_backend` (default `native`):
+
+- `native` — the OS keyring (Windows Credential Manager, macOS Keychain, Linux Secret Service).
+- `session_only` — never touches the keyring. `set_password` stays in memory for the process only; at run time the password is taken from the `SSHW_PASSWORD` environment variable. Suited to ephemeral/CI use. `add --auth password` warns that the password is not persisted.
+
+An external-helper backend is a planned extension behind the same `CredentialStore` trait.
 
 ### Host Trust Flow
 
-Host key verification fails closed. Unknown or changed host keys are not silently accepted.
-
-Trust a server deliberately:
+Host key verification fails closed; unknown or changed keys are not silently accepted. Trusted keys are stored in the active home's `known_hosts`.
 
 ```bash
 sshw trust server-alpha
 sshw trust server-alpha --yes
 ```
 
-The trust command prints the host key algorithm and SHA256 fingerprint, asks for confirmation unless `--yes` is present, and writes the host key to the user's OpenSSH `known_hosts` file.
-
-`sshw trust` verifies that the fingerprint shown for confirmation still matches immediately before writing to `known_hosts`. If the key changes during the trust flow, the command fails instead of storing the new key.
+`trust` prints the algorithm and SHA256 fingerprint, confirms unless `--yes`, and re-verifies the fingerprint immediately before writing. If the key changes during the flow, it fails instead of storing the new key.
 
 ### Commands
 
 ```bash
-sshw list
-sshw list --json
+sshw list [--json]
+sshw show <name> [--json]
+sshw default [<name>]
+sshw trust <name> [--yes]
+sshw run [<name>] "<command>" [--json] [--yes]
+sshw put [<name>] <local> <remote> [--yes]
+sshw get [<name>] <remote> <local> [--yes]
+sshw remove <name> [--yes]
+sshw doctor [--json]
+sshw profile <add|list|show|default|remove> ...
+```
 
-sshw show server-alpha
-sshw show server-alpha --json
+Global flags (available on every command): `--home <path>`, `--profile <name>`, `--policy`.
 
-sshw default
-sshw default server-alpha
+When the name is omitted for `run`/`put`/`get`, the configured default server is used.
 
-sshw run server-alpha "hostname && whoami && pwd"
-sshw run server-alpha "pm2 status" --json
-sshw run server-alpha "pm2 restart my-app" --yes
-sshw run "hostname && whoami && pwd"
+### Safety Rails
 
-sshw put server-alpha ./app.exe /home/deploy/app/app.exe
-sshw put ./app.exe /home/deploy/app/app.exe
-sshw get server-alpha /home/deploy/app/log.txt ./log.txt
-sshw get /home/deploy/app/log.txt ./log.txt
-sshw get server-alpha /home/deploy/app/log.txt ./log.txt --yes
+Dangerous commands such as `rm -rf`, `sudo`, `chmod -R`, `chown -R`, `pm2 delete`, and obvious writes to `/etc` require `--yes`. `sshw get` will not overwrite an existing local file without `--yes`. `sshw put` creates remote files with owner-only permissions where the server honors SCP modes. These are safety rails, not a security sandbox.
 
-sshw remove server-alpha
-sshw remove server-alpha --yes
+### Policy Enforcement
 
+Policy is **off by default**. Turn it on for an invocation with `--policy`, or persistently with `"enabled": true` in the home's `policy.json`:
+
+```json
+{
+  "version": 1,
+  "enabled": true,
+  "allow_commands": ["uptime", "systemctl status *"],
+  "allow_put_paths": ["/srv/app"],
+  "allow_get_paths": ["/var/log"]
+}
+```
+
+When enforcing, `run` commands must match `allow_commands` and `put`/`get` paths must be under `allow_put_paths`/`allow_get_paths`. A command containing shell metacharacters (`;`, `&`, `|`, `` ` ``, `$`, `(`, `)`, `<`, `>`) only matches an **exact** allowlist entry. Transfer paths containing `..` are rejected. Denied operations return exit code 7 (`policy`).
+
+Policy fails closed: with `--policy`, a missing policy file is an error, and a present-but-unparseable file is always an error.
+
+See the Security Boundary note: `allow_commands` matches by program name and does not restrict arguments or file paths.
+
+### Audit Log
+
+Mutating/active operations (`add`, `remove`, `trust`, `default`, `run`, `put`, `get`) are appended to the home's `audit.jsonl`, one JSON object per line:
+
+```json
+{"time_ms":1700000000000,"action":"run","server":"web","status":"ok","exit_code":0,"detail":"uptime"}
+```
+
+`detail` for `run` is only the program name (not its arguments). Server names, paths, and details are redacted on a best-effort basis. Read-only commands (`list`, `show`, `doctor`, `profile`) are not audited. Audit writes are best-effort and never fail the operation; the file is owner-only on Unix (best-effort on Windows). Treat `audit.jsonl` as sensitive.
+
+### Output Redaction
+
+`run` stdout, stderr, and the echoed command are passed through best-effort redaction that masks PEM private-key blocks, `keyword=value`/`keyword: value` assignments for common secret keywords, and bearer tokens. This does not understand shell semantics: a secret passed as a flag value (`mysql -phunter2`) or split across lines may not be masked. Do not pass secrets inline; remote command output is otherwise returned verbatim.
+
+### Doctor
+
+```bash
 sshw doctor
 sshw doctor --json
 ```
 
-Dangerous commands such as `rm -rf`, `sudo`, `chmod -R`, `chown -R`, `pm2 delete`, and obvious writes to `/etc` require `--yes`. These are safety rails, not a security sandbox.
-
-`sshw get` will not overwrite an existing local file unless `--yes` is provided. `sshw put` creates remote files with owner-only permissions where the SSH server honors SCP modes.
-
-Remote command stdout and stderr are remote data. `sshw` never prints stored secrets by itself, but it cannot prevent a remote command from printing sensitive file contents if the caller asks it to do so.
+`doctor` reports the resolved home and how it was selected, the config / known_hosts / policy / audit paths, the credential namespace, whether policy is present/valid/enabled, whether the audit log is writable, and the credential backend health.
 
 ### JSON Error Contract
 
-Commands with `--json` return a structured error envelope on runtime failures:
+Commands that support `--json` (`list`, `show`, `run`, `doctor`, `profile list`, `profile show`) return a structured error envelope on runtime failures:
 
 ```json
 {"ok":false,"error":{"kind":"config","message":"unknown server 'missing'","exit_code":3}}
 ```
 
-Successful JSON output keeps the existing command-specific schema. The error envelope applies after CLI arguments have been parsed; clap usage errors are still handled by clap.
-
-Stable error kinds and exit codes:
-
 | Kind | Exit code | Meaning |
 | --- | ---: | --- |
 | `safety` | 2 | A safety rail blocked the operation, usually requiring `--yes`. |
-| `config` | 3 | Configuration is missing, invalid, or references an unknown server. |
+| `config` | 3 | Config/registry/profile is missing, invalid, or references an unknown entry. |
 | `auth` | 4 | Credential lookup or authentication setup failed. |
-| `ssh` | 5 | SSH connection, host key, known_hosts, or session setup failed. |
+| `ssh` | 5 | SSH connection, host key, known_hosts, session, or transfer failed. |
 | `io` | 6 | Local file or filesystem handling failed. |
+| `policy` | 7 | A policy allowlist denied the operation, or policy enforcement failed closed. |
 | `unknown` | 1 | The failure did not match a stable category. |
 
-Human output keeps the existing plain stderr message, but uses the same stable exit code mapping.
+`put`, `get`, `add`, `trust`, `remove`, and `default` do not have a `--json` flag; they report human-readable errors on stderr with the same stable exit codes. Human output everywhere uses the same exit-code mapping.
+
+### File Permissions And Atomicity
+
+New `servers.json`, `policy.json`, `audit.jsonl`, and the profile registry are created owner-only on platforms that support it. Config and registry writes are atomic (write-temp-then-rename). On Windows, permissions are best-effort (NTFS ACLs on the per-user directory provide the protection) and the atomic replace preserves the existing file if the write is interrupted.
 
 ### Coding Agent Usage
 
-Use prompts like:
-
 ```text
 Use only the local sshw CLI for server operations.
-Do not ask for or print SSH passwords.
+Do not ask for, type, or print SSH passwords; do not pass secrets inline as command arguments.
 Before making changes, run: sshw run <server> "hostname && whoami && pwd"
 Before destructive or service-impacting commands, show the exact command list and wait for confirmation.
 Prefer sshw run --json when parsing output.
@@ -192,15 +269,25 @@ MIT
 
 `sshw`는 SSH 비밀번호, 개인키, 패스프레이즈, 토큰을 프롬프트, 셸 히스토리, 평문 설정 파일에 남기지 않고 등록된 SSH 서버를 조작하기 위한 크로스플랫폼 Rust CLI입니다.
 
-로컬 코딩 에이전트가 간단한 배포와 유지보수 작업을 위임받아 수행해야 할 때 쓰도록 설계했습니다.
+로컬 코딩 에이전트가 간단한 배포·유지보수 작업을 위임받아 수행할 때 쓰도록 설계했습니다. 강한 OS 샌드박스가 아니라 **sandbox-aware SSH wrapper**로서, 프로젝트별 profile 격리, 선택적 command/transfer policy, audit log, 출력 redaction을 제공합니다.
 
 ### 보안 경계
 
-`sshw`는 채팅, 명령줄, 셸 히스토리, JSON 설정 파일, 일반 명령 출력에서 비밀이 실수로 노출되는 일을 줄입니다.
+`sshw`는 채팅, 명령줄, 셸 히스토리, JSON 설정, 일반 출력에서 비밀이 실수로 노출되는 일을 줄이며, 추가로 다음을 제공합니다.
 
-이 도구는 위임된 접근 수단이지 샌드박스가 아닙니다. 로컬 코딩 에이전트에게 `sshw run` 실행 권한을 주면, 그 에이전트는 설정된 계정이 가진 서버 권한을 사용할 수 있습니다. 같은 OS 사용자 권한으로 실행되는 완전한 로컬 프로세스는 운영체제 credential store에 직접 접근을 시도할 수도 있습니다.
+- **profile/home 격리** — config, `known_hosts`, policy, audit, credential namespace가 home 단위로 분리됩니다.
+- **선택적 policy** — command 및 파일 전송 경로 allowlist(기본 off).
+- **audit log** — 변경/실행 작업의 append-only JSONL 기록.
+- **출력 redaction** — `run` 출력의 비밀 형태 문자열을 best-effort로 마스킹.
 
-`sshw`는 비밀번호, 개인키, 패스프레이즈, 토큰을 설정 파일에 저장하지 않습니다. password auth는 비밀번호를 native OS credential store에만 저장합니다. agent auth는 비밀을 저장하지 않고 사용자의 활성 SSH agent를 사용합니다.
+다만 **강한 OS 샌드박스가 아닙니다.**
+
+- 위임된 접근 수단입니다. 에이전트가 `sshw run`을 쓸 수 있으면 설정된 계정의 서버 권한을 갖습니다.
+- 같은 OS 사용자 권한의 완전한 로컬 프로세스는 OS credential store에 직접 접근할 수 있습니다.
+- policy의 `allow_commands`는 **프로그램 이름**으로 매칭하므로, 어떤 프로그램을 allowlist에 넣으면 *그 프로그램의 인자와 읽고 쓸 수 있는 파일까지 포함한 전체 기능*을 허용하는 것입니다. 따라서 `allow_commands`는 `allow_get_paths`/`allow_put_paths`보다 강한 권한이며, 임의 인자를 신뢰할 수 있는 프로그램만 등록해야 합니다.
+- redaction과 audit redaction은 **best-effort**입니다. 흔한 형태(PEM 키, `keyword=value`, bearer 토큰)는 잡지만, 플래그로 전달된 비밀(`-p`, `-a`, 위치 인자 토큰)이나 여러 줄에 걸친 비밀은 못 잡을 수 있습니다. 비밀을 명령줄에 인라인으로 넘기지 말고 저장된 credential을 사용하세요.
+
+`sshw`는 비밀번호·개인키·패스프레이즈·토큰을 설정 파일에 저장하지 않습니다. password auth는 native OS credential store(또는 opt-in session-only in-memory backend)에만 저장하며, agent auth는 비밀을 저장하지 않고 사용자의 활성 SSH agent를 사용합니다.
 
 ### 소스에서 설치
 
@@ -208,42 +295,75 @@ MIT
 cargo build --locked --release
 ```
 
-빌드된 바이너리는 아래 경로에 생성됩니다.
-
-```text
-target/release/sshw
-target/release/sshw.exe
-```
+바이너리는 `target/release/sshw`(Windows는 `sshw.exe`)에 생성됩니다.
 
 ### 릴리스 빌드
 
-태그 릴리스는 GitHub Release 산출물을 아래 플랫폼용으로 생성합니다.
-
-- `x86_64-unknown-linux-gnu`
-- `x86_64-pc-windows-msvc`
-- `x86_64-apple-darwin`
-- `aarch64-apple-darwin`
-
-각 릴리스에는 산출물 무결성 확인을 위한 `SHA256SUMS` 파일도 포함됩니다. 릴리스 워크플로우는 GitHub Actions를 commit SHA로 pin합니다. action major version을 올릴 때는 해당 SHA를 검토해야 합니다.
-
-릴리스는 버전 태그를 push해서 생성합니다.
+태그 릴리스는 `x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`, `x86_64-apple-darwin`, `aarch64-apple-darwin`용 GitHub Release 산출물과 `SHA256SUMS`를 생성합니다. 릴리스 워크플로우는 GitHub Actions를 commit SHA로 pin합니다.
 
 ```bash
 git tag vX.Y.Z
 git push origin vX.Y.Z
 ```
 
-### 설정
+### 저장 구조와 profile
 
-`sshw`는 비밀이 아닌 서버 메타데이터를 사용자별 설정 디렉터리에 저장합니다.
+모든 상태는 프로젝트별 **home** 아래에 있습니다. home 디렉터리 구성:
 
 ```text
-Windows: C:\Users\<user>\AppData\Roaming\sshw\servers.json
-macOS:   /Users/<user>/Library/Application Support/sshw/servers.json
-Linux:   /home/<user>/.config/sshw/servers.json
+<home>/servers.json    서버 메타데이터(host, port, user, auth type, credential key)
+<home>/known_hosts      신뢰한 SSH host key(OpenSSH 형식)
+<home>/policy.json      선택적 policy(아래 Policy 참고)
+<home>/audit.jsonl      append-only audit log
 ```
 
-설정 파일에는 서버 host, port, user, auth type, credential key name만 들어갑니다.
+전역 profile registry는 profile 이름을 home에 매핑합니다.
+
+```text
+<config_dir>/sshw/profiles.json            registry
+<config_dir>/sshw/profiles/default/         내장 default profile home
+```
+
+`<config_dir>`는 Windows `%AppData%\sshw`, macOS `~/Library/Application Support/sshw`, Linux `~/.config/sshw`입니다.
+
+credential keyring 키는 항상 namespaced이므로, 서로 다른 home에서 같은 서버 이름을 써도 충돌하지 않습니다.
+
+```text
+sshw:<profile-id>:<server>     등록/내장 profile
+sshw:home_<hash>:<server>      ad-hoc --home / SSHW_HOME
+```
+
+### home 선택
+
+우선순위(높은 순):
+
+1. `--home <path>` — 일회성/프로젝트 로컬 home.
+2. `SSHW_HOME` — 환경변수로 동일.
+3. `--profile <name>` — 등록된 profile(없으면 에러).
+4. registry의 default profile.
+5. 내장 default profile home(`<config_dir>/sshw/profiles/default`).
+
+`--home`과 `--profile`은 함께 쓸 수 없습니다(exit code 3).
+
+```bash
+sshw --home ./.sshw list
+SSHW_HOME=./.sshw sshw list
+sshw --profile prod run web "uptime"
+```
+
+### profile 관리
+
+```bash
+sshw profile add prod --home /srv/prod    # home은 전역 --home 플래그에서 가져옵니다
+sshw profile list
+sshw profile list --json
+sshw profile show prod
+sshw profile show prod --json
+sshw profile default prod
+sshw profile remove prod                  # registry 항목만 제거. home 디렉터리와 credential은 보존
+```
+
+각 profile은 stable id와 home 경로를 저장합니다. 처음 추가한 profile이 default가 됩니다.
 
 ### 비밀번호 인증
 
@@ -251,9 +371,9 @@ Linux:   /home/<user>/.config/sshw/servers.json
 sshw add server-alpha --host 192.0.2.10 --port 2222 --user deploy
 ```
 
-비밀번호 인증이 기본값입니다. `sshw`는 숨김 입력으로 비밀번호를 받고, `sshw:server-alpha` 같은 키로 native OS credential store에 저장합니다.
+비밀번호 인증이 기본값입니다. `sshw`는 숨김 입력으로 비밀번호를 받아 활성 credential backend의 home namespace 키로 저장합니다.
 
-Linux에서 비밀번호 인증을 쓰려면 GNOME Keyring 또는 KWallet 같은 Secret Service provider가 동작해야 합니다. Headless Linux 환경에는 없는 경우가 많습니다. `sshw doctor`가 이 상태를 명확히 보고하며, `sshw`는 평문 비밀번호 저장으로 fallback하지 않습니다.
+Linux의 native backend는 동작하는 Secret Service provider(GNOME Keyring, KWallet)가 필요합니다. `sshw doctor`가 가용성을 보고하며, 평문 저장으로 fallback하지 않습니다.
 
 ### SSH Agent 인증
 
@@ -261,89 +381,123 @@ Linux에서 비밀번호 인증을 쓰려면 GNOME Keyring 또는 KWallet 같은
 sshw add server-beta --host 192.0.2.11 --port 2222 --user deploy --auth agent
 ```
 
-Agent auth는 `sshw`에 비밀을 저장하지 않습니다. 사용자의 활성 SSH agent와 로드된 identity에 의존합니다.
+agent auth는 비밀을 저장하지 않고 활성 SSH agent를 사용합니다.
+
+### Credential 백엔드
+
+home의 `servers.json`이 `credential_backend`(기본 `native`)로 백엔드를 선택합니다.
+
+- `native` — OS keyring(Windows Credential Manager, macOS Keychain, Linux Secret Service).
+- `session_only` — keyring을 쓰지 않습니다. `set_password`는 프로세스 메모리에만 유지되고, 실행 시 비밀번호는 `SSHW_PASSWORD` 환경변수에서 가져옵니다. ephemeral/CI에 적합합니다. `add --auth password`는 비밀번호가 영속되지 않는다고 경고합니다.
+
+external-helper 백엔드는 동일한 `CredentialStore` trait 뒤의 후속 확장점입니다.
 
 ### Host Trust Flow
 
-Host key 검증은 fail-closed입니다. 알 수 없거나 변경된 host key는 조용히 허용하지 않습니다.
-
-서버를 명시적으로 신뢰하려면 아래 명령을 사용합니다.
+Host key 검증은 fail-closed이며, 알 수 없거나 변경된 key는 조용히 허용하지 않습니다. 신뢰한 key는 활성 home의 `known_hosts`에 저장됩니다.
 
 ```bash
 sshw trust server-alpha
 sshw trust server-alpha --yes
 ```
 
-trust 명령은 host key algorithm과 SHA256 fingerprint를 출력하고, `--yes`가 없으면 확인을 요청한 뒤 사용자의 OpenSSH `known_hosts` 파일에 host key를 기록합니다.
-
-`sshw trust`는 확인 화면에 보여준 fingerprint가 `known_hosts`에 쓰기 직전에도 같은지 다시 검증합니다. trust 흐름 중 key가 바뀌면 새 key를 저장하지 않고 실패합니다.
+`trust`는 algorithm과 SHA256 fingerprint를 출력하고 `--yes`가 없으면 확인하며, 쓰기 직전에 fingerprint를 다시 검증합니다. 흐름 중 key가 바뀌면 새 key를 저장하지 않고 실패합니다.
 
 ### 명령
 
 ```bash
-sshw list
-sshw list --json
+sshw list [--json]
+sshw show <name> [--json]
+sshw default [<name>]
+sshw trust <name> [--yes]
+sshw run [<name>] "<command>" [--json] [--yes]
+sshw put [<name>] <local> <remote> [--yes]
+sshw get [<name>] <remote> <local> [--yes]
+sshw remove <name> [--yes]
+sshw doctor [--json]
+sshw profile <add|list|show|default|remove> ...
+```
 
-sshw show server-alpha
-sshw show server-alpha --json
+전역 플래그(모든 명령에서 사용): `--home <path>`, `--profile <name>`, `--policy`.
 
-sshw default
-sshw default server-alpha
+`run`/`put`/`get`에서 이름을 생략하면 설정된 default 서버를 사용합니다.
 
-sshw run server-alpha "hostname && whoami && pwd"
-sshw run server-alpha "pm2 status" --json
-sshw run server-alpha "pm2 restart my-app" --yes
-sshw run "hostname && whoami && pwd"
+### Safety Rails
 
-sshw put server-alpha ./app.exe /home/deploy/app/app.exe
-sshw put ./app.exe /home/deploy/app/app.exe
-sshw get server-alpha /home/deploy/app/log.txt ./log.txt
-sshw get /home/deploy/app/log.txt ./log.txt
-sshw get server-alpha /home/deploy/app/log.txt ./log.txt --yes
+`rm -rf`, `sudo`, `chmod -R`, `chown -R`, `pm2 delete`, `/etc`에 대한 명백한 쓰기 같은 위험 명령은 `--yes`가 필요합니다. `sshw get`은 `--yes` 없이 기존 로컬 파일을 덮어쓰지 않습니다. `sshw put`은 서버가 SCP mode를 존중하면 owner-only 권한으로 원격 파일을 만듭니다. 이것은 safety rail이지 보안 샌드박스가 아닙니다.
 
-sshw remove server-alpha
-sshw remove server-alpha --yes
+### Policy 적용
 
+policy는 **기본 off**입니다. 호출별로 `--policy`로 켜거나, home의 `policy.json`에 `"enabled": true`로 영속 적용합니다.
+
+```json
+{
+  "version": 1,
+  "enabled": true,
+  "allow_commands": ["uptime", "systemctl status *"],
+  "allow_put_paths": ["/srv/app"],
+  "allow_get_paths": ["/var/log"]
+}
+```
+
+적용 시 `run` 명령은 `allow_commands`에, `put`/`get` 경로는 `allow_put_paths`/`allow_get_paths` 하위에 매칭돼야 합니다. 쉘 메타문자(`;`, `&`, `|`, `` ` ``, `$`, `(`, `)`, `<`, `>`)를 포함한 명령은 **정확히 일치하는** allowlist 항목에만 매칭됩니다. `..`를 포함한 전송 경로는 거부됩니다. 거부된 작업은 exit code 7(`policy`)을 반환합니다.
+
+policy는 fail-closed입니다. `--policy`인데 파일이 없으면 에러이고, 파일이 있으나 파싱 불가면 항상 에러입니다.
+
+보안 경계 참고: `allow_commands`는 프로그램 이름으로 매칭하며 인자나 파일 경로를 제한하지 않습니다.
+
+### Audit Log
+
+변경/실행 작업(`add`, `remove`, `trust`, `default`, `run`, `put`, `get`)은 home의 `audit.jsonl`에 줄당 JSON 객체로 append됩니다.
+
+```json
+{"time_ms":1700000000000,"action":"run","server":"web","status":"ok","exit_code":0,"detail":"uptime"}
+```
+
+`run`의 `detail`은 인자가 아닌 프로그램 이름만 기록합니다. 서버명·경로·detail은 best-effort로 redaction됩니다. read-only 명령(`list`, `show`, `doctor`, `profile`)은 기록하지 않습니다. audit 쓰기는 best-effort이며 작업을 실패시키지 않습니다. 파일은 Unix에서 owner-only(Windows는 best-effort)입니다. `audit.jsonl`은 민감 파일로 취급하세요.
+
+### 출력 redaction
+
+`run`의 stdout/stderr/echo된 command는 best-effort redaction을 거칩니다. PEM 개인키 블록, 흔한 비밀 keyword의 `keyword=value`/`keyword: value`, bearer 토큰을 마스킹합니다. 쉘 의미는 이해하지 못하므로, 플래그 값으로 전달된 비밀(`mysql -phunter2`)이나 여러 줄에 걸친 비밀은 마스킹되지 않을 수 있습니다. 비밀을 인라인으로 넘기지 마세요. 그 외 원격 출력은 그대로 반환됩니다.
+
+### Doctor
+
+```bash
 sshw doctor
 sshw doctor --json
 ```
 
-`rm -rf`, `sudo`, `chmod -R`, `chown -R`, `pm2 delete`, `/etc`에 대한 명백한 쓰기 같은 위험 명령은 `--yes`가 필요합니다. 이것은 safety rail이지 보안 샌드박스가 아닙니다.
-
-`sshw get`은 `--yes`가 없으면 기존 로컬 파일을 덮어쓰지 않습니다. `sshw put`은 SSH 서버가 SCP mode를 존중하는 경우 owner-only 권한으로 원격 파일을 만듭니다.
-
-원격 명령의 stdout과 stderr는 원격 데이터입니다. `sshw` 자체는 저장된 비밀을 출력하지 않지만, 호출자가 민감한 파일 내용을 출력하는 원격 명령을 실행하면 그 출력을 막을 수 없습니다.
+`doctor`는 해석된 home과 선택 경위, config/known_hosts/policy/audit 경로, credential namespace, policy present/valid/enabled, audit 쓰기 가능 여부, credential backend 상태를 보고합니다.
 
 ### JSON 오류 계약
 
-`--json`을 가진 명령은 런타임 실패 시 구조화된 error envelope를 반환합니다.
+`--json`을 지원하는 명령(`list`, `show`, `run`, `doctor`, `profile list`, `profile show`)은 런타임 실패 시 구조화된 envelope를 반환합니다.
 
 ```json
 {"ok":false,"error":{"kind":"config","message":"unknown server 'missing'","exit_code":3}}
 ```
 
-성공 JSON 출력은 기존 명령별 스키마를 유지합니다. error envelope는 CLI 인자 파싱이 끝난 뒤의 실패 경로에 적용됩니다. clap usage error는 여전히 clap이 처리합니다.
-
-안정 오류 종류와 exit code는 아래와 같습니다.
-
 | Kind | Exit code | 의미 |
 | --- | ---: | --- |
-| `safety` | 2 | safety rail이 작업을 차단했습니다. 보통 `--yes`가 필요합니다. |
-| `config` | 3 | 설정이 없거나 잘못됐거나 알 수 없는 서버를 참조합니다. |
-| `auth` | 4 | credential 조회 또는 인증 준비에 실패했습니다. |
-| `ssh` | 5 | SSH 연결, host key, known_hosts, session 준비에 실패했습니다. |
-| `io` | 6 | 로컬 파일 또는 파일 시스템 처리에 실패했습니다. |
-| `unknown` | 1 | 안정 카테고리에 매핑되지 않은 실패입니다. |
+| `safety` | 2 | safety rail이 차단(보통 `--yes` 필요). |
+| `config` | 3 | config/registry/profile이 없거나 잘못됐거나 알 수 없는 항목 참조. |
+| `auth` | 4 | credential 조회 또는 인증 준비 실패. |
+| `ssh` | 5 | SSH 연결, host key, known_hosts, session, 전송 실패. |
+| `io` | 6 | 로컬 파일/파일시스템 처리 실패. |
+| `policy` | 7 | policy allowlist가 작업을 거부했거나 policy 적용이 fail-closed. |
+| `unknown` | 1 | 안정 카테고리에 매핑되지 않은 실패. |
 
-Human 출력은 기존처럼 stderr에 평문 메시지를 유지하지만, exit code는 같은 안정 매핑을 사용합니다.
+`put`, `get`, `add`, `trust`, `remove`, `default`에는 `--json` 플래그가 없으며, 동일한 안정 exit code로 stderr에 사람용 메시지를 출력합니다. human 출력도 같은 exit code 매핑을 사용합니다.
+
+### 파일 권한과 원자성
+
+새로 만드는 `servers.json`, `policy.json`, `audit.jsonl`, profile registry는 지원 플랫폼에서 owner-only로 생성됩니다. config·registry 저장은 atomic(temp 작성 후 rename)입니다. Windows에서는 권한이 best-effort(사용자별 디렉터리의 NTFS ACL이 보호)이며, atomic 교체는 쓰기 중단 시 기존 파일을 보존합니다.
 
 ### 코딩 에이전트 사용 예
 
-아래와 같은 프롬프트를 사용할 수 있습니다.
-
 ```text
 Use only the local sshw CLI for server operations.
-Do not ask for or print SSH passwords.
+Do not ask for, type, or print SSH passwords; do not pass secrets inline as command arguments.
 Before making changes, run: sshw run <server> "hostname && whoami && pwd"
 Before destructive or service-impacting commands, show the exact command list and wait for confirmation.
 Prefer sshw run --json when parsing output.
@@ -362,7 +516,7 @@ cargo run --locked -- doctor
 
 ### 보안 제보
 
-의심되는 취약점은 GitHub Security Advisories를 통해 제보해 주세요. 공개 이슈에는 실제 hostname, IP 주소, 비밀번호, 토큰, 개인키, 패스프레이즈를 남기지 마세요.
+의심되는 취약점은 GitHub Security Advisories로 제보해 주세요. 공개 이슈에는 실제 hostname, IP, 비밀번호, 토큰, 개인키, 패스프레이즈를 남기지 마세요.
 
 ### 라이선스
 
