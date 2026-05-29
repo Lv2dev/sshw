@@ -1,3 +1,4 @@
+use crate::audit::{self, AuditRecord, AuditSink, AuditStatus, FileAuditSink, NoopAudit};
 use crate::config::{AuthConfig, ServerConfig, SshwConfig, load_config, save_config};
 use crate::credentials::keyring_store::KeyringCredentialStore;
 use crate::credentials::{AuthMaterial, CredentialStore, CredentialStoreHealth};
@@ -233,6 +234,7 @@ pub struct ExecContext<'a> {
     pub registry_path: &'a Path,
     /// The `--policy` flag: force policy enforcement for this invocation.
     pub policy_forced: bool,
+    pub audit: &'a dyn AuditSink,
 }
 
 pub fn run() -> i32 {
@@ -245,10 +247,12 @@ pub fn run() -> i32 {
     let credentials = KeyringCredentialStore;
     let ssh = Ssh2Client::default().with_known_hosts(home.known_hosts_path.clone());
     let mut prompter = TerminalPrompter;
+    let audit = FileAuditSink::new(home.audit_path.clone());
     let ctx = ExecContext {
         home: &home,
         registry_path: &registry_path,
         policy_forced: cli.policy,
+        audit: &audit,
     };
     let output = execute_for_runtime_with(cli, &ctx, &credentials, &ssh, &mut prompter);
 
@@ -295,10 +299,12 @@ where
     let home = ResolvedHome::from_config_path(config_path);
     let registry_path = sibling_registry_path(config_path);
     let policy_forced = cli.policy;
+    let audit = NoopAudit;
     let ctx = ExecContext {
         home: &home,
         registry_path: &registry_path,
         policy_forced,
+        audit: &audit,
     };
     execute_with(cli, &ctx, credentials, ssh, prompter)
 }
@@ -318,10 +324,12 @@ where
     let home = ResolvedHome::from_config_path(config_path);
     let registry_path = sibling_registry_path(config_path);
     let policy_forced = cli.policy;
+    let audit = NoopAudit;
     let ctx = ExecContext {
         home: &home,
         registry_path: &registry_path,
         policy_forced,
+        audit: &audit,
     };
     execute_for_runtime_with(cli, &ctx, credentials, ssh, prompter)
 }
@@ -367,7 +375,9 @@ where
     let config_path = ctx.home.config_path.as_path();
     let mut config = load_config(config_path)?;
 
-    match command {
+    let descriptor = audit_descriptor(&command, &config);
+
+    let result = match command {
         Command::Add(args) => add_server(
             args,
             config_path,
@@ -404,6 +414,67 @@ where
             &config,
         ),
         Command::Profile(args) => run_profile(args, ctx.registry_path, home_flag.as_deref()),
+    };
+
+    if let Some((action, server, detail)) = descriptor {
+        let (status, exit_code) = match &result {
+            Ok(output) => (AuditStatus::Ok, output.exit_code),
+            Err(err) => (
+                AuditStatus::Error,
+                ErrorResponse::from_error(err).error.exit_code,
+            ),
+        };
+        // Best-effort: an audit write failure must not fail the operation.
+        let _ = ctx.audit.record(&AuditRecord {
+            action: action.to_string(),
+            server,
+            detail,
+            status,
+            exit_code,
+        });
+    }
+
+    result
+}
+
+/// Best-effort `(action, server, detail)` for the auditable commands. Returns
+/// `None` for read-only commands (list/show/doctor/profile) that are not
+/// audited. `detail` is redacted by the sink before being written.
+fn audit_descriptor(
+    command: &Command,
+    config: &SshwConfig,
+) -> Option<(&'static str, Option<String>, Option<String>)> {
+    let default = || config.default.clone();
+    match command {
+        Command::Add(a) => Some(("add", Some(a.name.clone()), None)),
+        Command::Remove(a) => Some(("remove", Some(a.name.clone()), None)),
+        Command::Trust(a) => Some(("trust", Some(a.name.clone()), None)),
+        Command::Default(a) => Some(("default", a.name.clone().or_else(default), None)),
+        Command::Run(a) => {
+            let (server, detail) = match a.target.as_slice() {
+                [name, command] => (Some(name.clone()), Some(command.clone())),
+                [command] => (default(), Some(command.clone())),
+                _ => (default(), None),
+            };
+            Some(("run", server, detail))
+        }
+        Command::Put(a) => {
+            let (server, detail) = match a.target.as_slice() {
+                [name, _local, remote] => (Some(name.clone()), Some(remote.clone())),
+                [_local, remote] => (default(), Some(remote.clone())),
+                _ => (default(), None),
+            };
+            Some(("put", server, detail))
+        }
+        Command::Get(a) => {
+            let (server, detail) = match a.target.as_slice() {
+                [name, remote, _local] => (Some(name.clone()), Some(remote.clone())),
+                [remote, _local] => (default(), Some(remote.clone())),
+                _ => (default(), None),
+            };
+            Some(("get", server, detail))
+        }
+        _ => None,
     }
 }
 
@@ -729,6 +800,7 @@ where
 {
     let config_path = home.config_path.as_path();
     let policy = describe_policy(&home.policy_path, policy_forced);
+    let audit_writable = audit::is_writable(&home.audit_path);
     let health = credentials
         .health_check()
         .unwrap_or_else(|err| CredentialStoreHealth {
@@ -751,6 +823,7 @@ where
             "policy_valid": policy.valid,
             "policy_enabled": policy.enabled,
             "audit_path": home.audit_path,
+            "audit_writable": audit_writable,
             "credential_namespace": home.namespace.token(),
             "os": std::env::consts::OS,
             "credential_backend": health.backend,
@@ -762,7 +835,7 @@ where
     }
 
     let mut stdout = format!(
-        "home: {}\nhome source: {}\nregistry path: {}\nconfig path: {}\nconfig exists: {}\nknown_hosts path: {}\npolicy path: {}\npolicy present: {}\npolicy valid: {}\npolicy enabled: {}\naudit path: {}\ncredential namespace: {}\nos: {}\ncredential backend: {}\ncredential available: {}\ncredential message: {}\n",
+        "home: {}\nhome source: {}\nregistry path: {}\nconfig path: {}\nconfig exists: {}\nknown_hosts path: {}\npolicy path: {}\npolicy present: {}\npolicy valid: {}\npolicy enabled: {}\naudit path: {}\naudit writable: {}\ncredential namespace: {}\nos: {}\ncredential backend: {}\ncredential available: {}\ncredential message: {}\n",
         home.root.display(),
         home.description,
         registry_path.display(),
@@ -774,6 +847,7 @@ where
         policy.valid,
         policy.enabled,
         home.audit_path.display(),
+        audit_writable,
         home.namespace.token(),
         std::env::consts::OS,
         health.backend,

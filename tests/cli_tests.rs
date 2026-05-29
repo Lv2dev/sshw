@@ -1,7 +1,11 @@
 use clap::Parser;
-use sshw::cli::{AuthArg, Cli, Command, Prompter, execute, execute_for_runtime};
+use sshw::audit::FileAuditSink;
+use sshw::cli::{
+    AuthArg, Cli, Command, ExecContext, Prompter, execute, execute_for_runtime, execute_with,
+};
 use sshw::config::{AuthConfig, ServerConfig, SshwConfig, save_config};
 use sshw::credentials::{AuthMaterial, CredentialStore, CredentialStoreHealth};
+use sshw::home::ResolvedHome;
 use sshw::ssh::{HostKeyInfo, RunResult, SshClient, TransferResult};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -985,6 +989,112 @@ fn run_redacts_secrets_in_output() {
 
 fn write_policy(dir: &Path, contents: &str) {
     std::fs::write(dir.join("policy.json"), contents).unwrap();
+}
+
+#[test]
+fn run_writes_redacted_audit_record() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &sample_config()).unwrap();
+    let store = FakeCredentialStore::default();
+    store
+        .set_password("sshw:server-alpha", "deploy", "YOUR_PASSWORD")
+        .unwrap();
+    let ssh = FakeSshClient::default();
+    let audit_path = temp.path().join("audit.jsonl");
+    let audit = FileAuditSink::new(audit_path.clone());
+    let home = ResolvedHome::from_config_path(&path);
+    let registry = temp.path().join("profiles.json");
+    let ctx = ExecContext {
+        home: &home,
+        registry_path: &registry,
+        policy_forced: false,
+        audit: &audit,
+    };
+
+    execute_with(
+        Cli::try_parse_from(["sshw", "run", "server-alpha", "mysql --password=hunter2"]).unwrap(),
+        &ctx,
+        &store,
+        &ssh,
+        &mut FakePrompter::default(),
+    )
+    .unwrap();
+
+    let log = std::fs::read_to_string(&audit_path).unwrap();
+    let rec: serde_json::Value = serde_json::from_str(log.trim()).unwrap();
+    assert_eq!(rec["action"], "run");
+    assert_eq!(rec["server"], "server-alpha");
+    assert_eq!(rec["status"], "ok");
+    assert!(!log.contains("hunter2"), "secret leaked into audit log");
+    assert!(rec["detail"].as_str().unwrap().contains("<redacted>"));
+}
+
+#[test]
+fn failed_run_is_audited_with_error_status() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &sample_config()).unwrap();
+    let store = FakeCredentialStore::default();
+    let ssh = FakeSshClient::default();
+    let audit_path = temp.path().join("audit.jsonl");
+    let audit = FileAuditSink::new(audit_path.clone());
+    let home = ResolvedHome::from_config_path(&path);
+    let registry = temp.path().join("profiles.json");
+    let ctx = ExecContext {
+        home: &home,
+        registry_path: &registry,
+        policy_forced: false,
+        audit: &audit,
+    };
+
+    let _ = execute_with(
+        Cli::try_parse_from(["sshw", "run", "missing", "hostname"]).unwrap(),
+        &ctx,
+        &store,
+        &ssh,
+        &mut FakePrompter::default(),
+    );
+
+    let log = std::fs::read_to_string(&audit_path).unwrap();
+    let rec: serde_json::Value = serde_json::from_str(log.trim()).unwrap();
+    assert_eq!(rec["action"], "run");
+    assert_eq!(rec["server"], "missing");
+    assert_eq!(rec["status"], "error");
+    assert_eq!(rec["exit_code"], 3);
+}
+
+#[test]
+fn read_only_commands_are_not_audited() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &sample_config()).unwrap();
+    let store = FakeCredentialStore::default();
+    let ssh = FakeSshClient::default();
+    let audit_path = temp.path().join("audit.jsonl");
+    let audit = FileAuditSink::new(audit_path.clone());
+    let home = ResolvedHome::from_config_path(&path);
+    let registry = temp.path().join("profiles.json");
+    let ctx = ExecContext {
+        home: &home,
+        registry_path: &registry,
+        policy_forced: false,
+        audit: &audit,
+    };
+
+    execute_with(
+        Cli::try_parse_from(["sshw", "list"]).unwrap(),
+        &ctx,
+        &store,
+        &ssh,
+        &mut FakePrompter::default(),
+    )
+    .unwrap();
+
+    assert!(
+        !audit_path.exists(),
+        "list should not write an audit record"
+    );
 }
 
 #[test]
