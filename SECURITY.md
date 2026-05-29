@@ -30,6 +30,7 @@ These are explicitly **not** strong guarantees:
 - **Redaction is best-effort.** Output and audit redaction catch PEM private-key blocks, `keyword=value`/`keyword: value` for common secret keywords, and bearer tokens. They do not understand shell syntax, so secrets passed as flag values (`-p`, `-a`, `-u user:pass`, bare positional tokens) or split across lines may not be masked. Do not pass secrets inline on the command line. The `run` audit record stores only the program name to avoid persisting inline secrets, but treat `audit.jsonl` as sensitive regardless.
 - **File protections are best-effort on Windows.** State files are created owner-only on Unix; on Windows protection relies on the per-user directory's NTFS ACLs. The audit log is plaintext.
 - **No OS-level sandboxing.** `sshw` does not constrain the remote host or the local process beyond the policy allowlist. Stronger per-OS sandbox backends are a possible future extension behind the existing `Sandbox` trait.
+- **No concurrent-write coordination.** State files are written atomically, so a half-written file is never observed, but there is no cross-process locking. Two `sshw` processes mutating the same home's `servers.json`, profile registry, or policy file concurrently will silently lose one update (last writer wins). Run mutating commands one at a time per home.
 
 ## Stable Exit Codes
 

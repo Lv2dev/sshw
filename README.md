@@ -238,6 +238,8 @@ These codes are sshw's own operational failures. When `run` connects and the rem
 
 New `servers.json`, `policy.json`, `audit.jsonl`, and the profile registry are created owner-only on platforms that support it. Config and registry writes are atomic (write-temp-then-rename). On Windows, permissions are best-effort (NTFS ACLs on the per-user directory provide the protection) and the atomic replace preserves the existing file if the write is interrupted.
 
+Writes within a home are not coordinated across processes: there is no file locking, so two `sshw` processes mutating the same `servers.json`, registry, or policy concurrently will lose one update (last writer wins). Run mutating commands one at a time per home.
+
 ### Coding Agent Usage
 
 ```text
@@ -498,6 +500,8 @@ sshw doctor --json
 ### 파일 권한과 원자성
 
 새로 만드는 `servers.json`, `policy.json`, `audit.jsonl`, profile registry는 지원 플랫폼에서 owner-only로 생성됩니다. config·registry 저장은 atomic(temp 작성 후 rename)입니다. Windows에서는 권한이 best-effort(사용자별 디렉터리의 NTFS ACL이 보호)이며, atomic 교체는 쓰기 중단 시 기존 파일을 보존합니다.
+
+한 home 안의 쓰기는 프로세스 간 조율되지 않습니다. 파일 잠금이 없으므로 두 `sshw` 프로세스가 같은 `servers.json`·registry·policy를 동시에 변경하면 한쪽 변경이 손실됩니다(마지막에 쓴 쪽이 이김). 변경 명령은 home별로 한 번에 하나씩 실행하세요.
 
 ### 코딩 에이전트 사용 예
 
