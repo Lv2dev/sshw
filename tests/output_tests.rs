@@ -89,6 +89,19 @@ fn classifies_ssh_session_and_transfer_errors_as_ssh() {
 }
 
 #[test]
+fn classifies_raw_ssh2_library_errors_as_ssh() {
+    // ssh2 errors (handshake/kex/known_hosts) carry no classification keyword
+    // and are not io::Error, so message matching alone misses them. They must
+    // still map to the stable ssh exit code (5), not unknown (1).
+    let err = anyhow::Error::new(ssh2::Error::unknown());
+
+    let kind = classify_error(&err);
+
+    assert_eq!(kind, ErrorKind::Ssh);
+    assert_eq!(kind.exit_code(), 5);
+}
+
+#[test]
 fn classifies_policy_errors_with_exit_code_7() {
     for message in [
         "command blocked by policy: 'rm' is not in the allowlist",

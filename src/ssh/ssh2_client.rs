@@ -314,7 +314,9 @@ fn authenticate(
 ) -> anyhow::Result<()> {
     match auth {
         AuthMaterial::Password(password) => {
-            session.userauth_password(&server.user, password)?;
+            session
+                .userauth_password(&server.user, password)
+                .context("SSH authentication failed")?;
         }
         AuthMaterial::Agent => {
             session

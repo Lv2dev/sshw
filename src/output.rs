@@ -97,6 +97,12 @@ pub fn classify_error(err: &anyhow::Error) -> ErrorKind {
         || message.contains("ssh handshake")
         || message.contains("ssh session")
         || message.contains("ssh transfer")
+        // ssh2 library errors (handshake/kex/known_hosts) carry no keyword and
+        // are not io::Error, so match them by type as a fall-back rather than
+        // letting them leak to the unknown bucket.
+        || err
+            .chain()
+            .any(|cause| cause.downcast_ref::<ssh2::Error>().is_some())
     {
         return ErrorKind::Ssh;
     }
