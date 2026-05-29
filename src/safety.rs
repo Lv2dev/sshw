@@ -75,13 +75,10 @@ fn writes_to_etc(command: &str) -> bool {
     let tokens = shellish_tokens(command);
     let redirects_to_etc = tokens
         .windows(2)
-        .any(|window| matches!(window[0].as_str(), ">" | ">>") && window[1].starts_with("/etc/"))
+        .any(|window| matches!(window[0].as_str(), ">" | ">>") && is_etc_path(&window[1]))
         || tokens
             .windows(3)
-            .any(|window| window[0] == ">" && window[1] == ">" && window[2].starts_with("/etc/"))
-        || tokens
-            .iter()
-            .any(|token| token.starts_with(">/etc/") || token.starts_with(">>/etc/"));
+            .any(|window| window[0] == ">" && window[1] == ">" && is_etc_path(&window[2]));
     let tools_write_to_etc = command_targets_etc(&tokens, "tee")
         || command_targets_etc(&tokens, "cp")
         || command_targets_etc(&tokens, "mv")
@@ -151,21 +148,17 @@ fn has_adjacent_tokens(tokens: &[String], first: &str, second: &str) -> bool {
 
 fn command_targets_etc(tokens: &[String], command: &str) -> bool {
     tokens.iter().enumerate().any(|(index, token)| {
-        command_name_is(token, command)
-            && tokens
-                .iter()
-                .skip(index + 1)
-                .any(|arg| arg.starts_with("/etc/"))
+        command_name_is(token, command) && tokens.iter().skip(index + 1).any(|arg| is_etc_path(arg))
     })
 }
 
 fn dd_writes_to_etc(tokens: &[String]) -> bool {
     tokens.iter().enumerate().any(|(index, token)| {
         command_name_is(token, "dd")
-            && tokens.iter().skip(index + 1).any(|arg| {
-                arg.strip_prefix("of=")
-                    .is_some_and(|path| path.starts_with("/etc/"))
-            })
+            && tokens
+                .iter()
+                .skip(index + 1)
+                .any(|arg| arg.strip_prefix("of=").is_some_and(is_etc_path))
     })
 }
 
@@ -181,4 +174,8 @@ fn is_path_or_child(path: &str, parent: &str) -> bool {
         || path
             .strip_prefix(parent)
             .is_some_and(|rest| rest.starts_with('/'))
+}
+
+fn is_etc_path(path: &str) -> bool {
+    is_path_or_child(path, "/etc")
 }

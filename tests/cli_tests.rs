@@ -55,7 +55,7 @@ fn parses_agent_add_run_and_trust() {
         panic!("expected run command");
     };
     assert!(args.json);
-    assert_eq!(args.command, "pm2 status");
+    assert_eq!(args.target, ["server-alpha", "pm2 status"]);
 
     let trust = Cli::try_parse_from(["sshw", "trust", "server-alpha", "--yes"]).unwrap();
     let Command::Trust(args) = trust.command else {
@@ -475,6 +475,185 @@ fn run_human_filters_known_stty_startup_noise_but_keeps_real_stderr() {
 
     assert_eq!(output.stdout, "ok\n");
     assert_eq!(output.stderr, "actual warning\n");
+}
+
+#[test]
+fn run_uses_default_server_when_name_is_omitted() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &sample_config()).unwrap();
+    let store = FakeCredentialStore::default();
+    store
+        .set_password("sshw:server-alpha", "deploy", "YOUR_PASSWORD")
+        .unwrap();
+    let ssh = FakeSshClient::default();
+    let mut prompter = FakePrompter::default();
+
+    let output = execute(
+        Cli::try_parse_from(["sshw", "run", "hostname"]).unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    )
+    .unwrap();
+
+    assert_eq!(output.stdout, "ok\n");
+    assert_eq!(ssh.run_commands.borrow().as_slice(), ["hostname"]);
+}
+
+#[test]
+fn run_without_name_requires_configured_default() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    let mut config = sample_config();
+    config.default = None;
+    save_config(&path, &config).unwrap();
+    let store = FakeCredentialStore::default();
+    let ssh = FakeSshClient::default();
+    let mut prompter = FakePrompter::default();
+
+    let err = execute(
+        Cli::try_parse_from(["sshw", "run", "hostname"]).unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    )
+    .unwrap_err();
+
+    assert!(err.to_string().contains("no default server configured"));
+    assert!(ssh.run_commands.borrow().is_empty());
+}
+
+#[test]
+fn put_uses_default_server_when_name_is_omitted() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &sample_config()).unwrap();
+    let local = temp.path().join("app");
+    std::fs::write(&local, "binary").unwrap();
+    let store = FakeCredentialStore::default();
+    store
+        .set_password("sshw:server-alpha", "deploy", "YOUR_PASSWORD")
+        .unwrap();
+    let ssh = FakeSshClient::default();
+    let mut prompter = FakePrompter::default();
+
+    let output = execute(
+        Cli::try_parse_from(["sshw", "put", local.to_str().unwrap(), "/tmp/app"]).unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    )
+    .unwrap();
+
+    assert!(output.stdout.contains("uploaded"));
+    assert_eq!(ssh.put_calls.borrow().as_slice(), ["/tmp/app"]);
+}
+
+#[test]
+fn get_uses_default_server_when_name_is_omitted() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &sample_config()).unwrap();
+    let local = temp.path().join("download.txt");
+    let store = FakeCredentialStore::default();
+    store
+        .set_password("sshw:server-alpha", "deploy", "YOUR_PASSWORD")
+        .unwrap();
+    let ssh = FakeSshClient::default();
+    let mut prompter = FakePrompter::default();
+
+    let output = execute(
+        Cli::try_parse_from(["sshw", "get", "/tmp/remote.txt", local.to_str().unwrap()]).unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    )
+    .unwrap();
+
+    assert!(output.stdout.contains("downloaded"));
+    assert_eq!(ssh.get_calls.borrow().as_slice(), [false]);
+}
+
+#[test]
+fn default_command_prints_and_updates_default_server() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    let mut config = sample_config();
+    config.servers.insert(
+        "server-beta".to_string(),
+        ServerConfig {
+            host: "192.0.2.11".to_string(),
+            port: 22,
+            user: "deploy".to_string(),
+            auth: AuthConfig::Agent,
+        },
+    );
+    save_config(&path, &config).unwrap();
+    let store = FakeCredentialStore::default();
+    let ssh = FakeSshClient::default();
+
+    let current = execute(
+        Cli::try_parse_from(["sshw", "default"]).unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut FakePrompter::default(),
+    )
+    .unwrap();
+    assert_eq!(current.stdout, "server-alpha\n");
+
+    let updated = execute(
+        Cli::try_parse_from(["sshw", "default", "server-beta"]).unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut FakePrompter::default(),
+    )
+    .unwrap();
+    assert_eq!(updated.stdout, "default set to server-beta\n");
+
+    let current = execute(
+        Cli::try_parse_from(["sshw", "default"]).unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut FakePrompter::default(),
+    )
+    .unwrap();
+    assert_eq!(current.stdout, "server-beta\n");
+}
+
+#[test]
+fn doctor_json_reports_missing_credentials_without_secrets() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &sample_config()).unwrap();
+    let store = FakeCredentialStore::default();
+    let ssh = FakeSshClient::default();
+    let mut prompter = FakePrompter::default();
+
+    let output = execute(
+        Cli::try_parse_from(["sshw", "doctor", "--json"]).unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    )
+    .unwrap();
+
+    let json: serde_json::Value = serde_json::from_str(output.stdout.trim()).unwrap();
+    assert_eq!(json["credential_backend"], "fake");
+    assert_eq!(json["credential_available"], true);
+    assert_eq!(
+        json["missing_credentials"],
+        serde_json::json!(["server-alpha"])
+    );
+    assert!(!output.stdout.contains("YOUR_PASSWORD"));
 }
 
 fn sample_config() -> SshwConfig {

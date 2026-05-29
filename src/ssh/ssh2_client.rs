@@ -255,7 +255,17 @@ fn verify_known_host(session: &Session, server: &ServerConfig) -> anyhow::Result
     let mut known_hosts = session.known_hosts()?;
     known_hosts.read_file(&known_hosts_path, KnownHostFileKind::OpenSSH)?;
 
-    match known_hosts.check_port(&server.host, server.port, key) {
+    known_host_verification_result(
+        known_hosts.check_port(&server.host, server.port, key),
+        server,
+    )
+}
+
+fn known_host_verification_result(
+    result: CheckResult,
+    server: &ServerConfig,
+) -> anyhow::Result<()> {
+    match result {
         CheckResult::Match => Ok(()),
         CheckResult::NotFound => Err(unknown_host_key_error(server)),
         CheckResult::Mismatch => Err(anyhow::anyhow!(
@@ -395,6 +405,8 @@ fn set_owner_only_permissions(_path: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::open_download_file;
+    use crate::config::{AuthConfig, ServerConfig};
+    use ssh2::CheckResult;
     use std::io::{Read, Write};
 
     #[test]
@@ -459,5 +471,51 @@ mod tests {
             super::timeout_millis(std::time::Duration::from_millis(u32::MAX as u64 + 1)),
             u32::MAX
         );
+    }
+
+    #[test]
+    fn known_host_verification_accepts_match() {
+        let server = server_config();
+
+        super::known_host_verification_result(CheckResult::Match, &server).unwrap();
+    }
+
+    #[test]
+    fn known_host_verification_rejects_not_found() {
+        let server = server_config();
+
+        let err =
+            super::known_host_verification_result(CheckResult::NotFound, &server).unwrap_err();
+
+        assert!(err.to_string().contains("not trusted"));
+        assert!(err.to_string().contains("sshw trust"));
+    }
+
+    #[test]
+    fn known_host_verification_rejects_mismatch() {
+        let server = server_config();
+
+        let err =
+            super::known_host_verification_result(CheckResult::Mismatch, &server).unwrap_err();
+
+        assert!(err.to_string().contains("trusted key changed"));
+    }
+
+    #[test]
+    fn known_host_verification_rejects_failure() {
+        let server = server_config();
+
+        let err = super::known_host_verification_result(CheckResult::Failure, &server).unwrap_err();
+
+        assert!(err.to_string().contains("host key verification failed"));
+    }
+
+    fn server_config() -> ServerConfig {
+        ServerConfig {
+            host: "192.0.2.10".to_string(),
+            port: 2222,
+            user: "deploy".to_string(),
+            auth: AuthConfig::Agent,
+        }
     }
 }

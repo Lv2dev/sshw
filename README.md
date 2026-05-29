@@ -17,7 +17,7 @@ It is delegated access, not a sandbox. If a local coding agent is allowed to run
 ## Install From Source
 
 ```bash
-cargo build --release
+cargo build --locked --release
 ```
 
 The binary will be at:
@@ -37,6 +37,7 @@ Tagged releases build GitHub release artifacts for:
 - `aarch64-apple-darwin`
 
 Each release also includes a `SHA256SUMS` file for artifact integrity checks.
+Release workflows pin GitHub Actions by commit SHA; review those SHAs when updating action major versions.
 
 Create a release by pushing a version tag:
 
@@ -105,9 +106,12 @@ sshw default server-alpha
 sshw run server-alpha "hostname && whoami && pwd"
 sshw run server-alpha "pm2 status" --json
 sshw run server-alpha "pm2 restart my-app" --yes
+sshw run "hostname && whoami && pwd"
 
 sshw put server-alpha ./app.exe /home/deploy/app/app.exe
+sshw put ./app.exe /home/deploy/app/app.exe
 sshw get server-alpha /home/deploy/app/log.txt ./log.txt
+sshw get /home/deploy/app/log.txt ./log.txt
 sshw get server-alpha /home/deploy/app/log.txt ./log.txt --yes
 
 sshw remove server-alpha
@@ -140,10 +144,10 @@ Use sshw put and sshw get for file transfer.
 
 ```bash
 cargo fmt --check
-cargo clippy -- -D warnings
-cargo test
-cargo run -- --help
-cargo run -- doctor
+cargo clippy --locked -- -D warnings
+cargo test --locked
+cargo run --locked -- --help
+cargo run --locked -- doctor
 ```
 
 ## Security Reports

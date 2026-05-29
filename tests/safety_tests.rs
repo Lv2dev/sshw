@@ -57,13 +57,17 @@ fn blocks_service_and_permission_commands_without_yes() {
 fn blocks_writes_to_etc_without_yes() {
     for command in [
         "echo x > /etc/app.conf",
+        "echo x > /etc",
         "echo x >> /etc/app.conf",
         "cat file >/etc/app.conf",
         "cat file >\t/etc/app.conf",
+        "cat file >/etc",
         "tee /etc/app.conf",
+        "tee /etc",
         "cp app.conf /etc/app.conf",
         "mv app.conf /etc/app.conf",
         "dd if=app.conf of=/etc/app.conf",
+        "dd if=app.conf of=/etc",
         "install app.conf /etc/app.conf",
     ] {
         assert!(

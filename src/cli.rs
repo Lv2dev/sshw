@@ -86,8 +86,8 @@ pub struct TrustArgs {
 
 #[derive(Debug, Args)]
 pub struct RunArgs {
-    pub name: String,
-    pub command: String,
+    #[arg(value_name = "TARGET", num_args = 1..=2)]
+    pub target: Vec<String>,
     #[arg(long)]
     pub json: bool,
     #[arg(long)]
@@ -96,18 +96,16 @@ pub struct RunArgs {
 
 #[derive(Debug, Args)]
 pub struct PutArgs {
-    pub name: String,
-    pub local: PathBuf,
-    pub remote: String,
+    #[arg(value_name = "TARGET", num_args = 2..=3)]
+    pub target: Vec<String>,
     #[arg(long)]
     pub yes: bool,
 }
 
 #[derive(Debug, Args)]
 pub struct GetArgs {
-    pub name: String,
-    pub remote: String,
-    pub local: PathBuf,
+    #[arg(value_name = "TARGET", num_args = 2..=3)]
+    pub target: Vec<String>,
     #[arg(long)]
     pub yes: bool,
 }
@@ -343,21 +341,24 @@ where
     C: CredentialStore,
     S: SshClient,
 {
-    match classify_command(&args.command, args.yes) {
+    let RunArgs { target, json, yes } = args;
+    let (server_name, command) = resolve_run_target(target, config)?;
+
+    match classify_command(&command, yes) {
         SafetyDecision::Allow => {}
         SafetyDecision::Block { reason } => return Err(anyhow::anyhow!("{reason}")),
     }
 
-    let server = get_server(config, &args.name)?;
+    let server = get_server(config, &server_name)?;
     let auth = resolve_auth(server, credentials)?;
-    let result = ssh.run(server, &auth, &args.command)?;
+    let result = ssh.run(server, &auth, &command)?;
     let exit_code = result.exit_status;
     let stderr = filter_startup_stderr_noise(&result.stderr);
 
-    if args.json {
+    if json {
         let output = RunOutput {
-            server: args.name,
-            command: args.command,
+            server: server_name,
+            command,
             exit_status: result.exit_status,
             stdout: result.stdout,
             stderr,
@@ -387,14 +388,17 @@ where
     C: CredentialStore,
     S: SshClient,
 {
-    match classify_remote_write_path(&args.remote, args.yes) {
+    let PutArgs { target, yes } = args;
+    let (server_name, local, remote) = resolve_put_target(target, config)?;
+
+    match classify_remote_write_path(&remote, yes) {
         SafetyDecision::Allow => {}
         SafetyDecision::Block { reason } => return Err(anyhow::anyhow!("{reason}")),
     }
 
-    let server = get_server(config, &args.name)?;
+    let server = get_server(config, &server_name)?;
     let auth = resolve_auth(server, credentials)?;
-    let result = ssh.put(server, &auth, &args.local, &args.remote)?;
+    let result = ssh.put(server, &auth, &local, &remote)?;
     Ok(ok(format!(
         "uploaded {} bytes from {} to {}\n",
         result.bytes, result.source, result.destination
@@ -411,16 +415,19 @@ where
     C: CredentialStore,
     S: SshClient,
 {
-    let server = get_server(config, &args.name)?;
-    if args.local.exists() && !args.yes {
+    let GetArgs { target, yes } = args;
+    let (server_name, remote, local) = resolve_get_target(target, config)?;
+
+    let server = get_server(config, &server_name)?;
+    if local.exists() && !yes {
         return Err(anyhow::anyhow!(
             "local file already exists: {}; pass --yes to overwrite",
-            args.local.display()
+            local.display()
         ));
     }
 
     let auth = resolve_auth(server, credentials)?;
-    let result = ssh.get(server, &auth, &args.remote, &args.local, args.yes)?;
+    let result = ssh.get(server, &auth, &remote, &local, yes)?;
     Ok(ok(format!(
         "downloaded {} bytes from {} to {}\n",
         result.bytes, result.source, result.destination
@@ -523,6 +530,54 @@ where
         }
         AuthConfig::Agent => Ok(AuthMaterial::Agent),
     }
+}
+
+fn resolve_run_target(
+    target: Vec<String>,
+    config: &SshwConfig,
+) -> anyhow::Result<(String, String)> {
+    match target.as_slice() {
+        [command] => Ok((default_server_name(config)?, command.clone())),
+        [name, command] => Ok((name.clone(), command.clone())),
+        _ => Err(anyhow::anyhow!("run expects [name] <command>")),
+    }
+}
+
+fn resolve_put_target(
+    target: Vec<String>,
+    config: &SshwConfig,
+) -> anyhow::Result<(String, PathBuf, String)> {
+    match target.as_slice() {
+        [local, remote] => Ok((
+            default_server_name(config)?,
+            PathBuf::from(local),
+            remote.clone(),
+        )),
+        [name, local, remote] => Ok((name.clone(), PathBuf::from(local), remote.clone())),
+        _ => Err(anyhow::anyhow!("put expects [name] <local> <remote>")),
+    }
+}
+
+fn resolve_get_target(
+    target: Vec<String>,
+    config: &SshwConfig,
+) -> anyhow::Result<(String, String, PathBuf)> {
+    match target.as_slice() {
+        [remote, local] => Ok((
+            default_server_name(config)?,
+            remote.clone(),
+            PathBuf::from(local),
+        )),
+        [name, remote, local] => Ok((name.clone(), remote.clone(), PathBuf::from(local))),
+        _ => Err(anyhow::anyhow!("get expects [name] <remote> <local>")),
+    }
+}
+
+fn default_server_name(config: &SshwConfig) -> anyhow::Result<String> {
+    config
+        .default
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("no default server configured"))
 }
 
 fn get_server<'a>(config: &'a SshwConfig, name: &str) -> anyhow::Result<&'a ServerConfig> {
