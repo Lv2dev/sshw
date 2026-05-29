@@ -1047,6 +1047,131 @@ fn run_audit_records_program_name_not_arguments() {
 }
 
 #[test]
+fn run_remote_nonzero_exit_maps_to_dedicated_exit_code() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &sample_config()).unwrap();
+    let store = FakeCredentialStore::default();
+    store
+        .set_password("sshw:server-alpha", "deploy", "YOUR_PASSWORD")
+        .unwrap();
+    let ssh = FakeSshClient::with_exit_status(5);
+    let mut prompter = FakePrompter::default();
+
+    let output = execute_for_runtime(
+        Cli::try_parse_from(["sshw", "run", "server-alpha", "false"]).unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    );
+
+    // A remote status of 5 must not surface as sshw's ssh exit code (5); it
+    // maps to the dedicated remote-non-zero code instead.
+    assert_eq!(output.exit_code, sshw::output::REMOTE_NONZERO_EXIT_CODE);
+    assert!(
+        output
+            .stderr
+            .contains("remote command exited with status 5"),
+        "human mode should note the real remote status; got: {:?}",
+        output.stderr
+    );
+}
+
+#[test]
+fn run_remote_nonzero_json_reports_real_status_and_dedicated_exit() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &sample_config()).unwrap();
+    let store = FakeCredentialStore::default();
+    store
+        .set_password("sshw:server-alpha", "deploy", "YOUR_PASSWORD")
+        .unwrap();
+    let ssh = FakeSshClient::with_exit_status(3);
+    let mut prompter = FakePrompter::default();
+
+    let output = execute_for_runtime(
+        Cli::try_parse_from(["sshw", "run", "server-alpha", "test -f /x", "--json"]).unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    );
+
+    assert_eq!(output.exit_code, sshw::output::REMOTE_NONZERO_EXIT_CODE);
+    assert_eq!(output.stderr, "", "JSON mode must not add the human note");
+    let body: serde_json::Value = serde_json::from_str(output.stdout.trim()).unwrap();
+    assert_eq!(
+        body["exit_status"], 3,
+        "JSON carries the real remote status"
+    );
+}
+
+#[test]
+fn run_remote_zero_exit_stays_zero() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &sample_config()).unwrap();
+    let store = FakeCredentialStore::default();
+    store
+        .set_password("sshw:server-alpha", "deploy", "YOUR_PASSWORD")
+        .unwrap();
+    let ssh = FakeSshClient::with_exit_status(0);
+    let mut prompter = FakePrompter::default();
+
+    let output = execute_for_runtime(
+        Cli::try_parse_from(["sshw", "run", "server-alpha", "true"]).unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    );
+
+    assert_eq!(output.exit_code, 0);
+    assert!(!output.stderr.contains("remote command exited"));
+}
+
+#[test]
+fn run_remote_nonzero_audit_records_real_status() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &sample_config()).unwrap();
+    let store = FakeCredentialStore::default();
+    store
+        .set_password("sshw:server-alpha", "deploy", "YOUR_PASSWORD")
+        .unwrap();
+    let ssh = FakeSshClient::with_exit_status(5);
+    let audit_path = temp.path().join("audit.jsonl");
+    let audit = FileAuditSink::new(audit_path.clone());
+    let home = ResolvedHome::from_config_path(&path);
+    let registry = temp.path().join("profiles.json");
+    let ctx = ExecContext {
+        home: &home,
+        registry_path: &registry,
+        policy_forced: false,
+        audit: &audit,
+    };
+
+    let output = execute_with(
+        Cli::try_parse_from(["sshw", "run", "server-alpha", "false"]).unwrap(),
+        &ctx,
+        &store,
+        &ssh,
+        &mut FakePrompter::default(),
+    )
+    .unwrap();
+
+    // User-facing exit is the dedicated code, but the audit log preserves the
+    // real remote status for diagnostics.
+    assert_eq!(output.exit_code, sshw::output::REMOTE_NONZERO_EXIT_CODE);
+    let rec: serde_json::Value =
+        serde_json::from_str(std::fs::read_to_string(&audit_path).unwrap().trim()).unwrap();
+    assert_eq!(rec["action"], "run");
+    assert_eq!(rec["status"], "ok");
+    assert_eq!(rec["exit_code"], 5);
+}
+
+#[test]
 fn ssh_session_failure_classifies_as_ssh_exit_5() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("servers.json");
@@ -1482,6 +1607,7 @@ struct FakeSshClient {
     stdout: Option<String>,
     stderr: String,
     run_error: Option<String>,
+    run_exit_status: i32,
 }
 
 impl FakeSshClient {
@@ -1502,6 +1628,13 @@ impl FakeSshClient {
     fn with_run_error(message: &str) -> Self {
         Self {
             run_error: Some(message.to_string()),
+            ..Self::default()
+        }
+    }
+
+    fn with_exit_status(exit_status: i32) -> Self {
+        Self {
+            run_exit_status: exit_status,
             ..Self::default()
         }
     }
@@ -1546,7 +1679,7 @@ impl SshClient for FakeSshClient {
             return Err(anyhow::anyhow!("{message}"));
         }
         Ok(RunResult {
-            exit_status: 0,
+            exit_status: self.run_exit_status,
             stdout: self.stdout.clone().unwrap_or_else(|| "ok\n".to_string()),
             stderr: self.stderr.clone(),
             duration_ms: 1,

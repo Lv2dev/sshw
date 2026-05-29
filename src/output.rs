@@ -29,6 +29,13 @@ impl ErrorKind {
     }
 }
 
+/// Process exit code for when a remote command ran under sshw's control but
+/// itself exited non-zero. Kept distinct from sshw's operational `ErrorKind`
+/// codes (1-7) so a remote command's status can never be mistaken for an sshw
+/// failure. The real remote status is still reported via `--json`
+/// (`exit_status`) and a human-readable note on stderr.
+pub const REMOTE_NONZERO_EXIT_CODE: i32 = 8;
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ErrorResponse {
     pub ok: bool,

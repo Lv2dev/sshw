@@ -33,4 +33,4 @@ These are explicitly **not** strong guarantees:
 
 ## Stable Exit Codes
 
-Failures map to stable exit codes for agent consumption: `2` safety, `3` config, `4` auth, `5` ssh, `6` io, `7` policy, `1` unknown.
+sshw's own failures map to stable exit codes for agent consumption: `2` safety, `3` config, `4` auth, `5` ssh, `6` io, `7` policy, `1` unknown. A successful `run` whose remote command exits non-zero returns `8` — kept distinct from the operational codes so a remote command's status can never be mistaken for an sshw failure. The real remote status is available via `run --json` (`exit_status`).

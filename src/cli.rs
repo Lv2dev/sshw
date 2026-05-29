@@ -408,6 +408,10 @@ where
     let mut config = load_config(config_path)?;
 
     let descriptor = audit_descriptor(&command, &config);
+    // Captured before `command` is consumed by dispatch: used to remap a remote
+    // command's exit code after auditing the real status.
+    let is_run = matches!(&command, Command::Run(_));
+    let run_json = matches!(&command, Command::Run(args) if args.json);
 
     let result = match command {
         Command::Add(args) => add_server(
@@ -466,7 +470,27 @@ where
         });
     }
 
-    result
+    // Remap a remote command's non-zero exit (recorded above) so it cannot be
+    // confused with sshw's own operational exit codes.
+    result.map(|output| remap_remote_nonzero_exit(output, is_run, run_json))
+}
+
+/// Remap a remote command's non-zero exit to [`crate::output::REMOTE_NONZERO_EXIT_CODE`]
+/// so it can never collide with sshw's operational exit codes (1-7). Applied
+/// after auditing, which records the real remote status. In non-JSON mode a
+/// human-readable note carries the real status; JSON output already includes
+/// `exit_status`.
+fn remap_remote_nonzero_exit(mut output: CommandOutput, is_run: bool, json: bool) -> CommandOutput {
+    if is_run && output.exit_code != 0 {
+        if !json {
+            output.stderr.push_str(&format!(
+                "note: remote command exited with status {}\n",
+                output.exit_code
+            ));
+        }
+        output.exit_code = crate::output::REMOTE_NONZERO_EXIT_CODE;
+    }
+    output
 }
 
 /// Best-effort `(action, server, detail)` for the auditable commands. Returns

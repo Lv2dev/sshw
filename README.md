@@ -232,6 +232,8 @@ Commands that support `--json` (`list`, `show`, `run`, `doctor`, `profile list`,
 
 `put`, `get`, `add`, `trust`, `remove`, and `default` do not have a `--json` flag; they report human-readable errors on stderr with the same stable exit codes. Human output everywhere uses the same exit-code mapping.
 
+These codes are sshw's own operational failures. When `run` connects and the remote command itself exits non-zero, sshw exits with code `8` — kept separate so a remote status can never be read as an sshw failure (e.g. a remote `grep` finding nothing). Exit `0` means the remote command succeeded. The real remote status is reported in `run --json` as `exit_status`, and in human mode as a `note: remote command exited with status N` line on stderr.
+
 ### File Permissions And Atomicity
 
 New `servers.json`, `policy.json`, `audit.jsonl`, and the profile registry are created owner-only on platforms that support it. Config and registry writes are atomic (write-temp-then-rename). On Windows, permissions are best-effort (NTFS ACLs on the per-user directory provide the protection) and the atomic replace preserves the existing file if the write is interrupted.
@@ -490,6 +492,8 @@ sshw doctor --json
 | `unknown` | 1 | 안정 카테고리에 매핑되지 않은 실패. |
 
 `put`, `get`, `add`, `trust`, `remove`, `default`에는 `--json` 플래그가 없으며, 동일한 안정 exit code로 stderr에 사람용 메시지를 출력합니다. human 출력도 같은 exit code 매핑을 사용합니다.
+
+이 코드들은 sshw 자신의 운영 실패입니다. `run`이 연결에 성공하고 원격 명령 자체가 0이 아닌 코드로 끝나면 sshw는 exit code `8`을 반환합니다 — 원격 상태(예: 매치를 못 찾은 원격 `grep`)가 sshw 실패로 오인되지 않도록 분리한 코드입니다. exit `0`은 원격 명령 성공을 뜻합니다. 실제 원격 상태는 `run --json`의 `exit_status`로, human 모드에서는 stderr의 `note: remote command exited with status N` 줄로 보고됩니다.
 
 ### 파일 권한과 원자성
 
