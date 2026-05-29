@@ -1,1 +1,9 @@
 /target
+
+# Local AI agent context and helper files
+.ai/
+ai.ps1
+AGENT.md
+AGENTS.md
+CLAUDE.md
+GEMINI.md
