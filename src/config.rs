@@ -98,18 +98,8 @@ fn write_config_file(path: &Path, contents: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(windows)]
 fn replace_config_file(temp_path: &Path, path: &Path) -> anyhow::Result<()> {
-    if path.exists() {
-        fs::remove_file(path)?;
-    }
-    fs::rename(temp_path, path)?;
-    Ok(())
-}
-
-#[cfg(not(windows))]
-fn replace_config_file(temp_path: &Path, path: &Path) -> anyhow::Result<()> {
-    fs::rename(temp_path, path)?;
+    tempfile::TempPath::try_from_path(temp_path)?.persist(path)?;
     Ok(())
 }
 
@@ -124,4 +114,22 @@ fn set_config_permissions(path: &Path) -> anyhow::Result<()> {
 #[cfg(not(unix))]
 fn set_config_permissions(_path: &Path) -> anyhow::Result<()> {
     Ok(())
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::replace_config_file;
+    use std::fs;
+
+    #[test]
+    fn windows_replace_preserves_destination_when_rename_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("servers.json");
+        let missing_temp = temp.path().join("missing.tmp");
+        fs::write(&destination, "original").unwrap();
+
+        let _err = replace_config_file(&missing_temp, &destination).unwrap_err();
+
+        assert_eq!(fs::read_to_string(destination).unwrap(), "original");
+    }
 }
