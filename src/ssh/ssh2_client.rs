@@ -1,0 +1,285 @@
+use super::{HostKeyInfo, RunResult, SshClient, TransferResult};
+use crate::config::ServerConfig;
+use crate::credentials::AuthMaterial;
+use anyhow::Context;
+use base64::Engine;
+use directories::BaseDirs;
+use ssh2::{CheckResult, HashType, HostKeyType, KnownHostFileKind, KnownHostKeyFormat, Session};
+use std::fs;
+use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::path::{Path, PathBuf};
+use std::time::Instant;
+
+#[derive(Debug, Default, Clone)]
+pub struct Ssh2Client;
+
+impl SshClient for Ssh2Client {
+    fn host_key(&self, server: &ServerConfig) -> anyhow::Result<HostKeyInfo> {
+        let session = connect(server)?;
+        host_key_info(&session)
+    }
+
+    fn trust_host(&self, server_name: &str, server: &ServerConfig) -> anyhow::Result<HostKeyInfo> {
+        let session = connect(server)?;
+        let (key, key_type) = session
+            .host_key()
+            .ok_or_else(|| anyhow::anyhow!("server did not provide a host key"))?;
+        ensure_supported_host_key(key_type)?;
+        let info = host_key_info(&session)?;
+        let known_hosts_path = known_hosts_path()?;
+        let mut known_hosts = session.known_hosts()?;
+
+        if known_hosts_path.exists() {
+            known_hosts.read_file(&known_hosts_path, KnownHostFileKind::OpenSSH)?;
+        }
+
+        match known_hosts.check_port(&server.host, server.port, key) {
+            CheckResult::Match => Ok(info),
+            CheckResult::Mismatch => Err(anyhow::anyhow!(
+                "host key for {}:{} changed; refusing to overwrite trusted key",
+                server.host,
+                server.port
+            )),
+            CheckResult::Failure => Err(anyhow::anyhow!(
+                "failed to check known_hosts for {}:{}",
+                server.host,
+                server.port
+            )),
+            CheckResult::NotFound => {
+                if let Some(parent) = known_hosts_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                let host_entry = known_host_name(&server.host, server.port);
+                known_hosts.add(
+                    &host_entry,
+                    key,
+                    server_name,
+                    KnownHostKeyFormat::from(key_type),
+                )?;
+                known_hosts.write_file(&known_hosts_path, KnownHostFileKind::OpenSSH)?;
+                Ok(info)
+            }
+        }
+    }
+
+    fn run(
+        &self,
+        server: &ServerConfig,
+        auth: &AuthMaterial,
+        command: &str,
+    ) -> anyhow::Result<RunResult> {
+        let started = Instant::now();
+        let session = connect_verified_authenticated(server, auth)?;
+        let mut channel = session.channel_session()?;
+        channel.exec(command)?;
+
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        channel.read_to_string(&mut stdout)?;
+        channel.stderr().read_to_string(&mut stderr)?;
+        channel.wait_close()?;
+        let exit_status = channel.exit_status()?;
+
+        Ok(RunResult {
+            exit_status,
+            stdout,
+            stderr,
+            duration_ms: started.elapsed().as_millis(),
+        })
+    }
+
+    fn put(
+        &self,
+        server: &ServerConfig,
+        auth: &AuthMaterial,
+        local: &Path,
+        remote: &str,
+    ) -> anyhow::Result<TransferResult> {
+        let metadata = fs::metadata(local)
+            .with_context(|| format!("local file not found: {}", local.display()))?;
+        if !metadata.is_file() {
+            return Err(anyhow::anyhow!(
+                "local path is not a regular file: {}",
+                local.display()
+            ));
+        }
+
+        let session = connect_verified_authenticated(server, auth)?;
+        let mut local_file = fs::File::open(local)?;
+        let mut remote_file = session.scp_send(Path::new(remote), 0o644, metadata.len(), None)?;
+        std::io::copy(&mut local_file, &mut remote_file)?;
+        remote_file.send_eof()?;
+        remote_file.wait_eof()?;
+        remote_file.close()?;
+        remote_file.wait_close()?;
+
+        Ok(TransferResult {
+            bytes: metadata.len(),
+            source: local.display().to_string(),
+            destination: remote.to_string(),
+        })
+    }
+
+    fn get(
+        &self,
+        server: &ServerConfig,
+        auth: &AuthMaterial,
+        remote: &str,
+        local: &Path,
+    ) -> anyhow::Result<TransferResult> {
+        let session = connect_verified_authenticated(server, auth)?;
+        let (mut remote_file, stat) = session.scp_recv(Path::new(remote))?;
+
+        if let Some(parent) = local.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)?;
+        }
+
+        let mut local_file = fs::File::create(local)?;
+        let bytes = std::io::copy(&mut remote_file, &mut local_file)?;
+        local_file.flush()?;
+        remote_file.send_eof()?;
+        remote_file.wait_eof()?;
+        remote_file.close()?;
+        remote_file.wait_close()?;
+
+        Ok(TransferResult {
+            bytes: bytes.min(stat.size()),
+            source: remote.to_string(),
+            destination: local.display().to_string(),
+        })
+    }
+}
+
+fn connect_verified_authenticated(
+    server: &ServerConfig,
+    auth: &AuthMaterial,
+) -> anyhow::Result<Session> {
+    let session = connect(server)?;
+    verify_known_host(&session, server)?;
+    authenticate(&session, server, auth)?;
+    Ok(session)
+}
+
+fn connect(server: &ServerConfig) -> anyhow::Result<Session> {
+    let tcp = TcpStream::connect((server.host.as_str(), server.port))
+        .with_context(|| format!("failed to connect to {}:{}", server.host, server.port))?;
+    let mut session = Session::new()?;
+    session.set_tcp_stream(tcp);
+    session.handshake()?;
+    Ok(session)
+}
+
+fn verify_known_host(session: &Session, server: &ServerConfig) -> anyhow::Result<()> {
+    let (key, _key_type) = session
+        .host_key()
+        .ok_or_else(|| anyhow::anyhow!("server did not provide a host key"))?;
+    let known_hosts_path = known_hosts_path()?;
+    if !known_hosts_path.exists() {
+        return Err(unknown_host_key_error(server));
+    }
+
+    let mut known_hosts = session.known_hosts()?;
+    known_hosts.read_file(&known_hosts_path, KnownHostFileKind::OpenSSH)?;
+
+    match known_hosts.check_port(&server.host, server.port, key) {
+        CheckResult::Match => Ok(()),
+        CheckResult::NotFound => Err(unknown_host_key_error(server)),
+        CheckResult::Mismatch => Err(anyhow::anyhow!(
+            "host key verification failed for {}:{}; trusted key changed",
+            server.host,
+            server.port
+        )),
+        CheckResult::Failure => Err(anyhow::anyhow!(
+            "host key verification failed for {}:{}",
+            server.host,
+            server.port
+        )),
+    }
+}
+
+fn authenticate(
+    session: &Session,
+    server: &ServerConfig,
+    auth: &AuthMaterial,
+) -> anyhow::Result<()> {
+    match auth {
+        AuthMaterial::Password(password) => {
+            session.userauth_password(&server.user, password)?;
+        }
+        AuthMaterial::Agent => {
+            session
+                .userauth_agent(&server.user)
+                .context("SSH agent authentication failed")?;
+        }
+    }
+
+    if !session.authenticated() {
+        return Err(anyhow::anyhow!("SSH authentication failed"));
+    }
+
+    Ok(())
+}
+
+fn host_key_info(session: &Session) -> anyhow::Result<HostKeyInfo> {
+    let (_key, key_type) = session
+        .host_key()
+        .ok_or_else(|| anyhow::anyhow!("server did not provide a host key"))?;
+    ensure_supported_host_key(key_type)?;
+    let fingerprint = session
+        .host_key_hash(HashType::Sha256)
+        .ok_or_else(|| anyhow::anyhow!("could not compute host key fingerprint"))?;
+
+    Ok(HostKeyInfo {
+        algorithm: host_key_algorithm(key_type).to_string(),
+        fingerprint_sha256: format!(
+            "SHA256:{}",
+            base64::engine::general_purpose::STANDARD_NO_PAD.encode(fingerprint)
+        ),
+    })
+}
+
+fn ensure_supported_host_key(key_type: HostKeyType) -> anyhow::Result<()> {
+    if matches!(key_type, HostKeyType::Unknown) {
+        return Err(anyhow::anyhow!(
+            "unsupported host key type from server; refusing to trust automatically"
+        ));
+    }
+    Ok(())
+}
+
+fn host_key_algorithm(key_type: HostKeyType) -> &'static str {
+    match key_type {
+        HostKeyType::Unknown => "unknown",
+        HostKeyType::Rsa => "ssh-rsa",
+        HostKeyType::Dss => "ssh-dss",
+        HostKeyType::Ecdsa256 => "ecdsa-sha2-nistp256",
+        HostKeyType::Ecdsa384 => "ecdsa-sha2-nistp384",
+        HostKeyType::Ecdsa521 => "ecdsa-sha2-nistp521",
+        HostKeyType::Ed25519 => "ssh-ed25519",
+    }
+}
+
+fn known_hosts_path() -> anyhow::Result<PathBuf> {
+    let dirs = BaseDirs::new()
+        .ok_or_else(|| anyhow::anyhow!("could not determine user home directory"))?;
+    Ok(dirs.home_dir().join(".ssh").join("known_hosts"))
+}
+
+fn known_host_name(host: &str, port: u16) -> String {
+    if port == 22 {
+        host.to_string()
+    } else {
+        format!("[{host}]:{port}")
+    }
+}
+
+fn unknown_host_key_error(server: &ServerConfig) -> anyhow::Error {
+    anyhow::anyhow!(
+        "host key for {}:{} is not trusted; run `sshw trust <name>` first",
+        server.host,
+        server.port
+    )
+}
