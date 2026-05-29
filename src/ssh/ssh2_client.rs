@@ -19,12 +19,14 @@ const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 #[derive(Debug, Clone)]
 pub struct Ssh2Client {
     connect_timeout: Duration,
+    known_hosts_path: Option<PathBuf>,
 }
 
 impl Default for Ssh2Client {
     fn default() -> Self {
         Self {
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            known_hosts_path: None,
         }
     }
 }
@@ -32,6 +34,24 @@ impl Default for Ssh2Client {
 impl Ssh2Client {
     pub fn connect_timeout(&self) -> Duration {
         self.connect_timeout
+    }
+
+    /// Use an explicit `known_hosts` file (e.g. the active profile home's file)
+    /// instead of the per-user default.
+    pub fn with_known_hosts(mut self, path: PathBuf) -> Self {
+        self.known_hosts_path = Some(path);
+        self
+    }
+
+    pub fn known_hosts_override(&self) -> Option<&Path> {
+        self.known_hosts_path.as_deref()
+    }
+
+    fn resolved_known_hosts_path(&self) -> anyhow::Result<PathBuf> {
+        match &self.known_hosts_path {
+            Some(path) => Ok(path.clone()),
+            None => known_hosts_path(),
+        }
     }
 }
 
@@ -61,7 +81,7 @@ impl SshClient for Ssh2Client {
             ));
         }
 
-        let known_hosts_path = known_hosts_path()?;
+        let known_hosts_path = self.resolved_known_hosts_path()?;
         let mut known_hosts = session.known_hosts()?;
 
         if known_hosts_path.exists() {
@@ -104,7 +124,9 @@ impl SshClient for Ssh2Client {
         command: &str,
     ) -> anyhow::Result<RunResult> {
         let started = Instant::now();
-        let session = connect_verified_authenticated(server, auth, self.connect_timeout)?;
+        let known_hosts = self.resolved_known_hosts_path()?;
+        let session =
+            connect_verified_authenticated(server, auth, self.connect_timeout, &known_hosts)?;
         let mut channel = session.channel_session()?;
         channel.exec(command)?;
 
@@ -139,7 +161,9 @@ impl SshClient for Ssh2Client {
             ));
         }
 
-        let session = connect_verified_authenticated(server, auth, self.connect_timeout)?;
+        let known_hosts = self.resolved_known_hosts_path()?;
+        let session =
+            connect_verified_authenticated(server, auth, self.connect_timeout, &known_hosts)?;
         let mut local_file = fs::File::open(local)?;
         let mut remote_file = session.scp_send(Path::new(remote), 0o600, metadata.len(), None)?;
         std::io::copy(&mut local_file, &mut remote_file)?;
@@ -163,7 +187,9 @@ impl SshClient for Ssh2Client {
         local: &Path,
         overwrite: bool,
     ) -> anyhow::Result<TransferResult> {
-        let session = connect_verified_authenticated(server, auth, self.connect_timeout)?;
+        let known_hosts = self.resolved_known_hosts_path()?;
+        let session =
+            connect_verified_authenticated(server, auth, self.connect_timeout, &known_hosts)?;
         let (mut remote_file, stat) = session.scp_recv(Path::new(remote))?;
 
         if let Some(parent) = local.parent()
@@ -192,9 +218,10 @@ fn connect_verified_authenticated(
     server: &ServerConfig,
     auth: &AuthMaterial,
     connect_timeout: Duration,
+    known_hosts_path: &Path,
 ) -> anyhow::Result<Session> {
     let session = connect(server, connect_timeout)?;
-    verify_known_host(&session, server)?;
+    verify_known_host(&session, server, known_hosts_path)?;
     authenticate(&session, server, auth)?;
     Ok(session)
 }
@@ -243,17 +270,20 @@ fn timeout_millis(timeout: Duration) -> u32 {
     timeout.as_millis().min(u32::MAX as u128) as u32
 }
 
-fn verify_known_host(session: &Session, server: &ServerConfig) -> anyhow::Result<()> {
+fn verify_known_host(
+    session: &Session,
+    server: &ServerConfig,
+    known_hosts_path: &Path,
+) -> anyhow::Result<()> {
     let (key, _key_type) = session
         .host_key()
         .ok_or_else(|| anyhow::anyhow!("server did not provide a host key"))?;
-    let known_hosts_path = known_hosts_path()?;
     if !known_hosts_path.exists() {
         return Err(unknown_host_key_error(server));
     }
 
     let mut known_hosts = session.known_hosts()?;
-    known_hosts.read_file(&known_hosts_path, KnownHostFileKind::OpenSSH)?;
+    known_hosts.read_file(known_hosts_path, KnownHostFileKind::OpenSSH)?;
 
     known_host_verification_result(
         known_hosts.check_port(&server.host, server.port, key),
@@ -458,6 +488,23 @@ mod tests {
         assert_eq!(
             super::Ssh2Client::default().connect_timeout(),
             std::time::Duration::from_secs(15)
+        );
+    }
+
+    #[test]
+    fn default_client_has_no_known_hosts_override() {
+        assert_eq!(super::Ssh2Client::default().known_hosts_override(), None);
+    }
+
+    #[test]
+    fn with_known_hosts_sets_override() {
+        use std::path::{Path, PathBuf};
+
+        let client = super::Ssh2Client::default().with_known_hosts(PathBuf::from("/x/known_hosts"));
+
+        assert_eq!(
+            client.known_hosts_override(),
+            Some(Path::new("/x/known_hosts"))
         );
     }
 

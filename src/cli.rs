@@ -1,8 +1,7 @@
-use crate::config::{
-    AuthConfig, ServerConfig, SshwConfig, default_config_path, load_config, save_config,
-};
+use crate::config::{AuthConfig, ServerConfig, SshwConfig, load_config, save_config};
 use crate::credentials::keyring_store::KeyringCredentialStore;
 use crate::credentials::{AuthMaterial, CredentialStore, CredentialStoreHealth};
+use crate::home::{CredentialNamespace, ResolvedHome, resolve_home, sshw_base_dir};
 use crate::output::{
     ErrorKind, ErrorResponse, RunOutput, ServerOutput, filter_startup_stderr_noise,
 };
@@ -22,6 +21,10 @@ use std::path::{Path, PathBuf};
     about = "Operate configured SSH servers without exposing secrets"
 )]
 pub struct Cli {
+    /// Use an explicit sshw home directory for this invocation (config,
+    /// known_hosts, policy, audit). Overrides `SSHW_HOME`.
+    #[arg(long, global = true, value_name = "PATH")]
+    pub home: Option<PathBuf>,
     #[command(subcommand)]
     pub command: Command,
 }
@@ -154,19 +157,55 @@ pub trait Prompter {
     fn password(&mut self, prompt: &str) -> anyhow::Result<String>;
 }
 
+/// Runtime context resolved from the active sshw home/profile. Grows in later
+/// milestones (policy, audit); for now it carries the resolved home layout.
+pub struct ExecContext<'a> {
+    pub home: &'a ResolvedHome,
+}
+
 pub fn run() -> i32 {
     let cli = Cli::parse();
     let json_errors = cli.command.wants_json_errors();
-    let config_path = match default_config_path() {
-        Ok(path) => path,
+    let home = match resolve_runtime_home(&cli) {
+        Ok(home) => home,
         Err(err) => return print_output(error_output(&err, json_errors)),
     };
     let credentials = KeyringCredentialStore;
-    let ssh = Ssh2Client::default();
+    let ssh = Ssh2Client::default().with_known_hosts(home.known_hosts_path.clone());
     let mut prompter = TerminalPrompter;
-    let output = execute_for_runtime(cli, &config_path, &credentials, &ssh, &mut prompter);
+    let ctx = ExecContext { home: &home };
+    let output = execute_for_runtime_with(cli, &ctx, &credentials, &ssh, &mut prompter);
 
     print_output(output)
+}
+
+fn resolve_runtime_home(cli: &Cli) -> anyhow::Result<ResolvedHome> {
+    let sshw_base = sshw_base_dir()?;
+    let env_home = std::env::var_os("SSHW_HOME").filter(|value| !value.is_empty());
+    Ok(resolve_home(
+        cli.home.as_deref(),
+        env_home.as_deref(),
+        &sshw_base,
+    ))
+}
+
+/// Backward-compatible facade: treat the parent of `config_path` as an ad-hoc
+/// home. Used by tests and callers that pass a config path directly.
+pub fn execute<C, S, P>(
+    cli: Cli,
+    config_path: &Path,
+    credentials: &C,
+    ssh: &S,
+    prompter: &mut P,
+) -> anyhow::Result<CommandOutput>
+where
+    C: CredentialStore,
+    S: SshClient,
+    P: Prompter,
+{
+    let home = ResolvedHome::from_config_path(config_path);
+    let ctx = ExecContext { home: &home };
+    execute_with(cli, &ctx, credentials, ssh, prompter)
 }
 
 pub fn execute_for_runtime<C, S, P>(
@@ -181,16 +220,33 @@ where
     S: SshClient,
     P: Prompter,
 {
+    let home = ResolvedHome::from_config_path(config_path);
+    let ctx = ExecContext { home: &home };
+    execute_for_runtime_with(cli, &ctx, credentials, ssh, prompter)
+}
+
+pub fn execute_for_runtime_with<C, S, P>(
+    cli: Cli,
+    ctx: &ExecContext,
+    credentials: &C,
+    ssh: &S,
+    prompter: &mut P,
+) -> CommandOutput
+where
+    C: CredentialStore,
+    S: SshClient,
+    P: Prompter,
+{
     let json_errors = cli.command.wants_json_errors();
-    match execute(cli, config_path, credentials, ssh, prompter) {
+    match execute_with(cli, ctx, credentials, ssh, prompter) {
         Ok(output) => output,
         Err(err) => error_output(&err, json_errors),
     }
 }
 
-pub fn execute<C, S, P>(
+pub fn execute_with<C, S, P>(
     cli: Cli,
-    config_path: &Path,
+    ctx: &ExecContext,
     credentials: &C,
     ssh: &S,
     prompter: &mut P,
@@ -200,10 +256,18 @@ where
     S: SshClient,
     P: Prompter,
 {
+    let config_path = ctx.home.config_path.as_path();
     let mut config = load_config(config_path)?;
 
     match cli.command {
-        Command::Add(args) => add_server(args, config_path, credentials, prompter, &mut config),
+        Command::Add(args) => add_server(
+            args,
+            config_path,
+            &ctx.home.namespace,
+            credentials,
+            prompter,
+            &mut config,
+        ),
         Command::List(args) => list_servers(args, &config),
         Command::Show(args) => show_server(args, &config),
         Command::Default(args) => default_server(args, config_path, &mut config),
@@ -214,13 +278,14 @@ where
         Command::Remove(args) => {
             remove_server(args, config_path, credentials, prompter, &mut config)
         }
-        Command::Doctor(args) => doctor(args, config_path, credentials, &config),
+        Command::Doctor(args) => doctor(args, ctx.home, credentials, &config),
     }
 }
 
 fn add_server<C, P>(
     args: AddArgs,
     config_path: &Path,
+    namespace: &CredentialNamespace,
     credentials: &C,
     prompter: &mut P,
     config: &mut SshwConfig,
@@ -239,7 +304,7 @@ where
 
     let auth = match args.auth {
         AuthArg::Password => {
-            let credential = format!("sshw:{}", args.name);
+            let credential = namespace.credential_key(&args.name);
             let password = prompter.password("SSH password: ")?;
             if password.is_empty() {
                 return Err(anyhow::anyhow!("password cannot be empty"));
@@ -505,13 +570,14 @@ where
 
 fn doctor<C>(
     args: DoctorArgs,
-    config_path: &Path,
+    home: &ResolvedHome,
     credentials: &C,
     config: &SshwConfig,
 ) -> anyhow::Result<CommandOutput>
 where
     C: CredentialStore,
 {
+    let config_path = home.config_path.as_path();
     let health = credentials
         .health_check()
         .unwrap_or_else(|err| CredentialStoreHealth {
@@ -523,8 +589,14 @@ where
 
     if args.json {
         let output = json!({
+            "home": home.root,
+            "home_source": home.description,
             "config_path": config_path,
             "config_exists": config_path.exists(),
+            "known_hosts_path": home.known_hosts_path,
+            "policy_path": home.policy_path,
+            "audit_path": home.audit_path,
+            "credential_namespace": home.namespace.token(),
             "os": std::env::consts::OS,
             "credential_backend": health.backend,
             "credential_available": health.available,
@@ -535,9 +607,15 @@ where
     }
 
     let mut stdout = format!(
-        "config path: {}\nconfig exists: {}\nos: {}\ncredential backend: {}\ncredential available: {}\ncredential message: {}\n",
+        "home: {}\nhome source: {}\nconfig path: {}\nconfig exists: {}\nknown_hosts path: {}\npolicy path: {}\naudit path: {}\ncredential namespace: {}\nos: {}\ncredential backend: {}\ncredential available: {}\ncredential message: {}\n",
+        home.root.display(),
+        home.description,
         config_path.display(),
         config_path.exists(),
+        home.known_hosts_path.display(),
+        home.policy_path.display(),
+        home.audit_path.display(),
+        home.namespace.token(),
         std::env::consts::OS,
         health.backend,
         health.available,

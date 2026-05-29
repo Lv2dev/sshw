@@ -1,4 +1,3 @@
-use directories::BaseDirs;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
@@ -39,12 +38,6 @@ pub struct ServerConfig {
 pub enum AuthConfig {
     Password { credential: String },
     Agent,
-}
-
-pub fn default_config_path() -> anyhow::Result<PathBuf> {
-    let dirs = BaseDirs::new()
-        .ok_or_else(|| anyhow::anyhow!("could not determine user config directory"))?;
-    Ok(dirs.config_dir().join("sshw").join("servers.json"))
 }
 
 pub fn load_config(path: &Path) -> anyhow::Result<SshwConfig> {

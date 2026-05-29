@@ -791,6 +791,65 @@ fn doctor_json_reports_missing_credentials_without_secrets() {
     assert!(!output.stdout.contains("YOUR_PASSWORD"));
 }
 
+#[test]
+fn parses_global_home_flag_before_subcommand() {
+    let cli = Cli::try_parse_from(["sshw", "--home", "/proj/.sshw", "list"]).unwrap();
+
+    assert_eq!(cli.home.as_deref(), Some(Path::new("/proj/.sshw")));
+    assert!(matches!(cli.command, Command::List(_)));
+}
+
+#[test]
+fn parses_global_home_flag_after_subcommand() {
+    let cli = Cli::try_parse_from(["sshw", "list", "--home", "/proj/.sshw"]).unwrap();
+
+    assert_eq!(cli.home.as_deref(), Some(Path::new("/proj/.sshw")));
+}
+
+#[test]
+fn add_password_stores_namespaced_credential_key() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &SshwConfig::default()).unwrap();
+    let store = FakeCredentialStore::default();
+    let ssh = FakeSshClient::default();
+    let mut prompter = FakePrompter {
+        confirm: false,
+        password: Some("secret-pw".to_string()),
+    };
+
+    execute(
+        Cli::try_parse_from([
+            "sshw",
+            "add",
+            "web",
+            "--host",
+            "192.0.2.10",
+            "--port",
+            "22",
+            "--user",
+            "deploy",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    )
+    .unwrap();
+
+    let keys: Vec<(String, String)> = store.values.borrow().keys().cloned().collect();
+    assert_eq!(keys.len(), 1);
+    let (credential, user) = &keys[0];
+    assert_eq!(user, "deploy");
+    // Always namespaced: sshw:<namespace>:web, never the legacy sshw:web.
+    let segments: Vec<&str> = credential.split(':').collect();
+    assert_eq!(segments.len(), 3, "credential was {credential}");
+    assert_eq!(segments[0], "sshw");
+    assert_eq!(segments[2], "web");
+    assert_ne!(credential.as_str(), "sshw:web");
+}
+
 fn sample_config() -> SshwConfig {
     let mut servers = BTreeMap::new();
     servers.insert(

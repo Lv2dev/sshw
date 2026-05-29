@@ -1,6 +1,4 @@
-use sshw::config::{
-    AuthConfig, ServerConfig, SshwConfig, default_config_path, load_config, save_config,
-};
+use sshw::config::{AuthConfig, ServerConfig, SshwConfig, load_config, save_config};
 
 #[test]
 fn new_config_starts_empty() {
@@ -91,12 +89,4 @@ fn config_save_uses_owner_only_permissions() {
 
     let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600);
-}
-
-#[test]
-fn default_config_path_uses_sshw_servers_json() {
-    let path = default_config_path().unwrap();
-
-    assert_eq!(path.file_name().unwrap(), "servers.json");
-    assert_eq!(path.parent().unwrap().file_name().unwrap(), "sshw");
 }
