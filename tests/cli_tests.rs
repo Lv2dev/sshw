@@ -146,10 +146,7 @@ fn remove_requires_confirmation_unless_yes() {
     save_config(&path, &sample_config()).unwrap();
     let store = FakeCredentialStore::default();
     let ssh = FakeSshClient::default();
-    let mut prompter = FakePrompter {
-        confirm: false,
-        ..FakePrompter::default()
-    };
+    let mut prompter = FakePrompter { confirm: false };
 
     let err = execute(
         Cli::try_parse_from(["sshw", "remove", "server-alpha"]).unwrap(),
@@ -182,10 +179,7 @@ fn trust_passes_displayed_fingerprint_to_storage() {
         host_key_fingerprint: "SHA256:displayed".to_string(),
         ..FakeSshClient::default()
     };
-    let mut prompter = FakePrompter {
-        confirm: true,
-        ..FakePrompter::default()
-    };
+    let mut prompter = FakePrompter { confirm: true };
 
     let output = execute(
         Cli::try_parse_from(["sshw", "trust", "server-alpha"]).unwrap(),

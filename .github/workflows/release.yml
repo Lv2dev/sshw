@@ -84,9 +84,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
+          (
+            cd artifacts
+            find . -type f -print0 | sort -z | xargs -0 sha256sum > ../SHA256SUMS
+          )
           mapfile -t files < <(find artifacts -type f)
           if [ "${#files[@]}" -eq 0 ]; then
             echo "no release artifacts found" >&2
             exit 1
           fi
-          gh release create "$GITHUB_REF_NAME" "${files[@]}" --generate-notes --repo "$GITHUB_REPOSITORY"
+          gh release create "$GITHUB_REF_NAME" "${files[@]}" SHA256SUMS --generate-notes --repo "$GITHUB_REPOSITORY"

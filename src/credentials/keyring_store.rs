@@ -1,6 +1,9 @@
 use super::{CredentialStore, CredentialStoreHealth};
 use std::sync::OnceLock;
 
+#[cfg(target_os = "linux")]
+use std::collections::HashMap;
+
 #[derive(Debug, Default, Clone)]
 pub struct KeyringCredentialStore;
 
@@ -61,27 +64,22 @@ fn ensure_native_store() -> anyhow::Result<()> {
 fn select_native_store() -> keyring_core::Result<()> {
     #[cfg(target_os = "windows")]
     {
-        keyring::use_named_store("windows")
+        keyring_core::set_default_store(windows_native_keyring_store::Store::new()?);
+        Ok(())
     }
     #[cfg(target_os = "macos")]
     {
-        keyring::use_named_store("keychain")
+        keyring_core::set_default_store(apple_native_keyring_store::keychain::Store::new()?);
+        Ok(())
     }
     #[cfg(target_os = "linux")]
     {
-        keyring::use_named_store("secret-service")
+        keyring_core::set_default_store(
+            dbus_secret_service_keyring_store::Store::new_with_configuration(&HashMap::new())?,
+        );
+        Ok(())
     }
-    #[cfg(any(target_os = "freebsd", target_os = "openbsd"))]
-    {
-        keyring::use_named_store("secret-service")
-    }
-    #[cfg(not(any(
-        target_os = "windows",
-        target_os = "macos",
-        target_os = "linux",
-        target_os = "freebsd",
-        target_os = "openbsd"
-    )))]
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     {
         Err(keyring_core::Error::NotSupportedByStore(format!(
             "{} is not supported by sshw password auth",
@@ -103,17 +101,7 @@ fn backend_name() -> &'static str {
     {
         "secret-service"
     }
-    #[cfg(any(target_os = "freebsd", target_os = "openbsd"))]
-    {
-        "secret-service"
-    }
-    #[cfg(not(any(
-        target_os = "windows",
-        target_os = "macos",
-        target_os = "linux",
-        target_os = "freebsd",
-        target_os = "openbsd"
-    )))]
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     {
         "unsupported"
     }

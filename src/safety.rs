@@ -18,7 +18,7 @@ pub fn classify_command(command: &str, yes: bool) -> SafetyDecision {
         };
     }
 
-    if tokens.iter().any(|token| token == "sudo") {
+    if tokens.iter().any(|token| command_name_is(token, "sudo")) {
         return SafetyDecision::Block {
             reason: "sudo requires --yes".to_string(),
         };
@@ -64,7 +64,9 @@ fn writes_to_etc(command: &str) -> bool {
             .any(|token| token.starts_with(">/etc/") || token.starts_with(">>/etc/"));
     let tools_write_to_etc = command_targets_etc(&tokens, "tee")
         || command_targets_etc(&tokens, "cp")
-        || command_targets_etc(&tokens, "mv");
+        || command_targets_etc(&tokens, "mv")
+        || command_targets_etc(&tokens, "install")
+        || dd_writes_to_etc(&tokens);
 
     redirects_to_etc || tools_write_to_etc
 }
@@ -92,7 +94,7 @@ fn shellish_tokens(command: &str) -> Vec<String> {
 
 fn has_rm_recursive_force(tokens: &[String]) -> bool {
     tokens.iter().enumerate().any(|(index, token)| {
-        token == "rm" && {
+        command_name_is(token, "rm") && {
             let mut recursive = false;
             let mut force = false;
             for arg in tokens.iter().skip(index + 1) {
@@ -110,7 +112,7 @@ fn has_rm_recursive_force(tokens: &[String]) -> bool {
 
 fn has_recursive_command(tokens: &[String], command: &str) -> bool {
     tokens.iter().enumerate().any(|(index, token)| {
-        token == command
+        command_name_is(token, command)
             && tokens.iter().skip(index + 1).any(|arg| {
                 has_short_flag(arg, 'r') || has_short_flag(arg, 'R') || arg == "--recursive"
             })
@@ -124,15 +126,32 @@ fn has_short_flag(arg: &str, flag: char) -> bool {
 fn has_adjacent_tokens(tokens: &[String], first: &str, second: &str) -> bool {
     tokens
         .windows(2)
-        .any(|window| window[0] == first && window[1] == second)
+        .any(|window| command_name_is(&window[0], first) && window[1] == second)
 }
 
 fn command_targets_etc(tokens: &[String], command: &str) -> bool {
     tokens.iter().enumerate().any(|(index, token)| {
-        token == command
+        command_name_is(token, command)
             && tokens
                 .iter()
                 .skip(index + 1)
                 .any(|arg| arg.starts_with("/etc/"))
     })
+}
+
+fn dd_writes_to_etc(tokens: &[String]) -> bool {
+    tokens.iter().enumerate().any(|(index, token)| {
+        command_name_is(token, "dd")
+            && tokens.iter().skip(index + 1).any(|arg| {
+                arg.strip_prefix("of=")
+                    .is_some_and(|path| path.starts_with("/etc/"))
+            })
+    })
+}
+
+fn command_name_is(token: &str, expected: &str) -> bool {
+    token
+        .rsplit(['/', '\\'])
+        .next()
+        .is_some_and(|name| name == expected)
 }

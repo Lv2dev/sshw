@@ -36,6 +36,8 @@ Tagged releases build GitHub release artifacts for:
 - `x86_64-apple-darwin`
 - `aarch64-apple-darwin`
 
+Each release also includes a `SHA256SUMS` file for artifact integrity checks.
+
 Create a release by pushing a version tag:
 
 ```bash
