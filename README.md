@@ -1,5 +1,7 @@
 # sshw
 
+[![CI](https://github.com/Lv2dev/sshw/actions/workflows/ci.yml/badge.svg)](https://github.com/Lv2dev/sshw/actions/workflows/ci.yml)
+
 `sshw` is a cross-platform Rust CLI for operating known SSH servers without placing SSH passwords, private keys, passphrases, or tokens in prompts, shell history, or plaintext config files.
 
 It is designed for local coding agents that need delegated server access for simple deployment and maintenance tasks.
@@ -23,6 +25,22 @@ The binary will be at:
 ```text
 target/release/sshw
 target/release/sshw.exe
+```
+
+## Release Builds
+
+Tagged releases build GitHub release artifacts for:
+
+- `x86_64-unknown-linux-gnu`
+- `x86_64-pc-windows-msvc`
+- `x86_64-apple-darwin`
+- `aarch64-apple-darwin`
+
+Create a release by pushing a version tag:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
 ```
 
 ## Config
