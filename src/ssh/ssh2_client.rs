@@ -6,13 +6,10 @@ use base64::Engine;
 use directories::BaseDirs;
 use ssh2::{CheckResult, HashType, HostKeyType, KnownHostFileKind, KnownHostKeyFormat, Session};
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
 
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -196,15 +193,11 @@ impl SshClient for Ssh2Client {
             .scp_recv(Path::new(remote))
             .context("ssh transfer error")?;
 
-        if let Some(parent) = local.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            fs::create_dir_all(parent)?;
-        }
+        // Download to a sibling temp file and persist on success so a failed
+        // transfer never truncates or replaces an existing local file.
+        let bytes =
+            crate::storage::write_stream_owner_only_atomic(local, &mut remote_file, overwrite)?;
 
-        let mut local_file = open_download_file(local, overwrite)?;
-        let bytes = std::io::copy(&mut remote_file, &mut local_file)?;
-        local_file.flush()?;
         remote_file.send_eof().context("ssh transfer error")?;
         remote_file.wait_eof().context("ssh transfer error")?;
         remote_file.close().context("ssh transfer error")?;
@@ -273,7 +266,6 @@ fn connect(server: &ServerConfig, timeout: Duration) -> anyhow::Result<Session> 
 fn timeout_millis(timeout: Duration) -> u32 {
     timeout.as_millis().min(u32::MAX as u128) as u32
 }
-
 fn verify_known_host(
     session: &Session,
     server: &ServerConfig,
@@ -399,93 +391,10 @@ fn unknown_host_key_error(server: &ServerConfig) -> anyhow::Error {
     )
 }
 
-fn open_download_file(local: &Path, overwrite: bool) -> anyhow::Result<fs::File> {
-    let mut options = fs::OpenOptions::new();
-    options
-        .write(true)
-        .create(true)
-        .create_new(!overwrite)
-        .truncate(overwrite);
-    #[cfg(unix)]
-    options.mode(0o600);
-
-    let file = options.open(local).with_context(|| {
-        if overwrite {
-            format!("failed to open local file for writing: {}", local.display())
-        } else {
-            format!(
-                "local file already exists: {}; pass --yes to overwrite",
-                local.display()
-            )
-        }
-    })?;
-    set_owner_only_permissions(local)?;
-    Ok(file)
-}
-
-#[cfg(unix)]
-fn set_owner_only_permissions(path: &Path) -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn set_owner_only_permissions(_path: &Path) -> anyhow::Result<()> {
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
-    use super::open_download_file;
     use crate::config::{AuthConfig, ServerConfig};
     use ssh2::CheckResult;
-    use std::io::{Read, Write};
-
-    #[test]
-    fn open_download_file_refuses_existing_file_without_overwrite() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("download.txt");
-        std::fs::write(&path, "keep").unwrap();
-
-        let err = open_download_file(&path, false).unwrap_err();
-
-        assert!(err.to_string().contains("already exists"));
-    }
-
-    #[test]
-    fn open_download_file_truncates_existing_file_with_overwrite() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("download.txt");
-        std::fs::write(&path, "old contents").unwrap();
-
-        {
-            let mut file = open_download_file(&path, true).unwrap();
-            file.write_all(b"new").unwrap();
-        }
-
-        let mut contents = String::new();
-        std::fs::File::open(&path)
-            .unwrap()
-            .read_to_string(&mut contents)
-            .unwrap();
-        assert_eq!(contents, "new");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn open_download_file_uses_owner_only_permissions() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("download.txt");
-
-        let _file = open_download_file(&path, false).unwrap();
-
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
-    }
 
     #[test]
     fn default_client_has_connect_timeout() {
