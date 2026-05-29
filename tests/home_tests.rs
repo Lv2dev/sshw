@@ -1,5 +1,16 @@
-use sshw::home::{ResolvedHome, resolve_home};
+use sshw::home::ResolvedHome;
+use sshw::profile::{ProfileRegistry, resolve_home_with_registry};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+
+/// Resolve a home with an empty registry and no `--profile`, exercising the
+/// `--home`/`SSHW_HOME`/built-in-default tail of the resolution chain. This is
+/// the home-model invariant surface; profile/registry priority lives in
+/// `profile_tests`.
+fn resolve_home(home_flag: Option<&Path>, env_home: Option<&OsStr>, base: &Path) -> ResolvedHome {
+    resolve_home_with_registry(home_flag, env_home, None, &ProfileRegistry::default(), base)
+        .expect("empty registry without --profile never errors")
+}
 
 #[test]
 fn default_home_resolves_under_profiles_default() {

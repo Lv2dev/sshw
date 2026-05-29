@@ -1,6 +1,5 @@
 use anyhow::Result;
 use directories::BaseDirs;
-use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -104,41 +103,12 @@ pub fn sshw_base_dir() -> Result<PathBuf> {
     Ok(dirs.config_dir().join("sshw"))
 }
 
-/// Built-in default profile home: `<config_dir>/sshw/profiles/default`.
-pub fn default_home_dir() -> Result<PathBuf> {
-    Ok(sshw_base_dir()?.join("profiles").join("default"))
-}
-
-/// Resolve the active home from the `--home` flag and `SSHW_HOME` env, falling
-/// back to the built-in default profile home under `sshw_base`.
-///
-/// Priority: `--home` > `SSHW_HOME` > built-in default profile home. (M16 will
-/// insert `--profile`/registry-default selection between the env var and the
-/// built-in default.)
-pub fn resolve_home(
-    home_flag: Option<&Path>,
-    env_home: Option<&OsStr>,
-    sshw_base: &Path,
-) -> ResolvedHome {
-    if let Some(path) = home_flag {
-        return ResolvedHome::ad_hoc(path, format!("--home {}", path.display()));
-    }
-    if let Some(env) = env_home {
-        let path = Path::new(env);
-        return ResolvedHome::ad_hoc(path, format!("SSHW_HOME {}", path.display()));
-    }
-    builtin_default_home(sshw_base)
-}
-
-/// Built-in default profile home: `<sshw_base>/profiles/default`.
+/// Built-in default profile home: `<sshw_base>/profiles/default`. Used as the
+/// final fallback in the home resolution chain
+/// (`profile::resolve_home_with_registry`).
 pub fn builtin_default_home(sshw_base: &Path) -> ResolvedHome {
     let root = sshw_base.join("profiles").join("default");
     ResolvedHome::profile(root, "default", "default profile".to_string())
-}
-
-/// Path to the global profile registry: `<config_dir>/sshw/profiles.json`.
-pub fn registry_path() -> Result<PathBuf> {
-    Ok(sshw_base_dir()?.join("profiles.json"))
 }
 
 /// Generate a stable, persisted profile id from the profile name and home path.
