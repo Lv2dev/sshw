@@ -812,6 +812,15 @@ fn parses_global_home_flag_after_subcommand() {
 }
 
 #[test]
+fn parses_global_timeout_flag() {
+    let cli = Cli::try_parse_from(["sshw", "--timeout", "30", "run", "uptime"]).unwrap();
+    assert_eq!(cli.timeout, Some(30));
+
+    let without = Cli::try_parse_from(["sshw", "run", "uptime"]).unwrap();
+    assert_eq!(without.timeout, None);
+}
+
+#[test]
 fn add_password_stores_namespaced_credential_key() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("servers.json");

@@ -22,6 +22,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde_json::json;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -42,6 +43,11 @@ pub struct Cli {
     /// default; fails closed if the policy file is missing or invalid.
     #[arg(long, global = true)]
     pub policy: bool,
+    /// Inactivity timeout in seconds for remote operations (run/put/get) after
+    /// the connection is established. 0 means no timeout. Connection setup
+    /// always uses a fixed timeout. Default: no operation timeout.
+    #[arg(long, global = true, value_name = "SECONDS")]
+    pub timeout: Option<u64>,
     #[command(subcommand)]
     pub command: Command,
 }
@@ -247,7 +253,14 @@ pub fn run() -> i32 {
         Ok(resolved) => resolved,
         Err(err) => return print_output(error_output(&err, json_errors)),
     };
-    let ssh = Ssh2Client::default().with_known_hosts(home.known_hosts_path.clone());
+    // Connection setup keeps the fixed connect timeout; the operation phase
+    // uses the optional `--timeout` (0/absent = no timeout).
+    let op_timeout = cli
+        .timeout
+        .and_then(|secs| (secs > 0).then(|| Duration::from_secs(secs)));
+    let ssh = Ssh2Client::default()
+        .with_known_hosts(home.known_hosts_path.clone())
+        .with_op_timeout(op_timeout);
     let mut prompter = TerminalPrompter;
     let audit = FileAuditSink::new(home.audit_path.clone());
     let ctx = ExecContext {
@@ -387,6 +400,7 @@ where
         home: home_flag,
         profile: _,
         policy: _,
+        timeout: _,
         command,
     } = cli;
 

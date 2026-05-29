@@ -16,6 +16,7 @@ const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 #[derive(Debug, Clone)]
 pub struct Ssh2Client {
     connect_timeout: Duration,
+    op_timeout: Option<Duration>,
     known_hosts_path: Option<PathBuf>,
 }
 
@@ -23,6 +24,7 @@ impl Default for Ssh2Client {
     fn default() -> Self {
         Self {
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            op_timeout: None,
             known_hosts_path: None,
         }
     }
@@ -31,6 +33,19 @@ impl Default for Ssh2Client {
 impl Ssh2Client {
     pub fn connect_timeout(&self) -> Duration {
         self.connect_timeout
+    }
+
+    /// Inactivity timeout for remote operations (run/put/get) applied *after*
+    /// the connection is established. `None` (the default) means no operation
+    /// timeout, matching `ssh`'s behavior so long-running or quiet commands are
+    /// not killed. Connection setup always uses `connect_timeout`.
+    pub fn with_op_timeout(mut self, op_timeout: Option<Duration>) -> Self {
+        self.op_timeout = op_timeout;
+        self
+    }
+
+    pub fn op_timeout(&self) -> Option<Duration> {
+        self.op_timeout
     }
 
     /// Use an explicit `known_hosts` file (e.g. the active profile home's file)
@@ -122,8 +137,13 @@ impl SshClient for Ssh2Client {
     ) -> anyhow::Result<RunResult> {
         let started = Instant::now();
         let known_hosts = self.resolved_known_hosts_path()?;
-        let session =
-            connect_verified_authenticated(server, auth, self.connect_timeout, &known_hosts)?;
+        let session = connect_verified_authenticated(
+            server,
+            auth,
+            self.connect_timeout,
+            self.op_timeout,
+            &known_hosts,
+        )?;
         let mut channel = session.channel_session().context("ssh session error")?;
         channel.exec(command).context("ssh session error")?;
 
@@ -159,8 +179,13 @@ impl SshClient for Ssh2Client {
         }
 
         let known_hosts = self.resolved_known_hosts_path()?;
-        let session =
-            connect_verified_authenticated(server, auth, self.connect_timeout, &known_hosts)?;
+        let session = connect_verified_authenticated(
+            server,
+            auth,
+            self.connect_timeout,
+            self.op_timeout,
+            &known_hosts,
+        )?;
         let mut local_file = fs::File::open(local)?;
         let mut remote_file = session
             .scp_send(Path::new(remote), 0o600, metadata.len(), None)
@@ -187,8 +212,13 @@ impl SshClient for Ssh2Client {
         overwrite: bool,
     ) -> anyhow::Result<TransferResult> {
         let known_hosts = self.resolved_known_hosts_path()?;
-        let session =
-            connect_verified_authenticated(server, auth, self.connect_timeout, &known_hosts)?;
+        let session = connect_verified_authenticated(
+            server,
+            auth,
+            self.connect_timeout,
+            self.op_timeout,
+            &known_hosts,
+        )?;
         let (mut remote_file, stat) = session
             .scp_recv(Path::new(remote))
             .context("ssh transfer error")?;
@@ -215,11 +245,16 @@ fn connect_verified_authenticated(
     server: &ServerConfig,
     auth: &AuthMaterial,
     connect_timeout: Duration,
+    op_timeout: Option<Duration>,
     known_hosts_path: &Path,
 ) -> anyhow::Result<Session> {
     let session = connect(server, connect_timeout)?;
     verify_known_host(&session, server, known_hosts_path)?;
     authenticate(&session, server, auth)?;
+    // Switch from the connect-phase timeout to the operation timeout (0 = no
+    // timeout) so long-running or quiet remote commands are not killed by the
+    // connection setup timeout.
+    session.set_timeout(op_timeout_millis(op_timeout));
     Ok(session)
 }
 
@@ -265,6 +300,12 @@ fn connect(server: &ServerConfig, timeout: Duration) -> anyhow::Result<Session> 
 
 fn timeout_millis(timeout: Duration) -> u32 {
     timeout.as_millis().min(u32::MAX as u128) as u32
+}
+
+/// libssh2 blocking timeout in milliseconds for the operation phase. `None`
+/// maps to `0`, which libssh2 treats as "no timeout".
+fn op_timeout_millis(op_timeout: Option<Duration>) -> u32 {
+    op_timeout.map(timeout_millis).unwrap_or(0)
 }
 fn verify_known_host(
     session: &Session,
@@ -403,6 +444,35 @@ mod tests {
         assert_eq!(
             super::Ssh2Client::default().connect_timeout(),
             std::time::Duration::from_secs(15)
+        );
+    }
+
+    #[test]
+    fn default_client_has_no_op_timeout() {
+        assert_eq!(super::Ssh2Client::default().op_timeout(), None);
+    }
+
+    #[test]
+    fn with_op_timeout_sets_op_timeout() {
+        let client =
+            super::Ssh2Client::default().with_op_timeout(Some(std::time::Duration::from_secs(30)));
+
+        assert_eq!(
+            client.op_timeout(),
+            Some(std::time::Duration::from_secs(30))
+        );
+    }
+
+    #[test]
+    fn op_timeout_millis_maps_none_to_unlimited_and_clamps() {
+        assert_eq!(super::op_timeout_millis(None), 0);
+        assert_eq!(
+            super::op_timeout_millis(Some(std::time::Duration::from_secs(30))),
+            30_000
+        );
+        assert_eq!(
+            super::op_timeout_millis(Some(std::time::Duration::from_millis(u32::MAX as u64 + 1))),
+            u32::MAX
         );
     }
 

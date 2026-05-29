@@ -159,7 +159,9 @@ sshw doctor [--json]
 sshw profile <add|list|show|default|remove> ...
 ```
 
-Global flags (available on every command): `--home <path>`, `--profile <name>`, `--policy`.
+Global flags (available on every command): `--home <path>`, `--profile <name>`, `--policy`, `--timeout <seconds>`.
+
+`--timeout` sets an inactivity timeout (seconds) for the remote operation phase of `run`/`put`/`get` after the connection is established; `0` or omitting it means no operation timeout, so long-running or quiet commands are not killed (matching `ssh`). Connection setup always uses a fixed timeout regardless. Note: without `--timeout`, a remote that floods stderr while withholding stdout could make `run` block indefinitely (the stdout-then-stderr read is sequential); set `--timeout` in automated or untrusted contexts to bound this.
 
 When the name is omitted for `run`/`put`/`get`, the configured default server is used.
 
@@ -418,9 +420,9 @@ sshw doctor [--json]
 sshw profile <add|list|show|default|remove> ...
 ```
 
-전역 플래그(모든 명령에서 사용): `--home <path>`, `--profile <name>`, `--policy`.
+전역 플래그(모든 명령에서 사용): `--home <path>`, `--profile <name>`, `--policy`, `--timeout <seconds>`.
 
-`run`/`put`/`get`에서 이름을 생략하면 설정된 default 서버를 사용합니다.
+`--timeout`은 연결 수립 이후 `run`/`put`/`get`의 원격 작업 단계에 적용되는 무진행(inactivity) 타임아웃(초)입니다. `0`이거나 생략하면 작업 타임아웃이 없어, 오래 걸리거나 조용한 명령이 강제 종료되지 않습니다(`ssh`와 동일). 연결 수립 단계는 항상 고정 타임아웃을 사용합니다. 참고: `--timeout` 없이 원격이 stdout을 보류한 채 stderr를 가득 채우면 `run`이 무한 대기할 수 있습니다(stdout→stderr 순차 read). 자동화/비신뢰 환경에서는 `--timeout`으로 상한을 두세요.
 
 ### Safety Rails
 
