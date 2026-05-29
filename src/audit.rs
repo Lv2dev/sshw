@@ -49,7 +49,10 @@ impl AuditSink for NoopAudit {
 }
 
 /// Appends one JSON object per line to `<home>/audit.jsonl`. Owner-only on
-/// platforms that support it. Never records secrets.
+/// platforms that support it. Secret-bearing fields are redacted on a
+/// best-effort basis before writing (see `redact_secrets`); the `run` action
+/// records only the program name, not its arguments, to avoid persisting
+/// secrets passed inline.
 pub struct FileAuditSink {
     path: PathBuf,
 }

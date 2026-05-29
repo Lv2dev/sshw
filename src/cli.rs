@@ -469,12 +469,18 @@ fn audit_descriptor(
         Command::Trust(a) => Some(("trust", Some(a.name.clone()), None)),
         Command::Default(a) => Some(("default", a.name.clone().or_else(default), None)),
         Command::Run(a) => {
-            let (server, detail) = match a.target.as_slice() {
+            let (server, command) = match a.target.as_slice() {
                 [name, command] => (Some(name.clone()), Some(command.clone())),
                 [command] => (default(), Some(command.clone())),
                 _ => (default(), None),
             };
-            Some(("run", server, detail))
+            // Record only the program name, never the full argument string, so
+            // secrets passed inline (e.g. `mysql -phunter2`) are not persisted.
+            let program = command
+                .as_deref()
+                .and_then(|c| c.split_whitespace().next())
+                .map(str::to_string);
+            Some(("run", server, program))
         }
         Command::Put(a) => {
             let (server, detail) = match a.target.as_slice() {
@@ -554,7 +560,7 @@ where
         credentials.delete_password(&credential, &user)?;
     }
 
-    Ok(ok(format!(
+    let mut message = format!(
         "{} {}\n",
         if previous_server.is_some() {
             "updated"
@@ -562,7 +568,13 @@ where
             "added"
         },
         args.name
-    )))
+    );
+    if matches!(args.auth, AuthArg::Password) && !credentials.is_persistent() {
+        message.push_str(
+            "warning: this credential backend does not persist passwords; supply SSHW_PASSWORD at run time\n",
+        );
+    }
+    Ok(ok(message))
 }
 
 fn list_servers(args: ListArgs, config: &SshwConfig) -> anyhow::Result<CommandOutput> {

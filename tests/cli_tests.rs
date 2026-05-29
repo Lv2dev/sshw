@@ -4,6 +4,7 @@ use sshw::cli::{
     AuthArg, Cli, Command, ExecContext, Prompter, execute, execute_for_runtime, execute_with,
 };
 use sshw::config::{AuthConfig, ServerConfig, SshwConfig, save_config};
+use sshw::credentials::session_store::SessionOnlyStore;
 use sshw::credentials::{AuthMaterial, CredentialStore, CredentialStoreHealth};
 use sshw::home::ResolvedHome;
 use sshw::ssh::{HostKeyInfo, RunResult, SshClient, TransferResult};
@@ -992,7 +993,7 @@ fn write_policy(dir: &Path, contents: &str) {
 }
 
 #[test]
-fn run_writes_redacted_audit_record() {
+fn run_audit_records_program_name_not_arguments() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("servers.json");
     save_config(&path, &sample_config()).unwrap();
@@ -1026,8 +1027,79 @@ fn run_writes_redacted_audit_record() {
     assert_eq!(rec["action"], "run");
     assert_eq!(rec["server"], "server-alpha");
     assert_eq!(rec["status"], "ok");
+    // Only the program name is recorded; inline arguments (and any secret in
+    // them) are never persisted.
+    assert_eq!(rec["detail"], "mysql");
     assert!(!log.contains("hunter2"), "secret leaked into audit log");
-    assert!(rec["detail"].as_str().unwrap().contains("<redacted>"));
+    assert!(
+        !log.contains("--password"),
+        "arguments leaked into audit log"
+    );
+}
+
+#[test]
+fn ssh_session_failure_classifies_as_ssh_exit_5() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &sample_config()).unwrap();
+    let store = FakeCredentialStore::default();
+    store
+        .set_password("sshw:server-alpha", "deploy", "YOUR_PASSWORD")
+        .unwrap();
+    let ssh = FakeSshClient::with_run_error("ssh session error: channel failure");
+    let mut prompter = FakePrompter::default();
+
+    let output = execute_for_runtime(
+        Cli::try_parse_from(["sshw", "run", "server-alpha", "hostname", "--json"]).unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    );
+
+    assert_eq!(output.exit_code, 5);
+    let json: serde_json::Value = serde_json::from_str(output.stdout.trim()).unwrap();
+    assert_eq!(json["error"]["kind"], "ssh");
+}
+
+#[test]
+fn add_password_under_session_backend_warns_not_persisted() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &SshwConfig::default()).unwrap();
+    let store = SessionOnlyStore::new();
+    let ssh = FakeSshClient::default();
+    let mut prompter = FakePrompter {
+        confirm: false,
+        password: Some("secret-pw".to_string()),
+    };
+
+    let output = execute(
+        Cli::try_parse_from([
+            "sshw",
+            "add",
+            "web",
+            "--host",
+            "192.0.2.10",
+            "--port",
+            "22",
+            "--user",
+            "deploy",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    )
+    .unwrap();
+
+    assert!(output.stdout.contains("added web"));
+    assert!(
+        output.stdout.contains("does not persist"),
+        "expected a non-persistent backend warning, got: {}",
+        output.stdout
+    );
 }
 
 #[test]
@@ -1400,6 +1472,7 @@ struct FakeSshClient {
     host_key_fingerprint: String,
     stdout: Option<String>,
     stderr: String,
+    run_error: Option<String>,
 }
 
 impl FakeSshClient {
@@ -1413,6 +1486,13 @@ impl FakeSshClient {
     fn with_stdout(stdout: &str) -> Self {
         Self {
             stdout: Some(stdout.to_string()),
+            ..Self::default()
+        }
+    }
+
+    fn with_run_error(message: &str) -> Self {
+        Self {
+            run_error: Some(message.to_string()),
             ..Self::default()
         }
     }
@@ -1453,6 +1533,9 @@ impl SshClient for FakeSshClient {
         command: &str,
     ) -> anyhow::Result<RunResult> {
         self.run_commands.borrow_mut().push(command.to_string());
+        if let Some(message) = &self.run_error {
+            return Err(anyhow::anyhow!("{message}"));
+        }
         Ok(RunResult {
             exit_status: 0,
             stdout: self.stdout.clone().unwrap_or_else(|| "ok\n".to_string()),

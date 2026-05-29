@@ -1,15 +1,17 @@
 use super::{CredentialStore, CredentialStoreHealth};
 use std::cell::RefCell;
 use std::collections::HashMap;
+use zeroize::Zeroizing;
 
 /// In-memory credential store that never touches the OS keyring. Useful for
 /// ephemeral/CI contexts where secrets must not be persisted. A password may
 /// be supplied for the invocation via the `SSHW_PASSWORD` environment
 /// variable; anything stored with `set_password` lives only for this process.
-#[derive(Debug, Default)]
+/// Held secrets are zeroized on drop.
+#[derive(Default)]
 pub struct SessionOnlyStore {
-    session_password: Option<String>,
-    values: RefCell<HashMap<(String, String), String>>,
+    session_password: Option<Zeroizing<String>>,
+    values: RefCell<HashMap<(String, String), Zeroizing<String>>>,
 }
 
 impl SessionOnlyStore {
@@ -22,7 +24,8 @@ impl SessionOnlyStore {
     pub fn from_env() -> Self {
         let session_password = std::env::var("SSHW_PASSWORD")
             .ok()
-            .filter(|value| !value.is_empty());
+            .filter(|value| !value.is_empty())
+            .map(Zeroizing::new);
         Self {
             session_password,
             values: RefCell::new(HashMap::new()),
@@ -31,7 +34,7 @@ impl SessionOnlyStore {
 
     pub fn with_session_password(password: Option<String>) -> Self {
         Self {
-            session_password: password,
+            session_password: password.map(Zeroizing::new),
             values: RefCell::new(HashMap::new()),
         }
     }
@@ -41,7 +44,7 @@ impl CredentialStore for SessionOnlyStore {
     fn set_password(&self, credential: &str, user: &str, password: &str) -> anyhow::Result<()> {
         self.values.borrow_mut().insert(
             (credential.to_string(), user.to_string()),
-            password.to_string(),
+            Zeroizing::new(password.to_string()),
         );
         Ok(())
     }
@@ -52,13 +55,16 @@ impl CredentialStore for SessionOnlyStore {
             .borrow()
             .get(&(credential.to_string(), user.to_string()))
         {
-            return Ok(value.clone());
+            return Ok(value.as_str().to_string());
         }
-        self.session_password.clone().ok_or_else(|| {
-            anyhow::anyhow!(
-                "session-only credential backend has no password for {credential}; set SSHW_PASSWORD or use the native backend"
-            )
-        })
+        self.session_password
+            .as_ref()
+            .map(|password| password.as_str().to_string())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "session-only credential backend has no password for {credential}; set SSHW_PASSWORD or use the native backend"
+                )
+            })
     }
 
     fn delete_password(&self, credential: &str, user: &str) -> anyhow::Result<()> {
@@ -79,5 +85,9 @@ impl CredentialStore for SessionOnlyStore {
             available: true,
             message,
         })
+    }
+
+    fn is_persistent(&self) -> bool {
+        false
     }
 }

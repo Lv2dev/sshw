@@ -94,6 +94,13 @@ fn session_only_store_falls_back_to_session_password() {
 }
 
 #[test]
+fn session_only_store_is_not_persistent() {
+    assert!(!SessionOnlyStore::new().is_persistent());
+    // The default trait method (used by the native keyring) is persistent.
+    assert!(FakeCredentialStore::default().is_persistent());
+}
+
+#[test]
 fn session_only_store_without_password_reports_unavailable_secret() {
     let store = SessionOnlyStore::with_session_password(None);
     let err = store

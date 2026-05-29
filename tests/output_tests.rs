@@ -77,6 +77,18 @@ fn filters_known_noninteractive_stty_startup_noise() {
 }
 
 #[test]
+fn classifies_ssh_session_and_transfer_errors_as_ssh() {
+    for message in [
+        "ssh session error: channel failure",
+        "ssh transfer error: scp protocol error",
+    ] {
+        let kind = classify_error(&anyhow::anyhow!("{message}"));
+        assert_eq!(kind, ErrorKind::Ssh, "message: {message}");
+        assert_eq!(kind.exit_code(), 5);
+    }
+}
+
+#[test]
 fn classifies_policy_errors_with_exit_code_7() {
     for message in [
         "command blocked by policy: 'rm' is not in the allowlist",

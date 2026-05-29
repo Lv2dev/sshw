@@ -96,6 +96,7 @@ pub fn classify_error(err: &anyhow::Error) -> ErrorKind {
         || message.contains("failed to resolve")
         || message.contains("ssh handshake")
         || message.contains("ssh session")
+        || message.contains("ssh transfer")
     {
         return ErrorKind::Ssh;
     }

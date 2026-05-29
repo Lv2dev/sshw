@@ -127,15 +127,15 @@ impl SshClient for Ssh2Client {
         let known_hosts = self.resolved_known_hosts_path()?;
         let session =
             connect_verified_authenticated(server, auth, self.connect_timeout, &known_hosts)?;
-        let mut channel = session.channel_session()?;
-        channel.exec(command)?;
+        let mut channel = session.channel_session().context("ssh session error")?;
+        channel.exec(command).context("ssh session error")?;
 
         let mut stdout = String::new();
         let mut stderr = String::new();
         channel.read_to_string(&mut stdout)?;
         channel.stderr().read_to_string(&mut stderr)?;
-        channel.wait_close()?;
-        let exit_status = channel.exit_status()?;
+        channel.wait_close().context("ssh session error")?;
+        let exit_status = channel.exit_status().context("ssh session error")?;
 
         Ok(RunResult {
             exit_status,
@@ -165,12 +165,14 @@ impl SshClient for Ssh2Client {
         let session =
             connect_verified_authenticated(server, auth, self.connect_timeout, &known_hosts)?;
         let mut local_file = fs::File::open(local)?;
-        let mut remote_file = session.scp_send(Path::new(remote), 0o600, metadata.len(), None)?;
+        let mut remote_file = session
+            .scp_send(Path::new(remote), 0o600, metadata.len(), None)
+            .context("ssh transfer error")?;
         std::io::copy(&mut local_file, &mut remote_file)?;
-        remote_file.send_eof()?;
-        remote_file.wait_eof()?;
-        remote_file.close()?;
-        remote_file.wait_close()?;
+        remote_file.send_eof().context("ssh transfer error")?;
+        remote_file.wait_eof().context("ssh transfer error")?;
+        remote_file.close().context("ssh transfer error")?;
+        remote_file.wait_close().context("ssh transfer error")?;
 
         Ok(TransferResult {
             bytes: metadata.len(),
@@ -190,7 +192,9 @@ impl SshClient for Ssh2Client {
         let known_hosts = self.resolved_known_hosts_path()?;
         let session =
             connect_verified_authenticated(server, auth, self.connect_timeout, &known_hosts)?;
-        let (mut remote_file, stat) = session.scp_recv(Path::new(remote))?;
+        let (mut remote_file, stat) = session
+            .scp_recv(Path::new(remote))
+            .context("ssh transfer error")?;
 
         if let Some(parent) = local.parent()
             && !parent.as_os_str().is_empty()
@@ -201,10 +205,10 @@ impl SshClient for Ssh2Client {
         let mut local_file = open_download_file(local, overwrite)?;
         let bytes = std::io::copy(&mut remote_file, &mut local_file)?;
         local_file.flush()?;
-        remote_file.send_eof()?;
-        remote_file.wait_eof()?;
-        remote_file.close()?;
-        remote_file.wait_close()?;
+        remote_file.send_eof().context("ssh transfer error")?;
+        remote_file.wait_eof().context("ssh transfer error")?;
+        remote_file.close().context("ssh transfer error")?;
+        remote_file.wait_close().context("ssh transfer error")?;
 
         Ok(TransferResult {
             bytes: bytes.min(stat.size()),

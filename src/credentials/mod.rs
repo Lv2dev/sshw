@@ -46,4 +46,11 @@ pub trait CredentialStore {
     fn get_password(&self, credential: &str, user: &str) -> anyhow::Result<String>;
     fn delete_password(&self, credential: &str, user: &str) -> anyhow::Result<()>;
     fn health_check(&self) -> anyhow::Result<CredentialStoreHealth>;
+
+    /// Whether `set_password` durably persists the secret across invocations.
+    /// Non-persistent backends (e.g. session-only) let the CLI warn that a
+    /// stored password will not survive the process.
+    fn is_persistent(&self) -> bool {
+        true
+    }
 }
