@@ -3,7 +3,7 @@ use crate::config::{
 };
 use crate::credentials::keyring_store::KeyringCredentialStore;
 use crate::credentials::{AuthMaterial, CredentialStore, CredentialStoreHealth};
-use crate::output::{RunOutput, ServerOutput};
+use crate::output::{RunOutput, ServerOutput, filter_startup_stderr_noise};
 use crate::safety::{SafetyDecision, classify_command};
 use crate::ssh::SshClient;
 use crate::ssh::ssh2_client::Ssh2Client;
@@ -342,6 +342,7 @@ where
     let auth = resolve_auth(server, credentials)?;
     let result = ssh.run(server, &auth, &args.command)?;
     let exit_code = result.exit_status;
+    let stderr = filter_startup_stderr_noise(&result.stderr);
 
     if args.json {
         let output = RunOutput {
@@ -349,7 +350,7 @@ where
             command: args.command,
             exit_status: result.exit_status,
             stdout: result.stdout,
-            stderr: result.stderr,
+            stderr,
             duration_ms: result.duration_ms,
         };
         return Ok(CommandOutput {
@@ -361,7 +362,7 @@ where
 
     Ok(CommandOutput {
         stdout: result.stdout,
-        stderr: result.stderr,
+        stderr,
         exit_code,
     })
 }

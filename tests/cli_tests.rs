@@ -172,6 +172,65 @@ fn remove_requires_confirmation_unless_yes() {
     assert!(output.stdout.contains("removed server-alpha"));
 }
 
+#[test]
+fn run_json_filters_known_stty_startup_noise_but_keeps_real_stderr() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &sample_config()).unwrap();
+    let store = FakeCredentialStore::default();
+    store
+        .set_password("sshw:server-alpha", "deploy", "YOUR_PASSWORD")
+        .unwrap();
+    let ssh = FakeSshClient::with_stderr(
+        "stty: 'standard input': Inappropriate ioctl for device\nactual warning\n",
+    );
+    let mut prompter = FakePrompter::default();
+
+    let output = execute(
+        Cli::try_parse_from(["sshw", "run", "server-alpha", "hostname", "--json"]).unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    )
+    .unwrap();
+
+    let json: serde_json::Value = serde_json::from_str(output.stdout.trim()).unwrap();
+    assert_eq!(json["stderr"], "actual warning\n");
+    assert!(
+        !output
+            .stdout
+            .contains("stty: 'standard input': Inappropriate ioctl for device")
+    );
+}
+
+#[test]
+fn run_human_filters_known_stty_startup_noise_but_keeps_real_stderr() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &sample_config()).unwrap();
+    let store = FakeCredentialStore::default();
+    store
+        .set_password("sshw:server-alpha", "deploy", "YOUR_PASSWORD")
+        .unwrap();
+    let ssh = FakeSshClient::with_stderr(
+        "stty: 'standard input': Inappropriate ioctl for device\nactual warning\n",
+    );
+    let mut prompter = FakePrompter::default();
+
+    let output = execute(
+        Cli::try_parse_from(["sshw", "run", "server-alpha", "hostname"]).unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    )
+    .unwrap();
+
+    assert_eq!(output.stdout, "ok\n");
+    assert_eq!(output.stderr, "actual warning\n");
+}
+
 fn sample_config() -> SshwConfig {
     let mut servers = BTreeMap::new();
     servers.insert(
@@ -235,6 +294,16 @@ impl CredentialStore for FakeCredentialStore {
 #[derive(Default)]
 struct FakeSshClient {
     run_commands: RefCell<Vec<String>>,
+    stderr: String,
+}
+
+impl FakeSshClient {
+    fn with_stderr(stderr: &str) -> Self {
+        Self {
+            stderr: stderr.to_string(),
+            ..Self::default()
+        }
+    }
 }
 
 impl SshClient for FakeSshClient {
@@ -259,7 +328,7 @@ impl SshClient for FakeSshClient {
         Ok(RunResult {
             exit_status: 0,
             stdout: "ok\n".to_string(),
-            stderr: String::new(),
+            stderr: self.stderr.clone(),
             duration_ms: 1,
         })
     }

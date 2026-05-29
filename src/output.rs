@@ -1,6 +1,8 @@
 use crate::config::{AuthConfig, ServerConfig};
 use serde::Serialize;
 
+const NONINTERACTIVE_STTY_NOISE: &str = "stty: 'standard input': Inappropriate ioctl for device";
+
 #[derive(Debug, Clone, Serialize)]
 pub struct RunOutput {
     pub server: String,
@@ -50,4 +52,17 @@ impl AuthOutput {
             AuthConfig::Agent => Self::Agent,
         }
     }
+}
+
+pub fn filter_startup_stderr_noise(stderr: &str) -> String {
+    let mut filtered = String::new();
+
+    for line in stderr.split_inclusive('\n') {
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed != NONINTERACTIVE_STTY_NOISE {
+            filtered.push_str(line);
+        }
+    }
+
+    filtered
 }
