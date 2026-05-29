@@ -3,7 +3,7 @@ use crate::credentials::keyring_store::KeyringCredentialStore;
 use crate::credentials::{AuthMaterial, CredentialStore, CredentialStoreHealth};
 use crate::home::{CredentialNamespace, ResolvedHome, generate_profile_id, sshw_base_dir};
 use crate::output::{
-    ErrorKind, ErrorResponse, RunOutput, ServerOutput, filter_startup_stderr_noise,
+    ErrorKind, ErrorResponse, RunOutput, ServerOutput, filter_startup_stderr_noise, redact_secrets,
 };
 use crate::profile::{
     ProfileEntry, ProfileRegistry, load_registry, resolve_home_with_registry, save_registry,
@@ -553,14 +553,15 @@ where
     let auth = resolve_auth(server, credentials)?;
     let result = ssh.run(server, &auth, &command)?;
     let exit_code = result.exit_status;
-    let stderr = filter_startup_stderr_noise(&result.stderr);
+    let stdout = redact_secrets(&result.stdout);
+    let stderr = redact_secrets(&filter_startup_stderr_noise(&result.stderr));
 
     if json {
         let output = RunOutput {
             server: server_name,
-            command,
+            command: redact_secrets(&command),
             exit_status: result.exit_status,
-            stdout: result.stdout,
+            stdout,
             stderr,
             duration_ms: result.duration_ms,
         };
@@ -572,7 +573,7 @@ where
     }
 
     Ok(CommandOutput {
-        stdout: result.stdout,
+        stdout,
         stderr,
         exit_code,
     })

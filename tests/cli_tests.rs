@@ -943,6 +943,46 @@ fn profile_add_requires_home() {
     assert!(err.to_string().contains("requires --home"));
 }
 
+#[test]
+fn run_redacts_secrets_in_output() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &sample_config()).unwrap();
+    let store = FakeCredentialStore::default();
+    store
+        .set_password("sshw:server-alpha", "deploy", "YOUR_PASSWORD")
+        .unwrap();
+    let mut prompter = FakePrompter::default();
+
+    let human = execute(
+        Cli::try_parse_from(["sshw", "run", "server-alpha", "cat env"]).unwrap(),
+        &path,
+        &store,
+        &FakeSshClient::with_stdout("db password=hunter2\nok\n"),
+        &mut prompter,
+    )
+    .unwrap();
+    assert!(human.stdout.contains("password=<redacted>"));
+    assert!(!human.stdout.contains("hunter2"));
+
+    let json_out = execute(
+        Cli::try_parse_from(["sshw", "run", "server-alpha", "cat env", "--json"]).unwrap(),
+        &path,
+        &store,
+        &FakeSshClient::with_stdout("db password=hunter2\n"),
+        &mut prompter,
+    )
+    .unwrap();
+    let json: serde_json::Value = serde_json::from_str(json_out.stdout.trim()).unwrap();
+    assert!(
+        json["stdout"]
+            .as_str()
+            .unwrap()
+            .contains("password=<redacted>")
+    );
+    assert!(!json_out.stdout.contains("hunter2"));
+}
+
 fn sample_config() -> SshwConfig {
     let mut servers = BTreeMap::new();
     servers.insert(
@@ -1010,6 +1050,7 @@ struct FakeSshClient {
     put_calls: RefCell<Vec<String>>,
     get_calls: RefCell<Vec<bool>>,
     host_key_fingerprint: String,
+    stdout: Option<String>,
     stderr: String,
 }
 
@@ -1017,6 +1058,13 @@ impl FakeSshClient {
     fn with_stderr(stderr: &str) -> Self {
         Self {
             stderr: stderr.to_string(),
+            ..Self::default()
+        }
+    }
+
+    fn with_stdout(stdout: &str) -> Self {
+        Self {
+            stdout: Some(stdout.to_string()),
             ..Self::default()
         }
     }
@@ -1059,7 +1107,7 @@ impl SshClient for FakeSshClient {
         self.run_commands.borrow_mut().push(command.to_string());
         Ok(RunResult {
             exit_status: 0,
-            stdout: "ok\n".to_string(),
+            stdout: self.stdout.clone().unwrap_or_else(|| "ok\n".to_string()),
             stderr: self.stderr.clone(),
             duration_ms: 1,
         })

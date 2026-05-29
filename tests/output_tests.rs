@@ -1,6 +1,6 @@
 use sshw::config::{AuthConfig, ServerConfig};
 use sshw::output::{
-    ErrorKind, RunOutput, ServerOutput, classify_error, filter_startup_stderr_noise,
+    ErrorKind, RunOutput, ServerOutput, classify_error, filter_startup_stderr_noise, redact_secrets,
 };
 
 #[test]
@@ -74,6 +74,65 @@ fn filters_known_noninteractive_stty_startup_noise() {
     let filtered = filter_startup_stderr_noise(stderr);
 
     assert_eq!(filtered, "actual warning\n");
+}
+
+#[test]
+fn redacts_pem_private_key_block() {
+    let input = "before\n-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXk\nAAAA\n-----END OPENSSH PRIVATE KEY-----\nafter\n";
+
+    let out = redact_secrets(input);
+
+    assert!(out.contains("[redacted private key]"));
+    assert!(!out.contains("b3BlbnNzaC1rZXk"));
+    assert!(!out.contains("AAAA"));
+    assert!(out.contains("before\n"));
+    assert!(out.contains("after\n"));
+}
+
+#[test]
+fn redacts_keyword_assignments() {
+    assert_eq!(redact_secrets("password=hunter2"), "password=<redacted>");
+    assert_eq!(redact_secrets("PASSWORD: hunter2"), "PASSWORD: <redacted>");
+
+    let api = redact_secrets("api_key = \"abc123\"");
+    assert!(api.starts_with("api_key = "));
+    assert!(!api.contains("abc123"));
+
+    let token = redact_secrets("export TOKEN=abcdef\n");
+    assert!(token.contains("TOKEN=<redacted>"));
+    assert!(!token.contains("abcdef"));
+}
+
+#[test]
+fn redacts_bearer_token() {
+    let out = redact_secrets("Authorization: Bearer abc.def.ghi");
+
+    assert!(out.contains("Bearer <redacted>"));
+    assert!(!out.contains("abc.def.ghi"));
+}
+
+#[test]
+fn leaves_ordinary_output_and_identifiers_untouched() {
+    assert_eq!(redact_secrets("ok\n"), "ok\n");
+    assert_eq!(
+        redact_secrets("the password is in the vault"),
+        "the password is in the vault"
+    );
+    assert_eq!(redact_secrets("sshw:p_abc123:web"), "sshw:p_abc123:web");
+    assert_eq!(
+        redact_secrets("hostname\nuptime 3 days\n"),
+        "hostname\nuptime 3 days\n"
+    );
+}
+
+#[test]
+fn redaction_is_idempotent() {
+    let once = redact_secrets("password=hunter2\nAuthorization: Bearer xyz\nok\n");
+    let twice = redact_secrets(&once);
+
+    assert_eq!(once, twice);
+    assert!(!once.contains("hunter2"));
+    assert!(!once.contains("xyz"));
 }
 
 #[test]
