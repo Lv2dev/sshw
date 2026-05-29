@@ -4,7 +4,7 @@ use crate::config::{
 use crate::credentials::keyring_store::KeyringCredentialStore;
 use crate::credentials::{AuthMaterial, CredentialStore, CredentialStoreHealth};
 use crate::output::{RunOutput, ServerOutput, filter_startup_stderr_noise};
-use crate::safety::{SafetyDecision, classify_command};
+use crate::safety::{SafetyDecision, classify_command, classify_remote_write_path};
 use crate::ssh::SshClient;
 use crate::ssh::ssh2_client::Ssh2Client;
 use anyhow::Context;
@@ -141,7 +141,7 @@ pub fn run() -> anyhow::Result<i32> {
     let cli = Cli::parse();
     let config_path = default_config_path()?;
     let credentials = KeyringCredentialStore;
-    let ssh = Ssh2Client;
+    let ssh = Ssh2Client::default();
     let mut prompter = TerminalPrompter;
     let output = execute(cli, &config_path, &credentials, &ssh, &mut prompter)?;
 
@@ -203,6 +203,9 @@ where
         AuthArg::Password => {
             let credential = format!("sshw:{}", args.name);
             let password = prompter.password("SSH password: ")?;
+            if password.is_empty() {
+                return Err(anyhow::anyhow!("password cannot be empty"));
+            }
             credentials.set_password(&credential, &args.user, &password)?;
             AuthConfig::Password { credential }
         }
@@ -384,8 +387,9 @@ where
     C: CredentialStore,
     S: SshClient,
 {
-    if args.remote.starts_with("/etc/") && !args.yes {
-        return Err(anyhow::anyhow!("writing to /etc requires --yes"));
+    match classify_remote_write_path(&args.remote, args.yes) {
+        SafetyDecision::Allow => {}
+        SafetyDecision::Block { reason } => return Err(anyhow::anyhow!("{reason}")),
     }
 
     let server = get_server(config, &args.name)?;

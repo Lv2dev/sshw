@@ -146,7 +146,10 @@ fn remove_requires_confirmation_unless_yes() {
     save_config(&path, &sample_config()).unwrap();
     let store = FakeCredentialStore::default();
     let ssh = FakeSshClient::default();
-    let mut prompter = FakePrompter { confirm: false };
+    let mut prompter = FakePrompter {
+        confirm: false,
+        password: None,
+    };
 
     let err = execute(
         Cli::try_parse_from(["sshw", "remove", "server-alpha"]).unwrap(),
@@ -179,7 +182,10 @@ fn trust_passes_displayed_fingerprint_to_storage() {
         host_key_fingerprint: "SHA256:displayed".to_string(),
         ..FakeSshClient::default()
     };
-    let mut prompter = FakePrompter { confirm: true };
+    let mut prompter = FakePrompter {
+        confirm: true,
+        password: None,
+    };
 
     let output = execute(
         Cli::try_parse_from(["sshw", "trust", "server-alpha"]).unwrap(),
@@ -308,6 +314,111 @@ fn add_agent_update_deletes_old_password_credential() {
 }
 
 #[test]
+fn add_password_rejects_empty_password_before_storing_secret() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &SshwConfig::default()).unwrap();
+    let store = FakeCredentialStore::default();
+    let ssh = FakeSshClient::default();
+    let mut prompter = FakePrompter {
+        confirm: false,
+        password: Some(String::new()),
+    };
+
+    let err = execute(
+        Cli::try_parse_from([
+            "sshw",
+            "add",
+            "server-alpha",
+            "--host",
+            "192.0.2.10",
+            "--port",
+            "2222",
+            "--user",
+            "deploy",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    )
+    .unwrap_err();
+
+    assert!(err.to_string().contains("password cannot be empty"));
+    assert!(store.values.borrow().is_empty());
+}
+
+#[test]
+fn put_to_system_path_requires_yes_before_ssh() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &sample_config()).unwrap();
+    let local = temp.path().join("app");
+    std::fs::write(&local, "binary").unwrap();
+    let store = FakeCredentialStore::default();
+    store
+        .set_password("sshw:server-alpha", "deploy", "YOUR_PASSWORD")
+        .unwrap();
+    let ssh = FakeSshClient::default();
+    let mut prompter = FakePrompter::default();
+
+    let err = execute(
+        Cli::try_parse_from([
+            "sshw",
+            "put",
+            "server-alpha",
+            local.to_str().unwrap(),
+            "/usr/bin/app",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    )
+    .unwrap_err();
+
+    assert!(err.to_string().contains("requires --yes"));
+    assert!(ssh.put_calls.borrow().is_empty());
+}
+
+#[test]
+fn put_to_system_path_with_yes_allows_upload() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &sample_config()).unwrap();
+    let local = temp.path().join("app");
+    std::fs::write(&local, "binary").unwrap();
+    let store = FakeCredentialStore::default();
+    store
+        .set_password("sshw:server-alpha", "deploy", "YOUR_PASSWORD")
+        .unwrap();
+    let ssh = FakeSshClient::default();
+    let mut prompter = FakePrompter::default();
+
+    let output = execute(
+        Cli::try_parse_from([
+            "sshw",
+            "put",
+            "server-alpha",
+            local.to_str().unwrap(),
+            "/usr/bin/app",
+            "--yes",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    )
+    .unwrap();
+
+    assert!(output.stdout.contains("uploaded"));
+    assert_eq!(ssh.put_calls.borrow().as_slice(), ["/usr/bin/app"]);
+}
+
+#[test]
 fn run_json_filters_known_stty_startup_noise_but_keeps_real_stderr() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("servers.json");
@@ -430,6 +541,7 @@ impl CredentialStore for FakeCredentialStore {
 struct FakeSshClient {
     run_commands: RefCell<Vec<String>>,
     trusted_expected_fingerprints: RefCell<Vec<String>>,
+    put_calls: RefCell<Vec<String>>,
     get_calls: RefCell<Vec<bool>>,
     host_key_fingerprint: String,
     stderr: String,
@@ -494,6 +606,7 @@ impl SshClient for FakeSshClient {
         local: &Path,
         remote: &str,
     ) -> anyhow::Result<TransferResult> {
+        self.put_calls.borrow_mut().push(remote.to_string());
         Ok(TransferResult {
             bytes: 1,
             source: local.display().to_string(),
@@ -521,6 +634,7 @@ impl SshClient for FakeSshClient {
 #[derive(Default)]
 struct FakePrompter {
     confirm: bool,
+    password: Option<String>,
 }
 
 impl Prompter for FakePrompter {
@@ -529,6 +643,9 @@ impl Prompter for FakePrompter {
     }
 
     fn password(&mut self, _prompt: &str) -> anyhow::Result<String> {
-        Ok("YOUR_PASSWORD".to_string())
+        Ok(self
+            .password
+            .clone()
+            .unwrap_or_else(|| "YOUR_PASSWORD".to_string()))
     }
 }

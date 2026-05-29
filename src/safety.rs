@@ -51,6 +51,26 @@ pub fn classify_command(command: &str, yes: bool) -> SafetyDecision {
     SafetyDecision::Allow
 }
 
+pub fn classify_remote_write_path(path: &str, yes: bool) -> SafetyDecision {
+    if yes {
+        return SafetyDecision::Allow;
+    }
+
+    let system_paths = [
+        "/etc", "/usr", "/bin", "/sbin", "/lib", "/lib64", "/boot", "/root",
+    ];
+    if system_paths
+        .iter()
+        .any(|system_path| is_path_or_child(path, system_path))
+    {
+        return SafetyDecision::Block {
+            reason: format!("writing to {path} requires --yes"),
+        };
+    }
+
+    SafetyDecision::Allow
+}
+
 fn writes_to_etc(command: &str) -> bool {
     let tokens = shellish_tokens(command);
     let redirects_to_etc = tokens
@@ -154,4 +174,11 @@ fn command_name_is(token: &str, expected: &str) -> bool {
         .rsplit(['/', '\\'])
         .next()
         .is_some_and(|name| name == expected)
+}
+
+fn is_path_or_child(path: &str, parent: &str) -> bool {
+    path == parent
+        || path
+            .strip_prefix(parent)
+            .is_some_and(|rest| rest.starts_with('/'))
 }

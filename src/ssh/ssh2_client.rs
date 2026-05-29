@@ -7,19 +7,37 @@ use directories::BaseDirs;
 use ssh2::{CheckResult, HashType, HostKeyType, KnownHostFileKind, KnownHostKeyFormat, Session};
 use std::fs;
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
-#[derive(Debug, Default, Clone)]
-pub struct Ssh2Client;
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+#[derive(Debug, Clone)]
+pub struct Ssh2Client {
+    connect_timeout: Duration,
+}
+
+impl Default for Ssh2Client {
+    fn default() -> Self {
+        Self {
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+        }
+    }
+}
+
+impl Ssh2Client {
+    pub fn connect_timeout(&self) -> Duration {
+        self.connect_timeout
+    }
+}
 
 impl SshClient for Ssh2Client {
     fn host_key(&self, server: &ServerConfig) -> anyhow::Result<HostKeyInfo> {
-        let session = connect(server)?;
+        let session = connect(server, self.connect_timeout)?;
         host_key_info(&session)
     }
 
@@ -29,7 +47,7 @@ impl SshClient for Ssh2Client {
         server: &ServerConfig,
         expected_fingerprint_sha256: &str,
     ) -> anyhow::Result<HostKeyInfo> {
-        let session = connect(server)?;
+        let session = connect(server, self.connect_timeout)?;
         let (key, key_type) = session
             .host_key()
             .ok_or_else(|| anyhow::anyhow!("server did not provide a host key"))?;
@@ -86,7 +104,7 @@ impl SshClient for Ssh2Client {
         command: &str,
     ) -> anyhow::Result<RunResult> {
         let started = Instant::now();
-        let session = connect_verified_authenticated(server, auth)?;
+        let session = connect_verified_authenticated(server, auth, self.connect_timeout)?;
         let mut channel = session.channel_session()?;
         channel.exec(command)?;
 
@@ -121,7 +139,7 @@ impl SshClient for Ssh2Client {
             ));
         }
 
-        let session = connect_verified_authenticated(server, auth)?;
+        let session = connect_verified_authenticated(server, auth, self.connect_timeout)?;
         let mut local_file = fs::File::open(local)?;
         let mut remote_file = session.scp_send(Path::new(remote), 0o600, metadata.len(), None)?;
         std::io::copy(&mut local_file, &mut remote_file)?;
@@ -145,7 +163,7 @@ impl SshClient for Ssh2Client {
         local: &Path,
         overwrite: bool,
     ) -> anyhow::Result<TransferResult> {
-        let session = connect_verified_authenticated(server, auth)?;
+        let session = connect_verified_authenticated(server, auth, self.connect_timeout)?;
         let (mut remote_file, stat) = session.scp_recv(Path::new(remote))?;
 
         if let Some(parent) = local.parent()
@@ -173,20 +191,56 @@ impl SshClient for Ssh2Client {
 fn connect_verified_authenticated(
     server: &ServerConfig,
     auth: &AuthMaterial,
+    connect_timeout: Duration,
 ) -> anyhow::Result<Session> {
-    let session = connect(server)?;
+    let session = connect(server, connect_timeout)?;
     verify_known_host(&session, server)?;
     authenticate(&session, server, auth)?;
     Ok(session)
 }
 
-fn connect(server: &ServerConfig) -> anyhow::Result<Session> {
-    let tcp = TcpStream::connect((server.host.as_str(), server.port))
-        .with_context(|| format!("failed to connect to {}:{}", server.host, server.port))?;
-    let mut session = Session::new()?;
-    session.set_tcp_stream(tcp);
-    session.handshake()?;
-    Ok(session)
+fn connect(server: &ServerConfig, timeout: Duration) -> anyhow::Result<Session> {
+    let address = format!("{}:{}", server.host, server.port);
+    let mut last_error = None;
+    let mut resolved_any = false;
+    for socket_addr in address
+        .to_socket_addrs()
+        .with_context(|| format!("failed to resolve {address}"))?
+    {
+        resolved_any = true;
+        match TcpStream::connect_timeout(&socket_addr, timeout) {
+            Ok(tcp) => {
+                tcp.set_read_timeout(Some(timeout))?;
+                tcp.set_write_timeout(Some(timeout))?;
+                let mut session = Session::new()?;
+                session.set_timeout(timeout_millis(timeout));
+                session.set_tcp_stream(tcp);
+                session.handshake()?;
+                return Ok(session);
+            }
+            Err(err) => last_error = Some(err),
+        }
+    }
+
+    if !resolved_any {
+        return Err(anyhow::anyhow!("failed to resolve {address}"));
+    }
+
+    let err = last_error
+        .map(anyhow::Error::from)
+        .unwrap_or_else(|| anyhow::anyhow!("no resolved address was reachable"));
+    Err(err).with_context(|| {
+        format!(
+            "failed to connect to {}:{} within {} seconds",
+            server.host,
+            server.port,
+            timeout.as_secs()
+        )
+    })
+}
+
+fn timeout_millis(timeout: Duration) -> u32 {
+    timeout.as_millis().min(u32::MAX as u128) as u32
 }
 
 fn verify_known_host(session: &Session, server: &ServerConfig) -> anyhow::Result<()> {
@@ -385,5 +439,25 @@ mod tests {
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn default_client_has_connect_timeout() {
+        assert_eq!(
+            super::Ssh2Client::default().connect_timeout(),
+            std::time::Duration::from_secs(15)
+        );
+    }
+
+    #[test]
+    fn timeout_millis_clamps_to_session_timeout_range() {
+        assert_eq!(
+            super::timeout_millis(std::time::Duration::from_secs(15)),
+            15_000
+        );
+        assert_eq!(
+            super::timeout_millis(std::time::Duration::from_millis(u32::MAX as u64 + 1)),
+            u32::MAX
+        );
     }
 }
