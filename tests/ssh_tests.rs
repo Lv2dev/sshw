@@ -17,8 +17,11 @@ impl SshClient for FakeSshClient {
         &self,
         _server_name: &str,
         _server: &ServerConfig,
+        expected_fingerprint_sha256: &str,
     ) -> anyhow::Result<HostKeyInfo> {
-        self.host_key(_server)
+        let host_key = self.host_key(_server)?;
+        assert_eq!(host_key.fingerprint_sha256, expected_fingerprint_sha256);
+        Ok(host_key)
     }
 
     fn run(
@@ -55,6 +58,7 @@ impl SshClient for FakeSshClient {
         _auth: &AuthMaterial,
         remote: &str,
         local: &Path,
+        _overwrite: bool,
     ) -> anyhow::Result<TransferResult> {
         Ok(TransferResult {
             bytes: 10,
@@ -99,6 +103,7 @@ fn ssh_client_trait_supports_run_and_transfer_results() {
             &AuthMaterial::Agent,
             "/tmp/local.bin",
             Path::new("local.bin"),
+            true,
         )
         .unwrap();
     assert_eq!(get.destination, "local.bin");

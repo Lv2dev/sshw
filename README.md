@@ -86,6 +86,8 @@ sshw trust server-alpha --yes
 
 The trust command prints the host key algorithm and SHA256 fingerprint, asks for confirmation unless `--yes` is present, and writes the host key to the user's OpenSSH `known_hosts` file.
 
+`sshw trust` verifies that the fingerprint shown for confirmation still matches immediately before writing to `known_hosts`. If the key changes during the trust flow, the command fails instead of storing the new key.
+
 ## Commands
 
 ```bash
@@ -104,6 +106,7 @@ sshw run server-alpha "pm2 restart my-app" --yes
 
 sshw put server-alpha ./app.exe /home/deploy/app/app.exe
 sshw get server-alpha /home/deploy/app/log.txt ./log.txt
+sshw get server-alpha /home/deploy/app/log.txt ./log.txt --yes
 
 sshw remove server-alpha
 sshw remove server-alpha --yes
@@ -113,6 +116,10 @@ sshw doctor --json
 ```
 
 Dangerous commands such as `rm -rf`, `sudo`, `chmod -R`, `chown -R`, `pm2 delete`, and obvious writes to `/etc` require `--yes`. These are safety rails, not a security sandbox.
+
+`sshw get` will not overwrite an existing local file unless `--yes` is provided. `sshw put` creates remote files with owner-only permissions where the SSH server honors SCP modes.
+
+Remote command stdout and stderr are remote data. `sshw` never prints stored secrets by itself, but it cannot prevent a remote command from printing sensitive file contents if the caller asks it to do so.
 
 ## Coding Agent Usage
 
@@ -136,3 +143,11 @@ cargo test
 cargo run -- --help
 cargo run -- doctor
 ```
+
+## Security Reports
+
+Please report suspected vulnerabilities through GitHub Security Advisories. Do not place real hostnames, IP addresses, passwords, tokens, private keys, or passphrases in public issues.
+
+## License
+
+MIT

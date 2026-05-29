@@ -11,6 +11,9 @@ use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+
 #[derive(Debug, Default, Clone)]
 pub struct Ssh2Client;
 
@@ -20,13 +23,26 @@ impl SshClient for Ssh2Client {
         host_key_info(&session)
     }
 
-    fn trust_host(&self, server_name: &str, server: &ServerConfig) -> anyhow::Result<HostKeyInfo> {
+    fn trust_host(
+        &self,
+        server_name: &str,
+        server: &ServerConfig,
+        expected_fingerprint_sha256: &str,
+    ) -> anyhow::Result<HostKeyInfo> {
         let session = connect(server)?;
         let (key, key_type) = session
             .host_key()
             .ok_or_else(|| anyhow::anyhow!("server did not provide a host key"))?;
         ensure_supported_host_key(key_type)?;
         let info = host_key_info(&session)?;
+        if info.fingerprint_sha256 != expected_fingerprint_sha256 {
+            return Err(anyhow::anyhow!(
+                "host key fingerprint changed before trust; expected {}, got {}",
+                expected_fingerprint_sha256,
+                info.fingerprint_sha256
+            ));
+        }
+
         let known_hosts_path = known_hosts_path()?;
         let mut known_hosts = session.known_hosts()?;
 
@@ -107,7 +123,7 @@ impl SshClient for Ssh2Client {
 
         let session = connect_verified_authenticated(server, auth)?;
         let mut local_file = fs::File::open(local)?;
-        let mut remote_file = session.scp_send(Path::new(remote), 0o644, metadata.len(), None)?;
+        let mut remote_file = session.scp_send(Path::new(remote), 0o600, metadata.len(), None)?;
         std::io::copy(&mut local_file, &mut remote_file)?;
         remote_file.send_eof()?;
         remote_file.wait_eof()?;
@@ -127,6 +143,7 @@ impl SshClient for Ssh2Client {
         auth: &AuthMaterial,
         remote: &str,
         local: &Path,
+        overwrite: bool,
     ) -> anyhow::Result<TransferResult> {
         let session = connect_verified_authenticated(server, auth)?;
         let (mut remote_file, stat) = session.scp_recv(Path::new(remote))?;
@@ -137,7 +154,7 @@ impl SshClient for Ssh2Client {
             fs::create_dir_all(parent)?;
         }
 
-        let mut local_file = fs::File::create(local)?;
+        let mut local_file = open_download_file(local, overwrite)?;
         let bytes = std::io::copy(&mut remote_file, &mut local_file)?;
         local_file.flush()?;
         remote_file.send_eof()?;
@@ -282,4 +299,91 @@ fn unknown_host_key_error(server: &ServerConfig) -> anyhow::Error {
         server.host,
         server.port
     )
+}
+
+fn open_download_file(local: &Path, overwrite: bool) -> anyhow::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options
+        .write(true)
+        .create(true)
+        .create_new(!overwrite)
+        .truncate(overwrite);
+    #[cfg(unix)]
+    options.mode(0o600);
+
+    let file = options.open(local).with_context(|| {
+        if overwrite {
+            format!("failed to open local file for writing: {}", local.display())
+        } else {
+            format!(
+                "local file already exists: {}; pass --yes to overwrite",
+                local.display()
+            )
+        }
+    })?;
+    set_owner_only_permissions(local)?;
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn set_owner_only_permissions(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_owner_only_permissions(_path: &Path) -> anyhow::Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::open_download_file;
+    use std::io::{Read, Write};
+
+    #[test]
+    fn open_download_file_refuses_existing_file_without_overwrite() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("download.txt");
+        std::fs::write(&path, "keep").unwrap();
+
+        let err = open_download_file(&path, false).unwrap_err();
+
+        assert!(err.to_string().contains("already exists"));
+    }
+
+    #[test]
+    fn open_download_file_truncates_existing_file_with_overwrite() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("download.txt");
+        std::fs::write(&path, "old contents").unwrap();
+
+        {
+            let mut file = open_download_file(&path, true).unwrap();
+            file.write_all(b"new").unwrap();
+        }
+
+        let mut contents = String::new();
+        std::fs::File::open(&path)
+            .unwrap()
+            .read_to_string(&mut contents)
+            .unwrap();
+        assert_eq!(contents, "new");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_download_file_uses_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("download.txt");
+
+        let _file = open_download_file(&path, false).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
 }

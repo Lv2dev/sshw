@@ -2,6 +2,13 @@
 name = "sshw"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
+description = "Cross-platform SSH helper for delegated local coding-agent access without plaintext secrets."
+license = "MIT"
+repository = "https://github.com/Lv2dev/sshw"
+readme = "README.md"
+keywords = ["ssh", "cli", "keyring", "automation"]
+categories = ["command-line-utilities", "authentication"]
 
 [dependencies]
 anyhow = "1.0.102"

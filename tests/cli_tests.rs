@@ -173,6 +173,147 @@ fn remove_requires_confirmation_unless_yes() {
 }
 
 #[test]
+fn trust_passes_displayed_fingerprint_to_storage() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &sample_config()).unwrap();
+    let store = FakeCredentialStore::default();
+    let ssh = FakeSshClient {
+        host_key_fingerprint: "SHA256:displayed".to_string(),
+        ..FakeSshClient::default()
+    };
+    let mut prompter = FakePrompter {
+        confirm: true,
+        ..FakePrompter::default()
+    };
+
+    let output = execute(
+        Cli::try_parse_from(["sshw", "trust", "server-alpha"]).unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    )
+    .unwrap();
+
+    assert!(output.stdout.contains("SHA256:displayed"));
+    assert_eq!(
+        ssh.trusted_expected_fingerprints.borrow().as_slice(),
+        ["SHA256:displayed"]
+    );
+}
+
+#[test]
+fn get_existing_local_file_requires_yes_before_ssh() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &sample_config()).unwrap();
+    let local = temp.path().join("existing.txt");
+    std::fs::write(&local, "keep").unwrap();
+    let store = FakeCredentialStore::default();
+    store
+        .set_password("sshw:server-alpha", "deploy", "YOUR_PASSWORD")
+        .unwrap();
+    let ssh = FakeSshClient::default();
+    let mut prompter = FakePrompter::default();
+
+    let err = execute(
+        Cli::try_parse_from([
+            "sshw",
+            "get",
+            "server-alpha",
+            "/tmp/remote.txt",
+            local.to_str().unwrap(),
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    )
+    .unwrap_err();
+
+    assert!(err.to_string().contains("already exists"));
+    assert!(ssh.get_calls.borrow().is_empty());
+}
+
+#[test]
+fn get_existing_local_file_with_yes_allows_overwrite() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &sample_config()).unwrap();
+    let local = temp.path().join("existing.txt");
+    std::fs::write(&local, "replace").unwrap();
+    let store = FakeCredentialStore::default();
+    store
+        .set_password("sshw:server-alpha", "deploy", "YOUR_PASSWORD")
+        .unwrap();
+    let ssh = FakeSshClient::default();
+    let mut prompter = FakePrompter::default();
+
+    let output = execute(
+        Cli::try_parse_from([
+            "sshw",
+            "get",
+            "server-alpha",
+            "/tmp/remote.txt",
+            local.to_str().unwrap(),
+            "--yes",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    )
+    .unwrap();
+
+    assert!(output.stdout.contains("downloaded"));
+    assert_eq!(ssh.get_calls.borrow().as_slice(), [true]);
+}
+
+#[test]
+fn add_agent_update_deletes_old_password_credential() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &sample_config()).unwrap();
+    let store = FakeCredentialStore::default();
+    store
+        .set_password("sshw:server-alpha", "deploy", "YOUR_PASSWORD")
+        .unwrap();
+    let ssh = FakeSshClient::default();
+    let mut prompter = FakePrompter::default();
+
+    execute(
+        Cli::try_parse_from([
+            "sshw",
+            "add",
+            "server-alpha",
+            "--host",
+            "192.0.2.10",
+            "--port",
+            "2222",
+            "--user",
+            "deploy",
+            "--auth",
+            "agent",
+            "--force",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    )
+    .unwrap();
+
+    assert_eq!(
+        store.deleted.borrow().as_slice(),
+        [("sshw:server-alpha".to_string(), "deploy".to_string())]
+    );
+}
+
+#[test]
 fn run_json_filters_known_stty_startup_noise_but_keeps_real_stderr() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("servers.json");
@@ -294,6 +435,9 @@ impl CredentialStore for FakeCredentialStore {
 #[derive(Default)]
 struct FakeSshClient {
     run_commands: RefCell<Vec<String>>,
+    trusted_expected_fingerprints: RefCell<Vec<String>>,
+    get_calls: RefCell<Vec<bool>>,
+    host_key_fingerprint: String,
     stderr: String,
 }
 
@@ -310,12 +454,28 @@ impl SshClient for FakeSshClient {
     fn host_key(&self, _server: &ServerConfig) -> anyhow::Result<HostKeyInfo> {
         Ok(HostKeyInfo {
             algorithm: "ssh-ed25519".to_string(),
-            fingerprint_sha256: "SHA256:abc".to_string(),
+            fingerprint_sha256: if self.host_key_fingerprint.is_empty() {
+                "SHA256:abc".to_string()
+            } else {
+                self.host_key_fingerprint.clone()
+            },
         })
     }
 
-    fn trust_host(&self, _server_name: &str, server: &ServerConfig) -> anyhow::Result<HostKeyInfo> {
-        self.host_key(server)
+    fn trust_host(
+        &self,
+        _server_name: &str,
+        server: &ServerConfig,
+        expected_fingerprint_sha256: &str,
+    ) -> anyhow::Result<HostKeyInfo> {
+        self.trusted_expected_fingerprints
+            .borrow_mut()
+            .push(expected_fingerprint_sha256.to_string());
+        let host_key = self.host_key(server)?;
+        if host_key.fingerprint_sha256 != expected_fingerprint_sha256 {
+            return Err(anyhow::anyhow!("host key fingerprint changed before trust"));
+        }
+        Ok(host_key)
     }
 
     fn run(
@@ -353,7 +513,9 @@ impl SshClient for FakeSshClient {
         _auth: &AuthMaterial,
         remote: &str,
         local: &Path,
+        overwrite: bool,
     ) -> anyhow::Result<TransferResult> {
+        self.get_calls.borrow_mut().push(overwrite);
         Ok(TransferResult {
             bytes: 1,
             source: remote.to_string(),

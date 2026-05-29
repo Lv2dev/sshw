@@ -79,6 +79,20 @@ fn config_saves_and_loads_round_trip() {
     assert_eq!(loaded, config);
 }
 
+#[cfg(unix)]
+#[test]
+fn config_save_uses_owner_only_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+
+    save_config(&path, &SshwConfig::default()).unwrap();
+
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+}
+
 #[test]
 fn default_config_path_uses_sshw_servers_json() {
     let path = default_config_path().unwrap();

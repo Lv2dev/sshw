@@ -191,8 +191,8 @@ where
     C: CredentialStore,
     P: Prompter,
 {
-    let existed = config.servers.contains_key(&args.name);
-    if existed
+    let previous_server = config.servers.get(&args.name).cloned();
+    if previous_server.is_some()
         && !args.force
         && !prompter.confirm(&format!("update existing server '{}'? [y/N] ", args.name))?
     {
@@ -209,24 +209,31 @@ where
         AuthArg::Agent => AuthConfig::Agent,
     };
 
-    config.servers.insert(
-        args.name.clone(),
-        ServerConfig {
-            host: args.host,
-            port: args.port,
-            user: args.user,
-            auth,
-        },
-    );
+    let new_server = ServerConfig {
+        host: args.host,
+        port: args.port,
+        user: args.user,
+        auth,
+    };
+    let stale_credential = stale_password_credential(previous_server.as_ref(), &new_server);
+    config.servers.insert(args.name.clone(), new_server);
 
     if config.default.is_none() {
         config.default = Some(args.name.clone());
     }
 
     save_config(config_path, config)?;
+    if let Some((credential, user)) = stale_credential {
+        credentials.delete_password(&credential, &user)?;
+    }
+
     Ok(ok(format!(
         "{} {}\n",
-        if existed { "updated" } else { "added" },
+        if previous_server.is_some() {
+            "updated"
+        } else {
+            "added"
+        },
         args.name
     )))
 }
@@ -316,7 +323,7 @@ where
         return Err(anyhow::anyhow!("trust cancelled"));
     }
 
-    let trusted = ssh.trust_host(&args.name, server)?;
+    let trusted = ssh.trust_host(&args.name, server, &host_key.fingerprint_sha256)?;
     Ok(ok(format!(
         "trusted {} {} {}\n",
         args.name, trusted.algorithm, trusted.fingerprint_sha256
@@ -401,8 +408,15 @@ where
     S: SshClient,
 {
     let server = get_server(config, &args.name)?;
+    if args.local.exists() && !args.yes {
+        return Err(anyhow::anyhow!(
+            "local file already exists: {}; pass --yes to overwrite",
+            args.local.display()
+        ));
+    }
+
     let auth = resolve_auth(server, credentials)?;
-    let result = ssh.get(server, &auth, &args.remote, &args.local)?;
+    let result = ssh.get(server, &auth, &args.remote, &args.local, args.yes)?;
     Ok(ok(format!(
         "downloaded {} bytes from {} to {}\n",
         result.bytes, result.source, result.destination
@@ -540,6 +554,28 @@ where
             AuthConfig::Agent => None,
         })
         .collect()
+}
+
+fn stale_password_credential(
+    previous_server: Option<&ServerConfig>,
+    new_server: &ServerConfig,
+) -> Option<(String, String)> {
+    let previous = previous_server?;
+    let AuthConfig::Password {
+        credential: previous_credential,
+    } = &previous.auth
+    else {
+        return None;
+    };
+
+    match &new_server.auth {
+        AuthConfig::Password { credential }
+            if credential == previous_credential && new_server.user == previous.user =>
+        {
+            None
+        }
+        _ => Some((previous_credential.clone(), previous.user.clone())),
+    }
 }
 
 fn auth_label(auth: &crate::output::AuthOutput) -> &'static str {

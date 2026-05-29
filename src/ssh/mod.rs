@@ -27,7 +27,12 @@ pub struct HostKeyInfo {
 
 pub trait SshClient {
     fn host_key(&self, server: &ServerConfig) -> anyhow::Result<HostKeyInfo>;
-    fn trust_host(&self, server_name: &str, server: &ServerConfig) -> anyhow::Result<HostKeyInfo>;
+    fn trust_host(
+        &self,
+        server_name: &str,
+        server: &ServerConfig,
+        expected_fingerprint_sha256: &str,
+    ) -> anyhow::Result<HostKeyInfo>;
     fn run(
         &self,
         server: &ServerConfig,
@@ -47,5 +52,6 @@ pub trait SshClient {
         auth: &AuthMaterial,
         remote: &str,
         local: &Path,
+        overwrite: bool,
     ) -> anyhow::Result<TransferResult>;
 }
