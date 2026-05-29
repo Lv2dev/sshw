@@ -39,8 +39,8 @@ Tagged releases build GitHub release artifacts for:
 Create a release by pushing a version tag:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag vX.Y.Z
+git push origin vX.Y.Z
 ```
 
 ## Config
