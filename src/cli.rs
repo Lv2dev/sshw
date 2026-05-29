@@ -3,7 +3,9 @@ use crate::config::{
 };
 use crate::credentials::keyring_store::KeyringCredentialStore;
 use crate::credentials::{AuthMaterial, CredentialStore, CredentialStoreHealth};
-use crate::output::{RunOutput, ServerOutput, filter_startup_stderr_noise};
+use crate::output::{
+    ErrorKind, ErrorResponse, RunOutput, ServerOutput, filter_startup_stderr_noise,
+};
 use crate::safety::{SafetyDecision, classify_command, classify_remote_write_path};
 use crate::ssh::SshClient;
 use crate::ssh::ssh2_client::Ssh2Client;
@@ -36,6 +38,23 @@ pub enum Command {
     Get(GetArgs),
     Remove(RemoveArgs),
     Doctor(DoctorArgs),
+}
+
+impl Command {
+    fn wants_json_errors(&self) -> bool {
+        match self {
+            Self::List(args) => args.json,
+            Self::Show(args) => args.json,
+            Self::Run(args) => args.json,
+            Self::Doctor(args) => args.json,
+            Self::Add(_)
+            | Self::Default(_)
+            | Self::Trust(_)
+            | Self::Put(_)
+            | Self::Get(_)
+            | Self::Remove(_) => false,
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -135,17 +154,38 @@ pub trait Prompter {
     fn password(&mut self, prompt: &str) -> anyhow::Result<String>;
 }
 
-pub fn run() -> anyhow::Result<i32> {
+pub fn run() -> i32 {
     let cli = Cli::parse();
-    let config_path = default_config_path()?;
+    let json_errors = cli.command.wants_json_errors();
+    let config_path = match default_config_path() {
+        Ok(path) => path,
+        Err(err) => return print_output(error_output(&err, json_errors)),
+    };
     let credentials = KeyringCredentialStore;
     let ssh = Ssh2Client::default();
     let mut prompter = TerminalPrompter;
-    let output = execute(cli, &config_path, &credentials, &ssh, &mut prompter)?;
+    let output = execute_for_runtime(cli, &config_path, &credentials, &ssh, &mut prompter);
 
-    print!("{}", output.stdout);
-    eprint!("{}", output.stderr);
-    Ok(output.exit_code)
+    print_output(output)
+}
+
+pub fn execute_for_runtime<C, S, P>(
+    cli: Cli,
+    config_path: &Path,
+    credentials: &C,
+    ssh: &S,
+    prompter: &mut P,
+) -> CommandOutput
+where
+    C: CredentialStore,
+    S: SshClient,
+    P: Prompter,
+{
+    let json_errors = cli.command.wants_json_errors();
+    match execute(cli, config_path, credentials, ssh, prompter) {
+        Ok(output) => output,
+        Err(err) => error_output(&err, json_errors),
+    }
 }
 
 pub fn execute<C, S, P>(
@@ -650,6 +690,53 @@ fn ok(stdout: String) -> CommandOutput {
         stderr: String::new(),
         exit_code: 0,
     }
+}
+
+fn error_output(err: &anyhow::Error, json_errors: bool) -> CommandOutput {
+    let response = ErrorResponse::from_error(err);
+    let exit_code = response.error.exit_code;
+
+    if json_errors {
+        return CommandOutput {
+            stdout: error_json_line(&response),
+            stderr: String::new(),
+            exit_code,
+        };
+    }
+
+    CommandOutput {
+        stdout: String::new(),
+        stderr: format!("{}\n", response.error.message),
+        exit_code,
+    }
+}
+
+fn error_json_line(response: &ErrorResponse) -> String {
+    match serde_json::to_string(response) {
+        Ok(body) => format!("{body}\n"),
+        Err(err) => {
+            let fallback = ErrorResponse {
+                ok: false,
+                error: crate::output::ErrorBody {
+                    kind: ErrorKind::Unknown,
+                    message: format!("failed to serialize error response: {err}"),
+                    exit_code: ErrorKind::Unknown.exit_code(),
+                },
+            };
+            match serde_json::to_string(&fallback) {
+                Ok(body) => format!("{body}\n"),
+                Err(_) => {
+                    "{\"ok\":false,\"error\":{\"kind\":\"unknown\",\"message\":\"failed to serialize error response\",\"exit_code\":1}}\n".to_string()
+                }
+            }
+        }
+    }
+}
+
+fn print_output(output: CommandOutput) -> i32 {
+    print!("{}", output.stdout);
+    eprint!("{}", output.stderr);
+    output.exit_code
 }
 
 struct TerminalPrompter;

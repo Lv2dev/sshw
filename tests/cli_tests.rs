@@ -1,5 +1,5 @@
 use clap::Parser;
-use sshw::cli::{AuthArg, Cli, Command, Prompter, execute};
+use sshw::cli::{AuthArg, Cli, Command, Prompter, execute, execute_for_runtime};
 use sshw::config::{AuthConfig, ServerConfig, SshwConfig, save_config};
 use sshw::credentials::{AuthMaterial, CredentialStore, CredentialStoreHealth};
 use sshw::ssh::{HostKeyInfo, RunResult, SshClient, TransferResult};
@@ -118,6 +118,37 @@ fn unknown_server_returns_actionable_error() {
 }
 
 #[test]
+fn json_run_unknown_server_returns_structured_error() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &sample_config()).unwrap();
+    let store = FakeCredentialStore::default();
+    let ssh = FakeSshClient::default();
+    let mut prompter = FakePrompter::default();
+
+    let output = execute_for_runtime(
+        Cli::try_parse_from(["sshw", "run", "missing", "hostname", "--json"]).unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    );
+
+    let json: serde_json::Value = serde_json::from_str(output.stdout.trim()).unwrap();
+    assert_eq!(output.exit_code, 3);
+    assert_eq!(output.stderr, "");
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["error"]["kind"], "config");
+    assert_eq!(json["error"]["exit_code"], 3);
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("unknown server 'missing'")
+    );
+}
+
+#[test]
 fn dangerous_run_is_blocked_before_ssh() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("servers.json");
@@ -136,6 +167,75 @@ fn dangerous_run_is_blocked_before_ssh() {
     .unwrap_err();
 
     assert!(err.to_string().contains("requires --yes"));
+    assert!(ssh.run_commands.borrow().is_empty());
+}
+
+#[test]
+fn json_dangerous_run_returns_safety_error_before_ssh() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &sample_config()).unwrap();
+    let store = FakeCredentialStore::default();
+    let ssh = FakeSshClient::default();
+    let mut prompter = FakePrompter::default();
+
+    let output = execute_for_runtime(
+        Cli::try_parse_from([
+            "sshw",
+            "run",
+            "server-alpha",
+            "rm -rf /home/deploy/app",
+            "--json",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    );
+
+    let json: serde_json::Value = serde_json::from_str(output.stdout.trim()).unwrap();
+    assert_eq!(output.exit_code, 2);
+    assert_eq!(output.stderr, "");
+    assert_eq!(json["error"]["kind"], "safety");
+    assert_eq!(json["error"]["exit_code"], 2);
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("requires --yes")
+    );
+    assert!(ssh.run_commands.borrow().is_empty());
+}
+
+#[test]
+fn json_run_missing_credential_returns_auth_error() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &sample_config()).unwrap();
+    let store = FakeCredentialStore::default();
+    let ssh = FakeSshClient::default();
+    let mut prompter = FakePrompter::default();
+
+    let output = execute_for_runtime(
+        Cli::try_parse_from(["sshw", "run", "server-alpha", "hostname", "--json"]).unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    );
+
+    let json: serde_json::Value = serde_json::from_str(output.stdout.trim()).unwrap();
+    assert_eq!(output.exit_code, 4);
+    assert_eq!(output.stderr, "");
+    assert_eq!(json["error"]["kind"], "auth");
+    assert_eq!(json["error"]["exit_code"], 4);
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("missing credential entry")
+    );
     assert!(ssh.run_commands.borrow().is_empty());
 }
 
@@ -234,6 +334,41 @@ fn get_existing_local_file_requires_yes_before_ssh() {
     .unwrap_err();
 
     assert!(err.to_string().contains("already exists"));
+    assert!(ssh.get_calls.borrow().is_empty());
+}
+
+#[test]
+fn human_get_existing_local_file_returns_io_exit_code() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &sample_config()).unwrap();
+    let local = temp.path().join("existing.txt");
+    std::fs::write(&local, "keep").unwrap();
+    let store = FakeCredentialStore::default();
+    store
+        .set_password("sshw:server-alpha", "deploy", "YOUR_PASSWORD")
+        .unwrap();
+    let ssh = FakeSshClient::default();
+    let mut prompter = FakePrompter::default();
+
+    let output = execute_for_runtime(
+        Cli::try_parse_from([
+            "sshw",
+            "get",
+            "server-alpha",
+            "/tmp/remote.txt",
+            local.to_str().unwrap(),
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    );
+
+    assert_eq!(output.exit_code, 6);
+    assert_eq!(output.stdout, "");
+    assert!(output.stderr.contains("local file already exists"));
     assert!(ssh.get_calls.borrow().is_empty());
 }
 

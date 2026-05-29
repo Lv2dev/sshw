@@ -1,5 +1,7 @@
 use sshw::config::{AuthConfig, ServerConfig};
-use sshw::output::{RunOutput, ServerOutput, filter_startup_stderr_noise};
+use sshw::output::{
+    ErrorKind, RunOutput, ServerOutput, classify_error, filter_startup_stderr_noise,
+};
 
 #[test]
 fn run_output_serializes_for_agents() {
@@ -38,6 +40,16 @@ fn server_output_includes_metadata_without_secrets() {
     assert!(!json.contains("YOUR_PASSWORD"));
     assert!(!json.contains("private_key"));
     assert!(!json.contains("passphrase"));
+}
+
+#[test]
+fn classifies_ssh_connection_errors_for_stable_exit_codes() {
+    let err = anyhow::anyhow!("failed to connect to 192.0.2.10:22 within 15 seconds");
+
+    let kind = classify_error(&err);
+
+    assert_eq!(kind, ErrorKind::Ssh);
+    assert_eq!(kind.exit_code(), 5);
 }
 
 #[test]
