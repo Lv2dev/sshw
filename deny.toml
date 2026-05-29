@@ -1,0 +1,29 @@
+# cargo-deny configuration. Run locally with `cargo deny check`.
+# Gates the dependency graph on security advisories, licenses, and sources.
+
+[advisories]
+# Fail on any crate with a known RUSTSEC advisory or a yanked release.
+yanked = "deny"
+
+[licenses]
+# Permissive licenses present in the dependency tree. A crate offering a
+# choice (e.g. "MIT OR Apache-2.0") is satisfied if any allowed license
+# matches; an "AND" expression (e.g. unicode-ident's Unicode-3.0) needs each
+# part allowed.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "MPL-2.0",
+    "Unicode-3.0",
+]
+
+[bans]
+# Duplicate transitive versions are common and benign; surface them without
+# failing the build.
+multiple-versions = "warn"
+
+[sources]
+# Only crates.io is expected; reject anything from an unknown registry or git.
+unknown-registry = "deny"
+unknown-git = "deny"
