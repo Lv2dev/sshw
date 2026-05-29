@@ -190,14 +190,24 @@ impl SshClient for Ssh2Client {
         let mut remote_file = session
             .scp_send(Path::new(remote), 0o600, metadata.len(), None)
             .context("ssh transfer error")?;
-        std::io::copy(&mut local_file, &mut remote_file)?;
+        // scp promised `metadata.len()` bytes up front. Report what was actually
+        // sent and fail closed if the local file changed mid-transfer, so a
+        // truncated upload is never reported as a full success.
+        let copied = std::io::copy(&mut local_file, &mut remote_file)?;
+        if copied != metadata.len() {
+            return Err(anyhow::anyhow!(
+                "ssh transfer aborted: local file changed during transfer (expected {} bytes, sent {})",
+                metadata.len(),
+                copied
+            ));
+        }
         remote_file.send_eof().context("ssh transfer error")?;
         remote_file.wait_eof().context("ssh transfer error")?;
         remote_file.close().context("ssh transfer error")?;
         remote_file.wait_close().context("ssh transfer error")?;
 
         Ok(TransferResult {
-            bytes: metadata.len(),
+            bytes: copied,
             source: local.display().to_string(),
             destination: remote.to_string(),
         })
