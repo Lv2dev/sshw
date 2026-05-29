@@ -983,6 +983,190 @@ fn run_redacts_secrets_in_output() {
     assert!(!json_out.stdout.contains("hunter2"));
 }
 
+fn write_policy(dir: &Path, contents: &str) {
+    std::fs::write(dir.join("policy.json"), contents).unwrap();
+}
+
+#[test]
+fn policy_allows_listed_command_and_blocks_others() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &sample_config()).unwrap();
+    write_policy(
+        temp.path(),
+        r#"{"version":1,"enabled":true,"allow_commands":["uptime"]}"#,
+    );
+    let store = FakeCredentialStore::default();
+    store
+        .set_password("sshw:server-alpha", "deploy", "YOUR_PASSWORD")
+        .unwrap();
+    let ssh = FakeSshClient::default();
+    let mut prompter = FakePrompter::default();
+
+    let allowed = execute(
+        Cli::try_parse_from(["sshw", "run", "--policy", "server-alpha", "uptime"]).unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    )
+    .unwrap();
+    assert_eq!(allowed.stdout, "ok\n");
+
+    let denied = execute_for_runtime(
+        Cli::try_parse_from([
+            "sshw",
+            "run",
+            "--policy",
+            "server-alpha",
+            "whoami",
+            "--json",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    );
+    assert_eq!(denied.exit_code, 7);
+    let json: serde_json::Value = serde_json::from_str(denied.stdout.trim()).unwrap();
+    assert_eq!(json["error"]["kind"], "policy");
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("blocked by policy")
+    );
+    // Only the allowed command reached the SSH layer.
+    assert_eq!(ssh.run_commands.borrow().as_slice(), ["uptime"]);
+}
+
+#[test]
+fn policy_flag_without_file_fails_closed() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &sample_config()).unwrap();
+    let store = FakeCredentialStore::default();
+    store
+        .set_password("sshw:server-alpha", "deploy", "YOUR_PASSWORD")
+        .unwrap();
+    let ssh = FakeSshClient::default();
+    let mut prompter = FakePrompter::default();
+
+    let out = execute_for_runtime(
+        Cli::try_parse_from([
+            "sshw",
+            "run",
+            "--policy",
+            "server-alpha",
+            "uptime",
+            "--json",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    );
+
+    assert_eq!(out.exit_code, 7);
+    let json: serde_json::Value = serde_json::from_str(out.stdout.trim()).unwrap();
+    assert_eq!(json["error"]["kind"], "policy");
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no policy file")
+    );
+    assert!(ssh.run_commands.borrow().is_empty());
+}
+
+#[test]
+fn policy_blocks_put_and_get_outside_allowlist() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &sample_config()).unwrap();
+    write_policy(
+        temp.path(),
+        r#"{"enabled":true,"allow_put_paths":["/srv/app"],"allow_get_paths":["/var/log"]}"#,
+    );
+    let store = FakeCredentialStore::default();
+    store
+        .set_password("sshw:server-alpha", "deploy", "YOUR_PASSWORD")
+        .unwrap();
+    let ssh = FakeSshClient::default();
+    let mut prompter = FakePrompter::default();
+    let local = temp.path().join("artifact");
+    std::fs::write(&local, "x").unwrap();
+
+    let put_err = execute(
+        Cli::try_parse_from([
+            "sshw",
+            "put",
+            "--policy",
+            "server-alpha",
+            local.to_str().unwrap(),
+            "/tmp/app",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    )
+    .unwrap_err();
+    assert!(put_err.to_string().contains("blocked by policy"));
+    assert!(ssh.put_calls.borrow().is_empty());
+
+    let get_err = execute(
+        Cli::try_parse_from([
+            "sshw",
+            "get",
+            "--policy",
+            "server-alpha",
+            "/etc/secret",
+            temp.path().join("out").to_str().unwrap(),
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    )
+    .unwrap_err();
+    assert!(get_err.to_string().contains("blocked by policy"));
+    assert!(ssh.get_calls.borrow().is_empty());
+}
+
+#[test]
+fn policy_disabled_in_file_allows_everything_without_flag() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &sample_config()).unwrap();
+    write_policy(
+        temp.path(),
+        r#"{"enabled":false,"allow_commands":["uptime"]}"#,
+    );
+    let store = FakeCredentialStore::default();
+    store
+        .set_password("sshw:server-alpha", "deploy", "YOUR_PASSWORD")
+        .unwrap();
+    let ssh = FakeSshClient::default();
+    let mut prompter = FakePrompter::default();
+
+    // whoami is not in the allowlist, but enforcement is off (no --policy,
+    // file enabled=false), so it runs.
+    let out = execute(
+        Cli::try_parse_from(["sshw", "run", "server-alpha", "whoami"]).unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    )
+    .unwrap();
+    assert_eq!(out.stdout, "ok\n");
+}
+
 fn sample_config() -> SshwConfig {
     let mut servers = BTreeMap::new();
     servers.insert(

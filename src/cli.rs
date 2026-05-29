@@ -5,10 +5,12 @@ use crate::home::{CredentialNamespace, ResolvedHome, generate_profile_id, sshw_b
 use crate::output::{
     ErrorKind, ErrorResponse, RunOutput, ServerOutput, filter_startup_stderr_noise, redact_secrets,
 };
+use crate::policy::{Policy, describe_policy, resolve_policy};
 use crate::profile::{
     ProfileEntry, ProfileRegistry, load_registry, resolve_home_with_registry, save_registry,
 };
 use crate::safety::{SafetyDecision, classify_command, classify_remote_write_path};
+use crate::sandbox::{NoopSandbox, PolicyOnlySandbox, Sandbox, SandboxDecision};
 use crate::ssh::SshClient;
 use crate::ssh::ssh2_client::Ssh2Client;
 use anyhow::Context;
@@ -32,6 +34,10 @@ pub struct Cli {
     /// combined with `--home`.
     #[arg(long, global = true, value_name = "NAME")]
     pub profile: Option<String>,
+    /// Enforce the active home's policy.json for this invocation. Off by
+    /// default; fails closed if the policy file is missing or invalid.
+    #[arg(long, global = true)]
+    pub policy: bool,
     #[command(subcommand)]
     pub command: Command,
 }
@@ -225,6 +231,8 @@ pub trait Prompter {
 pub struct ExecContext<'a> {
     pub home: &'a ResolvedHome,
     pub registry_path: &'a Path,
+    /// The `--policy` flag: force policy enforcement for this invocation.
+    pub policy_forced: bool,
 }
 
 pub fn run() -> i32 {
@@ -240,6 +248,7 @@ pub fn run() -> i32 {
     let ctx = ExecContext {
         home: &home,
         registry_path: &registry_path,
+        policy_forced: cli.policy,
     };
     let output = execute_for_runtime_with(cli, &ctx, &credentials, &ssh, &mut prompter);
 
@@ -285,9 +294,11 @@ where
 {
     let home = ResolvedHome::from_config_path(config_path);
     let registry_path = sibling_registry_path(config_path);
+    let policy_forced = cli.policy;
     let ctx = ExecContext {
         home: &home,
         registry_path: &registry_path,
+        policy_forced,
     };
     execute_with(cli, &ctx, credentials, ssh, prompter)
 }
@@ -306,9 +317,11 @@ where
 {
     let home = ResolvedHome::from_config_path(config_path);
     let registry_path = sibling_registry_path(config_path);
+    let policy_forced = cli.policy;
     let ctx = ExecContext {
         home: &home,
         registry_path: &registry_path,
+        policy_forced,
     };
     execute_for_runtime_with(cli, &ctx, credentials, ssh, prompter)
 }
@@ -347,6 +360,7 @@ where
     let Cli {
         home: home_flag,
         profile: _,
+        policy: _,
         command,
     } = cli;
 
@@ -366,14 +380,37 @@ where
         Command::Show(args) => show_server(args, &config),
         Command::Default(args) => default_server(args, config_path, &mut config),
         Command::Trust(args) => trust_server(args, ssh, prompter, &config),
-        Command::Run(args) => run_remote(args, credentials, ssh, &config),
-        Command::Put(args) => put_file(args, credentials, ssh, &config),
-        Command::Get(args) => get_file(args, credentials, ssh, &config),
+        Command::Run(args) => {
+            let sandbox = build_sandbox(&ctx.home.policy_path, ctx.policy_forced)?;
+            run_remote(args, sandbox.as_ref(), credentials, ssh, &config)
+        }
+        Command::Put(args) => {
+            let sandbox = build_sandbox(&ctx.home.policy_path, ctx.policy_forced)?;
+            put_file(args, sandbox.as_ref(), credentials, ssh, &config)
+        }
+        Command::Get(args) => {
+            let sandbox = build_sandbox(&ctx.home.policy_path, ctx.policy_forced)?;
+            get_file(args, sandbox.as_ref(), credentials, ssh, &config)
+        }
         Command::Remove(args) => {
             remove_server(args, config_path, credentials, prompter, &mut config)
         }
-        Command::Doctor(args) => doctor(args, ctx.home, ctx.registry_path, credentials, &config),
+        Command::Doctor(args) => doctor(
+            args,
+            ctx.home,
+            ctx.registry_path,
+            ctx.policy_forced,
+            credentials,
+            &config,
+        ),
         Command::Profile(args) => run_profile(args, ctx.registry_path, home_flag.as_deref()),
+    }
+}
+
+fn build_sandbox(policy_path: &Path, forced: bool) -> anyhow::Result<Box<dyn Sandbox>> {
+    match resolve_policy(policy_path, forced)? {
+        Policy::Disabled => Ok(Box::new(NoopSandbox)),
+        Policy::Enabled(rules) => Ok(Box::new(PolicyOnlySandbox::new(rules))),
     }
 }
 
@@ -533,6 +570,7 @@ where
 
 fn run_remote<C, S>(
     args: RunArgs,
+    sandbox: &dyn Sandbox,
     credentials: &C,
     ssh: &S,
     config: &SshwConfig,
@@ -547,6 +585,10 @@ where
     match classify_command(&command, yes) {
         SafetyDecision::Allow => {}
         SafetyDecision::Block { reason } => return Err(anyhow::anyhow!("{reason}")),
+    }
+
+    if let SandboxDecision::Deny { reason } = sandbox.check_command(&command) {
+        return Err(anyhow::anyhow!("{reason}"));
     }
 
     let server = get_server(config, &server_name)?;
@@ -581,6 +623,7 @@ where
 
 fn put_file<C, S>(
     args: PutArgs,
+    sandbox: &dyn Sandbox,
     credentials: &C,
     ssh: &S,
     config: &SshwConfig,
@@ -597,6 +640,10 @@ where
         SafetyDecision::Block { reason } => return Err(anyhow::anyhow!("{reason}")),
     }
 
+    if let SandboxDecision::Deny { reason } = sandbox.check_put(&remote) {
+        return Err(anyhow::anyhow!("{reason}"));
+    }
+
     let server = get_server(config, &server_name)?;
     let auth = resolve_auth(server, credentials)?;
     let result = ssh.put(server, &auth, &local, &remote)?;
@@ -608,6 +655,7 @@ where
 
 fn get_file<C, S>(
     args: GetArgs,
+    sandbox: &dyn Sandbox,
     credentials: &C,
     ssh: &S,
     config: &SshwConfig,
@@ -620,6 +668,10 @@ where
     let (server_name, remote, local) = resolve_get_target(target, config)?;
 
     let server = get_server(config, &server_name)?;
+    if let SandboxDecision::Deny { reason } = sandbox.check_get(&remote) {
+        return Err(anyhow::anyhow!("{reason}"));
+    }
+
     if local.exists() && !yes {
         return Err(anyhow::anyhow!(
             "local file already exists: {}; pass --yes to overwrite",
@@ -668,6 +720,7 @@ fn doctor<C>(
     args: DoctorArgs,
     home: &ResolvedHome,
     registry_path: &Path,
+    policy_forced: bool,
     credentials: &C,
     config: &SshwConfig,
 ) -> anyhow::Result<CommandOutput>
@@ -675,6 +728,7 @@ where
     C: CredentialStore,
 {
     let config_path = home.config_path.as_path();
+    let policy = describe_policy(&home.policy_path, policy_forced);
     let health = credentials
         .health_check()
         .unwrap_or_else(|err| CredentialStoreHealth {
@@ -693,6 +747,9 @@ where
             "config_exists": config_path.exists(),
             "known_hosts_path": home.known_hosts_path,
             "policy_path": home.policy_path,
+            "policy_present": policy.present,
+            "policy_valid": policy.valid,
+            "policy_enabled": policy.enabled,
             "audit_path": home.audit_path,
             "credential_namespace": home.namespace.token(),
             "os": std::env::consts::OS,
@@ -705,7 +762,7 @@ where
     }
 
     let mut stdout = format!(
-        "home: {}\nhome source: {}\nregistry path: {}\nconfig path: {}\nconfig exists: {}\nknown_hosts path: {}\npolicy path: {}\naudit path: {}\ncredential namespace: {}\nos: {}\ncredential backend: {}\ncredential available: {}\ncredential message: {}\n",
+        "home: {}\nhome source: {}\nregistry path: {}\nconfig path: {}\nconfig exists: {}\nknown_hosts path: {}\npolicy path: {}\npolicy present: {}\npolicy valid: {}\npolicy enabled: {}\naudit path: {}\ncredential namespace: {}\nos: {}\ncredential backend: {}\ncredential available: {}\ncredential message: {}\n",
         home.root.display(),
         home.description,
         registry_path.display(),
@@ -713,6 +770,9 @@ where
         config_path.exists(),
         home.known_hosts_path.display(),
         home.policy_path.display(),
+        policy.present,
+        policy.valid,
+        policy.enabled,
         home.audit_path.display(),
         home.namespace.token(),
         std::env::consts::OS,

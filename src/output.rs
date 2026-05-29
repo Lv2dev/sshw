@@ -11,6 +11,7 @@ pub enum ErrorKind {
     Auth,
     Ssh,
     Io,
+    Policy,
     Unknown,
 }
 
@@ -22,6 +23,7 @@ impl ErrorKind {
             Self::Auth => 4,
             Self::Ssh => 5,
             Self::Io => 6,
+            Self::Policy => 7,
             Self::Unknown => 1,
         }
     }
@@ -59,6 +61,13 @@ pub fn classify_error(err: &anyhow::Error) -> ErrorKind {
 
     if message.contains("requires --yes") {
         return ErrorKind::Safety;
+    }
+
+    if message.contains("blocked by policy")
+        || message.contains("policy file")
+        || message.contains("policy enforcement")
+    {
+        return ErrorKind::Policy;
     }
 
     if message.contains("unknown server")

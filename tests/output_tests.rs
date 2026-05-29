@@ -77,6 +77,20 @@ fn filters_known_noninteractive_stty_startup_noise() {
 }
 
 #[test]
+fn classifies_policy_errors_with_exit_code_7() {
+    for message in [
+        "command blocked by policy: 'rm' is not in the allowlist",
+        "upload blocked by policy: '/tmp' is not in the allowed paths",
+        "invalid policy file at /x/policy.json: expected value",
+        "policy enforcement requested (--policy) but no policy file at /x/policy.json",
+    ] {
+        let kind = classify_error(&anyhow::anyhow!("{message}"));
+        assert_eq!(kind, ErrorKind::Policy, "message: {message}");
+        assert_eq!(kind.exit_code(), 7);
+    }
+}
+
+#[test]
 fn redacts_pem_private_key_block() {
     let input = "before\n-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXk\nAAAA\n-----END OPENSSH PRIVATE KEY-----\nafter\n";
 
