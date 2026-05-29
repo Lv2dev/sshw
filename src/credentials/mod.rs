@@ -1,4 +1,5 @@
 pub mod keyring_store;
+pub mod session_store;
 
 use std::fmt;
 use zeroize::Zeroize;
@@ -36,6 +37,10 @@ pub struct CredentialStoreHealth {
     pub message: String,
 }
 
+/// Abstraction over a credential backend. Implemented by the native OS keyring
+/// (`keyring_store`) and the in-memory `session_store`; an external-helper
+/// backend (shelling out to a user-provided program that prints the secret) is
+/// a planned extension behind this same trait.
 pub trait CredentialStore {
     fn set_password(&self, credential: &str, user: &str, password: &str) -> anyhow::Result<()>;
     fn get_password(&self, credential: &str, user: &str) -> anyhow::Result<String>;

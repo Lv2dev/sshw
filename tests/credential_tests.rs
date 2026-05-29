@@ -1,3 +1,4 @@
+use sshw::credentials::session_store::SessionOnlyStore;
 use sshw::credentials::{AuthMaterial, CredentialStore, CredentialStoreHealth};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -56,6 +57,49 @@ fn credential_store_trait_supports_password_lifecycle() {
         .delete_password("sshw:server-alpha", "deploy")
         .unwrap();
     assert!(store.get_password("sshw:server-alpha", "deploy").is_err());
+}
+
+#[test]
+fn session_only_store_keeps_secrets_in_memory() {
+    let store = SessionOnlyStore::new();
+
+    // Nothing stored and no session password -> error, never persisted.
+    assert!(store.get_password("sshw:default:web", "deploy").is_err());
+
+    store
+        .set_password("sshw:default:web", "deploy", "in-mem")
+        .unwrap();
+    assert_eq!(
+        store.get_password("sshw:default:web", "deploy").unwrap(),
+        "in-mem"
+    );
+
+    store.delete_password("sshw:default:web", "deploy").unwrap();
+    assert!(store.get_password("sshw:default:web", "deploy").is_err());
+}
+
+#[test]
+fn session_only_store_falls_back_to_session_password() {
+    let store = SessionOnlyStore::with_session_password(Some("from-env".to_string()));
+
+    // Any server without an explicit entry resolves to the session password.
+    assert_eq!(
+        store.get_password("sshw:default:web", "deploy").unwrap(),
+        "from-env"
+    );
+
+    let health = store.health_check().unwrap();
+    assert_eq!(health.backend, "session-only");
+    assert!(health.available);
+}
+
+#[test]
+fn session_only_store_without_password_reports_unavailable_secret() {
+    let store = SessionOnlyStore::with_session_password(None);
+    let err = store
+        .get_password("sshw:default:web", "deploy")
+        .unwrap_err();
+    assert!(err.to_string().contains("session-only"));
 }
 
 #[test]

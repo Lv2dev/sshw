@@ -1,6 +1,9 @@
 use crate::audit::{self, AuditRecord, AuditSink, AuditStatus, FileAuditSink, NoopAudit};
-use crate::config::{AuthConfig, ServerConfig, SshwConfig, load_config, save_config};
+use crate::config::{
+    AuthConfig, CredentialBackend, ServerConfig, SshwConfig, load_config, save_config,
+};
 use crate::credentials::keyring_store::KeyringCredentialStore;
+use crate::credentials::session_store::SessionOnlyStore;
 use crate::credentials::{AuthMaterial, CredentialStore, CredentialStoreHealth};
 use crate::home::{CredentialNamespace, ResolvedHome, generate_profile_id, sshw_base_dir};
 use crate::output::{
@@ -244,7 +247,6 @@ pub fn run() -> i32 {
         Ok(resolved) => resolved,
         Err(err) => return print_output(error_output(&err, json_errors)),
     };
-    let credentials = KeyringCredentialStore;
     let ssh = Ssh2Client::default().with_known_hosts(home.known_hosts_path.clone());
     let mut prompter = TerminalPrompter;
     let audit = FileAuditSink::new(home.audit_path.clone());
@@ -254,7 +256,23 @@ pub fn run() -> i32 {
         policy_forced: cli.policy,
         audit: &audit,
     };
-    let output = execute_for_runtime_with(cli, &ctx, &credentials, &ssh, &mut prompter);
+
+    // Select the credential backend from the home's config (default native).
+    let backend = load_config(&home.config_path)
+        .map(|config| config.credential_backend)
+        .unwrap_or_default();
+    let output = match backend {
+        CredentialBackend::Native => {
+            execute_for_runtime_with(cli, &ctx, &KeyringCredentialStore, &ssh, &mut prompter)
+        }
+        CredentialBackend::SessionOnly => execute_for_runtime_with(
+            cli,
+            &ctx,
+            &SessionOnlyStore::from_env(),
+            &ssh,
+            &mut prompter,
+        ),
+    };
 
     print_output(output)
 }

@@ -1,4 +1,6 @@
-use sshw::config::{AuthConfig, ServerConfig, SshwConfig, load_config, save_config};
+use sshw::config::{
+    AuthConfig, CredentialBackend, ServerConfig, SshwConfig, load_config, save_config,
+};
 
 #[test]
 fn new_config_starts_empty() {
@@ -51,6 +53,30 @@ fn missing_config_loads_default() {
     let config = load_config(&path).unwrap();
 
     assert_eq!(config, SshwConfig::default());
+}
+
+#[test]
+fn config_defaults_to_native_backend_and_round_trips_session() {
+    assert_eq!(
+        SshwConfig::default().credential_backend,
+        CredentialBackend::Native
+    );
+
+    // A config file without the field loads as native (backward compatible).
+    let legacy: SshwConfig =
+        serde_json::from_str(r#"{"version":1,"default":null,"servers":{}}"#).unwrap();
+    assert_eq!(legacy.credential_backend, CredentialBackend::Native);
+
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    let mut config = SshwConfig::default();
+    config.credential_backend = CredentialBackend::SessionOnly;
+    save_config(&path, &config).unwrap();
+
+    assert_eq!(
+        load_config(&path).unwrap().credential_backend,
+        CredentialBackend::SessionOnly
+    );
 }
 
 #[test]

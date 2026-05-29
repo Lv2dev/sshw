@@ -9,6 +9,10 @@ pub struct SshwConfig {
     pub version: u32,
     pub default: Option<String>,
     pub servers: BTreeMap<String, ServerConfig>,
+    /// Which credential backend this home uses. Defaults to the native OS
+    /// keyring; older config files without the field load as `native`.
+    #[serde(default)]
+    pub credential_backend: CredentialBackend,
 }
 
 impl Default for SshwConfig {
@@ -17,8 +21,21 @@ impl Default for SshwConfig {
             version: 1,
             default: None,
             servers: BTreeMap::new(),
+            credential_backend: CredentialBackend::Native,
         }
     }
+}
+
+/// Selects the credential store implementation. `native` uses the OS keyring;
+/// `session_only` keeps secrets in memory for the invocation (e.g. supplied
+/// via `SSHW_PASSWORD`) and never persists them. An external-helper backend is
+/// a planned extension behind the same `CredentialStore` trait.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialBackend {
+    #[default]
+    Native,
+    SessionOnly,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

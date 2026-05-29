@@ -1346,9 +1346,9 @@ fn sample_config() -> SshwConfig {
     );
 
     SshwConfig {
-        version: 1,
         default: Some("server-alpha".to_string()),
         servers,
+        ..SshwConfig::default()
     }
 }
 
