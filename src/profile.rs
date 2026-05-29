@@ -1,4 +1,4 @@
-use crate::home::{ResolvedHome, builtin_default_home};
+use crate::home::{ResolvedHome, builtin_default_home, is_reserved_profile_id};
 use crate::storage::write_owner_only_atomic;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -79,6 +79,7 @@ pub fn resolve_home_with_registry(
             .profiles
             .get(name)
             .ok_or_else(|| anyhow::anyhow!("unknown profile '{name}'"))?;
+        ensure_valid_profile_id(name, &entry.id)?;
         return Ok(ResolvedHome::profile(
             entry.home.clone(),
             &entry.id,
@@ -90,6 +91,7 @@ pub fn resolve_home_with_registry(
         let entry = registry.profiles.get(default_name).ok_or_else(|| {
             anyhow::anyhow!("default profile '{default_name}' is not present in the registry")
         })?;
+        ensure_valid_profile_id(default_name, &entry.id)?;
         return Ok(ResolvedHome::profile(
             entry.home.clone(),
             &entry.id,
@@ -98,4 +100,13 @@ pub fn resolve_home_with_registry(
     }
 
     Ok(builtin_default_home(sshw_base))
+}
+
+fn ensure_valid_profile_id(name: &str, id: &str) -> Result<()> {
+    if is_reserved_profile_id(id) {
+        return Err(anyhow::anyhow!(
+            "profile '{name}' has a reserved id '{id}'; remove and re-add the profile to regenerate it"
+        ));
+    }
+    Ok(())
 }

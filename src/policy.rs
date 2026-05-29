@@ -94,7 +94,12 @@ pub fn resolve_policy(policy_path: &Path, force_enable: bool) -> Result<Policy> 
         return Ok(Policy::Disabled);
     }
 
-    let contents = fs::read_to_string(policy_path)?;
+    let contents = fs::read_to_string(policy_path).map_err(|err| {
+        anyhow::anyhow!(
+            "failed to read policy file at {}: {err}",
+            policy_path.display()
+        )
+    })?;
     let file: PolicyFile = serde_json::from_str(&contents).map_err(|err| {
         anyhow::anyhow!("invalid policy file at {}: {err}", policy_path.display())
     })?;
@@ -139,6 +144,11 @@ pub fn describe_policy(policy_path: &Path, force_enable: bool) -> PolicyStatus {
 
 fn command_matches_simple(entry: &str, command: &str) -> bool {
     if let Some(prefix) = entry.strip_suffix('*') {
+        // An empty/whitespace-only prefix ("*") would match everything,
+        // including destructive commands; refuse it.
+        if prefix.trim().is_empty() {
+            return false;
+        }
         return command.starts_with(prefix);
     }
 
@@ -168,7 +178,13 @@ fn path_is_allowed(allowlist: &[String], path: &str) -> bool {
     if has_parent_traversal(path) {
         return false;
     }
-    allowlist.iter().any(|allowed| path_within(allowed, path))
+    allowlist.iter().any(|allowed| {
+        // Skip empty entries (which would otherwise match every absolute
+        // path) and normalize a trailing slash so "/srv/app/" behaves like
+        // "/srv/app".
+        let allowed = allowed.trim().trim_end_matches('/');
+        !allowed.is_empty() && path_within(allowed, path)
+    })
 }
 
 fn path_within(allowed: &str, path: &str) -> bool {

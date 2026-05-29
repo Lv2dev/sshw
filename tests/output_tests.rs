@@ -126,6 +126,20 @@ fn redacts_bearer_token() {
 }
 
 #[test]
+fn redacts_json_embedded_secrets() {
+    let compact = redact_secrets("{\"password\":\"hunter2\",\"region\":\"us\"}\n");
+    assert!(!compact.contains("hunter2"), "compact was {compact}");
+    assert!(compact.contains("<redacted>"));
+
+    let pretty = redact_secrets("  \"api_key\": \"AKIAEXAMPLEKEY\"\n");
+    assert!(!pretty.contains("AKIAEXAMPLEKEY"), "pretty was {pretty}");
+
+    let aws = redact_secrets("AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMIabcd\n");
+    assert!(!aws.contains("wJalrXUtnFEMIabcd"), "aws was {aws}");
+    assert!(aws.contains("<redacted>"));
+}
+
+#[test]
 fn leaves_ordinary_output_and_identifiers_untouched() {
     assert_eq!(redact_secrets("ok\n"), "ok\n");
     assert_eq!(

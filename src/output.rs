@@ -168,15 +168,18 @@ const SENSITIVE_KEYWORDS: &[&str] = &[
     "passphrase",
     "password",
     "passwd",
+    "secret_access_key",
     "secret_key",
     "secret",
     "access_token",
     "refresh_token",
+    "auth_token",
     "api_key",
     "apikey",
     "api-key",
     "token",
     "authorization",
+    "credential",
     "private_key",
 ];
 
@@ -275,12 +278,18 @@ fn sensitive_value_start(lower: &str, content: &str, keyword: &str) -> Option<us
     let mut search_from = 0;
     while let Some(rel) = lower[search_from..].find(keyword) {
         let kw_end = search_from + rel + keyword.len();
-        let after = &content[kw_end..];
+        // Allow an optional closing quote between the keyword and its
+        // separator so JSON keys such as `"password":"..."` are detected.
+        let mut cursor = kw_end;
+        if let Some(c @ ('"' | '\'')) = content[cursor..].chars().next() {
+            cursor += c.len_utf8();
+        }
+        let after = &content[cursor..];
         let leading_ws = after.len() - after.trim_start().len();
         let separator = after.trim_start().chars().next();
 
         if matches!(separator, Some('=') | Some(':')) {
-            let sep_idx = kw_end + leading_ws + 1;
+            let sep_idx = cursor + leading_ws + 1;
             let rest = &content[sep_idx..];
             let rest_ws = rest.len() - rest.trim_start().len();
             let mut value_start = sep_idx + rest_ws;

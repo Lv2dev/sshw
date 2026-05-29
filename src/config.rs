@@ -41,12 +41,15 @@ pub fn load_config(path: &Path) -> anyhow::Result<SshwConfig> {
         return Ok(SshwConfig::default());
     }
 
-    let contents = fs::read_to_string(path)?;
-    let config = serde_json::from_str(&contents)?;
+    let contents = fs::read_to_string(path)
+        .map_err(|err| anyhow::anyhow!("failed to load config at {}: {err}", path.display()))?;
+    let config = serde_json::from_str(&contents)
+        .map_err(|err| anyhow::anyhow!("failed to load config at {}: {err}", path.display()))?;
     Ok(config)
 }
 
 pub fn save_config(path: &Path, config: &SshwConfig) -> anyhow::Result<()> {
     let contents = serde_json::to_string_pretty(config)?;
     write_owner_only_atomic(path, &contents)
+        .map_err(|err| anyhow::anyhow!("failed to save config at {}: {err}", path.display()))
 }

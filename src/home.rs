@@ -160,12 +160,40 @@ pub fn generate_profile_id(name: &str, home: &Path) -> String {
 /// case-insensitive.
 fn canonical_key(path: &Path) -> String {
     let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
-    let text = absolute.to_string_lossy().to_string();
-    if cfg!(windows) {
+    let normalized = lexical_normalize(&absolute);
+    let text = normalized.to_string_lossy().to_string();
+    // Windows and the default macOS filesystem are case-insensitive, so fold
+    // case to keep the same directory mapping to one namespace.
+    if cfg!(windows) || cfg!(target_os = "macos") {
         text.to_lowercase()
     } else {
         text
     }
+}
+
+/// Collapse `.` and `..` components lexically (without touching the filesystem)
+/// so the same directory spelled differently hashes to one namespace.
+fn lexical_normalize(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Profile ids reserved for the built-in default home and ad-hoc `--home`
+/// namespaces. A registered profile must not reuse them, or it would share a
+/// credential namespace with a different home.
+pub fn is_reserved_profile_id(id: &str) -> bool {
+    id.is_empty() || id == "default" || id.starts_with("home_")
 }
 
 /// Deterministic FNV-1a 64-bit hash, hex encoded. Used only for credential

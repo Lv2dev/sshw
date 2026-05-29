@@ -144,6 +144,18 @@ fn unknown_profile_is_an_error() {
 }
 
 #[test]
+fn reserved_profile_id_is_rejected() {
+    let base = PathBuf::from("/base/sshw");
+    // A registry whose entry reuses the built-in default token must not be
+    // silently honored (it would share the credential namespace).
+    let registry = registry_with("prod", "default", "/homes/prod");
+
+    let err = resolve_home_with_registry(None, None, Some("prod"), &registry, &base).unwrap_err();
+
+    assert!(err.to_string().contains("reserved id"));
+}
+
+#[test]
 fn distinct_profiles_never_collide_on_paths_or_credentials() {
     let base = PathBuf::from("/base/sshw");
     let mut registry = registry_with("prod", "p_prod", "/homes/prod");

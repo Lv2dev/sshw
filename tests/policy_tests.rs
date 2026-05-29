@@ -72,6 +72,60 @@ fn force_flag_overrides_disabled_file() {
 }
 
 #[test]
+fn glob_star_entry_does_not_match_everything() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = write_policy(temp.path(), r#"{"enabled":true,"allow_commands":["*"]}"#);
+
+    match resolve_policy(&path, false).unwrap() {
+        Policy::Enabled(rules) => {
+            assert!(!rules.allows_command("rm -rf /home"));
+            assert!(!rules.allows_command("whoami"));
+        }
+        Policy::Disabled => panic!("expected enabled policy"),
+    }
+}
+
+#[test]
+fn empty_path_entry_does_not_allow_everything() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = write_policy(temp.path(), r#"{"enabled":true,"allow_get_paths":[""]}"#);
+
+    match resolve_policy(&path, false).unwrap() {
+        Policy::Enabled(rules) => assert!(!rules.allows_get("/etc/passwd")),
+        Policy::Disabled => panic!("expected enabled policy"),
+    }
+}
+
+#[test]
+fn trailing_slash_path_entry_matches_children() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = write_policy(
+        temp.path(),
+        r#"{"enabled":true,"allow_put_paths":["/srv/app/"]}"#,
+    );
+
+    match resolve_policy(&path, false).unwrap() {
+        Policy::Enabled(rules) => {
+            assert!(rules.allows_put("/srv/app/bin/run"));
+            assert!(!rules.allows_put("/etc/passwd"));
+        }
+        Policy::Disabled => panic!("expected enabled policy"),
+    }
+}
+
+#[test]
+fn unreadable_policy_file_classifies_as_policy() {
+    let temp = tempfile::tempdir().unwrap();
+    // A directory named policy.json cannot be read as a file.
+    let path = temp.path().join("policy.json");
+    std::fs::create_dir(&path).unwrap();
+
+    let err = resolve_policy(&path, false).unwrap_err();
+
+    assert!(err.to_string().contains("policy file"), "err was {err}");
+}
+
+#[test]
 fn describe_policy_reports_status_without_erroring() {
     let temp = tempfile::tempdir().unwrap();
     let missing = temp.path().join("policy.json");

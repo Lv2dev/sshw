@@ -67,6 +67,19 @@ fn credential_keys_are_always_namespaced() {
 }
 
 #[test]
+fn equivalent_home_paths_share_one_credential_namespace() {
+    let base = PathBuf::from("/base/sshw");
+    let dotted = resolve_home(Some(Path::new("/srv/data/../prod")), None, &base);
+    let plain = resolve_home(Some(Path::new("/srv/prod")), None, &base);
+
+    assert_eq!(dotted.namespace.token(), plain.namespace.token());
+    assert_eq!(
+        dotted.namespace.credential_key("web"),
+        plain.namespace.credential_key("web")
+    );
+}
+
+#[test]
 fn from_config_path_treats_parent_directory_as_home() {
     let resolved = ResolvedHome::from_config_path(Path::new("/tmp/x/servers.json"));
 

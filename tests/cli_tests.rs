@@ -1139,6 +1139,60 @@ fn policy_blocks_put_and_get_outside_allowlist() {
 }
 
 #[test]
+fn policy_denied_put_and_get_use_exit_code_7() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &sample_config()).unwrap();
+    write_policy(
+        temp.path(),
+        r#"{"enabled":true,"allow_put_paths":["/srv/app"],"allow_get_paths":["/var/log"]}"#,
+    );
+    let store = FakeCredentialStore::default();
+    store
+        .set_password("sshw:server-alpha", "deploy", "YOUR_PASSWORD")
+        .unwrap();
+    let ssh = FakeSshClient::default();
+    let local = temp.path().join("artifact");
+    std::fs::write(&local, "x").unwrap();
+
+    let put = execute_for_runtime(
+        Cli::try_parse_from([
+            "sshw",
+            "put",
+            "--policy",
+            "server-alpha",
+            local.to_str().unwrap(),
+            "/tmp/app",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut FakePrompter::default(),
+    );
+    assert_eq!(put.exit_code, 7);
+    assert!(put.stderr.contains("blocked by policy"));
+
+    let get = execute_for_runtime(
+        Cli::try_parse_from([
+            "sshw",
+            "get",
+            "--policy",
+            "server-alpha",
+            "/etc/secret",
+            temp.path().join("out").to_str().unwrap(),
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut FakePrompter::default(),
+    );
+    assert_eq!(get.exit_code, 7);
+    assert!(get.stderr.contains("blocked by policy"));
+}
+
+#[test]
 fn policy_disabled_in_file_allows_everything_without_flag() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("servers.json");

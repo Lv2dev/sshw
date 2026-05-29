@@ -54,6 +54,17 @@ fn missing_config_loads_default() {
 }
 
 #[test]
+fn corrupt_config_reports_config_error() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    std::fs::write(&path, "{ not valid json").unwrap();
+
+    let err = load_config(&path).unwrap_err();
+
+    assert!(err.to_string().contains("failed to load config"));
+}
+
+#[test]
 fn config_saves_and_loads_round_trip() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("nested").join("servers.json");
