@@ -19,7 +19,7 @@ Do not include real server passwords, private keys, passphrases, tokens, product
 - **Append-only audit log.** Mutating/active operations are recorded as JSONL in the home's `audit.jsonl`.
 - **Output and audit redaction.** Best-effort masking of secret-looking strings.
 
-Credentials: password authentication stores secrets only through the native OS credential store, or — opt-in — a session-only in-memory backend that never persists and reads `SSHW_PASSWORD` at run time. SSH agent authentication stores no secret in `sshw`.
+Credentials: password authentication stores secrets only through the native OS credential store, or — opt-in — a session-only in-memory backend that never persists and reads `SSHW_PASSWORD` at run time, then removes it from this process environment. SSH agent authentication stores no secret in `sshw`.
 
 ## Release Integrity And Provenance
 
@@ -42,6 +42,7 @@ These are explicitly **not** strong guarantees:
 - **Delegated access, not isolation.** Anything allowed to run `sshw run` has the configured account's server authority. A local process running as the same OS user may access the OS credential store directly.
 - **Command allowlist is program-name based.** `allow_commands` matches the program name, not its arguments. Allowlisting a program (e.g. `cat`, `tar`, `find`, `perl`) grants its full capability, including reading or writing any file it can reach and any subprocess it can spawn via its own flags. `allow_commands` is therefore a strictly stronger grant than `allow_get_paths`/`allow_put_paths`. Only allowlist programs you trust with arbitrary arguments.
 - **Redaction is best-effort.** Output and audit redaction catch PEM private-key blocks, `keyword=value`/`keyword: value` for common secret keywords, and bearer tokens. They do not understand shell syntax, so secrets passed as flag values (`-p`, `-a`, `-u user:pass`, bare positional tokens) or split across lines may not be masked. Do not pass secrets inline on the command line. The `run` audit record stores only the program name to avoid persisting inline secrets, but treat `audit.jsonl` as sensitive regardless.
+- **Environment variables are not a secret store.** The session-only backend removes `SSHW_PASSWORD` from `sshw`'s process environment immediately after reading it, but the value may already be visible to the parent shell, process launch metadata, shell history, or platform diagnostics. Prefer the native credential store for long-lived secrets.
 - **File protections are best-effort on Windows.** State files are created owner-only on Unix; on Windows protection relies on the per-user directory's NTFS ACLs. The audit log is plaintext.
 - **No OS-level sandboxing.** `sshw` does not constrain the remote host or the local process beyond the policy allowlist. Stronger per-OS sandbox backends are a possible future extension behind the existing `Sandbox` trait.
 - **No concurrent-write coordination.** State files are written atomically, so a half-written file is never observed, but there is no cross-process locking. Two `sshw` processes mutating the same home's `servers.json`, profile registry, or policy file concurrently will silently lose one update (last writer wins). Run mutating commands one at a time per home.

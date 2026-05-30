@@ -2,6 +2,9 @@ use sshw::credentials::session_store::SessionOnlyStore;
 use sshw::credentials::{AuthMaterial, CredentialStore, CredentialStoreHealth};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::sync::Mutex;
+
+static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Default)]
 struct FakeCredentialStore {
@@ -91,6 +94,22 @@ fn session_only_store_falls_back_to_session_password() {
     let health = store.health_check().unwrap();
     assert_eq!(health.backend, "session-only");
     assert!(health.available);
+}
+
+#[test]
+fn session_only_store_from_env_removes_password_from_environment_after_reading() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    unsafe {
+        std::env::set_var("SSHW_PASSWORD", "from-env");
+    }
+
+    let store = SessionOnlyStore::from_env();
+
+    assert_eq!(
+        store.get_password("sshw:default:web", "deploy").unwrap(),
+        "from-env"
+    );
+    assert!(std::env::var_os("SSHW_PASSWORD").is_none());
 }
 
 #[test]

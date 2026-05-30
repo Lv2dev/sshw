@@ -140,7 +140,7 @@ Agent auth stores no secret; it uses the active SSH agent.
 The home's `servers.json` selects the credential backend via `credential_backend` (default `native`):
 
 - `native` — the OS keyring (Windows Credential Manager, macOS Keychain, Linux Secret Service).
-- `session_only` — never touches the keyring. `set_password` stays in memory for the process only; at run time the password is taken from the `SSHW_PASSWORD` environment variable. Suited to ephemeral/CI use. `add --auth password` warns that the password is not persisted.
+- `session_only` — never touches the keyring. `set_password` stays in memory for the process only; at run time the password is taken from the `SSHW_PASSWORD` environment variable and then removed from this process environment. Suited to ephemeral/CI use. Environment variables can still be visible before `sshw` starts or in the parent shell, so treat `SSHW_PASSWORD` as sensitive. `add --auth password` warns that the password is not persisted.
 
 An external-helper backend is a planned extension behind the same `CredentialStore` trait.
 
@@ -416,7 +416,7 @@ agent auth는 비밀을 저장하지 않고 활성 SSH agent를 사용합니다.
 home의 `servers.json`이 `credential_backend`(기본 `native`)로 백엔드를 선택합니다.
 
 - `native` — OS keyring(Windows Credential Manager, macOS Keychain, Linux Secret Service).
-- `session_only` — keyring을 쓰지 않습니다. `set_password`는 프로세스 메모리에만 유지되고, 실행 시 비밀번호는 `SSHW_PASSWORD` 환경변수에서 가져옵니다. ephemeral/CI에 적합합니다. `add --auth password`는 비밀번호가 영속되지 않는다고 경고합니다.
+- `session_only` — keyring을 쓰지 않습니다. `set_password`는 프로세스 메모리에만 유지되고, 실행 시 비밀번호는 `SSHW_PASSWORD` 환경변수에서 가져온 뒤 이 프로세스 환경에서 제거합니다. ephemeral/CI에 적합합니다. 환경변수는 `sshw` 시작 전이나 부모 셸에는 노출될 수 있으므로 `SSHW_PASSWORD`를 민감하게 취급하세요. `add --auth password`는 비밀번호가 영속되지 않는다고 경고합니다.
 
 external-helper 백엔드는 동일한 `CredentialStore` trait 뒤의 후속 확장점입니다.
 

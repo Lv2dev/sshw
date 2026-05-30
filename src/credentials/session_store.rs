@@ -20,12 +20,19 @@ impl SessionOnlyStore {
     }
 
     /// Seed the session password from `SSHW_PASSWORD` (empty is treated as
-    /// unset).
+    /// unset), then remove the variable from this process environment to
+    /// reduce how long the secret is exposed to later code or child processes.
     pub fn from_env() -> Self {
         let session_password = std::env::var("SSHW_PASSWORD")
             .ok()
             .filter(|value| !value.is_empty())
             .map(Zeroizing::new);
+        // SAFETY: sshw calls this during single-threaded CLI startup before it
+        // spawns child processes. Clearing the variable after reading narrows
+        // the exposure window for this opt-in secret transport.
+        unsafe {
+            std::env::remove_var("SSHW_PASSWORD");
+        }
         Self {
             session_password,
             values: RefCell::new(HashMap::new()),
