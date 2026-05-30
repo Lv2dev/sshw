@@ -59,12 +59,9 @@ impl Command {
                     false
                 }
             },
-            Self::Add(_)
-            | Self::Default(_)
-            | Self::Trust(_)
-            | Self::Put(_)
-            | Self::Get(_)
-            | Self::Remove(_) => false,
+            Self::Put(args) => args.json,
+            Self::Get(args) => args.json,
+            Self::Add(_) | Self::Default(_) | Self::Trust(_) | Self::Remove(_) => false,
         }
     }
 }
@@ -178,6 +175,8 @@ pub struct PutArgs {
     pub target: Vec<String>,
     #[arg(long)]
     pub yes: bool,
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -186,6 +185,8 @@ pub struct GetArgs {
     pub target: Vec<String>,
     #[arg(long)]
     pub yes: bool,
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]

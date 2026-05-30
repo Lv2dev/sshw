@@ -576,7 +576,7 @@ where
     C: CredentialStore,
     S: SshClient,
 {
-    let PutArgs { target, yes } = args;
+    let PutArgs { target, yes, json } = args;
     let (server_name, local, remote) = resolve_put_target(target, config)?;
 
     match classify_remote_write_path(&remote, yes) {
@@ -591,6 +591,17 @@ where
     let server = get_server(config, &server_name)?;
     let auth = resolve_auth(server, credentials)?;
     let result = ssh.put(server, &auth, &local, &remote)?;
+    if json {
+        let output = json!({
+            "ok": true,
+            "server": redact_secrets(&server_name),
+            "local": redact_secrets(&result.source),
+            "remote": redact_secrets(&result.destination),
+            "bytes": result.bytes,
+        });
+        return Ok(ok(format!("{}\n", serde_json::to_string(&output)?)));
+    }
+
     Ok(ok(format!(
         "uploaded {} bytes from {} to {}\n",
         result.bytes, result.source, result.destination
@@ -608,7 +619,7 @@ where
     C: CredentialStore,
     S: SshClient,
 {
-    let GetArgs { target, yes } = args;
+    let GetArgs { target, yes, json } = args;
     let (server_name, remote, local) = resolve_get_target(target, config)?;
 
     let server = get_server(config, &server_name)?;
@@ -625,6 +636,17 @@ where
 
     let auth = resolve_auth(server, credentials)?;
     let result = ssh.get(server, &auth, &remote, &local, yes)?;
+    if json {
+        let output = json!({
+            "ok": true,
+            "server": redact_secrets(&server_name),
+            "remote": redact_secrets(&result.source),
+            "local": redact_secrets(&result.destination),
+            "bytes": result.bytes,
+        });
+        return Ok(ok(format!("{}\n", serde_json::to_string(&output)?)));
+    }
+
     Ok(ok(format!(
         "downloaded {} bytes from {} to {}\n",
         result.bytes, result.source, result.destination

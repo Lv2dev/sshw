@@ -759,6 +759,81 @@ fn put_uses_default_server_when_name_is_omitted() {
 }
 
 #[test]
+fn put_json_reports_transfer_result() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &sample_config()).unwrap();
+    let local = temp.path().join("app");
+    std::fs::write(&local, "binary").unwrap();
+    let store = FakeCredentialStore::default();
+    store
+        .set_password("sshw:server-alpha", "deploy", "YOUR_PASSWORD")
+        .unwrap();
+    let ssh = FakeSshClient::default();
+    let mut prompter = FakePrompter::default();
+
+    let output = execute(
+        Cli::try_parse_from([
+            "sshw",
+            "put",
+            "server-alpha",
+            local.to_str().unwrap(),
+            "/tmp/app",
+            "--json",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    )
+    .unwrap();
+
+    assert_eq!(output.stderr, "");
+    let json: serde_json::Value = serde_json::from_str(output.stdout.trim()).unwrap();
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["server"], "server-alpha");
+    assert_eq!(json["local"], local.display().to_string());
+    assert_eq!(json["remote"], "/tmp/app");
+    assert_eq!(json["bytes"], 1);
+}
+
+#[test]
+fn put_json_failure_uses_error_envelope() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &sample_config()).unwrap();
+    let local = temp.path().join("app");
+    std::fs::write(&local, "binary").unwrap();
+    let store = FakeCredentialStore::default();
+    let ssh = FakeSshClient::default();
+    let mut prompter = FakePrompter::default();
+
+    let output = execute_for_runtime(
+        Cli::try_parse_from([
+            "sshw",
+            "put",
+            local.to_str().unwrap(),
+            "/usr/bin/app",
+            "--json",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    );
+
+    assert_eq!(output.exit_code, 2);
+    assert_eq!(output.stderr, "");
+    let json: serde_json::Value = serde_json::from_str(output.stdout.trim()).unwrap();
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["error"]["kind"], "safety");
+    assert_eq!(json["error"]["exit_code"], 2);
+    assert!(ssh.put_calls.borrow().is_empty());
+}
+
+#[test]
 fn get_uses_default_server_when_name_is_omitted() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("servers.json");
@@ -782,6 +857,80 @@ fn get_uses_default_server_when_name_is_omitted() {
 
     assert!(output.stdout.contains("downloaded"));
     assert_eq!(ssh.get_calls.borrow().as_slice(), [false]);
+}
+
+#[test]
+fn get_json_reports_transfer_result() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &sample_config()).unwrap();
+    let local = temp.path().join("download.txt");
+    let store = FakeCredentialStore::default();
+    store
+        .set_password("sshw:server-alpha", "deploy", "YOUR_PASSWORD")
+        .unwrap();
+    let ssh = FakeSshClient::default();
+    let mut prompter = FakePrompter::default();
+
+    let output = execute(
+        Cli::try_parse_from([
+            "sshw",
+            "get",
+            "server-alpha",
+            "/tmp/remote.txt",
+            local.to_str().unwrap(),
+            "--json",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    )
+    .unwrap();
+
+    assert_eq!(output.stderr, "");
+    let json: serde_json::Value = serde_json::from_str(output.stdout.trim()).unwrap();
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["server"], "server-alpha");
+    assert_eq!(json["remote"], "/tmp/remote.txt");
+    assert_eq!(json["local"], local.display().to_string());
+    assert_eq!(json["bytes"], 1);
+}
+
+#[test]
+fn get_json_failure_uses_error_envelope() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &sample_config()).unwrap();
+    let local = temp.path().join("download.txt");
+    std::fs::write(&local, "existing").unwrap();
+    let store = FakeCredentialStore::default();
+    let ssh = FakeSshClient::default();
+    let mut prompter = FakePrompter::default();
+
+    let output = execute_for_runtime(
+        Cli::try_parse_from([
+            "sshw",
+            "get",
+            "/tmp/remote.txt",
+            local.to_str().unwrap(),
+            "--json",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    );
+
+    assert_eq!(output.exit_code, 6);
+    assert_eq!(output.stderr, "");
+    let json: serde_json::Value = serde_json::from_str(output.stdout.trim()).unwrap();
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["error"]["kind"], "io");
+    assert_eq!(json["error"]["exit_code"], 6);
+    assert!(ssh.get_calls.borrow().is_empty());
 }
 
 #[test]
