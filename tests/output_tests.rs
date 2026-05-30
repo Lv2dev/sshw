@@ -116,6 +116,55 @@ fn classifies_policy_errors_with_exit_code_7() {
 }
 
 #[test]
+fn classifies_safety_rail_errors_with_exit_code_2() {
+    for message in [
+        "'rm -rf /tmp/x' requires --yes to run a destructive command",
+        "writing to system path '/etc/hosts' requires --yes",
+    ] {
+        let kind = classify_error(&anyhow::anyhow!("{message}"));
+        assert_eq!(kind, ErrorKind::Safety, "message: {message}");
+        assert_eq!(kind.exit_code(), 2);
+    }
+}
+
+#[test]
+fn classifies_auth_errors_with_exit_code_4() {
+    for message in [
+        "missing credential entries for server 'web'",
+        "credential store unavailable",
+        "SSH authentication failed",
+        "password cannot be empty",
+    ] {
+        let kind = classify_error(&anyhow::anyhow!("{message}"));
+        assert_eq!(kind, ErrorKind::Auth, "message: {message}");
+        assert_eq!(kind.exit_code(), 4);
+    }
+}
+
+#[test]
+fn classifies_unknown_server_and_confirmation_errors_as_config() {
+    for message in [
+        "unknown server 'missing'",
+        "no default server configured; run 'sshw default <name>' to set one",
+        "failed to load config",
+        "confirmation requires an interactive terminal; rerun with --yes to confirm",
+        "confirmation input ended before a response; rerun with --yes to confirm",
+    ] {
+        let kind = classify_error(&anyhow::anyhow!("{message}"));
+        assert_eq!(kind, ErrorKind::Config, "message: {message}");
+        assert_eq!(kind.exit_code(), 3);
+    }
+}
+
+#[test]
+fn classifies_existing_local_file_as_io() {
+    let err = anyhow::anyhow!("local file already exists: ./out; pass --yes to overwrite");
+    let kind = classify_error(&err);
+    assert_eq!(kind, ErrorKind::Io);
+    assert_eq!(kind.exit_code(), 6);
+}
+
+#[test]
 fn redacts_pem_private_key_block() {
     let input = "before\n-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXk\nAAAA\n-----END OPENSSH PRIVATE KEY-----\nafter\n";
 

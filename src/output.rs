@@ -69,6 +69,16 @@ pub struct ErrorBody {
     pub exit_code: i32,
 }
 
+/// Map an error to a stable [`ErrorKind`] for agent consumption.
+///
+/// Most kinds are inferred from substrings of the human-readable message, so
+/// the marker phrases below are an implicit contract with the modules that
+/// *produce* those messages (`safety`, `sandbox`, `cli::prompt`, `config`,
+/// `profile`, `cli`). Changing a produced message so it no longer contains its
+/// marker silently reclassifies the error to `Unknown`. `tests/output_tests.rs`
+/// locks each marker → kind mapping to catch that regression; keep them in sync.
+/// `ssh2::Error` and `io::Error` are matched by type as a fallback since they
+/// carry no marker.
 pub fn classify_error(err: &anyhow::Error) -> ErrorKind {
     let message = format!("{err:#}").to_ascii_lowercase();
 
