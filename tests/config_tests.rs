@@ -69,8 +69,10 @@ fn config_defaults_to_native_backend_and_round_trips_session() {
 
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("servers.json");
-    let mut config = SshwConfig::default();
-    config.credential_backend = CredentialBackend::SessionOnly;
+    let config = SshwConfig {
+        credential_backend: CredentialBackend::SessionOnly,
+        ..SshwConfig::default()
+    };
     save_config(&path, &config).unwrap();
 
     assert_eq!(
@@ -94,9 +96,8 @@ fn corrupt_config_reports_config_error() {
 fn config_saves_and_loads_round_trip() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("nested").join("servers.json");
-    let mut config = SshwConfig::default();
-    config.default = Some("server-alpha".to_string());
-    config.servers.insert(
+    let mut servers = std::collections::BTreeMap::new();
+    servers.insert(
         "server-alpha".to_string(),
         ServerConfig {
             host: "192.0.2.10".to_string(),
@@ -107,6 +108,11 @@ fn config_saves_and_loads_round_trip() {
             },
         },
     );
+    let config = SshwConfig {
+        default: Some("server-alpha".to_string()),
+        servers,
+        ..SshwConfig::default()
+    };
 
     save_config(&path, &config).unwrap();
     let loaded = load_config(&path).unwrap();

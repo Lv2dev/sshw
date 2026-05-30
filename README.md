@@ -272,11 +272,13 @@ Use sshw put and sshw get for file transfer.
 
 ```bash
 cargo fmt --check
-cargo clippy --locked -- -D warnings
+cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 cargo run --locked -- --help
 cargo run --locked -- doctor
 ```
+
+On constrained local machines, limit Cargo parallelism per invocation instead of committing a repo-wide config, for example `CARGO_BUILD_JOBS=1 cargo test --locked`.
 
 ### Security Reports
 
@@ -552,11 +554,13 @@ Use sshw put and sshw get for file transfer.
 
 ```bash
 cargo fmt --check
-cargo clippy --locked -- -D warnings
+cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 cargo run --locked -- --help
 cargo run --locked -- doctor
 ```
+
+로컬 머신 부담이 크면 저장소 전체 설정을 커밋하지 말고 호출별로 Cargo 병렬도를 제한하세요. 예: `CARGO_BUILD_JOBS=1 cargo test --locked`.
 
 ### 보안 제보
 
