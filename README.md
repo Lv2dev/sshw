@@ -47,6 +47,17 @@ git tag vX.Y.Z
 git push origin vX.Y.Z
 ```
 
+Release artifacts are also published with GitHub Artifact Attestations. Checksums verify file integrity; attestations verify build provenance (repository, workflow, commit, and event). From a directory containing the downloaded release assets:
+
+```bash
+gh release download vX.Y.Z --repo Lv2dev/sshw
+sha256sum -c SHA256SUMS
+
+for artifact in sshw-*.tar.gz sshw-*.zip SHA256SUMS; do
+  gh attestation verify "$artifact" -R Lv2dev/sshw
+done
+```
+
 ### Storage Layout And Profiles
 
 All state lives under per-project **homes**. A home directory contains:
@@ -310,6 +321,17 @@ cargo build --locked --release
 ```bash
 git tag vX.Y.Z
 git push origin vX.Y.Z
+```
+
+릴리스 산출물에는 GitHub Artifact Attestation도 생성됩니다. checksum은 파일 무결성을 확인하고, attestation은 빌드 출처(repository, workflow, commit, event)를 확인합니다. 릴리스 산출물을 내려받은 디렉터리에서:
+
+```bash
+gh release download vX.Y.Z --repo Lv2dev/sshw
+sha256sum -c SHA256SUMS
+
+for artifact in sshw-*.tar.gz sshw-*.zip SHA256SUMS; do
+  gh attestation verify "$artifact" -R Lv2dev/sshw
+done
 ```
 
 ### 저장 구조와 profile

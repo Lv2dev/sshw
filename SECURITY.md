@@ -21,6 +21,20 @@ Do not include real server passwords, private keys, passphrases, tokens, product
 
 Credentials: password authentication stores secrets only through the native OS credential store, or — opt-in — a session-only in-memory backend that never persists and reads `SSHW_PASSWORD` at run time. SSH agent authentication stores no secret in `sshw`.
 
+## Release Integrity And Provenance
+
+Tagged releases publish platform archives plus `SHA256SUMS`. The checksum file lets users verify that downloaded bytes match the release manifest.
+
+Release assets are also covered by GitHub Artifact Attestations. The platform archives are attested in the release `build` jobs, and `SHA256SUMS` is attested in the `publish` job. Users can verify provenance with GitHub CLI:
+
+```bash
+gh release download vX.Y.Z --repo Lv2dev/sshw
+sha256sum -c SHA256SUMS
+gh attestation verify sshw-x86_64-unknown-linux-gnu.tar.gz -R Lv2dev/sshw
+```
+
+Attestations establish where and how an artifact was built (repository, workflow, commit, and event). They do not prove the artifact is vulnerability-free or safe to run in a particular environment; consumers still need to evaluate the release contents and their own policy.
+
 ## Limitations (Not Guarantees)
 
 These are explicitly **not** strong guarantees:
