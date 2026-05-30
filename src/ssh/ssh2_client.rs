@@ -231,9 +231,15 @@ impl SshClient for Ssh2Client {
             .context("ssh transfer error")?;
 
         // Download to a sibling temp file and persist on success so a failed
-        // transfer never truncates or replaces an existing local file.
-        let bytes =
-            crate::storage::write_stream_owner_only_atomic(local, &mut remote_file, overwrite)?;
+        // transfer never truncates or replaces an existing local file. Pass the
+        // SCP-announced size so a short/truncated download fails closed before
+        // persisting, mirroring the upload truncation guard in `put`.
+        let bytes = crate::storage::write_stream_owner_only_atomic(
+            local,
+            &mut remote_file,
+            overwrite,
+            Some(stat.size()),
+        )?;
 
         remote_file.send_eof().context("ssh transfer error")?;
         remote_file.wait_eof().context("ssh transfer error")?;
@@ -241,7 +247,7 @@ impl SshClient for Ssh2Client {
         remote_file.wait_close().context("ssh transfer error")?;
 
         Ok(TransferResult {
-            bytes: bytes.min(stat.size()),
+            bytes,
             source: remote.to_string(),
             destination: local.display().to_string(),
         })

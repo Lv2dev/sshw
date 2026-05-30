@@ -79,10 +79,17 @@ fn set_owner_only(_path: &Path) -> Result<()> {
 /// destination only after the copy + fsync succeed, so a failed or interrupted
 /// download never truncates or replaces an existing file. When `overwrite` is
 /// false, an existing destination is refused without being touched.
+///
+/// When `expected_len` is `Some(n)`, the copied byte count is verified to equal
+/// `n` *before* the temp file is persisted; a short transfer fails closed (with
+/// an ssh-classified error) and leaves the destination untouched, so a truncated
+/// download is never reported as a success. SCP downloads pass the remote size
+/// here; callers without an authoritative size pass `None`.
 pub fn write_stream_owner_only_atomic(
     path: &Path,
     reader: &mut dyn Read,
     overwrite: bool,
+    expected_len: Option<u64>,
 ) -> Result<u64> {
     if !overwrite && path.exists() {
         return Err(already_exists_error(path));
@@ -102,6 +109,15 @@ pub fn write_stream_owner_only_atomic(
             return Err(err);
         }
     };
+
+    // Fail closed on a short transfer before persisting, so a truncated download
+    // never overwrites or creates the destination.
+    if let Some(expected) = expected_len
+        && bytes != expected
+    {
+        let _ = fs::remove_file(&temp_path);
+        return Err(incomplete_transfer_error(expected, bytes));
+    }
 
     // Re-check in case the destination appeared during the download.
     if !overwrite && path.exists() {
@@ -131,6 +147,12 @@ fn already_exists_error(path: &Path) -> anyhow::Error {
     anyhow::anyhow!(
         "local file already exists: {}; pass --yes to overwrite",
         path.display()
+    )
+}
+
+fn incomplete_transfer_error(expected: u64, actual: u64) -> anyhow::Error {
+    anyhow::anyhow!(
+        "ssh transfer aborted: incomplete download (expected {expected} bytes, wrote {actual})"
     )
 }
 
@@ -191,7 +213,7 @@ mod stream_tests {
         fs::write(&dest, "ORIGINAL").unwrap();
 
         let mut reader = FailingReader { remaining: 8 };
-        let err = write_stream_owner_only_atomic(&dest, &mut reader, true).unwrap_err();
+        let err = write_stream_owner_only_atomic(&dest, &mut reader, true, None).unwrap_err();
 
         assert!(err.to_string().contains("simulated download failure"));
         assert_eq!(fs::read_to_string(&dest).unwrap(), "ORIGINAL");
@@ -209,10 +231,26 @@ mod stream_tests {
         fs::write(&dest, "ORIGINAL").unwrap();
 
         let mut reader = &b"NEWDATA"[..];
-        let bytes = write_stream_owner_only_atomic(&dest, &mut reader, true).unwrap();
+        let bytes = write_stream_owner_only_atomic(&dest, &mut reader, true, None).unwrap();
 
         assert_eq!(bytes, 7);
         assert_eq!(fs::read_to_string(&dest).unwrap(), "NEWDATA");
+        assert_eq!(count_temp_files(dir.path()), 0);
+    }
+
+    #[test]
+    fn rejects_incomplete_stream_and_preserves_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("data.txt");
+        fs::write(&dest, "ORIGINAL").unwrap();
+
+        // Reader yields 4 bytes but the caller expects 8 (a truncated download).
+        let mut reader = &b"NEWD"[..];
+        let err = write_stream_owner_only_atomic(&dest, &mut reader, true, Some(8)).unwrap_err();
+
+        // Fail closed: the existing destination is untouched and no temp leaks.
+        assert!(err.to_string().contains("ssh transfer aborted"));
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "ORIGINAL");
         assert_eq!(count_temp_files(dir.path()), 0);
     }
 
@@ -223,7 +261,7 @@ mod stream_tests {
         fs::write(&dest, "ORIGINAL").unwrap();
 
         let mut reader = &b"NEW"[..];
-        let err = write_stream_owner_only_atomic(&dest, &mut reader, false).unwrap_err();
+        let err = write_stream_owner_only_atomic(&dest, &mut reader, false, None).unwrap_err();
 
         assert!(err.to_string().contains("already exists"));
         assert_eq!(fs::read_to_string(&dest).unwrap(), "ORIGINAL");
@@ -238,7 +276,7 @@ mod stream_tests {
         let dest = dir.path().join("data.txt");
 
         let mut reader = &b"DATA"[..];
-        write_stream_owner_only_atomic(&dest, &mut reader, false).unwrap();
+        write_stream_owner_only_atomic(&dest, &mut reader, false, None).unwrap();
 
         let mode = fs::metadata(&dest).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
