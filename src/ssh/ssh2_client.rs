@@ -147,10 +147,7 @@ impl SshClient for Ssh2Client {
         let mut channel = session.channel_session().context("ssh session error")?;
         channel.exec(command).context("ssh session error")?;
 
-        let mut stdout = String::new();
-        let mut stderr = String::new();
-        channel.read_to_string(&mut stdout)?;
-        channel.stderr().read_to_string(&mut stderr)?;
+        let (stdout, stderr) = read_channel_outputs(&session, &mut channel, self.op_timeout)?;
         channel.wait_close().context("ssh session error")?;
         let exit_status = channel.exit_status().context("ssh session error")?;
 
@@ -316,6 +313,84 @@ fn timeout_millis(timeout: Duration) -> u32 {
 /// maps to `0`, which libssh2 treats as "no timeout".
 fn op_timeout_millis(op_timeout: Option<Duration>) -> u32 {
     op_timeout.map(timeout_millis).unwrap_or(0)
+}
+
+/// Read a channel's stdout and stderr concurrently so a large volume on one
+/// stream cannot deadlock the other. libssh2 multiplexes both over one TCP
+/// connection with per-stream flow-control windows; reading stdout fully before
+/// touching stderr stalls the remote once the stderr window fills (and vice
+/// versa).
+///
+/// Switches the session to non-blocking, drains both streams round-robin until
+/// each reaches EOF, then restores blocking mode for the caller's `wait_close`.
+/// `op_timeout` is an *inactivity* budget matching the connection's operation
+/// timeout: it fires only when neither stream makes progress for that long.
+/// `None` waits indefinitely.
+fn read_channel_outputs(
+    session: &Session,
+    channel: &mut ssh2::Channel,
+    op_timeout: Option<Duration>,
+) -> anyhow::Result<(String, String)> {
+    session.set_blocking(false);
+    let drained = drain_both_streams(channel, op_timeout);
+    session.set_blocking(true);
+    let (out, err) = drained?;
+    let stdout = String::from_utf8(out)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+    let stderr = String::from_utf8(err)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+    Ok((stdout, stderr))
+}
+
+fn drain_both_streams(
+    channel: &mut ssh2::Channel,
+    op_timeout: Option<Duration>,
+) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let mut out_done = false;
+    let mut err_done = false;
+    let mut buf = [0u8; 32 * 1024];
+    let mut last_progress = Instant::now();
+
+    while !(out_done && err_done) {
+        let mut progressed = false;
+
+        if !out_done {
+            match channel.read(&mut buf) {
+                Ok(0) => out_done = true,
+                Ok(n) => {
+                    out.extend_from_slice(&buf[..n]);
+                    progressed = true;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => return Err(anyhow::Error::new(e).context("ssh session error")),
+            }
+        }
+
+        if !err_done {
+            match channel.stderr().read(&mut buf) {
+                Ok(0) => err_done = true,
+                Ok(n) => {
+                    err.extend_from_slice(&buf[..n]);
+                    progressed = true;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => return Err(anyhow::Error::new(e).context("ssh session error")),
+            }
+        }
+
+        if progressed {
+            last_progress = Instant::now();
+        } else if !(out_done && err_done) {
+            if op_timeout.is_some_and(|timeout| last_progress.elapsed() >= timeout) {
+                return Err(anyhow::anyhow!("ssh session timed out waiting for output"));
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    Ok((out, err))
 }
 fn verify_known_host(
     session: &Session,
