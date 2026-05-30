@@ -8,6 +8,8 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-05-31
+
 ### Added
 - `run`, `show`, `doctor`, and `profile show` `--json` success responses now include `"ok":true`, matching `put`/`get` and the error envelope's `"ok":false` so consumers can branch on `ok`. `list`/`profile list` remain JSON arrays.
 - Regression tests locking the error message → `ErrorKind` classification for the safety/auth/config/io markers.
@@ -88,7 +90,8 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 
 - Initial public release: registered-server SSH `run`/`put`/`get` with secrets kept in the OS credential store, fail-closed `known_hosts` verification, and explicit `sshw trust`.
 
-[Unreleased]: https://github.com/Lv2dev/sshw/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/Lv2dev/sshw/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/Lv2dev/sshw/releases/tag/v0.5.1
 [0.5.0]: https://github.com/Lv2dev/sshw/releases/tag/v0.5.0
 [0.4.4]: https://github.com/Lv2dev/sshw/releases/tag/v0.4.4
 [0.4.3]: https://github.com/Lv2dev/sshw/releases/tag/v0.4.3
