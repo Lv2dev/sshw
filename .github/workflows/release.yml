@@ -93,10 +93,10 @@ jobs:
       - name: Generate SHA256SUMS
         shell: bash
         run: |
-          (
-            cd artifacts
-            find . -type f -print0 | sort -z | xargs -0 sha256sum > ../SHA256SUMS
-          )
+          while IFS= read -r -d '' file; do
+            digest="$(sha256sum "$file" | cut -d ' ' -f 1)"
+            printf '%s  %s\n' "$digest" "$(basename "$file")"
+          done < <(find artifacts -type f -print0 | sort -z) > SHA256SUMS
       - name: Attest SHA256SUMS provenance
         uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
         with:
