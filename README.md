@@ -158,6 +158,7 @@ sshw trust server-alpha --yes
 ### Commands
 
 ```bash
+sshw add <name> --host <host> --port <port> --user <user> [--auth password|agent] [--force]
 sshw list [--json]
 sshw show <name> [--json]
 sshw default [<name>]
@@ -169,6 +170,8 @@ sshw remove <name> [--yes]
 sshw doctor [--json]
 sshw profile <add|list|show|default|remove> ...
 ```
+
+`add` (and `profile add`) take `--force` to overwrite an existing entry without the interactive confirmation prompt — required when registering or updating an entry non-interactively (e.g. from an agent).
 
 Global flags (available on every command): `--home <path>`, `--profile <name>`, `--policy`, `--timeout <seconds>`.
 
@@ -221,7 +224,7 @@ sshw doctor
 sshw doctor --json
 ```
 
-`doctor` reports the resolved home and how it was selected, the config / known_hosts / policy / audit paths, the credential namespace, whether policy is present/valid/enabled, whether the audit log is writable, and the credential backend health.
+`doctor` reports the resolved home and how it was selected, the registry / config / known_hosts / policy / audit paths, whether the config file exists, the operating system, the credential namespace, whether policy is present/valid/enabled, whether the audit log is writable, the credential backend health, and any configured servers whose credentials are missing (`missing_credentials`).
 
 ### JSON Error Contract
 
@@ -447,6 +450,7 @@ sshw trust server-alpha --yes
 ### 명령
 
 ```bash
+sshw add <name> --host <host> --port <port> --user <user> [--auth password|agent] [--force]
 sshw list [--json]
 sshw show <name> [--json]
 sshw default [<name>]
@@ -458,6 +462,8 @@ sshw remove <name> [--yes]
 sshw doctor [--json]
 sshw profile <add|list|show|default|remove> ...
 ```
+
+`add`(및 `profile add`)는 `--force`로 기존 항목을 대화형 확인 프롬프트 없이 덮어씁니다 — 비대화형(예: 에이전트)에서 항목을 등록/갱신할 때 필요합니다.
 
 전역 플래그(모든 명령에서 사용): `--home <path>`, `--profile <name>`, `--policy`, `--timeout <seconds>`.
 
@@ -508,7 +514,7 @@ sshw doctor
 sshw doctor --json
 ```
 
-`doctor`는 해석된 home과 선택 경위, config/known_hosts/policy/audit 경로, credential namespace, policy present/valid/enabled, audit 쓰기 가능 여부, credential backend 상태를 보고합니다.
+`doctor`는 해석된 home과 선택 경위, registry/config/known_hosts/policy/audit 경로, config 파일 존재 여부, 운영체제, credential namespace, policy present/valid/enabled, audit 쓰기 가능 여부, credential backend 상태, 그리고 credential이 없는 등록 서버 목록(`missing_credentials`)을 보고합니다.
 
 ### JSON 오류 계약
 
