@@ -18,222 +18,27 @@ use crate::sandbox::{NoopSandbox, PolicyOnlySandbox, Sandbox, SandboxDecision};
 use crate::ssh::SshClient;
 use crate::ssh::ssh2_client::Ssh2Client;
 use anyhow::Context;
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::Parser;
 use serde_json::json;
-use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-#[derive(Debug, Parser)]
-#[command(
-    name = "sshw",
-    version,
-    about = "Operate configured SSH servers without exposing secrets"
-)]
-pub struct Cli {
-    /// Use an explicit sshw home directory for this invocation (config,
-    /// known_hosts, policy, audit). Overrides `SSHW_HOME` and `--profile`.
-    #[arg(long, global = true, value_name = "PATH")]
-    pub home: Option<PathBuf>,
-    /// Select a registered profile by name (see `sshw profile`). Cannot be
-    /// combined with `--home`.
-    #[arg(long, global = true, value_name = "NAME")]
-    pub profile: Option<String>,
-    /// Enforce the active home's policy.json for this invocation. Off by
-    /// default; fails closed if the policy file is missing or invalid.
-    #[arg(long, global = true)]
-    pub policy: bool,
-    /// Inactivity timeout in seconds for remote operations (run/put/get) after
-    /// the connection is established. 0 means no timeout. Connection setup
-    /// always uses a fixed timeout. Default: no operation timeout.
-    #[arg(long, global = true, value_name = "SECONDS")]
-    pub timeout: Option<u64>,
-    #[command(subcommand)]
-    pub command: Command,
-}
+mod model;
+mod prompt;
 
-#[derive(Debug, Subcommand)]
-pub enum Command {
-    Add(AddArgs),
-    List(ListArgs),
-    Show(ShowArgs),
-    Default(DefaultArgs),
-    Trust(TrustArgs),
-    Run(RunArgs),
-    Put(PutArgs),
-    Get(GetArgs),
-    Remove(RemoveArgs),
-    Doctor(DoctorArgs),
-    /// Manage named sshw profiles (each maps a name to a home directory).
-    Profile(ProfileArgs),
-}
-
-impl Command {
-    fn wants_json_errors(&self) -> bool {
-        match self {
-            Self::List(args) => args.json,
-            Self::Show(args) => args.json,
-            Self::Run(args) => args.json,
-            Self::Doctor(args) => args.json,
-            Self::Profile(args) => match &args.command {
-                ProfileCommand::List(a) => a.json,
-                ProfileCommand::Show(a) => a.json,
-                ProfileCommand::Add(_) | ProfileCommand::Default(_) | ProfileCommand::Remove(_) => {
-                    false
-                }
-            },
-            Self::Add(_)
-            | Self::Default(_)
-            | Self::Trust(_)
-            | Self::Put(_)
-            | Self::Get(_)
-            | Self::Remove(_) => false,
-        }
-    }
-}
-
-#[derive(Debug, Args)]
-pub struct ProfileArgs {
-    #[command(subcommand)]
-    pub command: ProfileCommand,
-}
-
-#[derive(Debug, Subcommand)]
-pub enum ProfileCommand {
-    /// Register a profile. The home directory is taken from the global
-    /// `--home <path>` flag, e.g. `sshw profile add prod --home /srv/prod`.
-    Add(ProfileAddArgs),
-    List(ProfileListArgs),
-    Show(ProfileShowArgs),
-    Default(ProfileDefaultArgs),
-    Remove(ProfileRemoveArgs),
-}
-
-#[derive(Debug, Args)]
-pub struct ProfileAddArgs {
-    pub name: String,
-    #[arg(long)]
-    pub force: bool,
-}
-
-#[derive(Debug, Args)]
-pub struct ProfileListArgs {
-    #[arg(long)]
-    pub json: bool,
-}
-
-#[derive(Debug, Args)]
-pub struct ProfileShowArgs {
-    pub name: String,
-    #[arg(long)]
-    pub json: bool,
-}
-
-#[derive(Debug, Args)]
-pub struct ProfileDefaultArgs {
-    pub name: String,
-}
-
-#[derive(Debug, Args)]
-pub struct ProfileRemoveArgs {
-    pub name: String,
-}
-
-#[derive(Debug, Args)]
-pub struct AddArgs {
-    pub name: String,
-    #[arg(long)]
-    pub host: String,
-    #[arg(long)]
-    pub port: u16,
-    #[arg(long)]
-    pub user: String,
-    #[arg(long, value_enum, default_value_t = AuthArg::Password)]
-    pub auth: AuthArg,
-    #[arg(long)]
-    pub force: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum AuthArg {
-    Password,
-    Agent,
-}
-
-#[derive(Debug, Args)]
-pub struct ListArgs {
-    #[arg(long)]
-    pub json: bool,
-}
-
-#[derive(Debug, Args)]
-pub struct ShowArgs {
-    pub name: String,
-    #[arg(long)]
-    pub json: bool,
-}
-
-#[derive(Debug, Args)]
-pub struct DefaultArgs {
-    pub name: Option<String>,
-}
-
-#[derive(Debug, Args)]
-pub struct TrustArgs {
-    pub name: String,
-    #[arg(long)]
-    pub yes: bool,
-}
-
-#[derive(Debug, Args)]
-pub struct RunArgs {
-    #[arg(value_name = "TARGET", num_args = 1..=2)]
-    pub target: Vec<String>,
-    #[arg(long)]
-    pub json: bool,
-    #[arg(long)]
-    pub yes: bool,
-}
-
-#[derive(Debug, Args)]
-pub struct PutArgs {
-    #[arg(value_name = "TARGET", num_args = 2..=3)]
-    pub target: Vec<String>,
-    #[arg(long)]
-    pub yes: bool,
-}
-
-#[derive(Debug, Args)]
-pub struct GetArgs {
-    #[arg(value_name = "TARGET", num_args = 2..=3)]
-    pub target: Vec<String>,
-    #[arg(long)]
-    pub yes: bool,
-}
-
-#[derive(Debug, Args)]
-pub struct RemoveArgs {
-    pub name: String,
-    #[arg(long)]
-    pub yes: bool,
-}
-
-#[derive(Debug, Args)]
-pub struct DoctorArgs {
-    #[arg(long)]
-    pub json: bool,
-}
+pub use model::{
+    AddArgs, AuthArg, Cli, Command, DefaultArgs, DoctorArgs, GetArgs, ListArgs, ProfileAddArgs,
+    ProfileArgs, ProfileCommand, ProfileDefaultArgs, ProfileListArgs, ProfileRemoveArgs,
+    ProfileShowArgs, PutArgs, RemoveArgs, RunArgs, ShowArgs, TrustArgs,
+};
+pub use prompt::Prompter;
+use prompt::TerminalPrompter;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandOutput {
     pub stdout: String,
     pub stderr: String,
     pub exit_code: i32,
-}
-
-pub trait Prompter {
-    fn confirm(&mut self, prompt: &str) -> anyhow::Result<bool>;
-    fn password(&mut self, prompt: &str) -> anyhow::Result<String>;
 }
 
 /// Runtime context resolved from the active sshw home/profile plus the global
@@ -667,7 +472,7 @@ fn default_server(
         let name = config
             .default
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("no default server configured"))?;
+            .ok_or_else(no_default_server_error)?;
         return Ok(ok(format!("{name}\n")));
     };
 
@@ -1140,10 +945,13 @@ fn resolve_get_target(
 }
 
 fn default_server_name(config: &SshwConfig) -> anyhow::Result<String> {
-    config
-        .default
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("no default server configured"))
+    config.default.clone().ok_or_else(no_default_server_error)
+}
+
+fn no_default_server_error() -> anyhow::Error {
+    anyhow::anyhow!(
+        "no default server configured; run 'sshw default <name>' to set one or pass an explicit server name"
+    )
 }
 
 fn get_server<'a>(config: &'a SshwConfig, name: &str) -> anyhow::Result<&'a ServerConfig> {
@@ -1263,24 +1071,4 @@ fn print_output(output: CommandOutput) -> i32 {
     print!("{}", output.stdout);
     eprint!("{}", output.stderr);
     output.exit_code
-}
-
-struct TerminalPrompter;
-
-impl Prompter for TerminalPrompter {
-    fn confirm(&mut self, prompt: &str) -> anyhow::Result<bool> {
-        eprint!("{prompt}");
-        io::stderr().flush()?;
-
-        let mut answer = String::new();
-        io::stdin().read_line(&mut answer)?;
-        Ok(matches!(
-            answer.trim().to_ascii_lowercase().as_str(),
-            "y" | "yes"
-        ))
-    }
-
-    fn password(&mut self, prompt: &str) -> anyhow::Result<String> {
-        Ok(rpassword::prompt_password(prompt)?)
-    }
 }

@@ -25,7 +25,7 @@ It is **not a strong OS sandbox**. Specifically:
 
 - It is delegated access. If an agent may run `sshw run`, it has the server authority of the configured account.
 - A fully privileged local process running as the same OS user may access the OS credential store directly.
-- The policy `allow_commands` list matches by **program name**, so allowlisting a program grants its full capability *including its arguments and any files it can read or write*. `allow_commands` is therefore a strictly stronger grant than `allow_get_paths`/`allow_put_paths`; only allowlist programs you trust with arbitrary arguments.
+- The policy `allow_commands` list matches by **program name**, not by arguments. Allowlisting a program delegates that program's whole remote capability: its flags, files it can read/write, and any subprocesses it can spawn. Be careful with shells/interpreters (`sh`, `bash`, `python`, `perl`), file tools (`cat`, `tar`, `find`, `rsync`, `scp`), and privilege/process tools (`sudo`, service managers). `allow_commands` is therefore a strictly stronger grant than `allow_get_paths`/`allow_put_paths`; prefer narrow exact commands such as `uptime` or `systemctl status app`.
 - Redaction and audit redaction are **best-effort**. They catch common forms (PEM keys, `keyword=value`, bearer tokens) but not every secret passed inline as a flag (`-p`, `-a`, positional tokens) or split across lines. Do not pass secrets inline on the command line; use stored credentials.
 
 `sshw` never stores passwords, private keys, passphrases, or tokens in its config files. Password auth stores the password only through the native OS credential store (or, opt-in, a session-only in-memory backend). Agent auth stores no secret and uses the user's active SSH agent.
@@ -198,7 +198,7 @@ When enforcing, `run` commands must match `allow_commands` and `put`/`get` paths
 
 Policy fails closed: with `--policy`, a missing policy file is an error, and a present-but-unparseable file is always an error.
 
-See the Security Boundary note: `allow_commands` matches by program name and does not restrict arguments or file paths.
+See the Security Boundary note: `allow_commands` delegates whole-program execution. It does not restrict arguments, file paths, or subprocess behavior inside the allowed program.
 
 ### Audit Log
 
@@ -301,7 +301,7 @@ MIT
 
 - 위임된 접근 수단입니다. 에이전트가 `sshw run`을 쓸 수 있으면 설정된 계정의 서버 권한을 갖습니다.
 - 같은 OS 사용자 권한의 완전한 로컬 프로세스는 OS credential store에 직접 접근할 수 있습니다.
-- policy의 `allow_commands`는 **프로그램 이름**으로 매칭하므로, 어떤 프로그램을 allowlist에 넣으면 *그 프로그램의 인자와 읽고 쓸 수 있는 파일까지 포함한 전체 기능*을 허용하는 것입니다. 따라서 `allow_commands`는 `allow_get_paths`/`allow_put_paths`보다 강한 권한이며, 임의 인자를 신뢰할 수 있는 프로그램만 등록해야 합니다.
+- policy의 `allow_commands`는 인자가 아니라 **프로그램 이름**으로 매칭합니다. 어떤 프로그램을 allowlist에 넣는 것은 그 프로그램의 원격 실행권 전체를 위임하는 것과 같습니다. 그 프로그램의 플래그, 읽고 쓸 수 있는 파일, 자체 기능으로 실행할 수 있는 하위 프로세스까지 포함됩니다. 쉘/인터프리터(`sh`, `bash`, `python`, `perl`), 파일 도구(`cat`, `tar`, `find`, `rsync`, `scp`), 권한/프로세스 도구(`sudo`, service manager)는 특히 주의하세요. 따라서 `allow_commands`는 `allow_get_paths`/`allow_put_paths`보다 강한 권한이며, `uptime`이나 `systemctl status app` 같은 좁은 exact command를 선호하세요.
 - redaction과 audit redaction은 **best-effort**입니다. 흔한 형태(PEM 키, `keyword=value`, bearer 토큰)는 잡지만, 플래그로 전달된 비밀(`-p`, `-a`, 위치 인자 토큰)이나 여러 줄에 걸친 비밀은 못 잡을 수 있습니다. 비밀을 명령줄에 인라인으로 넘기지 말고 저장된 credential을 사용하세요.
 
 `sshw`는 비밀번호·개인키·패스프레이즈·토큰을 설정 파일에 저장하지 않습니다. password auth는 native OS credential store(또는 opt-in session-only in-memory backend)에만 저장하며, agent auth는 비밀을 저장하지 않고 사용자의 활성 SSH agent를 사용합니다.
@@ -472,7 +472,7 @@ policy는 **기본 off**입니다. 호출별로 `--policy`로 켜거나, home의
 
 policy는 fail-closed입니다. `--policy`인데 파일이 없으면 에러이고, 파일이 있으나 파싱 불가면 항상 에러입니다.
 
-보안 경계 참고: `allow_commands`는 프로그램 이름으로 매칭하며 인자나 파일 경로를 제한하지 않습니다.
+보안 경계 참고: `allow_commands`는 프로그램 실행권 전체를 위임합니다. 허용된 프로그램 내부의 인자, 파일 경로, 하위 프로세스 동작은 제한하지 않습니다.
 
 ### Audit Log
 

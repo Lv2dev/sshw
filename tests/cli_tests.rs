@@ -253,6 +253,7 @@ fn remove_requires_confirmation_unless_yes() {
     let ssh = FakeSshClient::default();
     let mut prompter = FakePrompter {
         confirm: false,
+        confirm_error: None,
         password: None,
     };
 
@@ -278,6 +279,35 @@ fn remove_requires_confirmation_unless_yes() {
 }
 
 #[test]
+fn confirmation_failure_is_reported_as_config_error() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &sample_config()).unwrap();
+    let store = FakeCredentialStore::default();
+    let ssh = FakeSshClient::default();
+    let mut prompter = FakePrompter {
+        confirm: false,
+        confirm_error: Some(
+            "confirmation requires an interactive terminal; rerun with --yes to confirm"
+                .to_string(),
+        ),
+        password: None,
+    };
+
+    let output = execute_for_runtime(
+        Cli::try_parse_from(["sshw", "remove", "server-alpha"]).unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    );
+
+    assert_eq!(output.exit_code, 3);
+    assert_eq!(output.stdout, "");
+    assert!(output.stderr.contains("interactive terminal"));
+}
+
+#[test]
 fn trust_passes_displayed_fingerprint_to_storage() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("servers.json");
@@ -289,6 +319,7 @@ fn trust_passes_displayed_fingerprint_to_storage() {
     };
     let mut prompter = FakePrompter {
         confirm: true,
+        confirm_error: None,
         password: None,
     };
 
@@ -462,6 +493,7 @@ fn add_password_rejects_empty_password_before_storing_secret() {
     let ssh = FakeSshClient::default();
     let mut prompter = FakePrompter {
         confirm: false,
+        confirm_error: None,
         password: Some(String::new()),
     };
 
@@ -663,6 +695,39 @@ fn run_without_name_requires_configured_default() {
     .unwrap_err();
 
     assert!(err.to_string().contains("no default server configured"));
+    assert!(err.to_string().contains("sshw default <name>"));
+    assert!(ssh.run_commands.borrow().is_empty());
+}
+
+#[test]
+fn json_run_without_name_reports_default_hint() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    let mut config = sample_config();
+    config.default = None;
+    save_config(&path, &config).unwrap();
+    let store = FakeCredentialStore::default();
+    let ssh = FakeSshClient::default();
+    let mut prompter = FakePrompter::default();
+
+    let output = execute_for_runtime(
+        Cli::try_parse_from(["sshw", "run", "hostname", "--json"]).unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    );
+
+    assert_eq!(output.exit_code, 3);
+    assert_eq!(output.stderr, "");
+    let json: serde_json::Value = serde_json::from_str(output.stdout.trim()).unwrap();
+    assert_eq!(json["error"]["kind"], "config");
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("sshw default <name>")
+    );
     assert!(ssh.run_commands.borrow().is_empty());
 }
 
@@ -829,6 +894,7 @@ fn add_password_stores_namespaced_credential_key() {
     let ssh = FakeSshClient::default();
     let mut prompter = FakePrompter {
         confirm: false,
+        confirm_error: None,
         password: Some("secret-pw".to_string()),
     };
 
@@ -1205,6 +1271,7 @@ fn add_password_under_session_backend_warns_not_persisted() {
     let ssh = FakeSshClient::default();
     let mut prompter = FakePrompter {
         confirm: false,
+        confirm_error: None,
         password: Some("secret-pw".to_string()),
     };
 
@@ -1721,11 +1788,15 @@ impl SshClient for FakeSshClient {
 #[derive(Default)]
 struct FakePrompter {
     confirm: bool,
+    confirm_error: Option<String>,
     password: Option<String>,
 }
 
 impl Prompter for FakePrompter {
     fn confirm(&mut self, _prompt: &str) -> anyhow::Result<bool> {
+        if let Some(message) = &self.confirm_error {
+            return Err(anyhow::anyhow!(message.clone()));
+        }
         Ok(self.confirm)
     }
 
