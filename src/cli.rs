@@ -52,7 +52,13 @@ pub struct ExecContext<'a> {
 }
 
 pub fn run() -> i32 {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        // Argument-parsing failures never reach a command, so handle them here:
+        // help/version exit 0, genuine usage errors get the dedicated `usage`
+        // kind / exit code, as a JSON envelope when `--json` was requested.
+        Err(err) => return print_output(parse_error_output(err, json_requested_in_args())),
+    };
     let json_errors = cli.command.wants_json_errors();
     let (home, registry_path) = match resolve_runtime(&cli) {
         Ok(resolved) => resolved,
@@ -1093,4 +1099,109 @@ fn print_output(output: CommandOutput) -> i32 {
     print!("{}", output.stdout);
     eprint!("{}", output.stderr);
     output.exit_code
+}
+
+/// Whether `--json` appears in the process arguments. Parsing already failed by
+/// the time this is consulted, so the raw args are scanned directly to decide
+/// how to format a clap usage error.
+fn json_requested_in_args() -> bool {
+    std::env::args().skip(1).any(|arg| arg == "--json")
+}
+
+/// Map a clap parse failure to a [`CommandOutput`]. Help/version requests are
+/// not errors: clap renders them to stdout and the process exits 0. Genuine
+/// usage errors get the dedicated `usage` kind / exit code 9 (distinct from the
+/// safety code 2), surfaced as a JSON envelope on stdout when `--json` was
+/// requested, or clap's formatted message on stderr otherwise.
+fn parse_error_output(err: clap::Error, json: bool) -> CommandOutput {
+    use clap::error::ErrorKind as ClapErrorKind;
+
+    if matches!(
+        err.kind(),
+        ClapErrorKind::DisplayHelp
+            | ClapErrorKind::DisplayVersion
+            | ClapErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+    ) {
+        return CommandOutput {
+            stdout: err.render().to_string(),
+            stderr: String::new(),
+            exit_code: 0,
+        };
+    }
+
+    let kind = ErrorKind::Usage;
+    let exit_code = kind.exit_code();
+    let rendered = err.render().to_string();
+
+    if json {
+        let response = ErrorResponse {
+            ok: false,
+            error: crate::output::ErrorBody {
+                kind,
+                message: clap_usage_summary(&rendered),
+                exit_code,
+            },
+        };
+        return CommandOutput {
+            stdout: error_json_line(&response),
+            stderr: String::new(),
+            exit_code,
+        };
+    }
+
+    CommandOutput {
+        stdout: String::new(),
+        stderr: rendered,
+        exit_code,
+    }
+}
+
+/// Condense clap's multi-line usage error into a concise single-line message for
+/// the JSON envelope (the first non-empty line, minus clap's `error: ` prefix).
+fn clap_usage_summary(rendered: &str) -> String {
+    rendered
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(|line| line.trim_start_matches("error: ").to_string())
+        .unwrap_or_else(|| rendered.trim().to_string())
+}
+
+#[cfg(test)]
+mod parse_error_tests {
+    use super::*;
+    use crate::output::ErrorKind;
+
+    fn parse_err(args: &[&str]) -> clap::Error {
+        Cli::try_parse_from(args).unwrap_err()
+    }
+
+    #[test]
+    fn usage_error_is_exit_9_on_stderr_without_json() {
+        let out = parse_error_output(parse_err(&["sshw", "--definitely-not-a-flag"]), false);
+        assert_eq!(out.exit_code, ErrorKind::Usage.exit_code());
+        assert_eq!(out.exit_code, 9);
+        assert!(out.stdout.is_empty());
+        assert!(!out.stderr.is_empty());
+    }
+
+    #[test]
+    fn usage_error_emits_json_envelope_with_usage_kind() {
+        let out = parse_error_output(parse_err(&["sshw", "--definitely-not-a-flag"]), true);
+        assert_eq!(out.exit_code, 9);
+        assert!(out.stderr.is_empty());
+        let value: serde_json::Value = serde_json::from_str(out.stdout.trim()).unwrap();
+        assert_eq!(value["ok"], json!(false));
+        assert_eq!(value["error"]["kind"], json!("usage"));
+        assert_eq!(value["error"]["exit_code"], json!(9));
+        assert!(value["error"]["message"].as_str().is_some());
+    }
+
+    #[test]
+    fn help_request_exits_zero_to_stdout() {
+        let out = parse_error_output(parse_err(&["sshw", "--help"]), false);
+        assert_eq!(out.exit_code, 0);
+        assert!(!out.stdout.is_empty());
+        assert!(out.stderr.is_empty());
+    }
 }

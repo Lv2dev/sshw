@@ -12,6 +12,11 @@ pub enum ErrorKind {
     Ssh,
     Io,
     Policy,
+    /// CLI usage error (bad arguments / unknown subcommand) detected by the
+    /// argument parser before a command runs. Kept distinct from `Safety` (2)
+    /// so an agent can tell "called sshw wrong" apart from "a safety rail
+    /// blocked the operation".
+    Usage,
     Unknown,
 }
 
@@ -24,6 +29,7 @@ impl ErrorKind {
             Self::Ssh => 5,
             Self::Io => 6,
             Self::Policy => 7,
+            Self::Usage => 9,
             Self::Unknown => 1,
         }
     }

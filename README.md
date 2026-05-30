@@ -239,6 +239,7 @@ Commands that support `--json` (`list`, `show`, `run`, `put`, `get`, `doctor`, `
 | `ssh` | 5 | SSH connection, host key, known_hosts, session, or transfer failed. |
 | `io` | 6 | Local file or filesystem handling failed. |
 | `policy` | 7 | A policy allowlist denied the operation, or policy enforcement failed closed. |
+| `usage` | 9 | CLI arguments were invalid (unknown flag/subcommand, missing or extra argument), detected before any command runs. |
 | `unknown` | 1 | The failure did not match a stable category. |
 
 `put --json` and `get --json` return transfer summaries on success:
@@ -248,6 +249,8 @@ Commands that support `--json` (`list`, `show`, `run`, `put`, `get`, `doctor`, `
 ```
 
 `add`, `trust`, `remove`, and `default` do not have a `--json` flag; they report human-readable errors on stderr with the same stable exit codes. Human output everywhere uses the same exit-code mapping.
+
+Invalid CLI arguments exit with code `9` (`usage`), kept distinct from `safety` (2) so an agent can tell "called sshw wrong" apart from "a safety rail blocked the operation". With `--json`, a usage error is emitted as the same envelope on stdout (`{"ok":false,"error":{"kind":"usage",...}}`); otherwise the parser's message goes to stderr. `--help`/`--version` print to stdout and exit `0`.
 
 These codes are sshw's own operational failures. When `run` connects and the remote command itself exits non-zero, sshw exits with code `8` — kept separate so a remote status can never be read as an sshw failure (e.g. a remote `grep` finding nothing). Exit `0` means the remote command succeeded. The real remote status is reported in `run --json` as `exit_status`, and in human mode as a `note: remote command exited with status N` line on stderr.
 
@@ -521,6 +524,7 @@ sshw doctor --json
 | `ssh` | 5 | SSH 연결, host key, known_hosts, session, 전송 실패. |
 | `io` | 6 | 로컬 파일/파일시스템 처리 실패. |
 | `policy` | 7 | policy allowlist가 작업을 거부했거나 policy 적용이 fail-closed. |
+| `usage` | 9 | CLI 인자가 잘못됨(알 수 없는 플래그/서브커맨드, 인자 누락/초과). 명령 실행 전에 감지. |
 | `unknown` | 1 | 안정 카테고리에 매핑되지 않은 실패. |
 
 `put --json`과 `get --json`은 성공 시 전송 요약을 반환합니다.
@@ -530,6 +534,8 @@ sshw doctor --json
 ```
 
 `add`, `trust`, `remove`, `default`에는 `--json` 플래그가 없으며, 동일한 안정 exit code로 stderr에 사람용 메시지를 출력합니다. human 출력도 같은 exit code 매핑을 사용합니다.
+
+잘못된 CLI 인자는 exit code `9`(`usage`)로 끝나며, `safety`(2)와 분리해 에이전트가 "sshw를 잘못 호출함"과 "safety rail이 차단함"을 구분할 수 있습니다. `--json`이면 usage 오류도 동일한 envelope로 stdout에 출력하고(`{"ok":false,"error":{"kind":"usage",...}}`), 아니면 파서 메시지를 stderr로 보냅니다. `--help`/`--version`은 stdout으로 출력하고 exit `0`입니다.
 
 이 코드들은 sshw 자신의 운영 실패입니다. `run`이 연결에 성공하고 원격 명령 자체가 0이 아닌 코드로 끝나면 sshw는 exit code `8`을 반환합니다 — 원격 상태(예: 매치를 못 찾은 원격 `grep`)가 sshw 실패로 오인되지 않도록 분리한 코드입니다. exit `0`은 원격 명령 성공을 뜻합니다. 실제 원격 상태는 `run --json`의 `exit_status`로, human 모드에서는 stderr의 `note: remote command exited with status N` 줄로 보고됩니다.
 
