@@ -6,6 +6,7 @@ use sshw::output::{
 #[test]
 fn run_output_serializes_for_agents() {
     let output = RunOutput {
+        ok: true,
         server: "server-alpha".to_string(),
         command: "hostname".to_string(),
         exit_status: 0,
@@ -16,6 +17,7 @@ fn run_output_serializes_for_agents() {
 
     let json = serde_json::to_string(&output).unwrap();
 
+    assert!(json.contains("\"ok\":true"));
     assert!(json.contains("\"server\":\"server-alpha\""));
     assert!(json.contains("\"exit_status\":0"));
     assert!(!json.contains("password"));

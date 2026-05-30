@@ -42,7 +42,8 @@ pub struct CommandOutput {
 }
 
 /// Runtime context resolved from the active sshw home/profile plus the global
-/// profile registry. Grows in later milestones (policy, audit).
+/// profile registry, bundling the policy-enforcement flag and audit sink that
+/// command handlers need.
 pub struct ExecContext<'a> {
     pub home: &'a ResolvedHome,
     pub registry_path: &'a Path,
@@ -456,7 +457,13 @@ fn show_server(args: ShowArgs, config: &SshwConfig) -> anyhow::Result<CommandOut
     );
 
     if args.json {
-        return Ok(ok(format!("{}\n", serde_json::to_string(&output)?)));
+        // `show` returns a single object, so add the `ok` discriminator without
+        // touching `ServerOutput` (which `list` serializes as bare array items).
+        let mut value = serde_json::to_value(&output)?;
+        if let Some(map) = value.as_object_mut() {
+            map.insert("ok".to_string(), serde_json::Value::Bool(true));
+        }
+        return Ok(ok(format!("{}\n", serde_json::to_string(&value)?)));
     }
 
     Ok(ok(format!(
@@ -550,6 +557,7 @@ where
 
     if json {
         let output = RunOutput {
+            ok: true,
             server: server_name,
             command: redact_secrets(&command),
             exit_status: result.exit_status,
@@ -713,6 +721,7 @@ where
 
     if args.json {
         let output = json!({
+            "ok": true,
             "home": home.root,
             "home_source": home.description,
             "registry_path": registry_path,
@@ -861,6 +870,7 @@ fn profile_show(
 
     if args.json {
         let output = json!({
+            "ok": true,
             "name": args.name,
             "id": entry.id,
             "home": entry.home,

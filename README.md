@@ -248,6 +248,8 @@ Commands that support `--json` (`list`, `show`, `run`, `put`, `get`, `doctor`, `
 {"ok":true,"server":"server-alpha","local":"./app","remote":"/tmp/app","bytes":1234}
 ```
 
+Every single-object `--json` success response (`run`, `show`, `doctor`, `profile show`, `put`, `get`) includes `"ok":true`, mirroring the `"ok":false` error envelope so a consumer can branch on `ok`. `list` and `profile list` return a JSON array on success (no wrapping object); on failure they emit the same `{"ok":false,...}` envelope.
+
 `add`, `trust`, `remove`, and `default` do not have a `--json` flag; they report human-readable errors on stderr with the same stable exit codes. Human output everywhere uses the same exit-code mapping.
 
 Invalid CLI arguments exit with code `9` (`usage`), kept distinct from `safety` (2) so an agent can tell "called sshw wrong" apart from "a safety rail blocked the operation". With `--json`, a usage error is emitted as the same envelope on stdout (`{"ok":false,"error":{"kind":"usage",...}}`); otherwise the parser's message goes to stderr. `--help`/`--version` print to stdout and exit `0`.
@@ -532,6 +534,8 @@ sshw doctor --json
 ```json
 {"ok":true,"server":"server-alpha","local":"./app","remote":"/tmp/app","bytes":1234}
 ```
+
+단일 object를 반환하는 `--json` 성공 응답(`run`, `show`, `doctor`, `profile show`, `put`, `get`)은 모두 `"ok":true`를 포함해 오류 envelope의 `"ok":false`와 대칭을 이루므로, 소비자가 `ok`로 분기할 수 있습니다. `list`와 `profile list`는 성공 시 JSON 배열을 반환하며(래핑 object 없음), 실패 시에는 동일한 `{"ok":false,...}` envelope를 출력합니다.
 
 `add`, `trust`, `remove`, `default`에는 `--json` 플래그가 없으며, 동일한 안정 exit code로 stderr에 사람용 메시지를 출력합니다. human 출력도 같은 exit code 매핑을 사용합니다.
 

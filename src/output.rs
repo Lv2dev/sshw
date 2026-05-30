@@ -145,6 +145,9 @@ pub fn classify_error(err: &anyhow::Error) -> ErrorKind {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RunOutput {
+    /// Always `true`; mirrors the `ok` discriminator on the error envelope and
+    /// the put/get success summaries so JSON consumers can branch on `ok`.
+    pub ok: bool,
     pub server: String,
     pub command: String,
     pub exit_status: i32,
