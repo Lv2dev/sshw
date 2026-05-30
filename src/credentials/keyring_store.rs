@@ -1,5 +1,8 @@
 use super::{CredentialStore, CredentialStoreHealth};
+use anyhow::Context;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(target_os = "linux")]
 use std::collections::HashMap;
@@ -34,19 +37,54 @@ impl CredentialStore for KeyringCredentialStore {
     fn health_check(&self) -> anyhow::Result<CredentialStoreHealth> {
         ensure_native_store()?;
         let backend = backend_name().to_string();
-        let credential = "sshw:doctor";
-        let user = "doctor";
-        let entry = keyring_core::Entry::new(credential, user)?;
-        entry.set_password("doctor-secret")?;
-        let value = entry.get_password()?;
-        let _ = entry.delete_credential();
+        let probe = new_health_probe();
+        let entry = keyring_core::Entry::new(&probe.credential, probe.user)?;
+        entry.set_password(&probe.secret)?;
+        let value = entry.get_password();
+        cleanup_health_probe(entry.delete_credential())?;
+        let value = value?;
+        let available = value == probe.secret;
 
         Ok(CredentialStoreHealth {
             backend,
-            available: value == "doctor-secret",
-            message: "credential store read/write succeeded".to_string(),
+            available,
+            message: if available {
+                "credential store read/write/cleanup succeeded".to_string()
+            } else {
+                "credential store read/write mismatch".to_string()
+            },
         })
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HealthProbe {
+    credential: String,
+    user: &'static str,
+    secret: String,
+}
+
+fn new_health_probe() -> HealthProbe {
+    let nonce = health_nonce();
+    HealthProbe {
+        credential: format!("sshw:doctor:{nonce}"),
+        user: "doctor",
+        secret: format!("sshw-health-secret:{nonce}"),
+    }
+}
+
+fn health_nonce() -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!("{}-{timestamp:x}-{counter:x}", std::process::id())
+}
+
+fn cleanup_health_probe(result: keyring_core::Result<()>) -> anyhow::Result<()> {
+    result.context("credential health cleanup failed")
 }
 
 fn ensure_native_store() -> anyhow::Result<()> {
@@ -104,5 +142,30 @@ fn backend_name() -> &'static str {
     #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     {
         "unsupported"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn health_probe_uses_unique_nonce_and_non_fixed_secret() {
+        let first = super::new_health_probe();
+        let second = super::new_health_probe();
+
+        assert_ne!(first.credential, second.credential);
+        assert_ne!(first.secret, second.secret);
+        assert_ne!(first.secret, "doctor-secret");
+        assert!(first.credential.starts_with("sshw:doctor:"));
+        assert_eq!(first.user, "doctor");
+    }
+
+    #[test]
+    fn health_probe_cleanup_failure_is_reported() {
+        let err = super::cleanup_health_probe(Err(keyring_core::Error::NotSupportedByStore(
+            "cleanup failed".to_string(),
+        )))
+        .unwrap_err();
+
+        assert!(err.to_string().contains("credential health cleanup failed"));
     }
 }
