@@ -125,6 +125,14 @@ sshw add server-alpha --host 192.0.2.10 --port 2222 --user deploy
 
 Password auth is the default. `sshw` prompts for the password with hidden input and stores it in the active credential backend under the home's namespace.
 
+For non-interactive registration, pipe the password from a secret manager:
+
+```bash
+secret-manager-read deploy/server-alpha | sshw add server-alpha --host 192.0.2.10 --port 2222 --user deploy --password-stdin
+```
+
+`--password-stdin` is valid only with password auth. It reads stdin once, strips one final LF or CRLF, rejects empty input, and avoids placing the password in argv or shell history. `sshw` intentionally does not provide `--password <value>`.
+
 On Linux the native backend requires a working Secret Service provider (GNOME Keyring, KWallet). `sshw doctor` reports availability; `sshw` never falls back to plaintext storage.
 
 ### SSH Agent Auth
@@ -158,7 +166,7 @@ sshw trust server-alpha --yes
 ### Commands
 
 ```bash
-sshw add <name> --host <host> --port <port> --user <user> [--auth password|agent] [--force]
+sshw add <name> --host <host> --port <port> --user <user> [--auth password|agent] [--password-stdin] [--force]
 sshw list [--json]
 sshw show <name> [--json]
 sshw default [<name>]
@@ -417,6 +425,14 @@ sshw add server-alpha --host 192.0.2.10 --port 2222 --user deploy
 
 비밀번호 인증이 기본값입니다. `sshw`는 숨김 입력으로 비밀번호를 받아 활성 credential backend의 home namespace 키로 저장합니다.
 
+비대화형 등록에서는 secret manager 출력에서 비밀번호를 pipe로 전달할 수 있습니다.
+
+```bash
+secret-manager-read deploy/server-alpha | sshw add server-alpha --host 192.0.2.10 --port 2222 --user deploy --password-stdin
+```
+
+`--password-stdin`은 password auth에서만 유효합니다. stdin을 한 번 읽고 마지막 LF 또는 CRLF 하나만 제거하며, 빈 입력은 거부합니다. 이 경로는 비밀번호를 argv나 shell history에 남기지 않기 위한 것이며, `sshw`는 의도적으로 `--password <value>` 인자를 제공하지 않습니다.
+
 Linux의 native backend는 동작하는 Secret Service provider(GNOME Keyring, KWallet)가 필요합니다. `sshw doctor`가 가용성을 보고하며, 평문 저장으로 fallback하지 않습니다.
 
 ### SSH Agent 인증
@@ -450,7 +466,7 @@ sshw trust server-alpha --yes
 ### 명령
 
 ```bash
-sshw add <name> --host <host> --port <port> --user <user> [--auth password|agent] [--force]
+sshw add <name> --host <host> --port <port> --user <user> [--auth password|agent] [--password-stdin] [--force]
 sshw list [--json]
 sshw show <name> [--json]
 sshw default [<name>]

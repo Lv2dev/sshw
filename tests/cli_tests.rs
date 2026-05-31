@@ -39,6 +39,30 @@ fn parses_add_with_default_password_auth() {
 }
 
 #[test]
+fn parses_add_with_password_stdin() {
+    let cli = Cli::try_parse_from([
+        "sshw",
+        "add",
+        "server-alpha",
+        "--host",
+        "192.0.2.10",
+        "--port",
+        "2222",
+        "--user",
+        "deploy",
+        "--password-stdin",
+    ])
+    .unwrap();
+
+    let Command::Add(args) = cli.command else {
+        panic!("expected add command");
+    };
+
+    assert!(args.password_stdin);
+    assert_eq!(args.auth, AuthArg::Password);
+}
+
+#[test]
 fn parses_agent_add_run_and_trust() {
     Cli::try_parse_from([
         "sshw",
@@ -255,6 +279,7 @@ fn remove_requires_confirmation_unless_yes() {
         confirm: false,
         confirm_error: None,
         password: None,
+        password_stdin: None,
     };
 
     let err = execute(
@@ -292,6 +317,7 @@ fn confirmation_failure_is_reported_as_config_error() {
                 .to_string(),
         ),
         password: None,
+        password_stdin: None,
     };
 
     let output = execute_for_runtime(
@@ -321,6 +347,7 @@ fn trust_passes_displayed_fingerprint_to_storage() {
         confirm: true,
         confirm_error: None,
         password: None,
+        password_stdin: None,
     };
 
     let output = execute(
@@ -495,6 +522,7 @@ fn add_password_rejects_empty_password_before_storing_secret() {
         confirm: false,
         confirm_error: None,
         password: Some(String::new()),
+        password_stdin: None,
     };
 
     let err = execute(
@@ -518,6 +546,93 @@ fn add_password_rejects_empty_password_before_storing_secret() {
     .unwrap_err();
 
     assert!(err.to_string().contains("password cannot be empty"));
+    assert!(store.values.borrow().is_empty());
+}
+
+#[test]
+fn add_password_stdin_stores_namespaced_credential_key() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &SshwConfig::default()).unwrap();
+    let store = FakeCredentialStore::default();
+    let ssh = FakeSshClient::default();
+    let mut prompter = FakePrompter {
+        confirm: false,
+        confirm_error: None,
+        password: Some("PROMPT_PASSWORD".to_string()),
+        password_stdin: Some("STDIN_PASSWORD".to_string()),
+    };
+
+    execute(
+        Cli::try_parse_from([
+            "sshw",
+            "add",
+            "server-alpha",
+            "--host",
+            "192.0.2.10",
+            "--port",
+            "2222",
+            "--user",
+            "deploy",
+            "--password-stdin",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    )
+    .unwrap();
+
+    let values = store.values.borrow();
+    assert_eq!(values.len(), 1);
+    let ((credential, user), password) = values.iter().next().unwrap();
+    assert_eq!(user, "deploy");
+    assert_eq!(password, "STDIN_PASSWORD");
+    assert!(credential.starts_with("sshw:"));
+    assert!(credential.ends_with(":server-alpha"));
+    assert_ne!(credential, "sshw:server-alpha");
+}
+
+#[test]
+fn add_password_stdin_rejects_agent_auth() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &SshwConfig::default()).unwrap();
+    let store = FakeCredentialStore::default();
+    let ssh = FakeSshClient::default();
+    let mut prompter = FakePrompter {
+        confirm: false,
+        confirm_error: None,
+        password: None,
+        password_stdin: Some("STDIN_PASSWORD".to_string()),
+    };
+
+    let err = execute(
+        Cli::try_parse_from([
+            "sshw",
+            "add",
+            "server-alpha",
+            "--host",
+            "192.0.2.10",
+            "--port",
+            "2222",
+            "--user",
+            "deploy",
+            "--auth",
+            "agent",
+            "--password-stdin",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    )
+    .unwrap_err();
+
+    assert!(err.to_string().contains("--password-stdin"));
+    assert!(err.to_string().contains("--auth agent"));
     assert!(store.values.borrow().is_empty());
 }
 
@@ -1045,6 +1160,7 @@ fn add_password_stores_namespaced_credential_key() {
         confirm: false,
         confirm_error: None,
         password: Some("secret-pw".to_string()),
+        password_stdin: None,
     };
 
     execute(
@@ -1422,6 +1538,7 @@ fn add_password_under_session_backend_warns_not_persisted() {
         confirm: false,
         confirm_error: None,
         password: Some("secret-pw".to_string()),
+        password_stdin: None,
     };
 
     let output = execute(
@@ -1939,6 +2056,7 @@ struct FakePrompter {
     confirm: bool,
     confirm_error: Option<String>,
     password: Option<String>,
+    password_stdin: Option<String>,
 }
 
 impl Prompter for FakePrompter {
@@ -1954,5 +2072,12 @@ impl Prompter for FakePrompter {
             .password
             .clone()
             .unwrap_or_else(|| "YOUR_PASSWORD".to_string()))
+    }
+
+    fn password_stdin(&mut self) -> anyhow::Result<String> {
+        Ok(self
+            .password_stdin
+            .clone()
+            .unwrap_or_else(|| "YOUR_STDIN_PASSWORD".to_string()))
     }
 }

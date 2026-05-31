@@ -126,6 +126,8 @@ pub struct AddArgs {
     pub auth: AuthArg,
     #[arg(long)]
     pub force: bool,
+    #[arg(long)]
+    pub password_stdin: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

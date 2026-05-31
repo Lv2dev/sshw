@@ -383,14 +383,25 @@ where
     let auth = match args.auth {
         AuthArg::Password => {
             let credential = namespace.credential_key(&args.name);
-            let password = prompter.password("SSH password: ")?;
+            let password = if args.password_stdin {
+                prompter.password_stdin()?
+            } else {
+                prompter.password("SSH password: ")?
+            };
             if password.is_empty() {
                 return Err(anyhow::anyhow!("password cannot be empty"));
             }
             credentials.set_password(&credential, &args.user, &password)?;
             AuthConfig::Password { credential }
         }
-        AuthArg::Agent => AuthConfig::Agent,
+        AuthArg::Agent => {
+            if args.password_stdin {
+                return Err(anyhow::anyhow!(
+                    "--password-stdin cannot be used with --auth agent"
+                ));
+            }
+            AuthConfig::Agent
+        }
     };
 
     let new_server = ServerConfig {

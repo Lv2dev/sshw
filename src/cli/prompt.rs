@@ -1,8 +1,9 @@
-use std::io::{self, BufRead, IsTerminal, Write};
+use std::io::{self, BufRead, IsTerminal, Read, Write};
 
 pub trait Prompter {
     fn confirm(&mut self, prompt: &str) -> anyhow::Result<bool>;
     fn password(&mut self, prompt: &str) -> anyhow::Result<String>;
+    fn password_stdin(&mut self) -> anyhow::Result<String>;
 }
 
 pub(crate) struct TerminalPrompter;
@@ -19,6 +20,12 @@ impl Prompter for TerminalPrompter {
 
     fn password(&mut self, prompt: &str) -> anyhow::Result<String> {
         Ok(rpassword::prompt_password(prompt)?)
+    }
+
+    fn password_stdin(&mut self) -> anyhow::Result<String> {
+        let stdin = io::stdin();
+        let mut input = stdin.lock();
+        password_from_reader(&mut input)
     }
 }
 
@@ -55,6 +62,27 @@ where
     ))
 }
 
+fn password_from_reader<R>(input: &mut R) -> anyhow::Result<String>
+where
+    R: Read,
+{
+    let mut password = String::new();
+    input.read_to_string(&mut password)?;
+
+    if password.ends_with('\n') {
+        password.pop();
+        if password.ends_with('\r') {
+            password.pop();
+        }
+    }
+
+    if password.is_empty() {
+        return Err(anyhow::anyhow!("password cannot be empty"));
+    }
+
+    Ok(password)
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
@@ -89,5 +117,41 @@ mod tests {
 
         assert!(super::confirm_from_reader("confirm? ", &mut yes, &mut output, true).unwrap());
         assert!(!super::confirm_from_reader("confirm? ", &mut no, &mut output, true).unwrap());
+    }
+
+    #[test]
+    fn password_from_reader_strips_one_final_lf() {
+        let mut input = Cursor::new(b"secret\n");
+
+        let password = super::password_from_reader(&mut input).unwrap();
+
+        assert_eq!(password, "secret");
+    }
+
+    #[test]
+    fn password_from_reader_strips_one_final_crlf() {
+        let mut input = Cursor::new(b"secret\r\n");
+
+        let password = super::password_from_reader(&mut input).unwrap();
+
+        assert_eq!(password, "secret");
+    }
+
+    #[test]
+    fn password_from_reader_preserves_embedded_newline() {
+        let mut input = Cursor::new(b"line-one\nline-two\n");
+
+        let password = super::password_from_reader(&mut input).unwrap();
+
+        assert_eq!(password, "line-one\nline-two");
+    }
+
+    #[test]
+    fn password_from_reader_rejects_empty_after_trimming_final_newline() {
+        let mut input = Cursor::new(b"\n");
+
+        let err = super::password_from_reader(&mut input).unwrap_err();
+
+        assert!(err.to_string().contains("password cannot be empty"));
     }
 }
