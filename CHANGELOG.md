@@ -8,6 +8,11 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-06-01
+
+### Added
+- `sshw doctor` and `sshw doctor --json` now report the libssh2 version and OpenSSL linkage/version status used by the current build, helping users check installed binaries against native-library security advisories.
+
 ## [0.6.1] - 2026-06-01
 
 ### Fixed
@@ -103,7 +108,9 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 
 - Initial public release: registered-server SSH `run`/`put`/`get` with secrets kept in the OS credential store, fail-closed `known_hosts` verification, and explicit `sshw trust`.
 
-[Unreleased]: https://github.com/Lv2dev/sshw/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/Lv2dev/sshw/compare/v0.6.2...HEAD
+[0.6.2]: https://github.com/Lv2dev/sshw/compare/v0.6.1...v0.6.2
+[0.6.1]: https://github.com/Lv2dev/sshw/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/Lv2dev/sshw/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/Lv2dev/sshw/releases/tag/v0.5.1
 [0.5.0]: https://github.com/Lv2dev/sshw/releases/tag/v0.5.0
