@@ -1,0 +1,1 @@
+{"version":1,"enabled":true,"allow_commands":["ls","uptime","systemctl status *"],"allow_put_paths":["/srv/app"],"allow_get_paths":["/var/log"]}

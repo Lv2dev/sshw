@@ -10,11 +10,19 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+serde_json = "1.0"
 sshw = { path = ".." }
 
 [[bin]]
 name = "redact_secrets"
 path = "fuzz_targets/redact_secrets.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "policy_file"
+path = "fuzz_targets/policy_file.rs"
 test = false
 doc = false
 bench = false

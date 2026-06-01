@@ -1044,6 +1044,7 @@ name = "sshw-fuzz"
 version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
+ "serde_json",
  "sshw",
 ]
 

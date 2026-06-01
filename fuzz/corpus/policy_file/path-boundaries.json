@@ -1,0 +1,1 @@
+{"enabled":true,"allow_commands":[],"allow_put_paths":["","/srv/app/","/tmp/sshw"],"allow_get_paths":["/var/log/","/srv/app"]}

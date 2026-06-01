@@ -1,0 +1,1 @@
+{"enabled":true,"allow_commands":["ls","ls && echo done","deploy *"],"allow_put_paths":[],"allow_get_paths":[]}
