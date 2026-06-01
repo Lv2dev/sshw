@@ -2,8 +2,14 @@
 # Gates the dependency graph on security advisories, licenses, and sources.
 
 [advisories]
+# Use the canonical RustSec advisory database and keep advisory lint levels
+# explicit so cargo-deny default changes do not silently alter the CI gate.
+db-urls = ["https://github.com/RustSec/advisory-db"]
 # Fail on any crate with a known RUSTSEC advisory or a yanked release.
 yanked = "deny"
+unmaintained = "all"
+unsound = "workspace"
+unused-ignored-advisory = "deny"
 
 [licenses]
 # Permissive licenses present in the dependency tree. A crate offering a
