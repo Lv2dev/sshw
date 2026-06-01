@@ -8,6 +8,11 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-06-01
+
+### Fixed
+- Windows non-ASCII `known_hosts` paths are now handled through Rust file I/O instead of libssh2 path-based known-host file APIs, so host trust and verification work when the sshw home path contains Unicode characters.
+
 ## [0.6.0] - 2026-06-01
 
 ### Added

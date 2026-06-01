@@ -1,6 +1,6 @@
 [package]
 name = "sshw"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2024"
 rust-version = "1.88"
 description = "Cross-platform SSH helper for delegated local coding-agent access without plaintext secrets."
