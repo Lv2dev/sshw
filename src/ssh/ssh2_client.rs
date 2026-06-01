@@ -97,7 +97,7 @@ impl SshClient for Ssh2Client {
         let mut known_hosts = session.known_hosts()?;
 
         if known_hosts_path.exists() {
-            known_hosts.read_file(&known_hosts_path, KnownHostFileKind::OpenSSH)?;
+            read_known_hosts_file(&mut known_hosts, &known_hosts_path)?;
         }
 
         match known_hosts.check_port(&server.host, server.port, key) {
@@ -113,9 +113,6 @@ impl SshClient for Ssh2Client {
                 server.port
             )),
             CheckResult::NotFound => {
-                if let Some(parent) = known_hosts_path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
                 let host_entry = known_host_name(&server.host, server.port);
                 known_hosts.add(
                     &host_entry,
@@ -123,7 +120,7 @@ impl SshClient for Ssh2Client {
                     server_name,
                     KnownHostKeyFormat::from(key_type),
                 )?;
-                known_hosts.write_file(&known_hosts_path, KnownHostFileKind::OpenSSH)?;
+                write_known_hosts_file(&known_hosts, &known_hosts_path)?;
                 Ok(info)
             }
         }
@@ -413,12 +410,39 @@ fn verify_known_host(
     }
 
     let mut known_hosts = session.known_hosts()?;
-    known_hosts.read_file(known_hosts_path, KnownHostFileKind::OpenSSH)?;
+    read_known_hosts_file(&mut known_hosts, known_hosts_path)?;
 
     known_host_verification_result(
         known_hosts.check_port(&server.host, server.port, key),
         server,
     )
+}
+
+fn read_known_hosts_file(known_hosts: &mut ssh2::KnownHosts, path: &Path) -> anyhow::Result<()> {
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("failed to read known_hosts file: {}", path.display()))?;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let mut entry = String::with_capacity(line.len() + 1);
+        entry.push_str(line);
+        entry.push('\n');
+        known_hosts
+            .read_str(&entry, KnownHostFileKind::OpenSSH)
+            .with_context(|| format!("failed to parse known_hosts file: {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn write_known_hosts_file(known_hosts: &ssh2::KnownHosts, path: &Path) -> anyhow::Result<()> {
+    let mut output = String::new();
+    for host in known_hosts.hosts()? {
+        output.push_str(&known_hosts.write_string(&host, KnownHostFileKind::OpenSSH)?);
+    }
+    crate::storage::write_owner_only_atomic(path, &output)
+        .with_context(|| format!("failed to write known_hosts file: {}", path.display()))
 }
 
 fn known_host_verification_result(
@@ -531,6 +555,11 @@ fn unknown_host_key_error(server: &ServerConfig) -> anyhow::Error {
 mod tests {
     use crate::config::{AuthConfig, ServerConfig};
     use ssh2::CheckResult;
+    use std::fs;
+
+    const KNOWN_HOSTS_LINE: &str = "\
+example.test ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB9zU1OEQ2tzYhrXq4/DEjvRNvKv6cU4Xar6gghj1p7D
+";
 
     #[test]
     fn default_client_has_connect_timeout() {
@@ -583,6 +612,38 @@ mod tests {
         assert_eq!(
             client.known_hosts_override(),
             Some(Path::new("/x/known_hosts"))
+        );
+    }
+
+    #[test]
+    fn read_known_hosts_file_supports_non_ascii_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let known_hosts_path = dir.path().join("유니코드").join("known_hosts");
+        fs::create_dir_all(known_hosts_path.parent().unwrap()).unwrap();
+        fs::write(&known_hosts_path, KNOWN_HOSTS_LINE).unwrap();
+        let session = ssh2::Session::new().unwrap();
+        let mut known_hosts = session.known_hosts().unwrap();
+
+        super::read_known_hosts_file(&mut known_hosts, &known_hosts_path).unwrap();
+
+        assert_eq!(known_hosts.hosts().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn write_known_hosts_file_supports_non_ascii_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let known_hosts_path = dir.path().join("유니코드").join("known_hosts");
+        let session = ssh2::Session::new().unwrap();
+        let mut known_hosts = session.known_hosts().unwrap();
+        known_hosts
+            .read_str(KNOWN_HOSTS_LINE, ssh2::KnownHostFileKind::OpenSSH)
+            .unwrap();
+
+        super::write_known_hosts_file(&known_hosts, &known_hosts_path).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&known_hosts_path).unwrap(),
+            KNOWN_HOSTS_LINE
         );
     }
 
