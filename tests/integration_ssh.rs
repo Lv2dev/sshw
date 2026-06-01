@@ -25,6 +25,9 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
+const TEST_USER: &str = "sshw";
+const TEST_PASSWORD: &str = "sshw-integration-password";
+
 /// A throwaway sshd + ssh-agent rooted in a temp dir. Everything is killed and
 /// removed on drop. Runs entirely as the current (non-root) user: the private
 /// sshd only accepts pubkey logins for that same user, which is all we need.
@@ -40,6 +43,16 @@ struct TestServer {
 impl TestServer {
     fn start() -> TestServer {
         let dir = tempfile::tempdir().expect("tempdir");
+        let known_hosts = dir.path().join("known_hosts");
+        Self::start_in(dir, known_hosts)
+    }
+
+    fn start_with_known_hosts(known_hosts: PathBuf) -> TestServer {
+        let dir = tempfile::tempdir().expect("tempdir");
+        Self::start_in(dir, known_hosts)
+    }
+
+    fn start_in(dir: TempDir, known_hosts: PathBuf) -> TestServer {
         let root = dir.path().to_path_buf();
         let user = std::env::var("USER")
             .or_else(|_| std::env::var("LOGNAME"))
@@ -129,7 +142,7 @@ impl TestServer {
             agent,
             port,
             user,
-            known_hosts: root.join("known_hosts"),
+            known_hosts,
         }
     }
 
@@ -164,6 +177,119 @@ impl Drop for TestServer {
         let _ = self.agent.kill();
         let _ = self.sshd.wait();
         let _ = self.agent.wait();
+    }
+}
+
+/// A throwaway Docker sshd used only for password auth. The normal OpenSSH
+/// loopback harness stays host-local and agent-only so it never touches system
+/// account passwords.
+struct DockerPasswordServer {
+    _dir: TempDir,
+    container_id: String,
+    image_tag: String,
+    port: u16,
+    known_hosts: PathBuf,
+}
+
+impl DockerPasswordServer {
+    fn start() -> Option<DockerPasswordServer> {
+        if !docker_available() {
+            if docker_required() {
+                panic!("Docker is required for the password auth integration test");
+            }
+            eprintln!("skipping password auth integration test: Docker is not available");
+            return None;
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let known_hosts = dir.path().join("known_hosts");
+        let image_tag = format!("sshw-password-sshd:integration-{}", std::process::id());
+        let fixture_dir =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/password-sshd");
+
+        let build = Command::new("docker")
+            .args(["build", "-q", "-t"])
+            .arg(&image_tag)
+            .arg(&fixture_dir)
+            .output()
+            .expect("docker build");
+        assert!(
+            build.status.success(),
+            "docker build failed:\n{}",
+            String::from_utf8_lossy(&build.stderr)
+        );
+
+        let port = free_port();
+        let run = Command::new("docker")
+            .args(["run", "-d", "--rm", "-p"])
+            .arg(format!("127.0.0.1:{port}:22"))
+            .arg(&image_tag)
+            .output()
+            .expect("docker run");
+        assert!(
+            run.status.success(),
+            "docker run failed:\n{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        let container_id = String::from_utf8_lossy(&run.stdout).trim().to_string();
+        assert!(
+            !container_id.is_empty(),
+            "docker run returned no container id"
+        );
+
+        let server = password_server_config(port);
+        if let Err(err) = wait_for_ssh_server(&server, Duration::from_secs(15)) {
+            let logs = docker_logs(&container_id);
+            let _ = Command::new("docker")
+                .args(["rm", "-f"])
+                .arg(&container_id)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            panic!("{err}\ncontainer logs:\n{logs}");
+        }
+
+        Some(DockerPasswordServer {
+            _dir: dir,
+            container_id,
+            image_tag,
+            port,
+            known_hosts,
+        })
+    }
+
+    fn server(&self) -> ServerConfig {
+        password_server_config(self.port)
+    }
+
+    fn client(&self) -> Ssh2Client {
+        Ssh2Client::default().with_known_hosts(self.known_hosts.clone())
+    }
+
+    fn trust(&self) {
+        let client = self.client();
+        let server = self.server();
+        let info = client.host_key(&server).expect("host_key");
+        client
+            .trust_host("docker-password", &server, &info.fingerprint_sha256)
+            .expect("trust_host");
+    }
+}
+
+impl Drop for DockerPasswordServer {
+    fn drop(&mut self) {
+        let _ = Command::new("docker")
+            .args(["rm", "-f"])
+            .arg(&self.container_id)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        let _ = Command::new("docker")
+            .args(["rmi", "-f"])
+            .arg(&self.image_tag)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
     }
 }
 
@@ -212,6 +338,86 @@ fn wait_for_port(port: u16) {
     }
 }
 
+fn wait_for_ssh_server(server: &ServerConfig, timeout: Duration) -> Result<(), String> {
+    let start = Instant::now();
+    let mut last_error = "not attempted yet".to_string();
+    loop {
+        if start.elapsed() >= timeout {
+            return Err(format!(
+                "timeout waiting for Docker sshd on {}:{}; last error: {}",
+                server.host, server.port, last_error
+            ));
+        }
+        match Ssh2Client::default().host_key(server) {
+            Ok(_) => return Ok(()),
+            Err(err) => last_error = err.to_string(),
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn password_server_config(port: u16) -> ServerConfig {
+    ServerConfig {
+        host: "127.0.0.1".to_string(),
+        port,
+        user: TEST_USER.to_string(),
+        auth: AuthConfig::Password {
+            credential: "docker-password".to_string(),
+        },
+    }
+}
+
+fn docker_available() -> bool {
+    Command::new("docker")
+        .args(["version", "--format", "{{.Server.Version}}"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn docker_required() -> bool {
+    std::env::var_os("CI").is_some()
+        || std::env::var("SSHW_DOCKER_PASSWORD_TEST").as_deref() == Ok("1")
+}
+
+fn docker_logs(container_id: &str) -> String {
+    match Command::new("docker").args(["logs", container_id]).output() {
+        Ok(output) => {
+            let mut logs = String::from_utf8_lossy(&output.stdout).into_owned();
+            logs.push_str(&String::from_utf8_lossy(&output.stderr));
+            logs
+        }
+        Err(err) => format!("failed to collect docker logs: {err}"),
+    }
+}
+
+fn clone_known_host_entry_to_port(known_hosts: &Path, from_port: u16, to_port: u16) {
+    let from = known_host_name("127.0.0.1", from_port);
+    let to = known_host_name("127.0.0.1", to_port);
+    let content = fs::read_to_string(known_hosts).expect("read known_hosts");
+    let line = content
+        .lines()
+        .find(|line| line.split_whitespace().next() == Some(from.as_str()))
+        .unwrap_or_else(|| panic!("known_hosts entry not found for {from}"));
+    let cloned = line.replacen(&from, &to, 1);
+    let mut updated = content;
+    if !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    updated.push_str(&cloned);
+    updated.push('\n');
+    fs::write(known_hosts, updated).expect("write cloned known_hosts entry");
+}
+
+fn known_host_name(host: &str, port: u16) -> String {
+    if port == 22 {
+        host.to_string()
+    } else {
+        format!("[{host}]:{port}")
+    }
+}
+
 #[test]
 #[ignore = "spawns a real sshd; run with --ignored --test-threads=1"]
 fn run_executes_remote_command() {
@@ -255,6 +461,53 @@ fn run_rejected_when_host_key_not_trusted() {
         err.to_string().contains("host key"),
         "unexpected error: {err}"
     );
+}
+
+#[test]
+#[ignore = "spawns a real sshd; run with --ignored --test-threads=1"]
+fn run_rejects_changed_host_key_for_trusted_host() {
+    let state = tempfile::tempdir().expect("tempdir");
+    let known_hosts = state.path().join("known_hosts");
+    let trusted = TestServer::start_with_known_hosts(known_hosts.clone());
+    trusted.trust();
+
+    let changed = TestServer::start_with_known_hosts(known_hosts.clone());
+    clone_known_host_entry_to_port(&known_hosts, trusted.port, changed.port);
+
+    let err = changed
+        .client()
+        .run(
+            &changed.server(),
+            &AuthMaterial::Agent,
+            "echo should-not-run",
+        )
+        .expect_err("run must fail closed when a trusted host key changes");
+
+    assert!(
+        err.to_string().contains("trusted key changed"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+#[ignore = "spawns a Docker-backed sshd; run with --ignored --test-threads=1"]
+fn run_authenticates_with_password_against_real_sshd() {
+    let Some(srv) = DockerPasswordServer::start() else {
+        return;
+    };
+    srv.trust();
+
+    let result = srv
+        .client()
+        .run(
+            &srv.server(),
+            &AuthMaterial::Password(TEST_PASSWORD.to_string()),
+            "printf password-ok",
+        )
+        .expect("password-authenticated run");
+
+    assert_eq!(result.exit_status, 0);
+    assert_eq!(result.stdout, "password-ok");
 }
 
 #[test]
