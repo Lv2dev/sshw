@@ -1,4 +1,6 @@
 /target
+/fuzz/artifacts
+/fuzz/target
 
 # Local AI agent context and helper files
 .ai/
