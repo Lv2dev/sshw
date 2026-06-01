@@ -240,6 +240,48 @@ fn redaction_is_idempotent() {
 }
 
 #[test]
+fn redaction_samples_remove_sensitive_values() {
+    for (input, secret) in [
+        ("password=hunter2", "hunter2"),
+        ("PASSWORD: swordfish", "swordfish"),
+        ("  \"password\":\"json-secret\"", "json-secret"),
+        ("api_key = \"AKIAEXAMPLEKEY\"", "AKIAEXAMPLEKEY"),
+        (
+            "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMIabcd",
+            "wJalrXUtnFEMIabcd",
+        ),
+        ("refresh_token: r1.r2.r3", "r1.r2.r3"),
+        ("auth_token='quoted-secret'", "quoted-secret"),
+        ("Authorization: Bearer abc.def.ghi", "abc.def.ghi"),
+    ] {
+        let once = redact_secrets(input);
+        let twice = redact_secrets(&once);
+
+        assert!(
+            once.contains("<redacted>"),
+            "sample was not redacted: {input}"
+        );
+        assert!(!once.contains(secret), "secret leaked for sample: {input}");
+        assert_eq!(once, twice, "redaction was not idempotent: {input}");
+    }
+}
+
+#[test]
+fn redaction_samples_keep_non_secret_text() {
+    for input in [
+        "ok\n",
+        "token bucket capacity is normal",
+        "the password is in the vault",
+        "credential name sshw:p_abc123:web",
+        "sshw:p_abc123:web",
+        "authentication succeeded",
+        "private_key material is not shown here",
+    ] {
+        assert_eq!(redact_secrets(input), input, "sample changed: {input}");
+    }
+}
+
+#[test]
 fn preserves_unrelated_stderr_lines() {
     let stderr = "permission denied\nstty: unexpected option\n";
 

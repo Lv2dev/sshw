@@ -114,6 +114,92 @@ fn trailing_slash_path_entry_matches_children() {
 }
 
 #[test]
+fn command_allowlist_rejects_metacharacter_bypass_samples() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = write_policy(
+        temp.path(),
+        r#"{"enabled":true,"allow_commands":["ls","uptime","systemctl status *"]}"#,
+    );
+
+    match resolve_policy(&path, false).unwrap() {
+        Policy::Enabled(rules) => {
+            assert!(rules.allows_command("ls -la /srv"));
+            assert!(rules.allows_command("uptime"));
+            assert!(rules.allows_command("systemctl status nginx"));
+
+            for command in [
+                "ls; whoami",
+                "ls && whoami",
+                "ls | sh",
+                "ls $(whoami)",
+                "ls `whoami`",
+                "ls > /tmp/out",
+                "ls\nwhoami",
+                "/bin/ls && rm -rf /",
+                "uptime || reboot",
+                "systemctl status nginx && reboot",
+                "systemctl status nginx; reboot",
+            ] {
+                assert!(
+                    !rules.allows_command(command),
+                    "metacharacter sample was allowed: {command:?}"
+                );
+            }
+        }
+        Policy::Disabled => panic!("expected enabled policy"),
+    }
+}
+
+#[test]
+fn transfer_allowlist_rejects_sibling_and_traversal_samples() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = write_policy(
+        temp.path(),
+        r#"{"enabled":true,"allow_put_paths":["/srv/app"],"allow_get_paths":["/var/log"]}"#,
+    );
+
+    match resolve_policy(&path, false).unwrap() {
+        Policy::Enabled(rules) => {
+            assert!(rules.allows_put("/srv/app"));
+            assert!(rules.allows_put("/srv/app/bin/run"));
+            assert!(rules.allows_get("/var/log"));
+            assert!(rules.allows_get("/var/log/syslog"));
+
+            for path in [
+                "/srv/app2",
+                "/srv/application",
+                "/srv/app../secret",
+                "/srv/app/../secret",
+                "/srv/app/../../etc/passwd",
+                "/srv/app\\..\\secret",
+                "/srv/app\\..\\..\\etc\\passwd",
+            ] {
+                assert!(
+                    !rules.allows_put(path),
+                    "put path sample was allowed: {path:?}"
+                );
+            }
+
+            for path in [
+                "/var/logs",
+                "/var/login",
+                "/var/log../secret",
+                "/var/log/../secret",
+                "/var/log/../../root/.ssh/id_rsa",
+                "/var/log\\..\\secret",
+                "/var/log\\..\\..\\root\\.ssh\\id_rsa",
+            ] {
+                assert!(
+                    !rules.allows_get(path),
+                    "get path sample was allowed: {path:?}"
+                );
+            }
+        }
+        Policy::Disabled => panic!("expected enabled policy"),
+    }
+}
+
+#[test]
 fn unreadable_policy_file_classifies_as_policy() {
     let temp = tempfile::tempdir().unwrap();
     // A directory named policy.json cannot be read as a file.
