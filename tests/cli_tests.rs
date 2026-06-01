@@ -1126,6 +1126,59 @@ fn doctor_json_reports_missing_credentials_without_secrets() {
 }
 
 #[test]
+fn doctor_json_reports_runtime_ssh_library_versions() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &SshwConfig::default()).unwrap();
+    let store = FakeCredentialStore::default();
+    let ssh = FakeSshClient::default();
+    let mut prompter = FakePrompter::default();
+
+    let output = execute(
+        Cli::try_parse_from(["sshw", "doctor", "--json"]).unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    )
+    .unwrap();
+
+    let json: serde_json::Value = serde_json::from_str(output.stdout.trim()).unwrap();
+    assert!(
+        json["libssh2_version"]
+            .as_str()
+            .is_some_and(|version| !version.is_empty())
+    );
+    assert!(
+        json["openssl_version"]
+            .as_str()
+            .is_some_and(|version| !version.is_empty())
+    );
+}
+
+#[test]
+fn doctor_human_reports_runtime_ssh_library_versions() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &SshwConfig::default()).unwrap();
+    let store = FakeCredentialStore::default();
+    let ssh = FakeSshClient::default();
+    let mut prompter = FakePrompter::default();
+
+    let output = execute(
+        Cli::try_parse_from(["sshw", "doctor"]).unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    )
+    .unwrap();
+
+    assert!(output.stdout.contains("libssh2 version: "));
+    assert!(output.stdout.contains("openssl version: "));
+}
+
+#[test]
 fn parses_global_home_flag_before_subcommand() {
     let cli = Cli::try_parse_from(["sshw", "--home", "/proj/.sshw", "list"]).unwrap();
 

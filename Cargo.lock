@@ -982,6 +982,8 @@ dependencies = [
  "dbus-secret-service-keyring-store",
  "directories",
  "keyring-core",
+ "libssh2-sys",
+ "openssl-sys",
  "rpassword",
  "serde",
  "serde_json",

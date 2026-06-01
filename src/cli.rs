@@ -12,7 +12,7 @@ use crate::profile::{load_registry, resolve_home_with_registry};
 use crate::safety::{SafetyDecision, classify_command};
 use crate::sandbox::{NoopSandbox, PolicyOnlySandbox, Sandbox, SandboxDecision};
 use crate::ssh::SshClient;
-use crate::ssh::ssh2_client::Ssh2Client;
+use crate::ssh::ssh2_client::{Ssh2Client, runtime_library_versions};
 use anyhow::Context;
 use clap::Parser;
 use serde_json::json;
@@ -436,6 +436,7 @@ where
             message: format!("credential store unavailable: {err}"),
         });
     let missing_credentials = missing_credentials(credentials, config);
+    let library_versions = runtime_library_versions();
 
     if args.json {
         let output = json!({
@@ -454,6 +455,8 @@ where
             "audit_writable": audit_writable,
             "credential_namespace": home.namespace.token(),
             "os": std::env::consts::OS,
+            "libssh2_version": library_versions.libssh2,
+            "openssl_version": library_versions.openssl,
             "credential_backend": health.backend,
             "credential_available": health.available,
             "credential_message": health.message,
@@ -463,7 +466,7 @@ where
     }
 
     let mut stdout = format!(
-        "home: {}\nhome source: {}\nregistry path: {}\nconfig path: {}\nconfig exists: {}\nknown_hosts path: {}\npolicy path: {}\npolicy present: {}\npolicy valid: {}\npolicy enabled: {}\naudit path: {}\naudit writable: {}\ncredential namespace: {}\nos: {}\ncredential backend: {}\ncredential available: {}\ncredential message: {}\n",
+        "home: {}\nhome source: {}\nregistry path: {}\nconfig path: {}\nconfig exists: {}\nknown_hosts path: {}\npolicy path: {}\npolicy present: {}\npolicy valid: {}\npolicy enabled: {}\naudit path: {}\naudit writable: {}\ncredential namespace: {}\nos: {}\nlibssh2 version: {}\nopenssl version: {}\ncredential backend: {}\ncredential available: {}\ncredential message: {}\n",
         home.root.display(),
         home.description,
         registry_path.display(),
@@ -478,6 +481,8 @@ where
         audit_writable,
         home.namespace.token(),
         std::env::consts::OS,
+        library_versions.libssh2,
+        library_versions.openssl,
         health.backend,
         health.available,
         health.message

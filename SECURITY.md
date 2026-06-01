@@ -35,6 +35,8 @@ gh attestation verify sshw-x86_64-unknown-linux-gnu.tar.gz -R Lv2dev/sshw
 
 Attestations establish where and how an artifact was built (repository, workflow, commit, and event). They do not prove the artifact is vulnerability-free or safe to run in a particular environment; consumers still need to evaluate the release contents and their own policy.
 
+`sshw doctor` reports the libssh2 and OpenSSL version/status that the current binary was built to use. This is diagnostic evidence for vulnerability triage, not a security guarantee and not a replacement for checksum or attestation verification. On Windows default builds, OpenSSL may be reported as not linked because libssh2 uses the Windows WinCNG backend.
+
 ## Limitations (Not Guarantees)
 
 These are explicitly **not** strong guarantees:

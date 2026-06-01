@@ -232,7 +232,7 @@ sshw doctor
 sshw doctor --json
 ```
 
-`doctor` reports the resolved home and how it was selected, the registry / config / known_hosts / policy / audit paths, whether the config file exists, the operating system, the credential namespace, whether policy is present/valid/enabled, whether the audit log is writable, the credential backend health, and any configured servers whose credentials are missing (`missing_credentials`).
+`doctor` reports the resolved home and how it was selected, the registry / config / known_hosts / policy / audit paths, whether the config file exists, the operating system, the linked libssh2 and OpenSSL version/status, the credential namespace, whether policy is present/valid/enabled, whether the audit log is writable, the credential backend health, and any configured servers whose credentials are missing (`missing_credentials`). On Windows default builds, `openssl_version` may report `not linked (Windows WinCNG backend)` because libssh2 uses WinCNG instead of OpenSSL.
 
 ### JSON Error Contract
 
@@ -530,7 +530,7 @@ sshw doctor
 sshw doctor --json
 ```
 
-`doctor`는 해석된 home과 선택 경위, registry/config/known_hosts/policy/audit 경로, config 파일 존재 여부, 운영체제, credential namespace, policy present/valid/enabled, audit 쓰기 가능 여부, credential backend 상태, 그리고 credential이 없는 등록 서버 목록(`missing_credentials`)을 보고합니다.
+`doctor`는 해석된 home과 선택 경위, registry/config/known_hosts/policy/audit 경로, config 파일 존재 여부, 운영체제, 연결된 libssh2 및 OpenSSL 버전/상태, credential namespace, policy present/valid/enabled, audit 쓰기 가능 여부, credential backend 상태, 그리고 credential이 없는 등록 서버 목록(`missing_credentials`)을 보고합니다. Windows 기본 빌드에서는 libssh2가 OpenSSL 대신 WinCNG를 사용하므로 `openssl_version`이 `not linked (Windows WinCNG backend)`로 표시될 수 있습니다.
 
 ### JSON 오류 계약
 

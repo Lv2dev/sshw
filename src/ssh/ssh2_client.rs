@@ -13,6 +13,23 @@ use std::time::{Duration, Instant};
 
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RuntimeLibraryVersions {
+    pub(crate) libssh2: String,
+    pub(crate) openssl: String,
+}
+
+pub(crate) fn runtime_library_versions() -> RuntimeLibraryVersions {
+    RuntimeLibraryVersions {
+        libssh2: option_env!("SSHW_LIBSSH2_VERSION")
+            .unwrap_or("unavailable")
+            .to_string(),
+        openssl: option_env!("SSHW_OPENSSL_VERSION")
+            .unwrap_or("unavailable")
+            .to_string(),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Ssh2Client {
     connect_timeout: Duration,
