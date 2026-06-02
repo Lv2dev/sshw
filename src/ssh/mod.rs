@@ -39,6 +39,18 @@ pub trait SshClient {
         auth: &AuthMaterial,
         command: &str,
     ) -> anyhow::Result<RunResult>;
+    fn run_with_stdin(
+        &self,
+        server: &ServerConfig,
+        auth: &AuthMaterial,
+        command: &str,
+        stdin: &str,
+    ) -> anyhow::Result<RunResult> {
+        let _ = (server, auth, command, stdin);
+        Err(anyhow::anyhow!(
+            "ssh session stdin is unsupported by this backend"
+        ))
+    }
     fn put(
         &self,
         server: &ServerConfig,

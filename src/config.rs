@@ -9,6 +9,8 @@ pub struct SshwConfig {
     pub version: u32,
     pub default: Option<String>,
     pub servers: BTreeMap<String, ServerConfig>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub privileges: BTreeMap<String, PrivilegeConfig>,
     /// Which credential backend this home uses. Defaults to the native OS
     /// keyring; older config files without the field load as `native`.
     #[serde(default)]
@@ -21,6 +23,7 @@ impl Default for SshwConfig {
             version: 1,
             default: None,
             servers: BTreeMap::new(),
+            privileges: BTreeMap::new(),
             credential_backend: CredentialBackend::Native,
         }
     }
@@ -51,6 +54,25 @@ pub struct ServerConfig {
 pub enum AuthConfig {
     Password { credential: String },
     Agent,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PrivilegeConfig {
+    pub method: PrivilegeMethod,
+    #[serde(default = "default_privilege_user")]
+    pub user: String,
+    pub credential: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum PrivilegeMethod {
+    Sudo,
+    Su,
+}
+
+fn default_privilege_user() -> String {
+    "root".to_string()
 }
 
 pub fn load_config(path: &Path) -> anyhow::Result<SshwConfig> {

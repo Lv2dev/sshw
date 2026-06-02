@@ -36,6 +36,10 @@ impl CredentialNamespace {
     pub fn credential_key(&self, server: &str) -> String {
         format!("sshw:{}:{}", self.token, server)
     }
+
+    pub fn privilege_credential_key(&self, server: &str) -> String {
+        format!("sshw:{}:privilege:{}", self.token, server)
+    }
 }
 
 /// Filesystem layout + credential namespace for the active home.

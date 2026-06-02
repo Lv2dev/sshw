@@ -41,6 +41,8 @@ pub enum Command {
     Get(GetArgs),
     Remove(RemoveArgs),
     Doctor(DoctorArgs),
+    /// Manage privilege escalation credentials for a configured server.
+    Privilege(PrivilegeArgs),
     /// Manage named sshw profiles (each maps a name to a home directory).
     Profile(ProfileArgs),
 }
@@ -59,11 +61,74 @@ impl Command {
                     false
                 }
             },
+            Self::Privilege(args) => match &args.command {
+                PrivilegeCommand::Show(a) => a.json,
+                PrivilegeCommand::Set(_) | PrivilegeCommand::Clear(_) => false,
+            },
             Self::Put(args) => args.json,
             Self::Get(args) => args.json,
             Self::Add(_) | Self::Default(_) | Self::Trust(_) | Self::Remove(_) => false,
         }
     }
+}
+
+#[derive(Debug, Args)]
+pub struct PrivilegeArgs {
+    #[command(subcommand)]
+    pub command: PrivilegeCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PrivilegeCommand {
+    /// Store privilege escalation metadata and password for a server.
+    Set(PrivilegeSetArgs),
+    /// Show privilege metadata without revealing the password.
+    Show(PrivilegeShowArgs),
+    /// Remove privilege metadata and delete the stored privilege password.
+    Clear(PrivilegeClearArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct PrivilegeSetArgs {
+    /// Server name to configure.
+    pub name: String,
+    /// Privilege method. `sudo` can execute via `run --as-root`; `su` is
+    /// stored as metadata but rejected for execution until PTY handling exists.
+    #[arg(long, value_enum, default_value_t = PrivilegeMethodArg::Sudo)]
+    pub method: PrivilegeMethodArg,
+    /// Target privileged user.
+    #[arg(long, default_value = "root")]
+    pub user: String,
+    /// Read the privilege password from stdin instead of a hidden prompt.
+    #[arg(long)]
+    pub password_stdin: bool,
+    /// Overwrite an existing privilege configuration without prompting.
+    #[arg(long)]
+    pub force: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct PrivilegeShowArgs {
+    /// Server name to inspect.
+    pub name: String,
+    /// Emit JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct PrivilegeClearArgs {
+    /// Server name to clear.
+    pub name: String,
+    /// Confirm removal non-interactively.
+    #[arg(long)]
+    pub yes: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum PrivilegeMethodArg {
+    Sudo,
+    Su,
 }
 
 #[derive(Debug, Args)]
@@ -165,10 +230,16 @@ pub struct TrustArgs {
 pub struct RunArgs {
     #[arg(value_name = "TARGET", num_args = 1..=2)]
     pub target: Vec<String>,
+    /// Emit JSON.
     #[arg(long)]
     pub json: bool,
+    /// Confirm safety-sensitive commands non-interactively.
     #[arg(long)]
     pub yes: bool,
+    /// Run through the server's configured sudo privilege path. Requires
+    /// `--yes`; never automatic.
+    #[arg(long)]
+    pub as_root: bool,
 }
 
 #[derive(Debug, Args)]

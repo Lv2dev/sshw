@@ -63,7 +63,7 @@ done
 All state lives under per-project **homes**. A home directory contains:
 
 ```text
-<home>/servers.json    server metadata (host, port, user, auth type, credential key)
+<home>/servers.json    server metadata (host, port, user, auth type, credential key, privilege metadata)
 <home>/known_hosts      trusted SSH host keys (OpenSSH format)
 <home>/policy.json      optional policy (see Policy Enforcement)
 <home>/audit.jsonl      append-only audit log
@@ -83,6 +83,7 @@ Credential keyring entries are always namespaced so the same server name in diff
 ```text
 sshw:<profile-id>:<server>     for registered/built-in profiles
 sshw:home_<hash>:<server>      for ad-hoc --home / SSHW_HOME
+sshw:<profile-id>:privilege:<server>     privileged sudo/su credential metadata
 ```
 
 ### Selecting A Home
@@ -152,6 +153,19 @@ The home's `servers.json` selects the credential backend via `credential_backend
 
 An external-helper backend is a planned extension behind the same `CredentialStore` trait.
 
+### Privileged Commands
+
+```bash
+secret-manager-read root/server-alpha | sshw privilege set server-alpha --method sudo --password-stdin
+sshw privilege show server-alpha
+sshw privilege clear server-alpha --yes
+sshw run server-alpha "systemctl restart app" --as-root --yes
+```
+
+`privilege set` stores only method, target user (default `root`), and credential key metadata in `servers.json`. The sudo/root password is stored in the active credential backend, never in CLI arguments or plaintext config. Without `--password-stdin`, `sshw` prompts with hidden input.
+
+`run --as-root` is explicit and always requires `--yes`. It first applies the normal safety and policy checks to the original command, then uses `sudo -S` with the privilege password passed through SSH channel stdin. The password is never embedded in the remote command string or audit detail. `su` metadata can be recorded, but `run --as-root` rejects `method=su` until PTY prompt handling is validated.
+
 ### Host Trust Flow
 
 Host key verification fails closed; unknown or changed keys are not silently accepted. Trusted keys are stored in the active home's `known_hosts`.
@@ -171,11 +185,12 @@ sshw list [--json]
 sshw show <name> [--json]
 sshw default [<name>]
 sshw trust <name> [--yes]
-sshw run [<name>] "<command>" [--json] [--yes]
+sshw run [<name>] "<command>" [--json] [--yes] [--as-root]
 sshw put [<name>] <local> <remote> [--json] [--yes]
 sshw get [<name>] <remote> <local> [--json] [--yes]
 sshw remove <name> [--yes]
 sshw doctor [--json]
+sshw privilege <set|show|clear> ...
 sshw profile <add|list|show|default|remove> ...
 ```
 
@@ -213,7 +228,7 @@ See the Security Boundary note: `allow_commands` delegates whole-program executi
 
 ### Audit Log
 
-Mutating/active operations (`add`, `remove`, `trust`, `default`, `run`, `put`, `get`) are appended to the home's `audit.jsonl`, one JSON object per line:
+Mutating/active operations (`add`, `remove`, `trust`, `default`, `run`, `put`, `get`, `privilege set`, `privilege clear`) are appended to the home's `audit.jsonl`, one JSON object per line:
 
 ```json
 {"time_ms":1700000000000,"action":"run","server":"web","status":"ok","exit_code":0,"detail":"uptime"}
@@ -223,7 +238,7 @@ Mutating/active operations (`add`, `remove`, `trust`, `default`, `run`, `put`, `
 
 ### Output Redaction
 
-`run` stdout, stderr, and the echoed command are passed through best-effort redaction that masks PEM private-key blocks, `keyword=value`/`keyword: value` assignments for common secret keywords, and bearer tokens. This does not understand shell semantics: a secret passed as a flag value (`mysql -phunter2`) or split across lines may not be masked. Do not pass secrets inline; remote command output is otherwise returned verbatim.
+`run` stdout, stderr, and the echoed command are passed through best-effort redaction that masks PEM private-key blocks, `keyword=value`/`keyword: value` assignments for common secret keywords, and bearer tokens. For `run --as-root`, the configured privilege password is also redacted if it appears verbatim in stdout/stderr. This does not understand shell semantics: a secret passed as a flag value (`mysql -phunter2`) or split across lines may not be masked. Do not pass secrets inline; remote command output is otherwise returned verbatim.
 
 ### Doctor
 
@@ -236,7 +251,7 @@ sshw doctor --json
 
 ### JSON Error Contract
 
-Commands that support `--json` (`list`, `show`, `run`, `put`, `get`, `doctor`, `profile list`, `profile show`) return a structured error envelope on runtime failures:
+Commands that support `--json` (`list`, `show`, `run`, `put`, `get`, `doctor`, `profile list`, `profile show`, `privilege show`) return a structured error envelope on runtime failures:
 
 ```json
 {"ok":false,"error":{"kind":"config","message":"unknown server 'missing'","exit_code":3}}
@@ -259,7 +274,7 @@ Commands that support `--json` (`list`, `show`, `run`, `put`, `get`, `doctor`, `
 {"ok":true,"server":"server-alpha","local":"./app","remote":"/tmp/app","bytes":1234}
 ```
 
-Every single-object `--json` success response (`run`, `show`, `doctor`, `profile show`, `put`, `get`) includes `"ok":true`, mirroring the `"ok":false` error envelope so a consumer can branch on `ok`. `list` and `profile list` return a JSON array on success (no wrapping object); on failure they emit the same `{"ok":false,...}` envelope.
+Every single-object `--json` success response (`run`, `show`, `doctor`, `profile show`, `privilege show`, `put`, `get`) includes `"ok":true`, mirroring the `"ok":false` error envelope so a consumer can branch on `ok`. `list` and `profile list` return a JSON array on success (no wrapping object); on failure they emit the same `{"ok":false,...}` envelope.
 
 `add`, `trust`, `remove`, and `default` do not have a `--json` flag; they report human-readable errors on stderr with the same stable exit codes. Human output everywhere uses the same exit-code mapping.
 
@@ -363,7 +378,7 @@ done
 모든 상태는 프로젝트별 **home** 아래에 있습니다. home 디렉터리 구성:
 
 ```text
-<home>/servers.json    서버 메타데이터(host, port, user, auth type, credential key)
+<home>/servers.json    서버 메타데이터(host, port, user, auth type, credential key, privilege metadata)
 <home>/known_hosts      신뢰한 SSH host key(OpenSSH 형식)
 <home>/policy.json      선택적 policy(아래 Policy 참고)
 <home>/audit.jsonl      append-only audit log
@@ -383,6 +398,7 @@ credential keyring 키는 항상 namespaced이므로, 서로 다른 home에서 �
 ```text
 sshw:<profile-id>:<server>     등록/내장 profile
 sshw:home_<hash>:<server>      ad-hoc --home / SSHW_HOME
+sshw:<profile-id>:privilege:<server>     privileged sudo/su credential metadata
 ```
 
 ### home 선택
@@ -452,6 +468,19 @@ home의 `servers.json`이 `credential_backend`(기본 `native`)로 백엔드를 
 
 external-helper 백엔드는 동일한 `CredentialStore` trait 뒤의 후속 확장점입니다.
 
+### 권한 상승 명령
+
+```bash
+secret-manager-read root/server-alpha | sshw privilege set server-alpha --method sudo --password-stdin
+sshw privilege show server-alpha
+sshw privilege clear server-alpha --yes
+sshw run server-alpha "systemctl restart app" --as-root --yes
+```
+
+`privilege set`은 method, 대상 user(기본 `root`), credential key metadata만 `servers.json`에 저장합니다. sudo/root 비밀번호는 활성 credential backend에만 저장되며 CLI 인자나 평문 config에는 들어가지 않습니다. `--password-stdin`을 쓰지 않으면 숨김 입력 프롬프트로 받습니다.
+
+`run --as-root`는 명시적으로만 동작하며 항상 `--yes`가 필요합니다. 원래 명령에 기존 safety/policy 검사를 먼저 적용한 뒤, SSH channel stdin으로만 privilege 비밀번호를 전달하는 `sudo -S` 경로를 사용합니다. 비밀번호는 원격 command string이나 audit detail에 들어가지 않습니다. `su` metadata는 기록할 수 있지만, PTY prompt 처리가 검증되기 전까지 `run --as-root`의 `method=su` 실행은 fail-closed로 거부됩니다.
+
 ### Host Trust Flow
 
 Host key 검증은 fail-closed이며, 알 수 없거나 변경된 key는 조용히 허용하지 않습니다. 신뢰한 key는 활성 home의 `known_hosts`에 저장됩니다.
@@ -471,11 +500,12 @@ sshw list [--json]
 sshw show <name> [--json]
 sshw default [<name>]
 sshw trust <name> [--yes]
-sshw run [<name>] "<command>" [--json] [--yes]
+sshw run [<name>] "<command>" [--json] [--yes] [--as-root]
 sshw put [<name>] <local> <remote> [--json] [--yes]
 sshw get [<name>] <remote> <local> [--json] [--yes]
 sshw remove <name> [--yes]
 sshw doctor [--json]
+sshw privilege <set|show|clear> ...
 sshw profile <add|list|show|default|remove> ...
 ```
 
@@ -511,7 +541,7 @@ policy는 fail-closed입니다. `--policy`인데 파일이 없으면 에러이�
 
 ### Audit Log
 
-변경/실행 작업(`add`, `remove`, `trust`, `default`, `run`, `put`, `get`)은 home의 `audit.jsonl`에 줄당 JSON 객체로 append됩니다.
+변경/실행 작업(`add`, `remove`, `trust`, `default`, `run`, `put`, `get`, `privilege set`, `privilege clear`)은 home의 `audit.jsonl`에 줄당 JSON 객체로 append됩니다.
 
 ```json
 {"time_ms":1700000000000,"action":"run","server":"web","status":"ok","exit_code":0,"detail":"uptime"}
@@ -521,7 +551,7 @@ policy는 fail-closed입니다. `--policy`인데 파일이 없으면 에러이�
 
 ### 출력 redaction
 
-`run`의 stdout/stderr/echo된 command는 best-effort redaction을 거칩니다. PEM 개인키 블록, 흔한 비밀 keyword의 `keyword=value`/`keyword: value`, bearer 토큰을 마스킹합니다. 쉘 의미는 이해하지 못하므로, 플래그 값으로 전달된 비밀(`mysql -phunter2`)이나 여러 줄에 걸친 비밀은 마스킹되지 않을 수 있습니다. 비밀을 인라인으로 넘기지 마세요. 그 외 원격 출력은 그대로 반환됩니다.
+`run`의 stdout/stderr/echo된 command는 best-effort redaction을 거칩니다. PEM 개인키 블록, 흔한 비밀 keyword의 `keyword=value`/`keyword: value`, bearer 토큰을 마스킹합니다. `run --as-root`에서는 설정된 privilege 비밀번호가 stdout/stderr에 그대로 나타나면 추가로 마스킹합니다. 쉘 의미는 이해하지 못하므로, 플래그 값으로 전달된 비밀(`mysql -phunter2`)이나 여러 줄에 걸친 비밀은 마스킹되지 않을 수 있습니다. 비밀을 인라인으로 넘기지 마세요. 그 외 원격 출력은 그대로 반환됩니다.
 
 ### Doctor
 
@@ -534,7 +564,7 @@ sshw doctor --json
 
 ### JSON 오류 계약
 
-`--json`을 지원하는 명령(`list`, `show`, `run`, `put`, `get`, `doctor`, `profile list`, `profile show`)은 런타임 실패 시 구조화된 envelope를 반환합니다.
+`--json`을 지원하는 명령(`list`, `show`, `run`, `put`, `get`, `doctor`, `profile list`, `profile show`, `privilege show`)은 런타임 실패 시 구조화된 envelope를 반환합니다.
 
 ```json
 {"ok":false,"error":{"kind":"config","message":"unknown server 'missing'","exit_code":3}}
@@ -557,7 +587,7 @@ sshw doctor --json
 {"ok":true,"server":"server-alpha","local":"./app","remote":"/tmp/app","bytes":1234}
 ```
 
-단일 object를 반환하는 `--json` 성공 응답(`run`, `show`, `doctor`, `profile show`, `put`, `get`)은 모두 `"ok":true`를 포함해 오류 envelope의 `"ok":false`와 대칭을 이루므로, 소비자가 `ok`로 분기할 수 있습니다. `list`와 `profile list`는 성공 시 JSON 배열을 반환하며(래핑 object 없음), 실패 시에는 동일한 `{"ok":false,...}` envelope를 출력합니다.
+단일 object를 반환하는 `--json` 성공 응답(`run`, `show`, `doctor`, `profile show`, `privilege show`, `put`, `get`)은 모두 `"ok":true`를 포함해 오류 envelope의 `"ok":false`와 대칭을 이루므로, 소비자가 `ok`로 분기할 수 있습니다. `list`와 `profile list`는 성공 시 JSON 배열을 반환하며(래핑 object 없음), 실패 시에는 동일한 `{"ok":false,...}` envelope를 출력합니다.
 
 `add`, `trust`, `remove`, `default`에는 `--json` 플래그가 없으며, 동일한 안정 exit code로 stderr에 사람용 메시지를 출력합니다. human 출력도 같은 exit code 매핑을 사용합니다.
 

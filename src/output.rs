@@ -101,6 +101,7 @@ pub fn classify_error(err: &anyhow::Error) -> ErrorKind {
         || message.contains("cannot use --home and --profile")
         || message.contains("not present in the registry")
         || message.contains("profile add requires")
+        || message.contains("privilege configuration")
         || message.contains("confirmation requires an interactive terminal")
         || message.contains("confirmation input ended before a response")
     {

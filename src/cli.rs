@@ -1,5 +1,8 @@
 use crate::audit::{self, AuditRecord, AuditSink, AuditStatus, FileAuditSink, NoopAudit};
-use crate::config::{AuthConfig, CredentialBackend, ServerConfig, SshwConfig, load_config};
+use crate::config::{
+    AuthConfig, CredentialBackend, PrivilegeConfig, PrivilegeMethod, ServerConfig, SshwConfig,
+    load_config,
+};
 use crate::credentials::keyring_store::KeyringCredentialStore;
 use crate::credentials::session_store::SessionOnlyStore;
 use crate::credentials::{AuthMaterial, CredentialStore, CredentialStoreHealth};
@@ -18,17 +21,20 @@ use clap::Parser;
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use zeroize::Zeroizing;
 
 mod model;
+mod privilege;
 mod profile;
 mod prompt;
 mod server;
 mod transfer;
 
 pub use model::{
-    AddArgs, AuthArg, Cli, Command, DefaultArgs, DoctorArgs, GetArgs, ListArgs, ProfileAddArgs,
-    ProfileArgs, ProfileCommand, ProfileDefaultArgs, ProfileListArgs, ProfileRemoveArgs,
-    ProfileShowArgs, PutArgs, RemoveArgs, RunArgs, ShowArgs, TrustArgs,
+    AddArgs, AuthArg, Cli, Command, DefaultArgs, DoctorArgs, GetArgs, ListArgs, PrivilegeArgs,
+    PrivilegeClearArgs, PrivilegeCommand, PrivilegeMethodArg, PrivilegeSetArgs, PrivilegeShowArgs,
+    ProfileAddArgs, ProfileArgs, ProfileCommand, ProfileDefaultArgs, ProfileListArgs,
+    ProfileRemoveArgs, ProfileShowArgs, PutArgs, RemoveArgs, RunArgs, ShowArgs, TrustArgs,
 };
 pub use prompt::Prompter;
 use prompt::TerminalPrompter;
@@ -260,6 +266,20 @@ where
             credentials,
             &config,
         ),
+        Command::Privilege(args) => match args.command {
+            PrivilegeCommand::Set(args) => privilege::set_privilege(
+                args,
+                config_path,
+                &ctx.home.namespace,
+                credentials,
+                prompter,
+                &mut config,
+            ),
+            PrivilegeCommand::Show(args) => privilege::show_privilege(args, &config),
+            PrivilegeCommand::Clear(args) => {
+                privilege::clear_privilege(args, config_path, credentials, prompter, &mut config)
+            }
+        },
         Command::Profile(args) => {
             profile::run_profile(args, ctx.registry_path, home_flag.as_deref())
         }
@@ -349,6 +369,19 @@ fn audit_descriptor(
             };
             Some(("get", server, detail))
         }
+        Command::Privilege(a) => match &a.command {
+            PrivilegeCommand::Set(args) => Some((
+                "privilege",
+                Some(args.name.clone()),
+                Some("set".to_string()),
+            )),
+            PrivilegeCommand::Clear(args) => Some((
+                "privilege",
+                Some(args.name.clone()),
+                Some("clear".to_string()),
+            )),
+            PrivilegeCommand::Show(_) => None,
+        },
         _ => None,
     }
 }
@@ -371,8 +404,19 @@ where
     C: CredentialStore,
     S: SshClient,
 {
-    let RunArgs { target, json, yes } = args;
+    let RunArgs {
+        target,
+        json,
+        yes,
+        as_root,
+    } = args;
     let (server_name, command) = resolve_run_target(target, config)?;
+
+    if as_root && !yes {
+        return Err(anyhow::anyhow!(
+            "root privilege escalation requires --yes; review the command and rerun with --yes"
+        ));
+    }
 
     match classify_command(&command, yes) {
         SafetyDecision::Allow => {}
@@ -385,10 +429,35 @@ where
 
     let server = get_server(config, &server_name)?;
     let auth = resolve_auth(server, credentials)?;
-    let result = ssh.run(server, &auth, &command)?;
+    let privileged = if as_root {
+        Some(resolve_privileged_execution(
+            &server_name,
+            &command,
+            config,
+            credentials,
+        )?)
+    } else {
+        None
+    };
+    let remote_command = privileged
+        .as_ref()
+        .map(|execution| execution.command.as_str())
+        .unwrap_or(command.as_str());
+    let result = if let Some(stdin) = privileged
+        .as_ref()
+        .and_then(|execution| execution.stdin.as_ref())
+    {
+        ssh.run_with_stdin(server, &auth, remote_command, stdin.as_str())?
+    } else {
+        ssh.run(server, &auth, remote_command)?
+    };
     let exit_code = result.exit_status;
-    let stdout = redact_secrets(&result.stdout);
-    let stderr = redact_secrets(&filter_startup_stderr_noise(&result.stderr));
+    let secret = privileged
+        .as_ref()
+        .and_then(|execution| execution.redact_secret.as_ref())
+        .map(|secret| secret.as_str());
+    let stdout = redact_with_known_secret(&result.stdout, secret);
+    let stderr = redact_with_known_secret(&filter_startup_stderr_noise(&result.stderr), secret);
 
     if json {
         let output = RunOutput {
@@ -412,6 +481,79 @@ where
         stderr,
         exit_code,
     })
+}
+
+struct PrivilegedExecution {
+    command: String,
+    stdin: Option<Zeroizing<String>>,
+    redact_secret: Option<Zeroizing<String>>,
+}
+
+fn resolve_privileged_execution<C>(
+    server_name: &str,
+    command: &str,
+    config: &SshwConfig,
+    credentials: &C,
+) -> anyhow::Result<PrivilegedExecution>
+where
+    C: CredentialStore,
+{
+    let privilege = config
+        .privileges
+        .get(server_name)
+        .ok_or_else(|| privilege::missing_privilege(server_name))?;
+
+    match privilege.method {
+        PrivilegeMethod::Sudo => sudo_execution(command, privilege, credentials),
+        PrivilegeMethod::Su => Err(anyhow::anyhow!(
+            "privilege configuration method 'su' requires PTY prompt validation and is not enabled yet; use method 'sudo'"
+        )),
+    }
+}
+
+fn sudo_execution<C>(
+    command: &str,
+    privilege: &PrivilegeConfig,
+    credentials: &C,
+) -> anyhow::Result<PrivilegedExecution>
+where
+    C: CredentialStore,
+{
+    let password = Zeroizing::new(
+        credentials
+            .get_password(&privilege.credential, &privilege.user)
+            .with_context(|| {
+                format!(
+                    "missing credential entry for {} and privilege user {}",
+                    privilege.credential, privilege.user
+                )
+            })?,
+    );
+    Ok(PrivilegedExecution {
+        command: sudo_command(command, &privilege.user),
+        stdin: Some(Zeroizing::new(format!("{}\n", password.as_str()))),
+        redact_secret: Some(password),
+    })
+}
+
+fn sudo_command(command: &str, user: &str) -> String {
+    format!(
+        "sudo -S -p '' -u {} -- sh -lc {}",
+        shell_quote(user),
+        shell_quote(command)
+    )
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn redact_with_known_secret(input: &str, secret: Option<&str>) -> String {
+    let redacted = redact_secrets(input);
+    match secret.filter(|value| !value.is_empty()) {
+        Some(secret) => redacted.replace(secret, "<redacted>"),
+        None => redacted,
+    }
 }
 
 fn doctor<C>(

@@ -38,6 +38,21 @@ impl SshClient for FakeSshClient {
         })
     }
 
+    fn run_with_stdin(
+        &self,
+        _server: &ServerConfig,
+        _auth: &AuthMaterial,
+        command: &str,
+        stdin: &str,
+    ) -> anyhow::Result<RunResult> {
+        Ok(RunResult {
+            exit_status: 0,
+            stdout: format!("{command}|stdin:{stdin}"),
+            stderr: String::new(),
+            duration_ms: 1,
+        })
+    }
+
     fn put(
         &self,
         _server: &ServerConfig,
@@ -86,6 +101,16 @@ fn ssh_client_trait_supports_run_and_transfer_results() {
         .unwrap();
     assert_eq!(run.exit_status, 0);
     assert_eq!(run.stdout, "hostname");
+
+    let run = client
+        .run_with_stdin(
+            &server,
+            &AuthMaterial::Agent,
+            "sudo -S id",
+            "ROOT_PASSWORD\n",
+        )
+        .unwrap();
+    assert_eq!(run.stdout, "sudo -S id|stdin:ROOT_PASSWORD\n");
 
     let put = client
         .put(

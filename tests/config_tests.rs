@@ -1,5 +1,6 @@
 use sshw::config::{
-    AuthConfig, CredentialBackend, ServerConfig, SshwConfig, load_config, save_config,
+    AuthConfig, CredentialBackend, PrivilegeConfig, PrivilegeMethod, ServerConfig, SshwConfig,
+    load_config, save_config,
 };
 
 #[test]
@@ -9,6 +10,7 @@ fn new_config_starts_empty() {
     assert_eq!(config.version, 1);
     assert!(config.default.is_none());
     assert!(config.servers.is_empty());
+    assert!(config.privileges.is_empty());
 }
 
 #[test]
@@ -34,13 +36,25 @@ fn config_serializes_password_and_agent_auth_without_secrets() {
             auth: AuthConfig::Agent,
         },
     );
+    config.privileges.insert(
+        "server-alpha".to_string(),
+        PrivilegeConfig {
+            method: PrivilegeMethod::Sudo,
+            user: "root".to_string(),
+            credential: "sshw:default:privilege:server-alpha".to_string(),
+        },
+    );
 
     let json = serde_json::to_string_pretty(&config).unwrap();
 
     assert!(json.contains("\"type\": \"password\""));
     assert!(json.contains("\"credential\": \"sshw:server-alpha\""));
     assert!(json.contains("\"type\": \"agent\""));
+    assert!(json.contains("\"method\": \"sudo\""));
+    assert!(json.contains("\"user\": \"root\""));
+    assert!(json.contains("\"credential\": \"sshw:default:privilege:server-alpha\""));
     assert!(!json.contains("YOUR_PASSWORD"));
+    assert!(!json.contains("ROOT_PASSWORD"));
     assert!(!json.contains("passphrase"));
     assert!(!json.contains("private_key"));
 }
@@ -66,6 +80,7 @@ fn config_defaults_to_native_backend_and_round_trips_session() {
     let legacy: SshwConfig =
         serde_json::from_str(r#"{"version":1,"default":null,"servers":{}}"#).unwrap();
     assert_eq!(legacy.credential_backend, CredentialBackend::Native);
+    assert!(legacy.privileges.is_empty());
 
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("servers.json");

@@ -6,7 +6,7 @@ use base64::Engine;
 use directories::BaseDirs;
 use ssh2::{CheckResult, HashType, HostKeyType, KnownHostFileKind, KnownHostKeyFormat, Session};
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -149,28 +149,17 @@ impl SshClient for Ssh2Client {
         auth: &AuthMaterial,
         command: &str,
     ) -> anyhow::Result<RunResult> {
-        let started = Instant::now();
-        let known_hosts = self.resolved_known_hosts_path()?;
-        let session = connect_verified_authenticated(
-            server,
-            auth,
-            self.connect_timeout,
-            self.op_timeout,
-            &known_hosts,
-        )?;
-        let mut channel = session.channel_session().context("ssh session error")?;
-        channel.exec(command).context("ssh session error")?;
+        self.run_inner(server, auth, command, None)
+    }
 
-        let (stdout, stderr) = read_channel_outputs(&session, &mut channel, self.op_timeout)?;
-        channel.wait_close().context("ssh session error")?;
-        let exit_status = channel.exit_status().context("ssh session error")?;
-
-        Ok(RunResult {
-            exit_status,
-            stdout,
-            stderr,
-            duration_ms: started.elapsed().as_millis(),
-        })
+    fn run_with_stdin(
+        &self,
+        server: &ServerConfig,
+        auth: &AuthMaterial,
+        command: &str,
+        stdin: &str,
+    ) -> anyhow::Result<RunResult> {
+        self.run_inner(server, auth, command, Some(stdin))
     }
 
     fn put(
@@ -266,6 +255,45 @@ impl SshClient for Ssh2Client {
             bytes,
             source: remote.to_string(),
             destination: local.display().to_string(),
+        })
+    }
+}
+
+impl Ssh2Client {
+    fn run_inner(
+        &self,
+        server: &ServerConfig,
+        auth: &AuthMaterial,
+        command: &str,
+        stdin: Option<&str>,
+    ) -> anyhow::Result<RunResult> {
+        let started = Instant::now();
+        let known_hosts = self.resolved_known_hosts_path()?;
+        let session = connect_verified_authenticated(
+            server,
+            auth,
+            self.connect_timeout,
+            self.op_timeout,
+            &known_hosts,
+        )?;
+        let mut channel = session.channel_session().context("ssh session error")?;
+        channel.exec(command).context("ssh session error")?;
+        if let Some(stdin) = stdin {
+            channel
+                .write_all(stdin.as_bytes())
+                .context("ssh session error")?;
+            channel.send_eof().context("ssh session error")?;
+        }
+
+        let (stdout, stderr) = read_channel_outputs(&session, &mut channel, self.op_timeout)?;
+        channel.wait_close().context("ssh session error")?;
+        let exit_status = channel.exit_status().context("ssh session error")?;
+
+        Ok(RunResult {
+            exit_status,
+            stdout,
+            stderr,
+            duration_ms: started.elapsed().as_millis(),
         })
     }
 }
