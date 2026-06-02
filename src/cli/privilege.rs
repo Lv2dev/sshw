@@ -38,10 +38,9 @@ where
     } else {
         prompter.password("Privilege password: ")?
     };
-    if password.is_empty() {
-        return Err(anyhow::anyhow!("password cannot be empty"));
-    }
+    validate_privilege_password(&password)?;
 
+    let previous_privilege = config.privileges.get(&args.name).cloned();
     let privilege = PrivilegeConfig {
         method: map_method(args.method),
         user: args.user,
@@ -50,6 +49,15 @@ where
     credentials.set_password(&privilege.credential, &privilege.user, &password)?;
     config.privileges.insert(args.name.clone(), privilege);
     save_config(config_path, config)?;
+    if let Some(previous) = previous_privilege {
+        let current = config
+            .privileges
+            .get(&args.name)
+            .expect("privilege just set");
+        if previous.credential != current.credential || previous.user != current.user {
+            credentials.delete_password(&previous.credential, &previous.user)?;
+        }
+    }
 
     let mut message = format!("privilege set for {}\n", args.name);
     if !credentials.is_persistent() {
@@ -119,9 +127,9 @@ where
         return Err(anyhow::anyhow!("privilege clear cancelled"));
     }
 
+    credentials.delete_password(&privilege.credential, &privilege.user)?;
     config.privileges.remove(&args.name);
     save_config(config_path, config)?;
-    credentials.delete_password(&privilege.credential, &privilege.user)?;
     Ok(ok(format!("privilege cleared for {}\n", args.name)))
 }
 
@@ -136,6 +144,16 @@ pub(super) fn method_label(method: PrivilegeMethod) -> &'static str {
         PrivilegeMethod::Sudo => "sudo",
         PrivilegeMethod::Su => "su",
     }
+}
+
+pub(super) fn validate_privilege_password(password: &str) -> anyhow::Result<()> {
+    if password.is_empty() {
+        return Err(anyhow::anyhow!("password cannot be empty"));
+    }
+    if password.contains(['\n', '\r']) {
+        return Err(anyhow::anyhow!("privilege password must be a single line"));
+    }
+    Ok(())
 }
 
 fn map_method(method: PrivilegeMethodArg) -> PrivilegeMethod {

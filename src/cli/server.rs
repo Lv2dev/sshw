@@ -6,7 +6,7 @@ use super::{
     AddArgs, AuthArg, CommandOutput, DefaultArgs, ListArgs, Prompter, RemoveArgs, ShowArgs,
     TrustArgs, get_server, no_default_server_error, ok, unknown_server,
 };
-use crate::config::{AuthConfig, ServerConfig, SshwConfig, save_config};
+use crate::config::{AuthConfig, PrivilegeConfig, ServerConfig, SshwConfig, save_config};
 use crate::credentials::CredentialStore;
 use crate::home::CredentialNamespace;
 use crate::output::ServerOutput;
@@ -64,7 +64,13 @@ where
         auth,
     };
     let stale_credential = stale_password_credential(previous_server.as_ref(), &new_server);
+    let stale_privilege = previous_server
+        .as_ref()
+        .and_then(|_| config.privileges.get(&args.name).cloned());
     config.servers.insert(args.name.clone(), new_server);
+    if previous_server.is_some() {
+        config.privileges.remove(&args.name);
+    }
 
     if config.default.is_none() {
         config.default = Some(args.name.clone());
@@ -73,6 +79,9 @@ where
     save_config(config_path, config)?;
     if let Some((credential, user)) = stale_credential {
         credentials.delete_password(&credential, &user)?;
+    }
+    if let Some(privilege) = stale_privilege {
+        delete_privilege_password(credentials, &privilege)?;
     }
 
     let mut message = format!(
@@ -202,17 +211,22 @@ where
     P: Prompter,
 {
     let server = get_server(config, &args.name)?.clone();
+    let privilege = config.privileges.get(&args.name).cloned();
     if !args.yes && !prompter.confirm(&format!("remove server '{}'? [y/N] ", args.name))? {
         return Err(anyhow::anyhow!("removal cancelled"));
     }
 
-    config.servers.remove(&args.name);
-    if config.default.as_deref() == Some(args.name.as_str()) {
-        config.default = config.servers.keys().next().cloned();
+    if let Some(privilege) = &privilege {
+        delete_privilege_password(credentials, privilege)?;
+    }
+    if let AuthConfig::Password { credential } = &server.auth {
+        credentials.delete_password(credential, &server.user)?;
     }
 
-    if let AuthConfig::Password { credential } = server.auth {
-        credentials.delete_password(&credential, &server.user)?;
+    config.servers.remove(&args.name);
+    config.privileges.remove(&args.name);
+    if config.default.as_deref() == Some(args.name.as_str()) {
+        config.default = config.servers.keys().next().cloned();
     }
 
     save_config(config_path, config)?;
@@ -249,6 +263,13 @@ fn stale_password_credential(
         }
         _ => Some((previous_credential.clone(), previous.user.clone())),
     }
+}
+
+fn delete_privilege_password<C>(credentials: &C, privilege: &PrivilegeConfig) -> anyhow::Result<()>
+where
+    C: CredentialStore,
+{
+    credentials.delete_password(&privilege.credential, &privilege.user)
 }
 
 fn auth_label(auth: &crate::output::AuthOutput) -> &'static str {

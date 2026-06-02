@@ -13,8 +13,13 @@
 //! agent, and that global must not be raced between concurrent tests.
 #![cfg(target_os = "linux")]
 
-use sshw::config::{AuthConfig, ServerConfig};
-use sshw::credentials::AuthMaterial;
+use clap::Parser;
+use sshw::cli::{Cli, Prompter, execute};
+use sshw::config::{
+    AuthConfig, PrivilegeConfig, PrivilegeMethod, ServerConfig, SshwConfig, save_config,
+};
+use sshw::credentials::session_store::SessionOnlyStore;
+use sshw::credentials::{AuthMaterial, CredentialStore};
 use sshw::ssh::SshClient;
 use sshw::ssh::ssh2_client::Ssh2Client;
 use std::fs;
@@ -27,6 +32,22 @@ use tempfile::TempDir;
 
 const TEST_USER: &str = "sshw";
 const TEST_PASSWORD: &str = "sshw-integration-password";
+
+struct NoopPrompter;
+
+impl Prompter for NoopPrompter {
+    fn confirm(&mut self, _prompt: &str) -> anyhow::Result<bool> {
+        Err(anyhow::anyhow!("unexpected prompt"))
+    }
+
+    fn password(&mut self, _prompt: &str) -> anyhow::Result<String> {
+        Err(anyhow::anyhow!("unexpected password prompt"))
+    }
+
+    fn password_stdin(&mut self) -> anyhow::Result<String> {
+        Err(anyhow::anyhow!("unexpected stdin password prompt"))
+    }
+}
 
 /// A throwaway sshd + ssh-agent rooted in a temp dir. Everything is killed and
 /// removed on drop. Runs entirely as the current (non-root) user: the private
@@ -508,6 +529,62 @@ fn run_authenticates_with_password_against_real_sshd() {
 
     assert_eq!(result.exit_status, 0);
     assert_eq!(result.stdout, "password-ok");
+}
+
+#[test]
+#[ignore = "spawns a Docker-backed sshd; run with --ignored --test-threads=1"]
+fn run_as_root_uses_sudo_against_real_sshd_without_forwarding_password_stdin() {
+    let Some(srv) = DockerPasswordServer::start() else {
+        return;
+    };
+    srv.trust();
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("servers.json");
+    let mut config = SshwConfig::default();
+    config.default = Some("docker-password".to_string());
+    config
+        .servers
+        .insert("docker-password".to_string(), srv.server());
+    config.privileges.insert(
+        "docker-password".to_string(),
+        PrivilegeConfig {
+            method: PrivilegeMethod::Sudo,
+            user: "root".to_string(),
+            credential: "docker-privilege".to_string(),
+        },
+    );
+    save_config(&path, &config).expect("save config");
+
+    let store = SessionOnlyStore::new();
+    store
+        .set_password("docker-password", TEST_USER, TEST_PASSWORD)
+        .expect("store ssh password");
+    store
+        .set_password("docker-privilege", "root", TEST_PASSWORD)
+        .expect("store privilege password");
+    let mut prompter = NoopPrompter;
+
+    let output = execute(
+        Cli::try_parse_from([
+            "sshw",
+            "run",
+            "docker-password",
+            "id -u; cat",
+            "--as-root",
+            "--yes",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &srv.client(),
+        &mut prompter,
+    )
+    .expect("run --as-root");
+
+    assert_eq!(output.exit_code, 0);
+    assert_eq!(output.stdout, "0\n");
+    assert_eq!(output.stderr, "");
 }
 
 #[test]

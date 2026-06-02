@@ -351,7 +351,25 @@ fn audit_descriptor(
                 .as_deref()
                 .and_then(|c| c.split_whitespace().next())
                 .map(str::to_string);
-            Some(("run", server, program))
+            let detail = if a.as_root {
+                let program = program.unwrap_or_else(|| "unknown".to_string());
+                let marker = server
+                    .as_deref()
+                    .and_then(|server| config.privileges.get(server))
+                    .map(|privilege| {
+                        format!(
+                            "as-root:{}:{}:{}",
+                            privilege::method_label(privilege.method),
+                            privilege.user,
+                            program
+                        )
+                    })
+                    .unwrap_or_else(|| format!("as-root:missing:{program}"));
+                Some(marker)
+            } else {
+                program
+            };
+            Some(("run", server, detail))
         }
         Command::Put(a) => {
             let (server, detail) = match a.target.as_slice() {
@@ -529,6 +547,7 @@ where
                 )
             })?,
     );
+    privilege::validate_privilege_password(password.as_str())?;
     Ok(PrivilegedExecution {
         command: sudo_command(command, &privilege.user),
         stdin: Some(Zeroizing::new(format!("{}\n", password.as_str()))),
@@ -537,11 +556,16 @@ where
 }
 
 fn sudo_command(command: &str, user: &str) -> String {
-    format!(
-        "sudo -S -p '' -u {} -- sh -lc {}",
-        shell_quote(user),
-        shell_quote(command)
-    )
+    let quoted_user = shell_quote(user);
+    let quoted_command = shell_quote(command);
+    let script = format!(
+        "IFS= read -r sshw_sudo_password || exit 1; \
+         printf '%s\\n' \"$sshw_sudo_password\" | sudo -S -p '' -u {quoted_user} -v; \
+         sshw_sudo_status=$?; unset sshw_sudo_password; \
+         [ \"$sshw_sudo_status\" -eq 0 ] || exit \"$sshw_sudo_status\"; \
+         sudo -n -p '' -u {quoted_user} -- sh -lc {quoted_command} < /dev/null"
+    );
+    format!("sh -c {}", shell_quote(&script))
 }
 
 fn shell_quote(value: &str) -> String {
