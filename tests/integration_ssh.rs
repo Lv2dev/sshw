@@ -541,8 +541,10 @@ fn run_as_root_uses_sudo_against_real_sshd_without_forwarding_password_stdin() {
 
     let temp = tempfile::tempdir().expect("tempdir");
     let path = temp.path().join("servers.json");
-    let mut config = SshwConfig::default();
-    config.default = Some("docker-password".to_string());
+    let mut config = SshwConfig {
+        default: Some("docker-password".to_string()),
+        ..SshwConfig::default()
+    };
     config
         .servers
         .insert("docker-password".to_string(), srv.server());
