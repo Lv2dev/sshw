@@ -1,6 +1,9 @@
 //! File transfer subcommand handlers.
 
-use super::{CommandOutput, GetArgs, PutArgs, default_server_name, get_server, ok, resolve_auth};
+use super::{
+    CommandOutput, GetArgs, PutArgs, get_server, ok, resolve_auth, resolve_target_server,
+    split_target,
+};
 use crate::config::SshwConfig;
 use crate::credentials::CredentialStore;
 use crate::output::redact_secrets;
@@ -102,28 +105,20 @@ fn resolve_put_target(
     target: Vec<String>,
     config: &SshwConfig,
 ) -> anyhow::Result<(String, PathBuf, String)> {
-    match target.as_slice() {
-        [local, remote] => Ok((
-            default_server_name(config)?,
-            PathBuf::from(local),
-            remote.clone(),
-        )),
-        [name, local, remote] => Ok((name.clone(), PathBuf::from(local), remote.clone())),
-        _ => Err(anyhow::anyhow!("put expects [name] <local> <remote>")),
-    }
+    // target is `[name] <local> <remote>`.
+    let (name, rest) = split_target(&target, 2)
+        .ok_or_else(|| anyhow::anyhow!("put expects [name] <local> <remote>"))?;
+    let server = resolve_target_server(name, config)?;
+    Ok((server, PathBuf::from(&rest[0]), rest[1].clone()))
 }
 
 fn resolve_get_target(
     target: Vec<String>,
     config: &SshwConfig,
 ) -> anyhow::Result<(String, String, PathBuf)> {
-    match target.as_slice() {
-        [remote, local] => Ok((
-            default_server_name(config)?,
-            remote.clone(),
-            PathBuf::from(local),
-        )),
-        [name, remote, local] => Ok((name.clone(), remote.clone(), PathBuf::from(local))),
-        _ => Err(anyhow::anyhow!("get expects [name] <remote> <local>")),
-    }
+    // target is `[name] <remote> <local>`.
+    let (name, rest) = split_target(&target, 2)
+        .ok_or_else(|| anyhow::anyhow!("get expects [name] <remote> <local>"))?;
+    let server = resolve_target_server(name, config)?;
+    Ok((server, rest[0].clone(), PathBuf::from(&rest[1])))
 }

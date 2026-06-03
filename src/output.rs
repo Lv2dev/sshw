@@ -69,60 +69,72 @@ pub struct ErrorBody {
     pub exit_code: i32,
 }
 
+/// Substring markers that map a produced error message to a stable [`ErrorKind`].
+///
+/// These are an implicit contract with the modules that *produce* the messages
+/// (`safety`, `sandbox`, `policy`, `cli`, `cli::prompt`, `config`, `profile`):
+/// changing a produced message so it no longer contains its marker silently
+/// reclassifies the error to `Unknown`. Collecting the markers here makes that
+/// contract visible in one place, and `tests/output_tests.rs` drives the real
+/// produced messages through `classify_error` so a dropped marker fails a test
+/// instead of slipping through. `ssh2::Error`/`io::Error` carry no marker and
+/// are matched by type as a fall-back.
+const SAFETY_MARKER: &str = "requires --yes";
+const POLICY_MARKERS: [&str; 3] = ["blocked by policy", "policy file", "policy enforcement"];
+const CONFIG_MARKERS: [&str; 11] = [
+    "unknown server",
+    "no default server configured",
+    "failed to load config",
+    "failed to save config",
+    "profile '",
+    "cannot use --home and --profile",
+    "not present in the registry",
+    "profile add requires",
+    "privilege configuration",
+    "confirmation requires an interactive terminal",
+    "confirmation input ended before a response",
+];
+const AUTH_MARKERS: [&str; 4] = [
+    "missing credential",
+    "credential store",
+    "authentication",
+    "password cannot be empty",
+];
+const SSH_MARKERS: [&str; 7] = [
+    "host key",
+    "known_hosts",
+    "failed to connect to",
+    "failed to resolve",
+    "ssh handshake",
+    "ssh session",
+    "ssh transfer",
+];
+const IO_MARKER: &str = "local file already exists";
+
 /// Map an error to a stable [`ErrorKind`] for agent consumption.
 ///
-/// Most kinds are inferred from substrings of the human-readable message, so
-/// the marker phrases below are an implicit contract with the modules that
-/// *produce* those messages (`safety`, `sandbox`, `cli::prompt`, `config`,
-/// `profile`, `cli`). Changing a produced message so it no longer contains its
-/// marker silently reclassifies the error to `Unknown`. `tests/output_tests.rs`
-/// locks each marker → kind mapping to catch that regression; keep them in sync.
-/// `ssh2::Error` and `io::Error` are matched by type as a fallback since they
-/// carry no marker.
+/// Most kinds are inferred from substrings of the human-readable message; the
+/// marker constants above are the contract with the modules that produce them.
 pub fn classify_error(err: &anyhow::Error) -> ErrorKind {
     let message = format!("{err:#}").to_ascii_lowercase();
 
-    if message.contains("requires --yes") {
+    if message.contains(SAFETY_MARKER) {
         return ErrorKind::Safety;
     }
 
-    if message.contains("blocked by policy")
-        || message.contains("policy file")
-        || message.contains("policy enforcement")
-    {
+    if POLICY_MARKERS.iter().any(|marker| message.contains(marker)) {
         return ErrorKind::Policy;
     }
 
-    if message.contains("unknown server")
-        || message.contains("no default server configured")
-        || message.contains("failed to load config")
-        || message.contains("failed to save config")
-        || message.contains("profile '")
-        || message.contains("cannot use --home and --profile")
-        || message.contains("not present in the registry")
-        || message.contains("profile add requires")
-        || message.contains("privilege configuration")
-        || message.contains("confirmation requires an interactive terminal")
-        || message.contains("confirmation input ended before a response")
-    {
+    if CONFIG_MARKERS.iter().any(|marker| message.contains(marker)) {
         return ErrorKind::Config;
     }
 
-    if message.contains("missing credential")
-        || message.contains("credential store")
-        || message.contains("authentication")
-        || message.contains("password cannot be empty")
-    {
+    if AUTH_MARKERS.iter().any(|marker| message.contains(marker)) {
         return ErrorKind::Auth;
     }
 
-    if message.contains("host key")
-        || message.contains("known_hosts")
-        || message.contains("failed to connect to")
-        || message.contains("failed to resolve")
-        || message.contains("ssh handshake")
-        || message.contains("ssh session")
-        || message.contains("ssh transfer")
+    if SSH_MARKERS.iter().any(|marker| message.contains(marker))
         // ssh2 library errors (handshake/kex/known_hosts) carry no keyword and
         // are not io::Error, so match them by type as a fall-back rather than
         // letting them leak to the unknown bucket.
@@ -133,7 +145,7 @@ pub fn classify_error(err: &anyhow::Error) -> ErrorKind {
         return ErrorKind::Ssh;
     }
 
-    if message.contains("local file already exists")
+    if message.contains(IO_MARKER)
         || err
             .chain()
             .any(|cause| cause.downcast_ref::<std::io::Error>().is_some())

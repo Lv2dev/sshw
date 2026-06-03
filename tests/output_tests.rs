@@ -2,6 +2,7 @@ use sshw::config::{AuthConfig, ServerConfig};
 use sshw::output::{
     ErrorKind, RunOutput, ServerOutput, classify_error, filter_startup_stderr_noise, redact_secrets,
 };
+use sshw::safety::{SafetyDecision, classify_command, classify_remote_write_path};
 
 #[test]
 fn run_output_serializes_for_agents() {
@@ -119,21 +120,40 @@ fn classifies_policy_errors_with_exit_code_7() {
 
 #[test]
 fn classifies_safety_rail_errors_with_exit_code_2() {
-    for message in [
-        "'rm -rf /tmp/x' requires --yes to run a destructive command",
-        "writing to system path '/etc/hosts' requires --yes",
+    // Drive classification with the *actual* reasons `safety` produces, so a
+    // change that drops the "requires --yes" marker fails here instead of
+    // silently reclassifying the block to Unknown.
+    let mut reasons = Vec::new();
+    for command in [
+        "rm -rf /tmp/x",
+        "sudo systemctl restart svc",
+        "chmod -R 777 /srv",
     ] {
-        let kind = classify_error(&anyhow::anyhow!("{message}"));
-        assert_eq!(kind, ErrorKind::Safety, "message: {message}");
+        match classify_command(command, false) {
+            SafetyDecision::Block { reason } => reasons.push(reason),
+            SafetyDecision::Allow => panic!("expected '{command}' to be blocked"),
+        }
+    }
+    match classify_remote_write_path("/etc/hosts", false) {
+        SafetyDecision::Block { reason } => reasons.push(reason),
+        SafetyDecision::Allow => panic!("expected '/etc/hosts' write to be blocked"),
+    }
+
+    for reason in reasons {
+        let kind = classify_error(&anyhow::anyhow!("{reason}"));
+        assert_eq!(kind, ErrorKind::Safety, "message: {reason}");
         assert_eq!(kind.exit_code(), 2);
     }
 }
 
 #[test]
 fn classifies_auth_errors_with_exit_code_4() {
+    // Use the exact messages the cli/credential paths produce so the markers
+    // stay anchored to real output, not paraphrases.
     for message in [
-        "missing credential entries for server 'web'",
-        "credential store unavailable",
+        "missing credential entries: server-alpha",
+        "missing credential entry for sshw:server-alpha and user deploy",
+        "credential store unavailable: backend offline",
         "SSH authentication failed",
         "password cannot be empty",
     ] {
@@ -147,7 +167,7 @@ fn classifies_auth_errors_with_exit_code_4() {
 fn classifies_unknown_server_and_confirmation_errors_as_config() {
     for message in [
         "unknown server 'missing'",
-        "no default server configured; run 'sshw default <name>' to set one",
+        "no default server configured; run 'sshw default <name>' to set one or pass an explicit server name",
         "failed to load config",
         "confirmation requires an interactive terminal; rerun with --yes to confirm",
         "confirmation input ended before a response; rerun with --yes to confirm",

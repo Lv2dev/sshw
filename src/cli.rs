@@ -340,10 +340,13 @@ fn audit_descriptor(
         Command::Trust(a) => Some(("trust", Some(a.name.clone()), None)),
         Command::Default(a) => Some(("default", a.name.clone().or_else(default), None)),
         Command::Run(a) => {
-            let (server, command) = match a.target.as_slice() {
-                [name, command] => (Some(name.clone()), Some(command.clone())),
-                [command] => (default(), Some(command.clone())),
-                _ => (default(), None),
+            // target is `[name] <command>`.
+            let (server, command) = match split_target(&a.target, 1) {
+                Some((name, rest)) => (
+                    name.map(str::to_string).or_else(default),
+                    Some(rest[0].clone()),
+                ),
+                None => (default(), None),
             };
             // Record only the program name, never the full argument string, so
             // secrets passed inline (e.g. `mysql -phunter2`) are not persisted.
@@ -372,18 +375,24 @@ fn audit_descriptor(
             Some(("run", server, detail))
         }
         Command::Put(a) => {
-            let (server, detail) = match a.target.as_slice() {
-                [name, _local, remote] => (Some(name.clone()), Some(remote.clone())),
-                [_local, remote] => (default(), Some(remote.clone())),
-                _ => (default(), None),
+            // target is `[name] <local> <remote>`; audit records the remote dest.
+            let (server, detail) = match split_target(&a.target, 2) {
+                Some((name, rest)) => (
+                    name.map(str::to_string).or_else(default),
+                    Some(rest[1].clone()),
+                ),
+                None => (default(), None),
             };
             Some(("put", server, detail))
         }
         Command::Get(a) => {
-            let (server, detail) = match a.target.as_slice() {
-                [name, remote, _local] => (Some(name.clone()), Some(remote.clone())),
-                [remote, _local] => (default(), Some(remote.clone())),
-                _ => (default(), None),
+            // target is `[name] <remote> <local>`; audit records the remote source.
+            let (server, detail) = match split_target(&a.target, 2) {
+                Some((name, rest)) => (
+                    name.map(str::to_string).or_else(default),
+                    Some(rest[0].clone()),
+                ),
+                None => (default(), None),
             };
             Some(("get", server, detail))
         }
@@ -682,15 +691,37 @@ where
     }
 }
 
+/// Split a positional `target` into its optional leading server name and the
+/// `fixed` trailing positionals the command requires. The name is present
+/// exactly when one extra argument was passed (`run` has 1 fixed arg, `put` and
+/// `get` have 2). Returns `None` when the count is neither `fixed` nor
+/// `fixed + 1`, which the parser's `num_args` normally prevents. Shared by
+/// `audit_descriptor` and the `resolve_*_target` helpers so the "[name] comes
+/// first" rule lives in one place and the audit log can't drift from what runs.
+fn split_target(target: &[String], fixed: usize) -> Option<(Option<&str>, &[String])> {
+    match target.len() {
+        n if n == fixed => Some((None, target)),
+        n if n == fixed + 1 => Some((Some(target[0].as_str()), &target[1..])),
+        _ => None,
+    }
+}
+
+/// Resolve the server name for a target, falling back to the configured default
+/// when the caller did not name one explicitly.
+fn resolve_target_server(name: Option<&str>, config: &SshwConfig) -> anyhow::Result<String> {
+    match name {
+        Some(name) => Ok(name.to_string()),
+        None => default_server_name(config),
+    }
+}
+
 fn resolve_run_target(
     target: Vec<String>,
     config: &SshwConfig,
 ) -> anyhow::Result<(String, String)> {
-    match target.as_slice() {
-        [command] => Ok((default_server_name(config)?, command.clone())),
-        [name, command] => Ok((name.clone(), command.clone())),
-        _ => Err(anyhow::anyhow!("run expects [name] <command>")),
-    }
+    let (name, rest) =
+        split_target(&target, 1).ok_or_else(|| anyhow::anyhow!("run expects [name] <command>"))?;
+    Ok((resolve_target_server(name, config)?, rest[0].clone()))
 }
 
 fn default_server_name(config: &SshwConfig) -> anyhow::Result<String> {
@@ -885,5 +916,70 @@ mod parse_error_tests {
         assert_eq!(out.exit_code, 0);
         assert!(!out.stdout.is_empty());
         assert!(out.stderr.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod sudo_command_tests {
+    use super::{shell_quote, sudo_command};
+
+    /// Inverse of `shell_quote` for the forms it produces. Used to peel the
+    /// outer `sh -c '<script>'` wrapper so the inner script can be inspected.
+    /// `shell_quote` replaces every `'` with `'"'"'`, so reversing that on the
+    /// stripped body reconstructs the original exactly.
+    fn shell_unquote(quoted: &str) -> String {
+        let inner = quoted
+            .strip_prefix('\'')
+            .and_then(|rest| rest.strip_suffix('\''))
+            .expect("shell_quote output is single-quoted");
+        inner.replace("'\"'\"'", "'")
+    }
+
+    #[test]
+    fn shell_quote_round_trips_metacharacters_through_single_quotes() {
+        // Metacharacters land inside a single-quoted literal (inert to sh) and
+        // embedded single quotes use the POSIX '"'"' escape. If quoting ever
+        // weakens, these exact strings change and the test fails.
+        let cases = [
+            ("root", "'root'"),
+            ("id -u", "'id -u'"),
+            ("a'b", "'a'\"'\"'b'"),
+            ("'; reboot #", "''\"'\"'; reboot #'"),
+            ("$(reboot)", "'$(reboot)'"),
+            ("`reboot`", "'`reboot`'"),
+            ("a && b", "'a && b'"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(shell_quote(input), expected, "input: {input}");
+        }
+    }
+
+    #[test]
+    fn sudo_command_separates_password_stdin_from_target() {
+        let assembled = sudo_command("id -u", "root");
+        // The whole thing runs under one `sh -c '<script>'`.
+        assert!(assembled.starts_with("sh -c '"), "got: {assembled}");
+        assert!(assembled.ends_with('\''));
+        // Password is consumed from stdin for `sudo -S -v` auth only...
+        assert!(assembled.contains("IFS= read -r sshw_sudo_password"));
+        assert!(assembled.contains("sudo -S -p"));
+        // ...and the target runs non-interactively with stdin detached, so the
+        // password line can never reach the target command's stdin.
+        assert!(assembled.contains("sudo -n -p"));
+        assert!(assembled.contains("< /dev/null"));
+    }
+
+    #[test]
+    fn sudo_command_keeps_injected_user_and_command_quoted() {
+        // Inject shell metacharacters into both user and command.
+        let assembled = sudo_command("id; reboot", "ro'ot");
+        let script = shell_unquote(assembled.strip_prefix("sh -c ").expect("sh -c prefix"));
+
+        // User and command appear only via their quoted forms, so a `;` or an
+        // embedded quote cannot split off a new command in the inner script.
+        assert!(script.contains(&format!("-u {}", shell_quote("ro'ot"))));
+        assert!(script.contains(&format!("sh -lc {}", shell_quote("id; reboot"))));
+        // The raw injected command must not appear unquoted after `sh -lc `.
+        assert!(!script.contains("sh -lc id; reboot"));
     }
 }
