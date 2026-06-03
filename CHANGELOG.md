@@ -8,6 +8,21 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-06-03
+
+### Added
+- `sshw privilege set/show/clear` stores per-server privilege metadata while keeping sudo/root passwords in the active credential backend instead of `servers.json`.
+- `sshw run --as-root --yes` executes commands through the configured privilege method. The current executable path supports `sudo`; `su` metadata can be stored but execution stays fail-closed until PTY prompt handling is implemented.
+- Cargo-fuzz harnesses and a scheduled/manual fuzz smoke workflow now cover redaction and policy parsing/allowlist invariants.
+
+### Security
+- Sudo privilege passwords are consumed by a validation step before the target command runs, and the target command runs with stdin redirected from `/dev/null`, preventing the privilege secret from flowing into command stdin.
+- Privilege passwords reject embedded LF/CR, are redacted from command output when exact matches appear, and privilege credentials are cleaned up when servers or privilege settings are removed/replaced.
+- CI now audits both the root package and the separate `fuzz/` cargo package with cargo-deny.
+
+### Documentation
+- Removed the stale Windows non-ASCII `known_hosts` limitation from current security guidance; Windows Unicode paths are handled through Rust file I/O as of `v0.6.1`.
+
 ## [0.6.2] - 2026-06-01
 
 ### Added
