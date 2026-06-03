@@ -164,7 +164,7 @@ sshw run server-alpha "systemctl restart app" --as-root --yes
 
 `privilege set` stores only method, target user (default `root`), and credential key metadata in `servers.json`. The sudo/root password is stored in the active credential backend, never in CLI arguments or plaintext config. Without `--password-stdin`, `sshw` prompts with hidden input.
 
-`run --as-root` is explicit and always requires `--yes`. It first applies the normal safety and policy checks to the original command, then uses `sudo -S` with the privilege password passed through SSH channel stdin. The password is never embedded in the remote command string or audit detail. `su` metadata can be recorded, but `run --as-root` rejects `method=su` until PTY prompt handling is validated.
+`run --as-root` is explicit and always requires `--yes`. It first applies the normal safety and policy checks to the original command, then uses `sudo -S` with the privilege password passed through SSH channel stdin. The password is never embedded in the remote command string or audit detail. If the target user has a `NOPASSWD` sudoers rule, the command runs regardless of whether the stored password is correct, since `sudo` never consumes it — keep the stored secret accurate, but do not rely on it as an extra gate in that configuration. `su` metadata can be recorded, but `run --as-root` rejects `method=su` until PTY prompt handling is validated.
 
 ### Host Trust Flow
 
@@ -224,7 +224,7 @@ When enforcing, `run` commands must match `allow_commands` and `put`/`get` paths
 
 Policy fails closed: with `--policy`, a missing policy file is an error, and a present-but-unparseable file is always an error.
 
-See the Security Boundary note: `allow_commands` delegates whole-program execution. It does not restrict arguments, file paths, or subprocess behavior inside the allowed program.
+See the Security Boundary note: `allow_commands` delegates whole-program execution. It does not restrict arguments, file paths, or subprocess behavior inside the allowed program. `allow_put_paths`/`allow_get_paths` match remote paths by lexical prefix and reject `..`, but they do not resolve remote symlinks or canonicalize paths, so a symlink under an allowed prefix can still point elsewhere on the host — the path allowlist is a guardrail, not a remote sandbox.
 
 ### Audit Log
 
@@ -234,7 +234,7 @@ Mutating/active operations (`add`, `remove`, `trust`, `default`, `run`, `put`, `
 {"time_ms":1700000000000,"action":"run","server":"web","status":"ok","exit_code":0,"detail":"uptime"}
 ```
 
-`detail` for `run` is only the program name (not its arguments). Server names, paths, and details are redacted on a best-effort basis. Read-only commands (`list`, `show`, `doctor`, `profile`) are not audited. Audit writes are best-effort and never fail the operation; the file is owner-only on Unix (best-effort on Windows). Treat `audit.jsonl` as sensitive.
+`detail` for `run` is only the program name (not its arguments). Server names, paths, and details are redacted on a best-effort basis. Read-only commands (`list`, `show`, `doctor`, `profile`) are not audited. Audit writes are best-effort and never fail the operation; the file is owner-only on Unix (best-effort on Windows). The log is append-only but not tamper-evident — it has no integrity chain or signing, and anyone who can write the home can edit or delete entries. Treat `audit.jsonl` as sensitive.
 
 ### Output Redaction
 
@@ -479,7 +479,7 @@ sshw run server-alpha "systemctl restart app" --as-root --yes
 
 `privilege set`은 method, 대상 user(기본 `root`), credential key metadata만 `servers.json`에 저장합니다. sudo/root 비밀번호는 활성 credential backend에만 저장되며 CLI 인자나 평문 config에는 들어가지 않습니다. `--password-stdin`을 쓰지 않으면 숨김 입력 프롬프트로 받습니다.
 
-`run --as-root`는 명시적으로만 동작하며 항상 `--yes`가 필요합니다. 원래 명령에 기존 safety/policy 검사를 먼저 적용한 뒤, SSH channel stdin으로만 privilege 비밀번호를 전달하는 `sudo -S` 경로를 사용합니다. 비밀번호는 원격 command string이나 audit detail에 들어가지 않습니다. `su` metadata는 기록할 수 있지만, PTY prompt 처리가 검증되기 전까지 `run --as-root`의 `method=su` 실행은 fail-closed로 거부됩니다.
+`run --as-root`는 명시적으로만 동작하며 항상 `--yes`가 필요합니다. 원래 명령에 기존 safety/policy 검사를 먼저 적용한 뒤, SSH channel stdin으로만 privilege 비밀번호를 전달하는 `sudo -S` 경로를 사용합니다. 비밀번호는 원격 command string이나 audit detail에 들어가지 않습니다. 대상 user에 `NOPASSWD` sudoers 규칙이 있으면 `sudo`가 비밀번호를 소비하지 않으므로, 저장된 비밀번호의 정확성과 무관하게 명령이 실행됩니다 — 이 경우 저장 비밀번호는 추가 게이트가 아닙니다. `su` metadata는 기록할 수 있지만, PTY prompt 처리가 검증되기 전까지 `run --as-root`의 `method=su` 실행은 fail-closed로 거부됩니다.
 
 ### Host Trust Flow
 
@@ -537,7 +537,7 @@ policy는 **기본 off**입니다. 호출별로 `--policy`로 켜거나, home의
 
 policy는 fail-closed입니다. `--policy`인데 파일이 없으면 에러이고, 파일이 있으나 파싱 불가면 항상 에러입니다.
 
-보안 경계 참고: `allow_commands`는 프로그램 실행권 전체를 위임합니다. 허용된 프로그램 내부의 인자, 파일 경로, 하위 프로세스 동작은 제한하지 않습니다.
+보안 경계 참고: `allow_commands`는 프로그램 실행권 전체를 위임합니다. 허용된 프로그램 내부의 인자, 파일 경로, 하위 프로세스 동작은 제한하지 않습니다. `allow_put_paths`/`allow_get_paths`는 원격 경로를 lexical prefix로 매칭하고 `..`를 거부하지만, 원격 symlink를 따라가거나 canonical 경로로 검증하지는 않습니다. 허용된 prefix 아래의 symlink가 호스트의 다른 위치를 가리킬 수 있으므로 path allowlist는 원격 sandbox가 아니라 guardrail입니다.
 
 ### Audit Log
 
@@ -547,7 +547,7 @@ policy는 fail-closed입니다. `--policy`인데 파일이 없으면 에러이�
 {"time_ms":1700000000000,"action":"run","server":"web","status":"ok","exit_code":0,"detail":"uptime"}
 ```
 
-`run`의 `detail`은 인자가 아닌 프로그램 이름만 기록합니다. 서버명·경로·detail은 best-effort로 redaction됩니다. read-only 명령(`list`, `show`, `doctor`, `profile`)은 기록하지 않습니다. audit 쓰기는 best-effort이며 작업을 실패시키지 않습니다. 파일은 Unix에서 owner-only(Windows는 best-effort)입니다. `audit.jsonl`은 민감 파일로 취급하세요.
+`run`의 `detail`은 인자가 아닌 프로그램 이름만 기록합니다. 서버명·경로·detail은 best-effort로 redaction됩니다. read-only 명령(`list`, `show`, `doctor`, `profile`)은 기록하지 않습니다. audit 쓰기는 best-effort이며 작업을 실패시키지 않습니다. 파일은 Unix에서 owner-only(Windows는 best-effort)입니다. append-only이지만 tamper-evident가 아닙니다 — 무결성 체인이나 서명이 없고, home을 쓸 수 있는 누구나 항목을 수정·삭제할 수 있습니다. `audit.jsonl`은 민감 파일로 취급하세요.
 
 ### 출력 redaction
 

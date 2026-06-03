@@ -237,7 +237,8 @@ pub struct RunArgs {
     #[arg(long)]
     pub yes: bool,
     /// Run through the server's configured sudo privilege path. Requires
-    /// `--yes`; never automatic.
+    /// `--yes`; never automatic. With NOPASSWD sudoers the command runs even if
+    /// the stored password is wrong, since sudo does not consume it.
     #[arg(long)]
     pub as_root: bool,
 }

@@ -39,6 +39,14 @@ pub trait SshClient {
         auth: &AuthMaterial,
         command: &str,
     ) -> anyhow::Result<RunResult>;
+    /// Run `command`, writing `stdin` to the channel before draining output.
+    ///
+    /// `stdin` is written in full before output draining begins, so it must fit
+    /// within the SSH channel's flow-control window (tens of KB). A larger
+    /// payload combined with a command that emits substantial output before it
+    /// finishes reading stdin can deadlock when no operation timeout is set. The
+    /// only in-tree caller passes a single sudo password line, well within
+    /// bounds. The default implementation reports the backend as unsupported.
     fn run_with_stdin(
         &self,
         server: &ServerConfig,
