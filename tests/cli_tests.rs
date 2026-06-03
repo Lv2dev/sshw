@@ -1062,6 +1062,84 @@ fn privilege_set_update_deletes_previous_user_credential() {
 }
 
 #[test]
+fn privilege_set_update_surfaces_previous_credential_delete_failure() {
+    // set-update stores the new credential and config first, then deletes the
+    // previous user's credential. If that cleanup delete fails it is surfaced as
+    // an error (not swallowed): the new credential and config are already in
+    // place, and the previous credential remains as an orphan in the backend.
+    // Pin that behavior so a future change cannot silently drop the failure.
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    let mut config = sample_config();
+    config.privileges.insert(
+        "server-alpha".to_string(),
+        PrivilegeConfig {
+            method: PrivilegeMethod::Sudo,
+            user: "root".to_string(),
+            credential: "sshw:default:privilege:server-alpha".to_string(),
+        },
+    );
+    save_config(&path, &config).unwrap();
+    let store = FakeCredentialStore {
+        delete_error: Some("keyring delete failed".to_string()),
+        ..FakeCredentialStore::default()
+    };
+    store
+        .set_password(
+            "sshw:default:privilege:server-alpha",
+            "root",
+            "OLD_ROOT_PASSWORD",
+        )
+        .unwrap();
+    let ssh = FakeSshClient::default();
+    let mut prompter = FakePrompter {
+        confirm: false,
+        confirm_error: None,
+        password: None,
+        password_stdin: Some("NEW_ADMIN_PASSWORD".to_string()),
+    };
+
+    let err = execute(
+        Cli::try_parse_from([
+            "sshw",
+            "privilege",
+            "set",
+            "server-alpha",
+            "--method",
+            "sudo",
+            "--user",
+            "admin",
+            "--password-stdin",
+            "--force",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    )
+    .unwrap_err();
+
+    // The cleanup failure is surfaced, not swallowed.
+    assert!(err.to_string().contains("keyring delete failed"));
+    // The new credential and updated config were committed before cleanup ran.
+    let config = load_config(&path).unwrap();
+    let privilege = config.privileges.get("server-alpha").unwrap();
+    assert_eq!(privilege.user, "admin");
+    assert!(
+        store
+            .values
+            .borrow()
+            .contains_key(&(privilege.credential.clone(), "admin".to_string()))
+    );
+    // The previous user's credential remains an orphan because delete failed.
+    assert!(store.values.borrow().contains_key(&(
+        "sshw:default:privilege:server-alpha".to_string(),
+        "root".to_string()
+    )));
+}
+
+#[test]
 fn put_to_system_path_requires_yes_before_ssh() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("servers.json");
