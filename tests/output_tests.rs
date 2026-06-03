@@ -236,6 +236,25 @@ fn redacts_json_embedded_secrets() {
 }
 
 #[test]
+fn redacts_crlf_terminated_secret_and_preserves_line_ending() {
+    let out = redact_secrets("password=hunter2\r\nok\r\n");
+    assert!(!out.contains("hunter2"), "secret survived: {out:?}");
+    assert!(
+        out.contains("password=<redacted>\r\n"),
+        "CRLF line ending not preserved: {out:?}"
+    );
+    assert!(out.contains("ok\r\n"));
+}
+
+#[test]
+fn redacts_secrets_across_mixed_crlf_and_lf_lines() {
+    let out = redact_secrets("api_key=ABC123\r\nAuthorization: Bearer XYZ789\nplain text\n");
+    assert!(!out.contains("ABC123"), "CRLF secret survived: {out:?}");
+    assert!(!out.contains("XYZ789"), "LF bearer survived: {out:?}");
+    assert!(out.contains("plain text\n"));
+}
+
+#[test]
 fn leaves_ordinary_output_and_identifiers_untouched() {
     assert_eq!(redact_secrets("ok\n"), "ok\n");
     assert_eq!(

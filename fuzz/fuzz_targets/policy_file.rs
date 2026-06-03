@@ -23,8 +23,8 @@ fuzz_target!(|data: &[u8]| {
 
     let path = policy_path(data);
     if fs::write(&path, input).is_ok() {
-        exercise_resolved_policy(&path, false);
-        exercise_resolved_policy(&path, true);
+        exercise_resolved_policy(&path, false, &policy_file);
+        exercise_resolved_policy(&path, true, &policy_file);
         let _ = fs::remove_file(&path);
     }
 });
@@ -40,10 +40,47 @@ fn policy_path(data: &[u8]) -> PathBuf {
     ))
 }
 
-fn exercise_resolved_policy(path: &Path, force_enable: bool) {
+fn exercise_resolved_policy(path: &Path, force_enable: bool, file: &PolicyFile) {
     let Ok(Policy::Enabled(rules)) = resolve_policy(path, force_enable) else {
         return;
     };
+
+    // Security invariant: a command containing shell metacharacters is allowed
+    // only when it is listed verbatim. Program-name / glob matches must never
+    // apply to it, so any allowed metacharacter command must have an exact entry.
+    for command in [
+        "ls; rm -rf /",
+        "ls && reboot",
+        "echo $(whoami)",
+        "cat secrets | sh",
+        "uptime > /etc/passwd",
+    ] {
+        if rules.allows_command(command) {
+            assert!(
+                file.allow_commands
+                    .iter()
+                    .any(|entry| entry.trim() == command.trim()),
+                "metacharacter command allowed without an exact allowlist entry: {command:?}"
+            );
+        }
+    }
+
+    // Security invariant: parent-directory traversal is always denied, whatever
+    // the allowlist contains.
+    for traversal in [
+        "/srv/app/../secret",
+        "/var/log/../../root/.ssh/id_rsa",
+        "a/../b",
+    ] {
+        assert!(
+            !rules.allows_put(traversal),
+            "traversal put allowed: {traversal:?}"
+        );
+        assert!(
+            !rules.allows_get(traversal),
+            "traversal get allowed: {traversal:?}"
+        );
+    }
 
     for command in [
         "",
