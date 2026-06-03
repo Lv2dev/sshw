@@ -187,7 +187,10 @@ fn path_is_allowed(allowlist: &[String], path: &str) -> bool {
     })
 }
 
-fn path_within(allowed: &str, path: &str) -> bool {
+/// Lexical containment: `path` equals `allowed` or is a path-separated child of
+/// it. Shared with `safety` so both modules use one definition. Lexical only —
+/// it does not resolve remote symlinks or canonicalize paths.
+pub(crate) fn path_within(allowed: &str, path: &str) -> bool {
     path == allowed
         || path
             .strip_prefix(allowed)

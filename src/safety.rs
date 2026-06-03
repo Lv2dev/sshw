@@ -1,3 +1,5 @@
+use crate::policy::path_within;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SafetyDecision {
     Allow,
@@ -61,7 +63,7 @@ pub fn classify_remote_write_path(path: &str, yes: bool) -> SafetyDecision {
     ];
     if system_paths
         .iter()
-        .any(|system_path| is_path_or_child(path, system_path))
+        .any(|system_path| path_within(system_path, path))
     {
         return SafetyDecision::Block {
             reason: format!("writing to {path} requires --yes"),
@@ -169,13 +171,6 @@ fn command_name_is(token: &str, expected: &str) -> bool {
         .is_some_and(|name| name == expected)
 }
 
-fn is_path_or_child(path: &str, parent: &str) -> bool {
-    path == parent
-        || path
-            .strip_prefix(parent)
-            .is_some_and(|rest| rest.starts_with('/'))
-}
-
 fn is_etc_path(path: &str) -> bool {
-    is_path_or_child(path, "/etc")
+    path_within("/etc", path)
 }
