@@ -6,6 +6,7 @@ RUN apt-get update \
 
 RUN useradd -m -s /bin/sh sshw \
     && echo "sshw:sshw-integration-password" | chpasswd \
+    && echo "root:root-integration-password" | chpasswd \
     && echo "sshw ALL=(root) ALL" > /etc/sudoers.d/sshw \
     && chmod 0440 /etc/sudoers.d/sshw \
     && mkdir -p /run/sshd \

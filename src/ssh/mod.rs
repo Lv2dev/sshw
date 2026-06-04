@@ -59,6 +59,23 @@ pub trait SshClient {
             "ssh session stdin is unsupported by this backend"
         ))
     }
+    /// Run `command` under a PTY, injecting `password` once when the remote
+    /// emits a password prompt. Used for `su`, which reads its password from the
+    /// controlling terminal (PTY) rather than stdin; PTY echo is disabled so the
+    /// password is not echoed into the output. The default implementation
+    /// reports the backend as unsupported.
+    fn run_with_pty_password(
+        &self,
+        server: &ServerConfig,
+        auth: &AuthMaterial,
+        command: &str,
+        password: &str,
+    ) -> anyhow::Result<RunResult> {
+        let _ = (server, auth, command, password);
+        Err(anyhow::anyhow!(
+            "ssh pty password injection is unsupported by this backend"
+        ))
+    }
     fn put(
         &self,
         server: &ServerConfig,

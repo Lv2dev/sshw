@@ -475,6 +475,11 @@ where
         .and_then(|execution| execution.stdin.as_ref())
     {
         ssh.run_with_stdin(server, &auth, remote_command, stdin.as_str())?
+    } else if let Some(password) = privileged
+        .as_ref()
+        .and_then(|execution| execution.pty_password.as_ref())
+    {
+        ssh.run_with_pty_password(server, &auth, remote_command, password.as_str())?
     } else {
         ssh.run(server, &auth, remote_command)?
     };
@@ -512,7 +517,10 @@ where
 
 struct PrivilegedExecution {
     command: String,
+    /// sudo: password sent once over the channel stdin.
     stdin: Option<Zeroizing<String>>,
+    /// su: password injected at the PTY prompt by the ssh backend.
+    pty_password: Option<Zeroizing<String>>,
     redact_secret: Option<Zeroizing<String>>,
 }
 
@@ -532,9 +540,7 @@ where
 
     match privilege.method {
         PrivilegeMethod::Sudo => sudo_execution(command, privilege, credentials),
-        PrivilegeMethod::Su => Err(anyhow::anyhow!(
-            "privilege configuration method 'su' requires PTY prompt validation and is not enabled yet; use method 'sudo'"
-        )),
+        PrivilegeMethod::Su => su_execution(command, privilege, credentials),
     }
 }
 
@@ -560,6 +566,37 @@ where
     Ok(PrivilegedExecution {
         command: sudo_command(command, &privilege.user),
         stdin: Some(Zeroizing::new(format!("{}\n", password.as_str()))),
+        pty_password: None,
+        redact_secret: Some(password),
+    })
+}
+
+fn su_execution<C>(
+    command: &str,
+    privilege: &PrivilegeConfig,
+    credentials: &C,
+) -> anyhow::Result<PrivilegedExecution>
+where
+    C: CredentialStore,
+{
+    let password = Zeroizing::new(
+        credentials
+            .get_password(&privilege.credential, &privilege.user)
+            .with_context(|| {
+                format!(
+                    "missing credential entry for {} and privilege user {}",
+                    privilege.credential, privilege.user
+                )
+            })?,
+    );
+    privilege::validate_privilege_password(password.as_str())?;
+    Ok(PrivilegedExecution {
+        command: su_command(command, &privilege.user),
+        stdin: None,
+        // su prompts for the password on the PTY; the ssh backend injects this
+        // value when it detects the prompt. It is never placed on the command
+        // line or in the audit detail.
+        pty_password: Some(password.clone()),
         redact_secret: Some(password),
     })
 }
@@ -575,6 +612,16 @@ fn sudo_command(command: &str, user: &str) -> String {
          sudo -n -p '' -u {quoted_user} -- sh -lc {quoted_command} < /dev/null"
     );
     format!("sh -c {}", shell_quote(&script))
+}
+
+fn su_command(command: &str, user: &str) -> String {
+    // su reads its password from the controlling terminal (PTY), so there is no
+    // `-S`/stdin trick — the backend injects the password at the prompt. LC_ALL=C
+    // forces the English "Password:" prompt so the backend can detect it. The
+    // target command runs through the privilege user's login shell.
+    let quoted_user = shell_quote(user);
+    let quoted_command = shell_quote(command);
+    format!("LC_ALL=C su - {quoted_user} -c {quoted_command}")
 }
 
 fn shell_quote(value: &str) -> String {

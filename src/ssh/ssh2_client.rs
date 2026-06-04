@@ -162,6 +162,16 @@ impl SshClient for Ssh2Client {
         self.run_inner(server, auth, command, Some(stdin))
     }
 
+    fn run_with_pty_password(
+        &self,
+        server: &ServerConfig,
+        auth: &AuthMaterial,
+        command: &str,
+        password: &str,
+    ) -> anyhow::Result<RunResult> {
+        self.run_pty_inner(server, auth, command, password)
+    }
+
     fn put(
         &self,
         server: &ServerConfig,
@@ -296,6 +306,49 @@ impl Ssh2Client {
             duration_ms: started.elapsed().as_millis(),
         })
     }
+
+    fn run_pty_inner(
+        &self,
+        server: &ServerConfig,
+        auth: &AuthMaterial,
+        command: &str,
+        password: &str,
+    ) -> anyhow::Result<RunResult> {
+        let started = Instant::now();
+        let known_hosts = self.resolved_known_hosts_path()?;
+        let session = connect_verified_authenticated(
+            server,
+            auth,
+            self.connect_timeout,
+            self.op_timeout,
+            &known_hosts,
+        )?;
+        let mut channel = session.channel_session().context("ssh session error")?;
+        // Disable PTY echo so the injected password is never echoed back into
+        // the output stream we collect.
+        let mut modes = ssh2::PtyModes::new();
+        modes.set_boolean(ssh2::PtyModeOpcode::ECHO, false);
+        channel
+            .request_pty("xterm", Some(modes), None)
+            .context("ssh session error")?;
+        channel.exec(command).context("ssh session error")?;
+
+        let raw = pty_collect_with_password(&session, &mut channel, password, self.op_timeout)?;
+        channel.wait_close().context("ssh session error")?;
+        let exit_status = channel.exit_status().context("ssh session error")?;
+
+        if su_authentication_failed(&raw) {
+            return Err(anyhow::anyhow!("su authentication failed"));
+        }
+
+        Ok(RunResult {
+            exit_status,
+            stdout: clean_pty_output(&raw),
+            // A PTY merges stdout and stderr into a single stream.
+            stderr: String::new(),
+            duration_ms: started.elapsed().as_millis(),
+        })
+    }
 }
 
 fn connect_verified_authenticated(
@@ -363,6 +416,104 @@ fn timeout_millis(timeout: Duration) -> u32 {
 /// maps to `0`, which libssh2 treats as "no timeout".
 fn op_timeout_millis(op_timeout: Option<Duration>) -> u32 {
     op_timeout.map(timeout_millis).unwrap_or(0)
+}
+
+/// Drive a PTY-backed `su` execution: read the merged PTY output non-blocking,
+/// inject `password` (plus a newline) exactly once when the password prompt is
+/// detected, then collect the rest until EOF. PTY echo is disabled and the
+/// prompt locale is forced to English (LC_ALL=C) by the caller, so the password
+/// is not reflected back. `op_timeout` is the same inactivity budget as `run`.
+fn pty_collect_with_password(
+    session: &Session,
+    channel: &mut ssh2::Channel,
+    password: &str,
+    op_timeout: Option<Duration>,
+) -> anyhow::Result<String> {
+    session.set_blocking(false);
+    let collected = pty_collect_loop(session, channel, password, op_timeout);
+    session.set_blocking(true);
+    let out = collected?;
+    String::from_utf8(out)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))
+        .map_err(anyhow::Error::from)
+}
+
+fn pty_collect_loop(
+    session: &Session,
+    channel: &mut ssh2::Channel,
+    password: &str,
+    op_timeout: Option<Duration>,
+) -> anyhow::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut buf = [0u8; 32 * 1024];
+    let mut injected = false;
+    let mut last_progress = Instant::now();
+
+    loop {
+        let mut progressed = false;
+        match channel.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                out.extend_from_slice(&buf[..n]);
+                progressed = true;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) => return Err(anyhow::Error::new(e).context("ssh session error")),
+        }
+
+        if !injected && output_has_password_prompt(&out) {
+            // The password is short; switch to blocking for an atomic write,
+            // then restore non-blocking reads.
+            session.set_blocking(true);
+            let write = channel
+                .write_all(password.as_bytes())
+                .and_then(|()| channel.write_all(b"\n"));
+            session.set_blocking(false);
+            write.context("ssh session error")?;
+            injected = true;
+            progressed = true;
+        }
+
+        if progressed {
+            last_progress = Instant::now();
+        } else if op_timeout.is_some_and(|t| last_progress.elapsed() >= t) {
+            return Err(anyhow::anyhow!("ssh session timed out waiting for output"));
+        } else {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    Ok(out)
+}
+
+/// True if the accumulated PTY output already contains a password prompt.
+/// Checked before injection only; LC_ALL=C makes `su` print "Password:".
+fn output_has_password_prompt(out: &[u8]) -> bool {
+    String::from_utf8_lossy(out)
+        .to_ascii_lowercase()
+        .contains("password")
+}
+
+/// True if `su` reported an authentication failure (LC_ALL=C English text).
+fn su_authentication_failed(output: &str) -> bool {
+    let lower = output.to_ascii_lowercase();
+    lower.contains("authentication failure") || lower.contains("incorrect password")
+}
+
+/// Normalize PTY carriage returns and drop prompt line(s) so the caller sees the
+/// command's own output. Best-effort; echo-off already keeps the password out of
+/// `raw`, and any line containing the prompt text is removed.
+fn clean_pty_output(raw: &str) -> String {
+    let normalized = raw.replace("\r\n", "\n").replace('\r', "\n");
+    let mut cleaned = String::with_capacity(normalized.len());
+    for line in normalized.split_inclusive('\n') {
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        if body.to_ascii_lowercase().contains("password") {
+            continue;
+        }
+        cleaned.push_str(line);
+    }
+    cleaned
 }
 
 /// Read a channel's stdout and stderr concurrently so a large volume on one
@@ -690,6 +841,37 @@ example.test ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB9zU1OEQ2tzYhrXq4/DEjvRNvKv6cU
             fs::read_to_string(&known_hosts_path).unwrap(),
             KNOWN_HOSTS_LINE
         );
+    }
+
+    #[test]
+    fn detects_password_prompt_in_pty_output() {
+        assert!(super::output_has_password_prompt(b"Password: "));
+        assert!(super::output_has_password_prompt(b"\r\nPassword:"));
+        assert!(super::output_has_password_prompt(b"PASSWORD:"));
+        assert!(!super::output_has_password_prompt(b"id -u\r\n0\r\n"));
+        assert!(!super::output_has_password_prompt(b""));
+    }
+
+    #[test]
+    fn detects_su_authentication_failure() {
+        assert!(super::su_authentication_failed(
+            "su: Authentication failure\r\n"
+        ));
+        assert!(super::su_authentication_failed("Incorrect password\r\n"));
+        assert!(!super::su_authentication_failed("0\r\n"));
+    }
+
+    #[test]
+    fn cleans_pty_output_drops_prompt_and_normalizes_cr() {
+        // Echo-off keeps the password out of `raw`; the prompt line is dropped
+        // and CRLF is normalized to LF so the caller sees the command's output.
+        assert_eq!(super::clean_pty_output("Password: \r\n0\r\n"), "0\n");
+        assert_eq!(
+            super::clean_pty_output("Password: \r\nuid=0\r\nroot\r\n"),
+            "uid=0\nroot\n"
+        );
+        // No prompt: plain output passes through with CR normalized.
+        assert_eq!(super::clean_pty_output("hello\r\n"), "hello\n");
     }
 
     #[test]

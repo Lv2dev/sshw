@@ -1470,7 +1470,7 @@ fn run_as_root_rejects_stored_multiline_privilege_password_before_ssh() {
 }
 
 #[test]
-fn run_as_root_rejects_su_until_pty_support_exists() {
+fn run_as_root_su_injects_password_over_pty_without_leaking_it() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("servers.json");
     let mut config = sample_config();
@@ -1487,10 +1487,17 @@ fn run_as_root_rejects_su_until_pty_support_exists() {
     store
         .set_password("sshw:server-alpha", "deploy", "YOUR_PASSWORD")
         .unwrap();
-    let ssh = FakeSshClient::default();
+    store
+        .set_password(
+            "sshw:default:privilege:server-alpha",
+            "root",
+            "ROOT_SU_PASSWORD",
+        )
+        .unwrap();
+    let ssh = FakeSshClient::with_stdout("0\n");
     let mut prompter = FakePrompter::default();
 
-    let err = execute(
+    let output = execute(
         Cli::try_parse_from(["sshw", "run", "server-alpha", "id -u", "--as-root", "--yes"])
             .unwrap(),
         &path,
@@ -1498,11 +1505,27 @@ fn run_as_root_rejects_su_until_pty_support_exists() {
         &ssh,
         &mut prompter,
     )
-    .unwrap_err();
+    .unwrap();
 
-    assert!(err.to_string().contains("su"));
-    assert!(err.to_string().contains("PTY"));
-    assert!(ssh.run_commands.borrow().is_empty());
+    let commands = ssh.run_commands.borrow();
+    assert_eq!(commands.len(), 1);
+    // su reads its password from the PTY, so the wrapper is a plain
+    // `LC_ALL=C su - <user> -c <command>` (no -S/stdin trick), with the prompt
+    // locale forced to English for detection.
+    assert!(
+        commands[0].contains("LC_ALL=C su - 'root' -c"),
+        "got: {}",
+        commands[0]
+    );
+    assert!(commands[0].contains("'id -u'"));
+    // The password must never appear in the command string.
+    assert!(!commands[0].contains("ROOT_SU_PASSWORD"));
+    // It is delivered via the dedicated PTY-password path instead.
+    assert_eq!(
+        ssh.run_pty_passwords.borrow().as_slice(),
+        ["ROOT_SU_PASSWORD".to_string()]
+    );
+    assert_eq!(output.exit_code, 0);
 }
 
 #[test]
@@ -2749,6 +2772,7 @@ impl CredentialStore for FakeCredentialStore {
 struct FakeSshClient {
     run_commands: RefCell<Vec<String>>,
     run_stdin: RefCell<Vec<Option<String>>>,
+    run_pty_passwords: RefCell<Vec<String>>,
     trusted_expected_fingerprints: RefCell<Vec<String>>,
     put_calls: RefCell<Vec<String>>,
     get_calls: RefCell<Vec<bool>>,
@@ -2845,6 +2869,28 @@ impl SshClient for FakeSshClient {
     ) -> anyhow::Result<RunResult> {
         self.run_commands.borrow_mut().push(command.to_string());
         self.run_stdin.borrow_mut().push(Some(stdin.to_string()));
+        if let Some(message) = &self.run_error {
+            return Err(anyhow::anyhow!("{message}"));
+        }
+        Ok(RunResult {
+            exit_status: self.run_exit_status,
+            stdout: self.stdout.clone().unwrap_or_else(|| "ok\n".to_string()),
+            stderr: self.stderr.clone(),
+            duration_ms: 1,
+        })
+    }
+
+    fn run_with_pty_password(
+        &self,
+        _server: &ServerConfig,
+        _auth: &AuthMaterial,
+        command: &str,
+        password: &str,
+    ) -> anyhow::Result<RunResult> {
+        self.run_commands.borrow_mut().push(command.to_string());
+        self.run_pty_passwords
+            .borrow_mut()
+            .push(password.to_string());
         if let Some(message) = &self.run_error {
             return Err(anyhow::anyhow!("{message}"));
         }

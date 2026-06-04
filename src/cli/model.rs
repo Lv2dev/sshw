@@ -92,8 +92,9 @@ pub enum PrivilegeCommand {
 pub struct PrivilegeSetArgs {
     /// Server name to configure.
     pub name: String,
-    /// Privilege method. `sudo` can execute via `run --as-root`; `su` is
-    /// stored as metadata but rejected for execution until PTY handling exists.
+    /// Privilege method. Both execute via `run --as-root`: `sudo` uses
+    /// `sudo -S` (password over stdin); `su` uses a PTY and injects the password
+    /// at the prompt (more environment-sensitive).
     #[arg(long, value_enum, default_value_t = PrivilegeMethodArg::Sudo)]
     pub method: PrivilegeMethodArg,
     /// Target privileged user.
