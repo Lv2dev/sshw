@@ -648,8 +648,8 @@ fn run_as_root_uses_su_against_real_sshd_with_pty_password() {
         "stdout={:?} stderr={:?}",
         output.stdout, output.stderr
     );
-    // su ran the command as root (uid 0); the backend strips the prompt line so
-    // the output contains the command result.
+    // su ran the command as root (uid 0); the backend extracts the command
+    // output from between the BEGIN/END markers.
     assert!(
         output.stdout.contains('0'),
         "su did not run as root: stdout={:?}",
@@ -658,6 +658,71 @@ fn run_as_root_uses_su_against_real_sshd_with_pty_password() {
     // The su password must never appear in the output.
     assert!(!output.stdout.contains(ROOT_PASSWORD));
     assert!(!output.stderr.contains(ROOT_PASSWORD));
+}
+
+#[test]
+#[ignore = "spawns a Docker-backed sshd; run with --ignored --test-threads=1"]
+fn run_as_root_su_preserves_output_mentioning_password() {
+    let Some(srv) = DockerPasswordServer::start() else {
+        return;
+    };
+    srv.trust();
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("servers.json");
+    let mut config = SshwConfig {
+        default: Some("docker-password".to_string()),
+        ..SshwConfig::default()
+    };
+    config
+        .servers
+        .insert("docker-password".to_string(), srv.server());
+    config.privileges.insert(
+        "docker-password".to_string(),
+        PrivilegeConfig {
+            method: PrivilegeMethod::Su,
+            user: "root".to_string(),
+            credential: "docker-privilege".to_string(),
+        },
+    );
+    save_config(&path, &config).expect("save config");
+
+    let store = SessionOnlyStore::new();
+    store
+        .set_password("docker-password", TEST_USER, TEST_PASSWORD)
+        .expect("store ssh password");
+    store
+        .set_password("docker-privilege", "root", ROOT_PASSWORD)
+        .expect("store privilege password");
+    let mut prompter = NoopPrompter;
+
+    let output = execute(
+        Cli::try_parse_from([
+            "sshw",
+            "run",
+            "docker-password",
+            "echo SAW-password-line",
+            "--as-root",
+            "--yes",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &srv.client(),
+        &mut prompter,
+    )
+    .expect("run --as-root via su");
+
+    assert_eq!(output.exit_code, 0, "stdout={:?}", output.stdout);
+    // A line mentioning "password" must survive: marker framing extracts the
+    // command output structurally, unlike the old prompt-line heuristic that
+    // dropped any line containing "password".
+    assert!(
+        output.stdout.contains("SAW-password-line"),
+        "marker framing dropped legitimate output: stdout={:?}",
+        output.stdout
+    );
+    assert!(!output.stdout.contains(ROOT_PASSWORD));
 }
 
 #[test]

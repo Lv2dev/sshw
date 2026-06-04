@@ -335,16 +335,17 @@ impl Ssh2Client {
 
         let raw = pty_collect_with_password(&session, &mut channel, password, self.op_timeout)?;
         channel.wait_close().context("ssh session error")?;
-        let exit_status = channel.exit_status().context("ssh session error")?;
-
-        if su_authentication_failed(&raw) {
-            return Err(anyhow::anyhow!("su authentication failed"));
-        }
+        // The PTY channel exit status is unreliable (a signal-killed process can
+        // report 0), so the command's real exit code comes from the END marker
+        // the wrapper printed. Drain the channel status but do not trust it.
+        let _ = channel.exit_status();
+        let (stdout, exit_status) = extract_su_output(&raw)?;
 
         Ok(RunResult {
             exit_status,
-            stdout: clean_pty_output(&raw),
-            // A PTY merges stdout and stderr into a single stream.
+            stdout,
+            // A PTY merges stdout and stderr into one stream; the marker framing
+            // separates the command's output from the prompt/su noise.
             stderr: String::new(),
             duration_ms: started.elapsed().as_millis(),
         })
@@ -444,9 +445,14 @@ fn pty_collect_loop(
     password: &str,
     op_timeout: Option<Duration>,
 ) -> anyhow::Result<Vec<u8>> {
+    // Upper bound on the prompt/auth phase (before the command's BEGIN marker
+    // appears) so a missing or unrecognized password prompt cannot hang forever
+    // even when op_timeout is None.
+    const PROMPT_WAIT: Duration = Duration::from_secs(30);
     let mut out = Vec::new();
     let mut buf = [0u8; 32 * 1024];
     let mut injected = false;
+    let mut command_started = false;
     let mut last_progress = Instant::now();
 
     loop {
@@ -461,7 +467,13 @@ fn pty_collect_loop(
             Err(e) => return Err(anyhow::Error::new(e).context("ssh session error")),
         }
 
-        if !injected && output_has_password_prompt(&out) {
+        if !command_started && contains_subslice(&out, SU_MARKER_BEGIN.as_bytes()) {
+            // su authenticated and the wrapper began running the command; from
+            // here the command's own runtime governs the timeout.
+            command_started = true;
+        }
+
+        if !injected && !command_started && output_has_password_prompt(&out) {
             // The password is short; switch to blocking for an atomic write,
             // then restore non-blocking reads.
             session.set_blocking(true);
@@ -476,9 +488,20 @@ fn pty_collect_loop(
 
         if progressed {
             last_progress = Instant::now();
-        } else if op_timeout.is_some_and(|t| last_progress.elapsed() >= t) {
-            return Err(anyhow::anyhow!("ssh session timed out waiting for output"));
         } else {
+            // Before the command starts (prompt/auth phase) always bound the
+            // wait, even when op_timeout is None; after it starts, honor
+            // op_timeout (None = unlimited, like `run`).
+            let deadline = if command_started {
+                op_timeout
+            } else {
+                Some(op_timeout.map_or(PROMPT_WAIT, |t| t.min(PROMPT_WAIT)))
+            };
+            if deadline.is_some_and(|t| last_progress.elapsed() >= t) {
+                return Err(anyhow::anyhow!(
+                    "ssh session timed out waiting for the su password prompt or output"
+                ));
+            }
             std::thread::sleep(Duration::from_millis(5));
         }
     }
@@ -494,26 +517,53 @@ fn output_has_password_prompt(out: &[u8]) -> bool {
         .contains("password")
 }
 
-/// True if `su` reported an authentication failure (LC_ALL=C English text).
-fn su_authentication_failed(output: &str) -> bool {
-    let lower = output.to_ascii_lowercase();
-    lower.contains("authentication failure") || lower.contains("incorrect password")
+/// Markers that frame a `su` command's output on the PTY. The remote wrapper
+/// (`cli::su_command`) prints BEGIN, then the command's own stdout, then END
+/// followed by the command's exit code and a trailing `__`. Shared with the cli
+/// so the producer and parser agree on the protocol.
+pub(crate) const SU_MARKER_BEGIN: &str = "__SSHW_BEGIN__";
+pub(crate) const SU_MARKER_END_PREFIX: &str = "__SSHW_END__";
+
+/// True if `needle` occurs in `haystack` (byte search; no allocation).
+fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+    needle.is_empty()
+        || haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
 }
 
-/// Normalize PTY carriage returns and drop prompt line(s) so the caller sees the
-/// command's own output. Best-effort; echo-off already keeps the password out of
-/// `raw`, and any line containing the prompt text is removed.
-fn clean_pty_output(raw: &str) -> String {
-    let normalized = raw.replace("\r\n", "\n").replace('\r', "\n");
-    let mut cleaned = String::with_capacity(normalized.len());
-    for line in normalized.split_inclusive('\n') {
-        let body = line.strip_suffix('\n').unwrap_or(line);
-        if body.to_ascii_lowercase().contains("password") {
-            continue;
-        }
-        cleaned.push_str(line);
-    }
-    cleaned
+/// Parse the marker-framed output of a `su` PTY run. Everything before BEGIN
+/// (prompt, echo, su/login noise) is discarded; the bytes between BEGIN and END
+/// are the command's stdout, and the digits after END are its exit code. A
+/// missing BEGIN marker means su never reached the command (authentication
+/// failed or the prompt was not answered), independent of any localized text —
+/// this replaces both the fragile prompt-line stripping and the English-only
+/// auth-failure substring match.
+fn extract_su_output(raw: &str) -> anyhow::Result<(String, i32)> {
+    let begin = raw.find(SU_MARKER_BEGIN).ok_or_else(|| {
+        anyhow::anyhow!("su authentication failed or password prompt was not answered")
+    })?;
+    let after_begin = begin + SU_MARKER_BEGIN.len();
+    // Body starts after the newline that follows the BEGIN marker.
+    let body_start = raw[after_begin..]
+        .find('\n')
+        .map(|nl| after_begin + nl + 1)
+        .unwrap_or(after_begin);
+    let end_rel = raw[body_start..]
+        .find(SU_MARKER_END_PREFIX)
+        .ok_or_else(|| anyhow::anyhow!("su output ended before the completion marker"))?;
+    let end_abs = body_start + end_rel;
+    let body = &raw[body_start..end_abs];
+    // Exit-code digits follow the END prefix (terminated by `__`).
+    let after_end = end_abs + SU_MARKER_END_PREFIX.len();
+    let exit_code = raw[after_end..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .parse::<i32>()
+        .unwrap_or(0);
+    let stdout = body.replace("\r\n", "\n").replace('\r', "\n");
+    Ok((stdout, exit_code))
 }
 
 /// Read a channel's stdout and stderr concurrently so a large volume on one
@@ -853,25 +903,36 @@ example.test ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB9zU1OEQ2tzYhrXq4/DEjvRNvKv6cU
     }
 
     #[test]
-    fn detects_su_authentication_failure() {
-        assert!(super::su_authentication_failed(
-            "su: Authentication failure\r\n"
-        ));
-        assert!(super::su_authentication_failed("Incorrect password\r\n"));
-        assert!(!super::su_authentication_failed("0\r\n"));
+    fn extract_su_output_returns_body_and_exit_code() {
+        // Output is the bytes between BEGIN and END markers; prompt noise before
+        // BEGIN is discarded, CRLF is normalized.
+        let raw = "Password: \r\n__SSHW_BEGIN__\r\nhello\r\nworld\r\n__SSHW_END__0__\r\n";
+        let (out, code) = super::extract_su_output(raw).expect("marked output");
+        assert_eq!(out, "hello\nworld\n");
+        assert_eq!(code, 0);
     }
 
     #[test]
-    fn cleans_pty_output_drops_prompt_and_normalizes_cr() {
-        // Echo-off keeps the password out of `raw`; the prompt line is dropped
-        // and CRLF is normalized to LF so the caller sees the command's output.
-        assert_eq!(super::clean_pty_output("Password: \r\n0\r\n"), "0\n");
-        assert_eq!(
-            super::clean_pty_output("Password: \r\nuid=0\r\nroot\r\n"),
-            "uid=0\nroot\n"
-        );
-        // No prompt: plain output passes through with CR normalized.
-        assert_eq!(super::clean_pty_output("hello\r\n"), "hello\n");
+    fn extract_su_output_preserves_password_mentioning_lines() {
+        // Marker framing must NOT drop legitimate output lines mentioning password.
+        let raw = "__SSHW_BEGIN__\r\npassword policy: strong\r\n__SSHW_END__0__\r\n";
+        let (out, _) = super::extract_su_output(raw).expect("marked output");
+        assert!(out.contains("password policy: strong"), "got: {out:?}");
+    }
+
+    #[test]
+    fn extract_su_output_propagates_nonzero_exit_code() {
+        let raw = "__SSHW_BEGIN__\r\nboom\r\n__SSHW_END__7__\r\n";
+        let (_, code) = super::extract_su_output(raw).expect("marked output");
+        assert_eq!(code, 7);
+    }
+
+    #[test]
+    fn extract_su_output_errors_when_begin_marker_absent() {
+        // No BEGIN marker => su never ran the command (auth failure / prompt not
+        // handled), regardless of any localized failure text.
+        let raw = "Password: \r\nsu: Authentication failure\r\n";
+        assert!(super::extract_su_output(raw).is_err());
     }
 
     #[test]

@@ -15,7 +15,9 @@ use crate::profile::{load_registry, resolve_home_with_registry};
 use crate::safety::{SafetyDecision, classify_command};
 use crate::sandbox::{NoopSandbox, PolicyOnlySandbox, Sandbox, SandboxDecision};
 use crate::ssh::SshClient;
-use crate::ssh::ssh2_client::{Ssh2Client, runtime_library_versions};
+use crate::ssh::ssh2_client::{
+    SU_MARKER_BEGIN, SU_MARKER_END_PREFIX, Ssh2Client, runtime_library_versions,
+};
 use anyhow::Context;
 use clap::Parser;
 use serde_json::json;
@@ -618,10 +620,17 @@ fn su_command(command: &str, user: &str) -> String {
     // su reads its password from the controlling terminal (PTY), so there is no
     // `-S`/stdin trick — the backend injects the password at the prompt. LC_ALL=C
     // forces the English "Password:" prompt so the backend can detect it. The
-    // target command runs through the privilege user's login shell.
+    // command is wrapped in BEGIN/END markers so the backend extracts exactly the
+    // command's own output and its exit code from the merged PTY stream, instead
+    // of guessing which lines are prompt vs output.
     let quoted_user = shell_quote(user);
-    let quoted_command = shell_quote(command);
-    format!("LC_ALL=C su - {quoted_user} -c {quoted_command}")
+    let inner = format!(
+        "printf '{begin}\\n'; sh -c {cmd}; __sshw_ec=$?; printf '{end}%d__\\n' \"$__sshw_ec\"",
+        begin = SU_MARKER_BEGIN,
+        cmd = shell_quote(command),
+        end = SU_MARKER_END_PREFIX,
+    );
+    format!("LC_ALL=C su - {quoted_user} -c {}", shell_quote(&inner))
 }
 
 fn shell_quote(value: &str) -> String {

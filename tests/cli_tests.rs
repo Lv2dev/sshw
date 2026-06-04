@@ -1509,15 +1509,20 @@ fn run_as_root_su_injects_password_over_pty_without_leaking_it() {
 
     let commands = ssh.run_commands.borrow();
     assert_eq!(commands.len(), 1);
-    // su reads its password from the PTY, so the wrapper is a plain
-    // `LC_ALL=C su - <user> -c <command>` (no -S/stdin trick), with the prompt
-    // locale forced to English for detection.
+    // su reads its password from the PTY (no -S/stdin trick); the command is
+    // wrapped in BEGIN/END output markers so the backend extracts the command
+    // output and exit code without prompt-line heuristics.
     assert!(
         commands[0].contains("LC_ALL=C su - 'root' -c"),
         "got: {}",
         commands[0]
     );
-    assert!(commands[0].contains("'id -u'"));
+    assert!(
+        commands[0].contains("__SSHW_BEGIN__"),
+        "got: {}",
+        commands[0]
+    );
+    assert!(commands[0].contains("__SSHW_END__"));
     // The password must never appear in the command string.
     assert!(!commands[0].contains("ROOT_SU_PASSWORD"));
     // It is delivered via the dedicated PTY-password path instead.
