@@ -168,8 +168,9 @@ impl SshClient for Ssh2Client {
         auth: &AuthMaterial,
         command: &str,
         password: &str,
+        marker_nonce: &str,
     ) -> anyhow::Result<RunResult> {
-        self.run_pty_inner(server, auth, command, password)
+        self.run_pty_inner(server, auth, command, password, marker_nonce)
     }
 
     fn put(
@@ -313,6 +314,7 @@ impl Ssh2Client {
         auth: &AuthMaterial,
         command: &str,
         password: &str,
+        marker_nonce: &str,
     ) -> anyhow::Result<RunResult> {
         let started = Instant::now();
         let known_hosts = self.resolved_known_hosts_path()?;
@@ -333,13 +335,20 @@ impl Ssh2Client {
             .context("ssh session error")?;
         channel.exec(command).context("ssh session error")?;
 
-        let raw = pty_collect_with_password(&session, &mut channel, password, self.op_timeout)?;
+        let begin_marker = su_begin_marker(marker_nonce);
+        let raw = pty_collect_with_password(
+            &session,
+            &mut channel,
+            password,
+            self.op_timeout,
+            &begin_marker,
+        )?;
         channel.wait_close().context("ssh session error")?;
         // The PTY channel exit status is unreliable (a signal-killed process can
         // report 0), so the command's real exit code comes from the END marker
         // the wrapper printed. Drain the channel status but do not trust it.
         let _ = channel.exit_status();
-        let (stdout, exit_status) = extract_su_output(&raw)?;
+        let (stdout, exit_status) = extract_su_output(&raw, marker_nonce)?;
 
         Ok(RunResult {
             exit_status,
@@ -429,9 +438,10 @@ fn pty_collect_with_password(
     channel: &mut ssh2::Channel,
     password: &str,
     op_timeout: Option<Duration>,
+    begin_marker: &str,
 ) -> anyhow::Result<String> {
     session.set_blocking(false);
-    let collected = pty_collect_loop(session, channel, password, op_timeout);
+    let collected = pty_collect_loop(session, channel, password, op_timeout, begin_marker);
     session.set_blocking(true);
     let out = collected?;
     String::from_utf8(out)
@@ -444,6 +454,7 @@ fn pty_collect_loop(
     channel: &mut ssh2::Channel,
     password: &str,
     op_timeout: Option<Duration>,
+    begin_marker: &str,
 ) -> anyhow::Result<Vec<u8>> {
     // Upper bound on the prompt/auth phase (before the command's BEGIN marker
     // appears) so a missing or unrecognized password prompt cannot hang forever
@@ -467,7 +478,7 @@ fn pty_collect_loop(
             Err(e) => return Err(anyhow::Error::new(e).context("ssh session error")),
         }
 
-        if !command_started && contains_subslice(&out, SU_MARKER_BEGIN.as_bytes()) {
+        if !command_started && contains_subslice(&out, begin_marker.as_bytes()) {
             // su authenticated and the wrapper began running the command; from
             // here the command's own runtime governs the timeout.
             command_started = true;
@@ -517,12 +528,29 @@ fn output_has_password_prompt(out: &[u8]) -> bool {
         .contains("password")
 }
 
-/// Markers that frame a `su` command's output on the PTY. The remote wrapper
-/// (`cli::su_command`) prints BEGIN, then the command's own stdout, then END
-/// followed by the command's exit code and a trailing `__`. Shared with the cli
-/// so the producer and parser agree on the protocol.
-pub(crate) const SU_MARKER_BEGIN: &str = "__SSHW_BEGIN__";
-pub(crate) const SU_MARKER_END_PREFIX: &str = "__SSHW_END__";
+/// Build the BEGIN marker that frames a `su` command's output on the PTY from a
+/// per-execution `nonce`. The remote wrapper (`cli::su_command`) prints BEGIN,
+/// then the command's own stdout, then the END marker followed by the command's
+/// exit code and a trailing `__`. Shared with the cli so the producer and parser
+/// agree on the protocol.
+///
+/// The nonce (hex, from `cli::su_marker_nonce`) makes the framing unpredictable
+/// so a command's own stdout cannot accidentally — or via a `cat` of
+/// attacker-influenced data — reproduce the END marker and thereby truncate the
+/// captured output or spoof the exit code. A command that inspects its parent's
+/// argv (e.g. `ps`/`/proc/<ppid>/cmdline`) could still read the nonce, but it is
+/// already running as root in that case, so that is out of scope; the nonce
+/// defends against accidental and data-borne collisions, not a process already
+/// privileged enough to observe its launcher.
+pub(crate) fn su_begin_marker(nonce: &str) -> String {
+    format!("__SSHW_BEGIN_{nonce}__")
+}
+
+/// Prefix of the END marker for `nonce`; the command's exit-code digits and a
+/// trailing `__` follow it.
+pub(crate) fn su_end_prefix(nonce: &str) -> String {
+    format!("__SSHW_END_{nonce}_")
+}
 
 /// True if `needle` occurs in `haystack` (byte search; no allocation).
 fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
@@ -539,23 +567,25 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
 /// failed or the prompt was not answered), independent of any localized text —
 /// this replaces both the fragile prompt-line stripping and the English-only
 /// auth-failure substring match.
-fn extract_su_output(raw: &str) -> anyhow::Result<(String, i32)> {
-    let begin = raw.find(SU_MARKER_BEGIN).ok_or_else(|| {
+fn extract_su_output(raw: &str, marker_nonce: &str) -> anyhow::Result<(String, i32)> {
+    let begin_marker = su_begin_marker(marker_nonce);
+    let end_prefix = su_end_prefix(marker_nonce);
+    let begin = raw.find(&begin_marker).ok_or_else(|| {
         anyhow::anyhow!("su authentication failed or password prompt was not answered")
     })?;
-    let after_begin = begin + SU_MARKER_BEGIN.len();
+    let after_begin = begin + begin_marker.len();
     // Body starts after the newline that follows the BEGIN marker.
     let body_start = raw[after_begin..]
         .find('\n')
         .map(|nl| after_begin + nl + 1)
         .unwrap_or(after_begin);
     let end_rel = raw[body_start..]
-        .find(SU_MARKER_END_PREFIX)
+        .find(&end_prefix)
         .ok_or_else(|| anyhow::anyhow!("su output ended before the completion marker"))?;
     let end_abs = body_start + end_rel;
     let body = &raw[body_start..end_abs];
     // Exit-code digits follow the END prefix (terminated by `__`).
-    let after_end = end_abs + SU_MARKER_END_PREFIX.len();
+    let after_end = end_abs + end_prefix.len();
     let exit_code = raw[after_end..]
         .chars()
         .take_while(|c| c.is_ascii_digit())
@@ -906,8 +936,8 @@ example.test ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB9zU1OEQ2tzYhrXq4/DEjvRNvKv6cU
     fn extract_su_output_returns_body_and_exit_code() {
         // Output is the bytes between BEGIN and END markers; prompt noise before
         // BEGIN is discarded, CRLF is normalized.
-        let raw = "Password: \r\n__SSHW_BEGIN__\r\nhello\r\nworld\r\n__SSHW_END__0__\r\n";
-        let (out, code) = super::extract_su_output(raw).expect("marked output");
+        let raw = "Password: \r\n__SSHW_BEGIN_deadbeef__\r\nhello\r\nworld\r\n__SSHW_END_deadbeef_0__\r\n";
+        let (out, code) = super::extract_su_output(raw, "deadbeef").expect("marked output");
         assert_eq!(out, "hello\nworld\n");
         assert_eq!(code, 0);
     }
@@ -915,15 +945,16 @@ example.test ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB9zU1OEQ2tzYhrXq4/DEjvRNvKv6cU
     #[test]
     fn extract_su_output_preserves_password_mentioning_lines() {
         // Marker framing must NOT drop legitimate output lines mentioning password.
-        let raw = "__SSHW_BEGIN__\r\npassword policy: strong\r\n__SSHW_END__0__\r\n";
-        let (out, _) = super::extract_su_output(raw).expect("marked output");
+        let raw =
+            "__SSHW_BEGIN_deadbeef__\r\npassword policy: strong\r\n__SSHW_END_deadbeef_0__\r\n";
+        let (out, _) = super::extract_su_output(raw, "deadbeef").expect("marked output");
         assert!(out.contains("password policy: strong"), "got: {out:?}");
     }
 
     #[test]
     fn extract_su_output_propagates_nonzero_exit_code() {
-        let raw = "__SSHW_BEGIN__\r\nboom\r\n__SSHW_END__7__\r\n";
-        let (_, code) = super::extract_su_output(raw).expect("marked output");
+        let raw = "__SSHW_BEGIN_deadbeef__\r\nboom\r\n__SSHW_END_deadbeef_7__\r\n";
+        let (_, code) = super::extract_su_output(raw, "deadbeef").expect("marked output");
         assert_eq!(code, 7);
     }
 
@@ -932,7 +963,21 @@ example.test ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB9zU1OEQ2tzYhrXq4/DEjvRNvKv6cU
         // No BEGIN marker => su never ran the command (auth failure / prompt not
         // handled), regardless of any localized failure text.
         let raw = "Password: \r\nsu: Authentication failure\r\n";
-        assert!(super::extract_su_output(raw).is_err());
+        assert!(super::extract_su_output(raw, "deadbeef").is_err());
+    }
+
+    #[test]
+    fn extract_su_output_ignores_markers_without_the_run_nonce() {
+        // A command whose stdout contains marker-shaped text WITHOUT this run's
+        // nonce (the old fixed `__SSHW_END__0__`, a different nonce, or a forged
+        // literal) must not truncate the body or spoof the exit code: only the
+        // nonce-qualified END marker terminates the frame.
+        let raw = "__SSHW_BEGIN_deadbeef__\r\nleak __SSHW_END__0__ and __SSHW_END_cafe_0__\r\nreal line\r\n__SSHW_END_deadbeef_7__\r\n";
+        let (out, code) = super::extract_su_output(raw, "deadbeef").expect("marked output");
+        assert!(out.contains("__SSHW_END__0__"), "got: {out:?}");
+        assert!(out.contains("__SSHW_END_cafe_0__"), "got: {out:?}");
+        assert!(out.contains("real line"), "got: {out:?}");
+        assert_eq!(code, 7);
     }
 
     #[test]

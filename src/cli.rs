@@ -16,7 +16,7 @@ use crate::safety::{SafetyDecision, classify_command};
 use crate::sandbox::{NoopSandbox, PolicyOnlySandbox, Sandbox, SandboxDecision};
 use crate::ssh::SshClient;
 use crate::ssh::ssh2_client::{
-    SU_MARKER_BEGIN, SU_MARKER_END_PREFIX, Ssh2Client, runtime_library_versions,
+    Ssh2Client, runtime_library_versions, su_begin_marker, su_end_prefix,
 };
 use anyhow::Context;
 use clap::Parser;
@@ -481,7 +481,17 @@ where
         .as_ref()
         .and_then(|execution| execution.pty_password.as_ref())
     {
-        ssh.run_with_pty_password(server, &auth, remote_command, password.as_str())?
+        let marker_nonce = privileged
+            .as_ref()
+            .and_then(|execution| execution.pty_marker_nonce.as_deref())
+            .unwrap_or_default();
+        ssh.run_with_pty_password(
+            server,
+            &auth,
+            remote_command,
+            password.as_str(),
+            marker_nonce,
+        )?
     } else {
         ssh.run(server, &auth, remote_command)?
     };
@@ -523,6 +533,9 @@ struct PrivilegedExecution {
     stdin: Option<Zeroizing<String>>,
     /// su: password injected at the PTY prompt by the ssh backend.
     pty_password: Option<Zeroizing<String>>,
+    /// su: per-execution nonce for the output framing markers, passed to the
+    /// backend so it parses exactly the markers `su_command` produced.
+    pty_marker_nonce: Option<String>,
     redact_secret: Option<Zeroizing<String>>,
 }
 
@@ -546,11 +559,13 @@ where
     }
 }
 
-fn sudo_execution<C>(
-    command: &str,
+/// Fetch the stored privilege password for `privilege` and validate its shape.
+/// Shared by the sudo and su execution builders so the credential lookup,
+/// missing-entry context, and non-empty/single-line validation stay identical.
+fn fetch_validated_privilege_password<C>(
     privilege: &PrivilegeConfig,
     credentials: &C,
-) -> anyhow::Result<PrivilegedExecution>
+) -> anyhow::Result<Zeroizing<String>>
 where
     C: CredentialStore,
 {
@@ -565,10 +580,23 @@ where
             })?,
     );
     privilege::validate_privilege_password(password.as_str())?;
+    Ok(password)
+}
+
+fn sudo_execution<C>(
+    command: &str,
+    privilege: &PrivilegeConfig,
+    credentials: &C,
+) -> anyhow::Result<PrivilegedExecution>
+where
+    C: CredentialStore,
+{
+    let password = fetch_validated_privilege_password(privilege, credentials)?;
     Ok(PrivilegedExecution {
         command: sudo_command(command, &privilege.user),
         stdin: Some(Zeroizing::new(format!("{}\n", password.as_str()))),
         pty_password: None,
+        pty_marker_nonce: None,
         redact_secret: Some(password),
     })
 }
@@ -581,24 +609,16 @@ fn su_execution<C>(
 where
     C: CredentialStore,
 {
-    let password = Zeroizing::new(
-        credentials
-            .get_password(&privilege.credential, &privilege.user)
-            .with_context(|| {
-                format!(
-                    "missing credential entry for {} and privilege user {}",
-                    privilege.credential, privilege.user
-                )
-            })?,
-    );
-    privilege::validate_privilege_password(password.as_str())?;
+    let password = fetch_validated_privilege_password(privilege, credentials)?;
+    let marker_nonce = su_marker_nonce();
     Ok(PrivilegedExecution {
-        command: su_command(command, &privilege.user),
+        command: su_command(command, &privilege.user, &marker_nonce),
         stdin: None,
         // su prompts for the password on the PTY; the ssh backend injects this
         // value when it detects the prompt. It is never placed on the command
         // line or in the audit detail.
         pty_password: Some(password.clone()),
+        pty_marker_nonce: Some(marker_nonce),
         redact_secret: Some(password),
     })
 }
@@ -616,21 +636,46 @@ fn sudo_command(command: &str, user: &str) -> String {
     format!("sh -c {}", shell_quote(&script))
 }
 
-fn su_command(command: &str, user: &str) -> String {
+fn su_command(command: &str, user: &str, marker_nonce: &str) -> String {
     // su reads its password from the controlling terminal (PTY), so there is no
     // `-S`/stdin trick — the backend injects the password at the prompt. LC_ALL=C
     // forces the English "Password:" prompt so the backend can detect it. The
     // command is wrapped in BEGIN/END markers so the backend extracts exactly the
     // command's own output and its exit code from the merged PTY stream, instead
-    // of guessing which lines are prompt vs output.
+    // of guessing which lines are prompt vs output. The markers embed a
+    // per-execution nonce so the command's own stdout cannot reproduce the END
+    // marker and forge the exit code (the backend uses the same nonce to parse).
     let quoted_user = shell_quote(user);
     let inner = format!(
         "printf '{begin}\\n'; sh -c {cmd}; __sshw_ec=$?; printf '{end}%d__\\n' \"$__sshw_ec\"",
-        begin = SU_MARKER_BEGIN,
+        begin = su_begin_marker(marker_nonce),
         cmd = shell_quote(command),
-        end = SU_MARKER_END_PREFIX,
+        end = su_end_prefix(marker_nonce),
     );
     format!("LC_ALL=C su - {quoted_user} -c {}", shell_quote(&inner))
+}
+
+/// Generate an unpredictable hex nonce for one `su` execution's output framing.
+/// Mixes a process-wide sequence counter, a wall-clock nanosecond sample, and
+/// the pid through the standard library's randomized hasher — dependency-free,
+/// and different on every call so a command's stdout cannot guess the markers.
+fn su_marker_nonce() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u64(seq);
+    hasher.write_u64(nanos);
+    hasher.write_u32(std::process::id());
+    format!("{:016x}", hasher.finish())
 }
 
 fn shell_quote(value: &str) -> String {

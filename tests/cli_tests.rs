@@ -1517,12 +1517,23 @@ fn run_as_root_su_injects_password_over_pty_without_leaking_it() {
         "got: {}",
         commands[0]
     );
+    // The output framing markers embed the per-execution nonce that is also
+    // handed to the backend, so a command's own stdout cannot forge the END
+    // marker and spoof the exit code.
+    let nonces = ssh.run_pty_nonces.borrow();
+    assert_eq!(nonces.len(), 1);
+    let nonce = &nonces[0];
+    assert!(!nonce.is_empty(), "a marker nonce should be generated");
     assert!(
-        commands[0].contains("__SSHW_BEGIN__"),
+        commands[0].contains(&format!("__SSHW_BEGIN_{nonce}__")),
         "got: {}",
         commands[0]
     );
-    assert!(commands[0].contains("__SSHW_END__"));
+    assert!(
+        commands[0].contains(&format!("__SSHW_END_{nonce}_")),
+        "got: {}",
+        commands[0]
+    );
     // The password must never appear in the command string.
     assert!(!commands[0].contains("ROOT_SU_PASSWORD"));
     // It is delivered via the dedicated PTY-password path instead.
@@ -2778,6 +2789,7 @@ struct FakeSshClient {
     run_commands: RefCell<Vec<String>>,
     run_stdin: RefCell<Vec<Option<String>>>,
     run_pty_passwords: RefCell<Vec<String>>,
+    run_pty_nonces: RefCell<Vec<String>>,
     trusted_expected_fingerprints: RefCell<Vec<String>>,
     put_calls: RefCell<Vec<String>>,
     get_calls: RefCell<Vec<bool>>,
@@ -2891,11 +2903,15 @@ impl SshClient for FakeSshClient {
         _auth: &AuthMaterial,
         command: &str,
         password: &str,
+        marker_nonce: &str,
     ) -> anyhow::Result<RunResult> {
         self.run_commands.borrow_mut().push(command.to_string());
         self.run_pty_passwords
             .borrow_mut()
             .push(password.to_string());
+        self.run_pty_nonces
+            .borrow_mut()
+            .push(marker_nonce.to_string());
         if let Some(message) = &self.run_error {
             return Err(anyhow::anyhow!("{message}"));
         }

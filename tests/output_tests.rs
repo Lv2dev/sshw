@@ -84,6 +84,8 @@ fn classifies_ssh_session_and_transfer_errors_as_ssh() {
     for message in [
         "ssh session error: channel failure",
         "ssh transfer error: scp protocol error",
+        // ssh2_client::extract_su_output when the su END marker never arrives.
+        "su output ended before the completion marker",
     ] {
         let kind = classify_error(&anyhow::anyhow!("{message}"));
         assert_eq!(kind, ErrorKind::Ssh, "message: {message}");
@@ -156,6 +158,8 @@ fn classifies_auth_errors_with_exit_code_4() {
         "credential store unavailable: backend offline",
         "SSH authentication failed",
         "password cannot be empty",
+        // privilege::validate_privilege_password rejects a multiline secret.
+        "privilege password must be a single line",
     ] {
         let kind = classify_error(&anyhow::anyhow!("{message}"));
         assert_eq!(kind, ErrorKind::Auth, "message: {message}");
@@ -179,11 +183,16 @@ fn classifies_unknown_server_and_confirmation_errors_as_config() {
 }
 
 #[test]
-fn classifies_existing_local_file_as_io() {
-    let err = anyhow::anyhow!("local file already exists: ./out; pass --yes to overwrite");
-    let kind = classify_error(&err);
-    assert_eq!(kind, ErrorKind::Io);
-    assert_eq!(kind.exit_code(), 6);
+fn classifies_io_errors_with_exit_code_6() {
+    for message in [
+        "local file already exists: ./out; pass --yes to overwrite",
+        // ssh2_client::put rejects a non-file local path (e.g. a directory).
+        "local path is not a regular file: ./somedir",
+    ] {
+        let kind = classify_error(&anyhow::anyhow!("{message}"));
+        assert_eq!(kind, ErrorKind::Io, "message: {message}");
+        assert_eq!(kind.exit_code(), 6);
+    }
 }
 
 #[test]

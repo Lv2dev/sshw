@@ -94,13 +94,14 @@ const CONFIG_MARKERS: [&str; 11] = [
     "confirmation requires an interactive terminal",
     "confirmation input ended before a response",
 ];
-const AUTH_MARKERS: [&str; 4] = [
+const AUTH_MARKERS: [&str; 5] = [
     "missing credential",
     "credential store",
     "authentication",
     "password cannot be empty",
+    "must be a single line",
 ];
-const SSH_MARKERS: [&str; 7] = [
+const SSH_MARKERS: [&str; 8] = [
     "host key",
     "known_hosts",
     "failed to connect to",
@@ -108,8 +109,9 @@ const SSH_MARKERS: [&str; 7] = [
     "ssh handshake",
     "ssh session",
     "ssh transfer",
+    "ended before the completion marker",
 ];
-const IO_MARKER: &str = "local file already exists";
+const IO_MARKERS: [&str; 2] = ["local file already exists", "not a regular file"];
 
 /// Map an error to a stable [`ErrorKind`] for agent consumption.
 ///
@@ -145,7 +147,7 @@ pub fn classify_error(err: &anyhow::Error) -> ErrorKind {
         return ErrorKind::Ssh;
     }
 
-    if message.contains(IO_MARKER)
+    if IO_MARKERS.iter().any(|marker| message.contains(marker))
         || err
             .chain()
             .any(|cause| cause.downcast_ref::<std::io::Error>().is_some())

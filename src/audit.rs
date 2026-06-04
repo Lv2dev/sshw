@@ -61,10 +61,6 @@ impl FileAuditSink {
     pub fn new(path: PathBuf) -> Self {
         Self { path }
     }
-
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
 }
 
 #[derive(Serialize)]
