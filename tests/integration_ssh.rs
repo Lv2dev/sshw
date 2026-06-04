@@ -627,8 +627,15 @@ fn run_as_root_uses_su_against_real_sshd_with_pty_password() {
     let mut prompter = NoopPrompter;
 
     let output = execute(
-        Cli::try_parse_from(["sshw", "run", "docker-password", "id -u", "--as-root", "--yes"])
-            .unwrap(),
+        Cli::try_parse_from([
+            "sshw",
+            "run",
+            "docker-password",
+            "id -u",
+            "--as-root",
+            "--yes",
+        ])
+        .unwrap(),
         &path,
         &store,
         &srv.client(),
