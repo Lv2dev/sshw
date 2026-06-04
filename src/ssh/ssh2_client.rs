@@ -520,12 +520,24 @@ fn pty_collect_loop(
     Ok(out)
 }
 
-/// True if the accumulated PTY output already contains a password prompt.
-/// Checked before injection only; LC_ALL=C makes `su` print "Password:".
+/// True if the accumulated PTY output is currently *waiting* at a password
+/// prompt. Checked before injection only.
+///
+/// `su` prints the prompt without a trailing newline and then blocks for input,
+/// so only the final unterminated line (the tail after the last `\n`/`\r`) is a
+/// live prompt candidate — completed lines are already-past output. We require
+/// that tail to contain "password" and, after trimming trailing spaces, end
+/// with a colon. This stops an earlier banner/PAM line that merely mentions a
+/// password (e.g. "Last password change: ..." or "...change your password")
+/// from triggering an early injection before the real prompt appears. LC_ALL=C
+/// makes `su`/PAM print the English "Password:" prompt. Limitation: a
+/// non-standard prompt without a trailing colon would not be detected, in which
+/// case the bounded prompt-wait surfaces a timeout rather than misfiring.
 fn output_has_password_prompt(out: &[u8]) -> bool {
-    String::from_utf8_lossy(out)
-        .to_ascii_lowercase()
-        .contains("password")
+    let text = String::from_utf8_lossy(out);
+    let tail = text.rsplit(['\n', '\r']).next().unwrap_or("");
+    let lower = tail.to_ascii_lowercase();
+    lower.contains("password") && lower.trim_end().ends_with(':')
 }
 
 /// Build the BEGIN marker that frames a `su` command's output on the PTY from a
@@ -930,6 +942,22 @@ example.test ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB9zU1OEQ2tzYhrXq4/DEjvRNvKv6cU
         assert!(super::output_has_password_prompt(b"PASSWORD:"));
         assert!(!super::output_has_password_prompt(b"id -u\r\n0\r\n"));
         assert!(!super::output_has_password_prompt(b""));
+    }
+
+    #[test]
+    fn ignores_password_mentioning_banner_before_the_real_prompt() {
+        // A pre-prompt banner/PAM line that merely mentions "password" is NOT a
+        // live colon-terminated prompt, so it must not trigger early injection.
+        assert!(!super::output_has_password_prompt(
+            b"Last password change: never"
+        ));
+        assert!(!super::output_has_password_prompt(
+            b"You are required to change your password immediately\r\n"
+        ));
+        // The real prompt appearing after such a banner is still detected.
+        assert!(super::output_has_password_prompt(
+            b"You must change your password\r\nPassword: "
+        ));
     }
 
     #[test]
