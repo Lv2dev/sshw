@@ -86,6 +86,8 @@ fn classifies_ssh_session_and_transfer_errors_as_ssh() {
         "ssh transfer error: scp protocol error",
         // ssh2_client::extract_su_output when the su END marker never arrives.
         "su output ended before the completion marker",
+        // ssh2_client::extract_su_output when the END marker is incomplete.
+        "su output ended with a malformed completion marker",
     ] {
         let kind = classify_error(&anyhow::anyhow!("{message}"));
         assert_eq!(kind, ErrorKind::Ssh, "message: {message}");
