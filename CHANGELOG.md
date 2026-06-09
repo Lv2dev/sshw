@@ -8,11 +8,14 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-06-09
+
 ### Added
 - `sshw run --as-root --yes` now executes `su` privilege escalation over a PTY for servers without `sudo`: the configured `su` password is injected at the prompt with PTY echo disabled and `LC_ALL=C`, and is never placed on the command line or in the audit detail.
 
 ### Security
 - `su` command output is framed with markers that embed a per-execution random nonce, so the privileged command's own stdout cannot reproduce the framing to truncate the captured output or spoof its exit code. The pre-command su prompt wait is bounded so a missing or unrecognized password prompt cannot hang indefinitely.
+- An `su` END marker without a well-formed exit-code suffix (no digits, a missing `__` terminator, or an `i32`-overflowing value) is now rejected as a fail-closed `ssh` error instead of being read as exit code `0`.
 
 ### Fixed
 - `put` to a directory (a non-regular file), a stored multiline privilege password, and an `su` run whose output frame ends early now map to their documented exit codes (`io`/6, `auth`/4, `ssh`/5) instead of the generic `unknown` (1).
@@ -135,7 +138,9 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 
 - Initial public release: registered-server SSH `run`/`put`/`get` with secrets kept in the OS credential store, fail-closed `known_hosts` verification, and explicit `sshw trust`.
 
-[Unreleased]: https://github.com/Lv2dev/sshw/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/Lv2dev/sshw/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/Lv2dev/sshw/compare/v0.7.0...v0.8.0
+[0.7.0]: https://github.com/Lv2dev/sshw/compare/v0.6.2...v0.7.0
 [0.6.2]: https://github.com/Lv2dev/sshw/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/Lv2dev/sshw/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/Lv2dev/sshw/compare/v0.5.1...v0.6.0
