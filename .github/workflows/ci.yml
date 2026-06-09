@@ -65,6 +65,7 @@ jobs:
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - run: cargo metadata --manifest-path fuzz/Cargo.toml --locked --format-version 1
       - run: cargo install cargo-deny --version 0.19.8 --locked
       - run: cargo deny check
       - run: cargo deny --manifest-path fuzz/Cargo.toml check

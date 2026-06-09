@@ -598,12 +598,17 @@ fn extract_su_output(raw: &str, marker_nonce: &str) -> anyhow::Result<(String, i
     let body = &raw[body_start..end_abs];
     // Exit-code digits follow the END prefix (terminated by `__`).
     let after_end = end_abs + end_prefix.len();
-    let exit_code = raw[after_end..]
-        .chars()
-        .take_while(|c| c.is_ascii_digit())
-        .collect::<String>()
+    let marker_tail = &raw[after_end..];
+    let digit_len = marker_tail
+        .bytes()
+        .take_while(|b| b.is_ascii_digit())
+        .count();
+    if digit_len == 0 || !marker_tail[digit_len..].starts_with("__") {
+        anyhow::bail!("su output ended with a malformed completion marker");
+    }
+    let exit_code = marker_tail[..digit_len]
         .parse::<i32>()
-        .unwrap_or(0);
+        .context("su output ended with a malformed completion marker")?;
     let stdout = body.replace("\r\n", "\n").replace('\r', "\n");
     Ok((stdout, exit_code))
 }
@@ -984,6 +989,17 @@ example.test ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB9zU1OEQ2tzYhrXq4/DEjvRNvKv6cU
         let raw = "__SSHW_BEGIN_deadbeef__\r\nboom\r\n__SSHW_END_deadbeef_7__\r\n";
         let (_, code) = super::extract_su_output(raw, "deadbeef").expect("marked output");
         assert_eq!(code, 7);
+    }
+
+    #[test]
+    fn extract_su_output_rejects_malformed_end_marker() {
+        let no_digits = "__SSHW_BEGIN_deadbeef__\r\nboom\r\n__SSHW_END_deadbeef___\r\n";
+        let missing_terminator = "__SSHW_BEGIN_deadbeef__\r\nboom\r\n__SSHW_END_deadbeef_7\r\n";
+        let overflow = "__SSHW_BEGIN_deadbeef__\r\nboom\r\n__SSHW_END_deadbeef_99999999999__\r\n";
+
+        assert!(super::extract_su_output(no_digits, "deadbeef").is_err());
+        assert!(super::extract_su_output(missing_terminator, "deadbeef").is_err());
+        assert!(super::extract_su_output(overflow, "deadbeef").is_err());
     }
 
     #[test]
