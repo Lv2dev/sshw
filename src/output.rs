@@ -101,7 +101,7 @@ const AUTH_MARKERS: [&str; 5] = [
     "password cannot be empty",
     "must be a single line",
 ];
-const SSH_MARKERS: [&str; 8] = [
+const SSH_MARKERS: [&str; 9] = [
     "host key",
     "known_hosts",
     "failed to connect to",
@@ -110,6 +110,7 @@ const SSH_MARKERS: [&str; 8] = [
     "ssh session",
     "ssh transfer",
     "ended before the completion marker",
+    "malformed completion marker",
 ];
 const IO_MARKERS: [&str; 2] = ["local file already exists", "not a regular file"];
 
