@@ -1,4 +1,6 @@
-use std::io::{self, BufRead, IsTerminal, Read, Write};
+use std::io::{self, IsTerminal, Read};
+#[cfg(test)]
+use std::io::{BufRead, Write};
 
 pub trait Prompter {
     fn confirm(&mut self, prompt: &str) -> anyhow::Result<bool>;
@@ -10,12 +12,18 @@ pub(crate) struct TerminalPrompter;
 
 impl Prompter for TerminalPrompter {
     fn confirm(&mut self, prompt: &str) -> anyhow::Result<bool> {
-        let stdin = io::stdin();
-        let interactive = stdin.is_terminal();
-        let mut input = stdin.lock();
-        let mut output = io::stderr();
+        if !io::stdin().is_terminal() {
+            return Err(anyhow::anyhow!(
+                "confirmation requires an interactive terminal; rerun with --yes to confirm"
+            ));
+        }
 
-        confirm_from_reader(prompt, &mut input, &mut output, interactive)
+        // Read the reply from the controlling terminal (CONIN$ on Windows) instead of the
+        // inherited stdin handle. std's buffered stdin read_line can hang under ConPTY
+        // (Windows Terminal / PowerShell), whereas rprompt opens the console device
+        // directly, the same way rpassword does for the password prompt.
+        let answer = rprompt::prompt_reply(prompt)?;
+        Ok(is_affirmative(&answer))
     }
 
     fn password(&mut self, prompt: &str) -> anyhow::Result<String> {
@@ -29,6 +37,14 @@ impl Prompter for TerminalPrompter {
     }
 }
 
+fn is_affirmative(answer: &str) -> bool {
+    matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+/// Testable mirror of `TerminalPrompter::confirm`. Production reads the console device
+/// directly via `rprompt::prompt_reply`; this exercises the interactive gate and answer
+/// parsing against an injected reader/writer. An EOF reply (no trailing newline) is rejected.
+#[cfg(test)]
 fn confirm_from_reader<R, W>(
     prompt: &str,
     input: &mut R,
@@ -45,21 +61,8 @@ where
         ));
     }
 
-    write!(output, "{prompt}")?;
-    output.flush()?;
-
-    let mut answer = String::new();
-    let bytes_read = input.read_line(&mut answer)?;
-    if bytes_read == 0 {
-        return Err(anyhow::anyhow!(
-            "confirmation input ended before a response; rerun with --yes to confirm"
-        ));
-    }
-
-    Ok(matches!(
-        answer.trim().to_ascii_lowercase().as_str(),
-        "y" | "yes"
-    ))
+    let answer = rprompt::prompt_reply_from_bufread(input, output, prompt)?;
+    Ok(is_affirmative(&answer))
 }
 
 fn password_from_reader<R>(input: &mut R) -> anyhow::Result<String>
@@ -103,10 +106,9 @@ mod tests {
         let mut input = Cursor::new(Vec::<u8>::new());
         let mut output = Vec::new();
 
-        let err =
-            super::confirm_from_reader("confirm? ", &mut input, &mut output, true).unwrap_err();
+        let result = super::confirm_from_reader("confirm? ", &mut input, &mut output, true);
 
-        assert!(err.to_string().contains("confirmation input ended"));
+        assert!(result.is_err());
     }
 
     #[test]
