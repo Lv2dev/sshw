@@ -17,6 +17,9 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 ### Fixed
 - `put` to a directory (a non-regular file), a stored multiline privilege password, and an `su` run whose output frame ends early now map to their documented exit codes (`io`/6, `auth`/4, `ssh`/5) instead of the generic `unknown` (1).
 
+### Documentation
+- `sshw --help` is now self-sufficient for agents: the long help adds SECURITY MODEL, EXIT CODES (the stable table), JSON OUTPUT (the `{"ok":...}` envelope and which subcommands take `--json`), and EXAMPLES sections, and every subcommand, flag, and value enum now carries help text (the put/get `[server] <local> <remote>` grammar, the run target grammar, which commands need `--yes`, sudo vs su, and that there is no `--password` flag). The `--policy` flag help and the SECURITY MODEL bullet now note that policy enforcement is also on automatically when policy.json sets `enabled: true`, not only when `--policy` is passed; the `--policy` help also clarifies that the `if requested` qualifier applies only to a missing file, while an invalid policy file always fails closed. The SECURITY MODEL bullet now states how to select the session-only credential backend (`credential_backend: session_only` in servers.json, fed via `SSHW_PASSWORD`). The `--home` help no longer claims it overrides `--profile` (passing both is a config error); it now states `--home` overrides `SSHW_HOME` and cannot be combined with `--profile`, matching the `--profile` help. Text-only; no new flags, commands, or JSON surface.
+
 ## [0.7.0] - 2026-06-03
 
 ### Added
