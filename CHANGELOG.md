@@ -8,6 +8,9 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 
 ## [Unreleased]
 
+### Fixed
+- Remote stdout/stderr that contain non-UTF-8 bytes are now preserved with Unicode replacement characters instead of failing the completed SSH command with an `io` error and dropping all captured output.
+
 ## [0.8.0] - 2026-06-09
 
 ### Added
