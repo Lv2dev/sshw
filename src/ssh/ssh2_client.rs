@@ -444,9 +444,7 @@ fn pty_collect_with_password(
     let collected = pty_collect_loop(session, channel, password, op_timeout, begin_marker);
     session.set_blocking(true);
     let out = collected?;
-    String::from_utf8(out)
-        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))
-        .map_err(anyhow::Error::from)
+    Ok(decode_remote_output_lossy(out))
 }
 
 fn pty_collect_loop(
@@ -572,6 +570,13 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
             .any(|window| window == needle)
 }
 
+fn decode_remote_output_lossy(bytes: Vec<u8>) -> String {
+    match String::from_utf8(bytes) {
+        Ok(output) => output,
+        Err(error) => String::from_utf8_lossy(&error.into_bytes()).into_owned(),
+    }
+}
+
 /// Parse the marker-framed output of a `su` PTY run. Everything before BEGIN
 /// (prompt, echo, su/login noise) is discarded; the bytes between BEGIN and END
 /// are the command's stdout, and the digits after END are its exit code. A
@@ -633,10 +638,8 @@ fn read_channel_outputs(
     let drained = drain_both_streams(channel, op_timeout);
     session.set_blocking(true);
     let (out, err) = drained?;
-    let stdout = String::from_utf8(out)
-        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
-    let stderr = String::from_utf8(err)
-        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+    let stdout = decode_remote_output_lossy(out);
+    let stderr = decode_remote_output_lossy(err);
     Ok((stdout, stderr))
 }
 
@@ -963,6 +966,13 @@ example.test ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB9zU1OEQ2tzYhrXq4/DEjvRNvKv6cU
         assert!(super::output_has_password_prompt(
             b"You must change your password\r\nPassword: "
         ));
+    }
+
+    #[test]
+    fn decodes_invalid_remote_output_lossily() {
+        let output = super::decode_remote_output_lossy(b"ok:\xff\xfe\n".to_vec());
+
+        assert_eq!(output, "ok:\u{fffd}\u{fffd}\n");
     }
 
     #[test]
