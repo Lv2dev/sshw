@@ -221,6 +221,322 @@ fn json_run_unknown_server_returns_structured_error() {
 }
 
 #[test]
+fn add_json_failure_uses_error_envelope() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &SshwConfig::default()).unwrap();
+    let store = FakeCredentialStore::default();
+    let ssh = FakeSshClient::default();
+    let mut prompter = FakePrompter {
+        confirm: false,
+        confirm_error: None,
+        password: Some(String::new()),
+        password_stdin: None,
+    };
+
+    let output = execute_for_runtime(
+        Cli::try_parse_from([
+            "sshw",
+            "add",
+            "server-alpha",
+            "--host",
+            "192.0.2.10",
+            "--port",
+            "2222",
+            "--user",
+            "deploy",
+            "--json",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    );
+
+    assert_json_error(output, 4, "auth", "password cannot be empty");
+    assert!(store.values.borrow().is_empty());
+}
+
+#[test]
+fn trust_json_failure_uses_error_envelope() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &SshwConfig::default()).unwrap();
+    let store = FakeCredentialStore::default();
+    let ssh = FakeSshClient::default();
+    let mut prompter = FakePrompter::default();
+
+    let output = execute_for_runtime(
+        Cli::try_parse_from(["sshw", "trust", "missing", "--yes", "--json"]).unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    );
+
+    assert_json_error(output, 3, "config", "unknown server 'missing'");
+}
+
+#[test]
+fn remove_json_failure_uses_error_envelope() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &SshwConfig::default()).unwrap();
+    let store = FakeCredentialStore::default();
+    let ssh = FakeSshClient::default();
+    let mut prompter = FakePrompter::default();
+
+    let output = execute_for_runtime(
+        Cli::try_parse_from(["sshw", "remove", "missing", "--yes", "--json"]).unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    );
+
+    assert_json_error(output, 3, "config", "unknown server 'missing'");
+}
+
+#[test]
+fn privilege_set_json_failure_uses_error_envelope() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &sample_config()).unwrap();
+    let store = FakeCredentialStore::default();
+    let ssh = FakeSshClient::default();
+    let mut prompter = FakePrompter {
+        confirm: false,
+        confirm_error: None,
+        password: None,
+        password_stdin: Some(String::new()),
+    };
+
+    let output = execute_for_runtime(
+        Cli::try_parse_from([
+            "sshw",
+            "privilege",
+            "set",
+            "server-alpha",
+            "--password-stdin",
+            "--json",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    );
+
+    assert_json_error(output, 4, "auth", "password cannot be empty");
+    assert!(store.values.borrow().is_empty());
+}
+
+#[test]
+fn privilege_clear_json_failure_uses_error_envelope() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &sample_config()).unwrap();
+    let store = FakeCredentialStore::default();
+    let ssh = FakeSshClient::default();
+    let mut prompter = FakePrompter::default();
+
+    let output = execute_for_runtime(
+        Cli::try_parse_from([
+            "sshw",
+            "privilege",
+            "clear",
+            "server-alpha",
+            "--yes",
+            "--json",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    );
+
+    assert_json_error(output, 3, "config", "privilege configuration missing");
+}
+
+#[test]
+fn add_json_success_reports_state_change_without_secret() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &SshwConfig::default()).unwrap();
+    let store = FakeCredentialStore::default();
+    let ssh = FakeSshClient::default();
+    let mut prompter = FakePrompter {
+        confirm: false,
+        confirm_error: None,
+        password: Some("SSH_PASSWORD".to_string()),
+        password_stdin: None,
+    };
+
+    let output = execute(
+        Cli::try_parse_from([
+            "sshw",
+            "add",
+            "server-alpha",
+            "--host",
+            "192.0.2.10",
+            "--port",
+            "2222",
+            "--user",
+            "deploy",
+            "--json",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    )
+    .unwrap();
+
+    let json: serde_json::Value = serde_json::from_str(output.stdout.trim()).unwrap();
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["action"], "added");
+    assert_eq!(json["server"], "server-alpha");
+    assert!(!output.stdout.contains("SSH_PASSWORD"));
+}
+
+#[test]
+fn trust_json_success_reports_state_change() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &sample_config()).unwrap();
+    let store = FakeCredentialStore::default();
+    let ssh = FakeSshClient {
+        host_key_fingerprint: "SHA256:displayed".to_string(),
+        ..FakeSshClient::default()
+    };
+    let mut prompter = FakePrompter::default();
+
+    let output = execute(
+        Cli::try_parse_from(["sshw", "trust", "server-alpha", "--yes", "--json"]).unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    )
+    .unwrap();
+
+    let json: serde_json::Value = serde_json::from_str(output.stdout.trim()).unwrap();
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["server"], "server-alpha");
+    assert_eq!(json["algorithm"], "ssh-ed25519");
+    assert_eq!(json["fingerprint_sha256"], "SHA256:displayed");
+}
+
+#[test]
+fn remove_json_success_reports_state_change() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &sample_config()).unwrap();
+    let store = FakeCredentialStore::default();
+    let ssh = FakeSshClient::default();
+    let mut prompter = FakePrompter::default();
+
+    let output = execute(
+        Cli::try_parse_from(["sshw", "remove", "server-alpha", "--yes", "--json"]).unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    )
+    .unwrap();
+
+    let json: serde_json::Value = serde_json::from_str(output.stdout.trim()).unwrap();
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["action"], "removed");
+    assert_eq!(json["server"], "server-alpha");
+}
+
+#[test]
+fn privilege_set_json_success_reports_state_change_without_secret() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &sample_config()).unwrap();
+    let store = FakeCredentialStore::default();
+    let ssh = FakeSshClient::default();
+    let mut prompter = FakePrompter {
+        confirm: false,
+        confirm_error: None,
+        password: None,
+        password_stdin: Some("ROOT_PASSWORD".to_string()),
+    };
+
+    let output = execute(
+        Cli::try_parse_from([
+            "sshw",
+            "privilege",
+            "set",
+            "server-alpha",
+            "--method",
+            "sudo",
+            "--password-stdin",
+            "--json",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    )
+    .unwrap();
+
+    let json: serde_json::Value = serde_json::from_str(output.stdout.trim()).unwrap();
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["server"], "server-alpha");
+    assert_eq!(json["method"], "sudo");
+    assert_eq!(json["user"], "root");
+    assert!(!output.stdout.contains("ROOT_PASSWORD"));
+}
+
+#[test]
+fn privilege_clear_json_success_reports_state_change() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    let mut config = sample_config();
+    config.privileges.insert(
+        "server-alpha".to_string(),
+        PrivilegeConfig {
+            method: PrivilegeMethod::Sudo,
+            user: "root".to_string(),
+            credential: "sshw:default:privilege:server-alpha".to_string(),
+        },
+    );
+    save_config(&path, &config).unwrap();
+    let store = FakeCredentialStore::default();
+    let ssh = FakeSshClient::default();
+    let mut prompter = FakePrompter::default();
+
+    let output = execute(
+        Cli::try_parse_from([
+            "sshw",
+            "privilege",
+            "clear",
+            "server-alpha",
+            "--yes",
+            "--json",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    )
+    .unwrap();
+
+    let json: serde_json::Value = serde_json::from_str(output.stdout.trim()).unwrap();
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["action"], "cleared");
+    assert_eq!(json["server"], "server-alpha");
+}
+
+#[test]
 fn dangerous_run_is_blocked_before_ssh() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("servers.json");
@@ -2715,6 +3031,26 @@ fn policy_disabled_in_file_allows_everything_without_flag() {
     )
     .unwrap();
     assert_eq!(out.stdout, "ok\n");
+}
+
+fn assert_json_error(
+    output: sshw::cli::CommandOutput,
+    exit_code: i32,
+    kind: &str,
+    message_part: &str,
+) {
+    assert_eq!(output.exit_code, exit_code);
+    assert_eq!(output.stderr, "");
+    let json: serde_json::Value = serde_json::from_str(output.stdout.trim()).unwrap();
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["error"]["kind"], kind);
+    assert_eq!(json["error"]["exit_code"], exit_code);
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(message_part)
+    );
 }
 
 fn sample_config() -> SshwConfig {

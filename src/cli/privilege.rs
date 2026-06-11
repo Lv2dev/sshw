@@ -46,6 +46,9 @@ where
         user: args.user,
         credential: namespace.privilege_credential_key(&args.name),
     };
+    let output_method = privilege.method;
+    let output_user = privilege.user.clone();
+    let output_credential = privilege.credential.clone();
     credentials.set_password(&privilege.credential, &privilege.user, &password)?;
     config.privileges.insert(args.name.clone(), privilege);
     save_config(config_path, config)?;
@@ -59,11 +62,34 @@ where
         }
     }
 
+    let warning = if !credentials.is_persistent() {
+        Some(
+            "this credential backend does not persist privilege passwords; supply SSHW_PASSWORD at run time",
+        )
+    } else {
+        None
+    };
+
+    if args.json {
+        let mut output = json!({
+            "ok": true,
+            "server": args.name,
+            "method": output_method,
+            "user": output_user,
+            "credential": output_credential,
+        });
+        if let (Some(map), Some(warning)) = (output.as_object_mut(), warning) {
+            map.insert(
+                "warning".to_string(),
+                serde_json::Value::String(warning.to_string()),
+            );
+        }
+        return Ok(ok(format!("{}\n", serde_json::to_string(&output)?)));
+    }
+
     let mut message = format!("privilege set for {}\n", args.name);
-    if !credentials.is_persistent() {
-        message.push_str(
-            "warning: this credential backend does not persist privilege passwords; supply SSHW_PASSWORD at run time\n",
-        );
+    if let Some(warning) = warning {
+        message.push_str(&format!("warning: {warning}\n"));
     }
     Ok(ok(message))
 }
@@ -130,6 +156,15 @@ where
     credentials.delete_password(&privilege.credential, &privilege.user)?;
     config.privileges.remove(&args.name);
     save_config(config_path, config)?;
+    if args.json {
+        let output = json!({
+            "ok": true,
+            "action": "cleared",
+            "server": args.name,
+        });
+        return Ok(ok(format!("{}\n", serde_json::to_string(&output)?)));
+    }
+
     Ok(ok(format!("privilege cleared for {}\n", args.name)))
 }
 

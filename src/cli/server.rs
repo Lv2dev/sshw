@@ -11,6 +11,7 @@ use crate::credentials::CredentialStore;
 use crate::home::CredentialNamespace;
 use crate::output::ServerOutput;
 use crate::ssh::SshClient;
+use serde_json::json;
 use std::path::Path;
 
 pub(super) fn add_server<C, P>(
@@ -84,19 +85,35 @@ where
         delete_privilege_password(credentials, &privilege)?;
     }
 
-    let mut message = format!(
-        "{} {}\n",
-        if previous_server.is_some() {
-            "updated"
-        } else {
-            "added"
-        },
-        args.name
-    );
-    if matches!(args.auth, AuthArg::Password) && !credentials.is_persistent() {
-        message.push_str(
-            "warning: this credential backend does not persist passwords; supply SSHW_PASSWORD at run time\n",
-        );
+    let action = if previous_server.is_some() {
+        "updated"
+    } else {
+        "added"
+    };
+    let warning = if matches!(args.auth, AuthArg::Password) && !credentials.is_persistent() {
+        Some("this credential backend does not persist passwords; supply SSHW_PASSWORD at run time")
+    } else {
+        None
+    };
+
+    if args.json {
+        let mut output = json!({
+            "ok": true,
+            "action": action,
+            "server": args.name,
+        });
+        if let (Some(map), Some(warning)) = (output.as_object_mut(), warning) {
+            map.insert(
+                "warning".to_string(),
+                serde_json::Value::String(warning.to_string()),
+            );
+        }
+        return Ok(ok(format!("{}\n", serde_json::to_string(&output)?)));
+    }
+
+    let mut message = format!("{action} {}\n", args.name);
+    if let Some(warning) = warning {
+        message.push_str(&format!("warning: {warning}\n"));
     }
     Ok(ok(message))
 }
@@ -193,6 +210,16 @@ where
     }
 
     let trusted = ssh.trust_host(&args.name, server, &host_key.fingerprint_sha256)?;
+    if args.json {
+        let output = json!({
+            "ok": true,
+            "server": args.name,
+            "algorithm": trusted.algorithm,
+            "fingerprint_sha256": trusted.fingerprint_sha256,
+        });
+        return Ok(ok(format!("{}\n", serde_json::to_string(&output)?)));
+    }
+
     Ok(ok(format!(
         "trusted {} {} {}\n",
         args.name, trusted.algorithm, trusted.fingerprint_sha256
@@ -230,6 +257,15 @@ where
     }
 
     save_config(config_path, config)?;
+    if args.json {
+        let output = json!({
+            "ok": true,
+            "action": "removed",
+            "server": args.name,
+        });
+        return Ok(ok(format!("{}\n", serde_json::to_string(&output)?)));
+    }
+
     Ok(ok(format!("removed {}\n", args.name)))
 }
 

@@ -39,11 +39,13 @@ EXIT CODES (stable; sshw's own operational failures):
      The real remote status is in `run --json` (`exit_status`).
 
 JSON OUTPUT:
-  `--json` is accepted by: list, show, run, put, get, doctor, profile list,
-  profile show, privilege show. add/trust/remove/default have no --json.
+  `--json` is accepted by: add, list, show, trust, run, put, get, remove,
+  doctor, profile list, profile show, privilege set/show/clear.
+  default/profile state changes have no --json.
   Success (single object) carries `"ok":true`, e.g.:
     run:      {"ok":true,"server":"web","command":"uptime","exit_status":0,...}
     put/get:  {"ok":true,"server":"web","local":"./app","remote":"/srv/app","bytes":1234}
+    change:   {"ok":true,"action":"added","server":"web"}
   list / profile list return a JSON array on success (no wrapping object).
   Failure (any --json command, including usage errors) uses one envelope:
     {"ok":false,"error":{"kind":"config","message":"unknown server 'x'","exit_code":3}}
@@ -146,11 +148,15 @@ impl Command {
             },
             Self::Privilege(args) => match &args.command {
                 PrivilegeCommand::Show(a) => a.json,
-                PrivilegeCommand::Set(_) | PrivilegeCommand::Clear(_) => false,
+                PrivilegeCommand::Set(a) => a.json,
+                PrivilegeCommand::Clear(a) => a.json,
             },
             Self::Put(args) => args.json,
             Self::Get(args) => args.json,
-            Self::Add(_) | Self::Default(_) | Self::Trust(_) | Self::Remove(_) => false,
+            Self::Add(args) => args.json,
+            Self::Trust(args) => args.json,
+            Self::Remove(args) => args.json,
+            Self::Default(_) => false,
         }
     }
 }
@@ -188,6 +194,9 @@ pub struct PrivilegeSetArgs {
     /// Overwrite an existing privilege configuration without prompting.
     #[arg(long)]
     pub force: bool,
+    /// Emit JSON.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -206,6 +215,9 @@ pub struct PrivilegeClearArgs {
     /// Confirm removal non-interactively.
     #[arg(long)]
     pub yes: bool,
+    /// Emit JSON.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -299,6 +311,9 @@ pub struct AddArgs {
     /// auth only; there is no `--password <value>` flag.
     #[arg(long)]
     pub password_stdin: bool,
+    /// Emit JSON.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -338,6 +353,9 @@ pub struct TrustArgs {
     /// Skip the interactive fingerprint confirmation (still re-verifies before writing).
     #[arg(long)]
     pub yes: bool,
+    /// Emit JSON.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -396,6 +414,9 @@ pub struct RemoveArgs {
     /// Confirm removal non-interactively.
     #[arg(long)]
     pub yes: bool,
+    /// Emit JSON.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -425,6 +446,10 @@ mod tests {
             "EXIT CODES",
             "sshw trust",
             "JSON OUTPUT:",
+            "`--json` is accepted by: add, list, show, trust, run, put, get, remove,",
+            "doctor, profile list, profile show, privilege set/show/clear.",
+            "default/profile state changes have no --json.",
+            "change:   {\"ok\":true,\"action\":\"added\",\"server\":\"web\"}",
             "{\"ok\":false,\"error\":",
             "EXAMPLES:",
             "AUTOMATION:",
