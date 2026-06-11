@@ -8,6 +8,9 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 
 ## [Unreleased]
 
+### Added
+- `sshw add`, `sshw trust`, `sshw remove`, `sshw privilege set`, and `sshw privilege clear` now accept `--json`, returning `"ok":true` state-change objects on success and the standard `{"ok":false,"error":...}` envelope on failure.
+
 ### Documentation
 - `sshw --help` and README now tell coding agents to chain dependent `sshw`
   calls with `&&` instead of `;`, and to briefly back off after exit-code-5
