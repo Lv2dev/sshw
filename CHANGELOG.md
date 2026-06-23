@@ -9,7 +9,12 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 ## [Unreleased]
 
 ### Documentation
-- `sshw --help` and README now tell coding agents to chain dependent `sshw` calls with `&&` instead of `;`, and to briefly back off and retry the whole sequence when an exit-code-5 KEX/handshake failure such as `Unable to exchange encryption keys` suggests rapid connection throttling.
+- `sshw --help` and README now tell coding agents to chain dependent `sshw`
+  calls with `&&` instead of `;`, and to briefly back off after exit-code-5
+  KEX/handshake failures during rapid repeated connections before retrying from
+  the failed step; earlier successful steps should only be replayed when they
+  are idempotent and safe, and repeated failures call for checking network,
+  server, and host trust state.
 
 ## [0.8.1] - 2026-06-10
 
