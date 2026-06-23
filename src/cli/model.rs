@@ -53,10 +53,12 @@ AUTOMATION:
   Chain dependent sshw calls with `&&`, not `;`, so a failed upload or trust
   step stops the sequence instead of running the next remote command against
   missing state.
-  Exit 5 with a key-exchange or handshake message such as `Unable to exchange encryption keys`
-  means SSH setup failed before the command ran. If this
-  appears during rapid repeated connections, the remote sshd may be throttling
-  unauthenticated starts; wait briefly and retry the whole dependent sequence.
+  Exit 5 with a key-exchange or handshake message means SSH setup failed before
+  the command ran. Example: `Unable to exchange encryption keys`.
+  If this appears during rapid repeated connections, wait briefly and retry from
+  the failed step. Retry earlier successful steps only when they are idempotent
+  and safe to repeat. If it fails again, inspect network, server, and host trust
+  state before retrying.
 
 EXAMPLES:
   sshw add web --host 192.0.2.10 --port 22 --user deploy   # password auth (prompts)
@@ -416,6 +418,7 @@ mod tests {
     #[test]
     fn long_help_documents_security_exit_codes_json_and_examples() {
         let help = Cli::command().render_long_help().to_string();
+        let normalized_help = help.split_whitespace().collect::<Vec<_>>().join(" ");
 
         for marker in [
             "SECURITY MODEL:",
@@ -424,9 +427,15 @@ mod tests {
             "JSON OUTPUT:",
             "{\"ok\":false,\"error\":",
             "EXAMPLES:",
+            "AUTOMATION:",
             "Chain dependent sshw calls with `&&`, not `;`",
+            "Exit 5",
+            "key-exchange or handshake",
             "Unable to exchange encryption keys",
-            "wait briefly and retry",
+            "rapid repeated connections",
+            "idempotent",
+            "safe to repeat",
+            "inspect network, server, and host trust",
             // Spot-check exact codes so a future renumber cannot pass silently.
             "0  success",
             "1  unknown",
@@ -442,6 +451,18 @@ mod tests {
             assert!(
                 help.contains(marker),
                 "long help is missing the {marker:?} section/marker"
+            );
+        }
+
+        for marker in [
+            "Exit 5 with a key-exchange or handshake message means SSH setup failed before the command ran",
+            "If this appears during rapid repeated connections, wait briefly and retry from the failed step",
+            "Retry earlier successful steps only when they are idempotent and safe to repeat",
+            "If it fails again, inspect network, server, and host trust state before retrying",
+        ] {
+            assert!(
+                normalized_help.contains(marker),
+                "long help is missing the {marker:?} normalized automation guidance"
             );
         }
     }

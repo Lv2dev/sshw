@@ -298,7 +298,10 @@ Before destructive or service-impacting commands, show the exact command list an
 Prefer sshw run --json when parsing output.
 Use sshw put and sshw get for file transfer.
 Chain dependent calls with &&, not ; (for example: sshw put ... && sleep 1 && sshw run ...).
-If exit 5 mentions KEX/handshake such as Unable to exchange encryption keys, wait briefly and retry the dependent sequence.
+If exit 5 mentions KEX/handshake during rapid repeated connections, wait briefly and retry from the failed step.
+Example: Unable to exchange encryption keys.
+Retry earlier successful steps only when they are idempotent and safe to repeat.
+If it fails again, inspect network, server, and host trust state.
 ```
 
 ### Development
@@ -612,8 +615,11 @@ Before making changes, run: sshw run <server> "hostname && whoami && pwd"
 Before destructive or service-impacting commands, show the exact command list and wait for confirmation.
 Prefer sshw run --json when parsing output.
 Use sshw put and sshw get for file transfer.
-서로 의존하는 호출은 ;가 아니라 &&로 묶으세요(예: sshw put ... && sleep 1 && sshw run ...).
-exit 5가 Unable to exchange encryption keys 같은 KEX/handshake 메시지를 포함하면 잠시 기다린 뒤 의존 시퀀스 전체를 다시 시도하세요.
+Chain dependent calls with &&, not ; (for example: sshw put ... && sleep 1 && sshw run ...).
+If exit 5 mentions KEX/handshake during rapid repeated connections, wait briefly and retry from the failed step.
+Example: Unable to exchange encryption keys.
+Retry earlier successful steps only when they are idempotent and safe to repeat.
+If it fails again, inspect network, server, and host trust state.
 ```
 
 ### 개발
