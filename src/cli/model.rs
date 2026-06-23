@@ -49,6 +49,15 @@ JSON OUTPUT:
     {"ok":false,"error":{"kind":"config","message":"unknown server 'x'","exit_code":3}}
   `kind` is one of safety/config/auth/ssh/io/policy/usage/unknown (see EXIT CODES).
 
+AUTOMATION:
+  Chain dependent sshw calls with `&&`, not `;`, so a failed upload or trust
+  step stops the sequence instead of running the next remote command against
+  missing state.
+  Exit 5 with a key-exchange or handshake message such as `Unable to exchange encryption keys`
+  means SSH setup failed before the command ran. If this
+  appears during rapid repeated connections, the remote sshd may be throttling
+  unauthenticated starts; wait briefly and retry the whole dependent sequence.
+
 EXAMPLES:
   sshw add web --host 192.0.2.10 --port 22 --user deploy   # password auth (prompts)
   secret-read web | sshw add web --host 192.0.2.10 --port 22 --user deploy --password-stdin
@@ -415,6 +424,9 @@ mod tests {
             "JSON OUTPUT:",
             "{\"ok\":false,\"error\":",
             "EXAMPLES:",
+            "Chain dependent sshw calls with `&&`, not `;`",
+            "Unable to exchange encryption keys",
+            "wait briefly and retry",
             // Spot-check exact codes so a future renumber cannot pass silently.
             "0  success",
             "1  unknown",
