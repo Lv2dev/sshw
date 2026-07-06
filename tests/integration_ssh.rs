@@ -471,6 +471,24 @@ fn run_reports_remote_exit_status() {
 
 #[test]
 #[ignore = "spawns a real sshd; run with --ignored --test-threads=1"]
+fn run_rejects_remote_exit_signal() {
+    let srv = TestServer::start();
+    srv.trust();
+
+    let err = srv
+        .client()
+        .run(&srv.server(), &AuthMaterial::Agent, "sh -c 'kill -TERM $$'")
+        .expect_err("signal-terminated remote commands must fail closed");
+
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("remote command terminated by signal TERM"),
+        "unexpected error: {message}"
+    );
+}
+
+#[test]
+#[ignore = "spawns a real sshd; run with --ignored --test-threads=1"]
 fn run_rejected_when_host_key_not_trusted() {
     let srv = TestServer::start();
     // Intentionally skip srv.trust(): the host key is unknown.
@@ -752,6 +770,29 @@ fn put_then_get_roundtrip() {
     assert_eq!(fs::read(&dest).expect("read dest"), payload);
 
     let _ = client.run(&server, &AuthMaterial::Agent, &format!("rm -f {remote}"));
+}
+
+#[test]
+#[ignore = "spawns a real sshd; run with --ignored --test-threads=1"]
+fn put_rejects_remote_scp_sink_nonzero_exit_status() {
+    let srv = TestServer::start();
+    srv.trust();
+    let client = srv.client();
+    let server = srv.server();
+
+    let work = tempfile::tempdir().expect("tempdir");
+    let src = work.path().join("src.bin");
+    fs::write(&src, b"payload for /dev/full\n").expect("write src");
+
+    let err = client
+        .put(&server, &AuthMaterial::Agent, &src, "/dev/full")
+        .expect_err("remote scp sink failure must fail closed");
+
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("remote scp exited with status"),
+        "unexpected error: {message}"
+    );
 }
 
 #[test]
