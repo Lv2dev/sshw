@@ -1,6 +1,6 @@
 [package]
 name = "sshw"
-version = "0.8.1"
+version = "0.9.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Cross-platform SSH helper for delegated local coding-agent access without plaintext secrets."
@@ -11,7 +11,7 @@ keywords = ["ssh", "cli", "keyring", "automation"]
 categories = ["command-line-utilities", "authentication"]
 
 [dependencies]
-anyhow = "1.0.102"
+anyhow = "1.0.103"
 base64 = "0.22.1"
 clap = { version = "4.6.1", features = ["derive"] }
 directories = "6.0.0"
