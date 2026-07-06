@@ -403,6 +403,56 @@ fn add_json_success_reports_state_change_without_secret() {
 }
 
 #[test]
+fn add_json_update_reports_updated_action_and_session_warning() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &sample_config()).unwrap();
+    let store = SessionOnlyStore::new();
+    let ssh = FakeSshClient::default();
+    let mut prompter = FakePrompter {
+        confirm: false,
+        confirm_error: None,
+        password: None,
+        password_stdin: Some("UPDATED_PASSWORD".to_string()),
+    };
+
+    let output = execute(
+        Cli::try_parse_from([
+            "sshw",
+            "add",
+            "server-alpha",
+            "--host",
+            "192.0.2.20",
+            "--port",
+            "2022",
+            "--user",
+            "deploy",
+            "--password-stdin",
+            "--force",
+            "--json",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    )
+    .unwrap();
+
+    let json: serde_json::Value = serde_json::from_str(output.stdout.trim()).unwrap();
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["action"], "updated");
+    assert_eq!(json["server"], "server-alpha");
+    assert!(
+        json["warning"]
+            .as_str()
+            .is_some_and(|warning| warning.contains("does not persist passwords")),
+        "expected session-only persistence warning, got: {json}"
+    );
+    assert!(!output.stdout.contains("UPDATED_PASSWORD"));
+}
+
+#[test]
 fn trust_json_success_reports_state_change() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("servers.json");
@@ -452,6 +502,34 @@ fn remove_json_success_reports_state_change() {
     assert_eq!(json["ok"], true);
     assert_eq!(json["action"], "removed");
     assert_eq!(json["server"], "server-alpha");
+}
+
+#[test]
+fn remove_json_delete_failure_uses_error_envelope_and_keeps_config() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &sample_config()).unwrap();
+    let store = FakeCredentialStore {
+        delete_error: Some("credential backend unavailable: delete denied".to_string()),
+        ..FakeCredentialStore::default()
+    };
+    let ssh = FakeSshClient::default();
+    let mut prompter = FakePrompter::default();
+
+    let output = execute_for_runtime(
+        Cli::try_parse_from(["sshw", "remove", "server-alpha", "--yes", "--json"]).unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    );
+
+    assert_json_error(output, 4, "auth", "credential backend unavailable");
+    let config = load_config(&path).unwrap();
+    assert!(
+        config.servers.contains_key("server-alpha"),
+        "config must remain untouched when credential deletion fails"
+    );
 }
 
 #[test]
@@ -625,6 +703,30 @@ fn json_run_missing_credential_returns_auth_error() {
             .contains("missing credential entry")
     );
     assert!(ssh.run_commands.borrow().is_empty());
+}
+
+#[test]
+fn show_json_success_includes_ok_true() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &sample_config()).unwrap();
+    let store = FakeCredentialStore::default();
+    let ssh = FakeSshClient::default();
+    let mut prompter = FakePrompter::default();
+
+    let output = execute(
+        Cli::try_parse_from(["sshw", "show", "server-alpha", "--json"]).unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    )
+    .unwrap();
+
+    let json: serde_json::Value = serde_json::from_str(output.stdout.trim()).unwrap();
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["name"], "server-alpha");
+    assert_eq!(json["is_default"], true);
 }
 
 #[test]
@@ -1227,6 +1329,40 @@ fn privilege_show_redacts_secret_material() {
             .contains("credential: sshw:default:privilege:server-alpha")
     );
     assert!(!output.stdout.contains("ROOT_PASSWORD"));
+}
+
+#[test]
+fn privilege_show_json_success_includes_ok_true() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    let mut config = sample_config();
+    config.privileges.insert(
+        "server-alpha".to_string(),
+        PrivilegeConfig {
+            method: PrivilegeMethod::Sudo,
+            user: "root".to_string(),
+            credential: "sshw:default:privilege:server-alpha".to_string(),
+        },
+    );
+    save_config(&path, &config).unwrap();
+    let store = FakeCredentialStore::default();
+    let ssh = FakeSshClient::default();
+    let mut prompter = FakePrompter::default();
+
+    let output = execute(
+        Cli::try_parse_from(["sshw", "privilege", "show", "server-alpha", "--json"]).unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    )
+    .unwrap();
+
+    let json: serde_json::Value = serde_json::from_str(output.stdout.trim()).unwrap();
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["server"], "server-alpha");
+    assert_eq!(json["method"], "sudo");
+    assert_eq!(json["user"], "root");
 }
 
 #[test]
@@ -2162,6 +2298,7 @@ fn doctor_json_reports_missing_credentials_without_secrets() {
     .unwrap();
 
     let json: serde_json::Value = serde_json::from_str(output.stdout.trim()).unwrap();
+    assert_eq!(json["ok"], true);
     assert_eq!(json["credential_backend"], "fake");
     assert_eq!(json["credential_available"], true);
     assert_eq!(
@@ -2365,6 +2502,57 @@ fn profile_add_list_show_default_remove_round_trip() {
     )
     .unwrap();
     assert_eq!(empty.stdout, "");
+}
+
+#[test]
+fn profile_json_success_contracts_are_stable() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &SshwConfig::default()).unwrap();
+    let store = FakeCredentialStore::default();
+    let ssh = FakeSshClient::default();
+    let prod_home = temp.path().join("prod-home");
+    let prod_home = prod_home.to_str().unwrap();
+
+    execute(
+        Cli::try_parse_from(["sshw", "profile", "add", "prod", "--home", prod_home]).unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut FakePrompter::default(),
+    )
+    .unwrap();
+
+    let listed = execute(
+        Cli::try_parse_from(["sshw", "profile", "list", "--json"]).unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut FakePrompter::default(),
+    )
+    .unwrap();
+    let entries: serde_json::Value = serde_json::from_str(listed.stdout.trim()).unwrap();
+    let entries = entries.as_array().expect("profile list stays a bare array");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["name"], "prod");
+    assert_eq!(entries[0]["is_default"], true);
+    assert!(
+        entries[0].get("ok").is_none(),
+        "profile list is intentionally not wrapped"
+    );
+
+    let shown = execute(
+        Cli::try_parse_from(["sshw", "profile", "show", "prod", "--json"]).unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut FakePrompter::default(),
+    )
+    .unwrap();
+    let json: serde_json::Value = serde_json::from_str(shown.stdout.trim()).unwrap();
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["name"], "prod");
+    assert_eq!(json["is_default"], true);
 }
 
 #[test]
