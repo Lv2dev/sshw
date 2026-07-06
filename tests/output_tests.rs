@@ -2,6 +2,7 @@ use sshw::config::{AuthConfig, ServerConfig};
 use sshw::output::{
     ErrorKind, RunOutput, ServerOutput, classify_error, filter_startup_stderr_noise, redact_secrets,
 };
+use sshw::profile::load_registry;
 use sshw::safety::{SafetyDecision, classify_command, classify_remote_write_path};
 
 #[test]
@@ -157,7 +158,7 @@ fn classifies_auth_errors_with_exit_code_4() {
     for message in [
         "missing credential entries: server-alpha",
         "missing credential entry for sshw:server-alpha and user deploy",
-        "credential store unavailable: backend offline",
+        "credential backend unavailable: backend offline. Run `sshw doctor` for setup details",
         "SSH authentication failed",
         "password cannot be empty",
         // privilege::validate_privilege_password rejects a multiline secret.
@@ -176,12 +177,49 @@ fn classifies_unknown_server_and_confirmation_errors_as_config() {
         "no default server configured; run 'sshw default <name>' to set one or pass an explicit server name",
         "failed to load config",
         "confirmation requires an interactive terminal; rerun with --yes to confirm",
-        "confirmation input ended before a response; rerun with --yes to confirm",
     ] {
         let kind = classify_error(&anyhow::anyhow!("{message}"));
         assert_eq!(kind, ErrorKind::Config, "message: {message}");
         assert_eq!(kind.exit_code(), 3);
     }
+}
+
+#[test]
+fn classifies_state_change_cancellations_as_config() {
+    for message in [
+        "add cancelled",
+        "trust cancelled",
+        "removal cancelled",
+        "privilege update cancelled",
+        "privilege clear cancelled",
+    ] {
+        let kind = classify_error(&anyhow::anyhow!("{message}"));
+        assert_eq!(kind, ErrorKind::Config, "message: {message}");
+        assert_eq!(kind.exit_code(), 3);
+    }
+}
+
+#[test]
+fn classifies_password_stdin_with_agent_as_config() {
+    let message = "--password-stdin cannot be used with --auth agent";
+
+    let kind = classify_error(&anyhow::anyhow!("{message}"));
+
+    assert_eq!(kind, ErrorKind::Config);
+    assert_eq!(kind.exit_code(), 3);
+}
+
+#[test]
+fn classifies_corrupt_profile_registry_load_as_config() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("profiles.json");
+    std::fs::write(&path, "{").unwrap();
+    let err = load_registry(&path).unwrap_err();
+
+    let kind = classify_error(&err);
+
+    assert_eq!(kind, ErrorKind::Config);
+    assert_eq!(kind.exit_code(), 3);
 }
 
 #[test]

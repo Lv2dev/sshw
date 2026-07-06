@@ -8,6 +8,9 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 
 ## [Unreleased]
 
+### Fixed
+- Several config/auth failures now map to their documented stable exit codes instead of `unknown` (1): unavailable native credential backends are `auth`/4, corrupt `profiles.json`, cancelled state-change confirmations, and `add --password-stdin --auth agent` are `config`/3.
+
 ## [0.9.0] - 2026-07-06
 
 ### Added
