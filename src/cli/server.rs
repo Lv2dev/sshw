@@ -34,6 +34,7 @@ where
         return Err(anyhow::anyhow!("add cancelled"));
     }
 
+    let mut new_password_credential = None;
     let auth = match args.auth {
         AuthArg::Password => {
             let credential = namespace.credential_key(&args.name);
@@ -46,6 +47,7 @@ where
                 return Err(anyhow::anyhow!("password cannot be empty"));
             }
             credentials.set_password(&credential, &args.user, &password)?;
+            new_password_credential = Some((credential.clone(), args.user.clone()));
             AuthConfig::Password { credential }
         }
         AuthArg::Agent => {
@@ -77,7 +79,14 @@ where
         config.default = Some(args.name.clone());
     }
 
-    save_config(config_path, config)?;
+    if let Err(err) = save_config(config_path, config) {
+        if let Some((credential, user)) = new_password_credential.as_ref()
+            && !password_credential_matches(previous_server.as_ref(), credential, user)
+        {
+            let _ = credentials.delete_password(credential, user);
+        }
+        return Err(err);
+    }
     if let Some((credential, user)) = stale_credential {
         credentials.delete_password(&credential, &user)?;
     }
@@ -243,13 +252,6 @@ where
         return Err(anyhow::anyhow!("removal cancelled"));
     }
 
-    if let Some(privilege) = &privilege {
-        delete_privilege_password(credentials, privilege)?;
-    }
-    if let AuthConfig::Password { credential } = &server.auth {
-        credentials.delete_password(credential, &server.user)?;
-    }
-
     config.servers.remove(&args.name);
     config.privileges.remove(&args.name);
     if config.default.as_deref() == Some(args.name.as_str()) {
@@ -257,6 +259,21 @@ where
     }
 
     save_config(config_path, config)?;
+    let mut cleanup_error = None;
+    if let Some(privilege) = &privilege
+        && let Err(err) = delete_privilege_password(credentials, privilege)
+    {
+        cleanup_error = Some(err);
+    }
+    if let AuthConfig::Password { credential } = &server.auth
+        && let Err(err) = credentials.delete_password(credential, &server.user)
+    {
+        cleanup_error.get_or_insert(err);
+    }
+    if let Some(err) = cleanup_error {
+        return Err(err);
+    }
+
     if args.json {
         let output = json!({
             "ok": true,
@@ -301,6 +318,22 @@ fn stale_password_credential(
     }
 }
 
+fn password_credential_matches(
+    server: Option<&ServerConfig>,
+    credential: &str,
+    user: &str,
+) -> bool {
+    let Some(server) = server else {
+        return false;
+    };
+    match &server.auth {
+        AuthConfig::Password {
+            credential: previous,
+        } => previous == credential && server.user == user,
+        AuthConfig::Agent => false,
+    }
+}
+
 fn delete_privilege_password<C>(credentials: &C, privilege: &PrivilegeConfig) -> anyhow::Result<()>
 where
     C: CredentialStore,
@@ -312,5 +345,171 @@ fn auth_label(auth: &crate::output::AuthOutput) -> &'static str {
     match auth {
         crate::output::AuthOutput::Password { .. } => "password",
         crate::output::AuthOutput::Agent => "agent",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::PrivilegeMethod;
+    use crate::credentials::CredentialStoreHealth;
+    use std::cell::RefCell;
+    use std::collections::BTreeMap;
+    use std::fs;
+
+    #[derive(Default)]
+    struct RecordingStore {
+        values: RefCell<BTreeMap<(String, String), String>>,
+        deleted: RefCell<Vec<(String, String)>>,
+    }
+
+    impl CredentialStore for RecordingStore {
+        fn set_password(&self, credential: &str, user: &str, password: &str) -> anyhow::Result<()> {
+            self.values.borrow_mut().insert(
+                (credential.to_string(), user.to_string()),
+                password.to_string(),
+            );
+            Ok(())
+        }
+
+        fn get_password(&self, credential: &str, user: &str) -> anyhow::Result<String> {
+            self.values
+                .borrow()
+                .get(&(credential.to_string(), user.to_string()))
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("missing credential"))
+        }
+
+        fn delete_password(&self, credential: &str, user: &str) -> anyhow::Result<()> {
+            self.deleted
+                .borrow_mut()
+                .push((credential.to_string(), user.to_string()));
+            self.values
+                .borrow_mut()
+                .remove(&(credential.to_string(), user.to_string()));
+            Ok(())
+        }
+
+        fn health_check(&self) -> anyhow::Result<CredentialStoreHealth> {
+            Ok(CredentialStoreHealth {
+                backend: "recording".to_string(),
+                available: true,
+                message: "ok".to_string(),
+            })
+        }
+    }
+
+    struct TestPrompter;
+
+    impl Prompter for TestPrompter {
+        fn confirm(&mut self, _prompt: &str) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+
+        fn password(&mut self, _prompt: &str) -> anyhow::Result<String> {
+            Ok("NEW_PASSWORD".to_string())
+        }
+
+        fn password_stdin(&mut self) -> anyhow::Result<String> {
+            Ok("NEW_STDIN_PASSWORD".to_string())
+        }
+    }
+
+    fn sample_config() -> SshwConfig {
+        let mut config = SshwConfig {
+            default: Some("web".to_string()),
+            ..SshwConfig::default()
+        };
+        config.servers.insert(
+            "web".to_string(),
+            ServerConfig {
+                host: "192.0.2.10".to_string(),
+                port: 22,
+                user: "deploy".to_string(),
+                auth: AuthConfig::Password {
+                    credential: "sshw:default:web".to_string(),
+                },
+            },
+        );
+        config.privileges.insert(
+            "web".to_string(),
+            PrivilegeConfig {
+                method: PrivilegeMethod::Sudo,
+                user: "root".to_string(),
+                credential: "sshw:default:privilege:web".to_string(),
+            },
+        );
+        config
+    }
+
+    #[test]
+    fn remove_does_not_delete_credentials_when_config_save_fails() {
+        let mut config = sample_config();
+        let store = RecordingStore::default();
+        let mut prompter = TestPrompter;
+        let temp = tempfile::tempdir().unwrap();
+        let file_parent = temp.path().join("not-a-directory");
+        fs::write(&file_parent, "not a directory").unwrap();
+        let config_path = file_parent.join("servers.json");
+
+        let err = remove_server(
+            RemoveArgs {
+                name: "web".to_string(),
+                yes: true,
+                json: false,
+            },
+            &config_path,
+            &store,
+            &mut prompter,
+            &mut config,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("failed to save config"));
+        assert!(
+            store.deleted.borrow().is_empty(),
+            "credentials must not be deleted before config removal is durable"
+        );
+    }
+
+    #[test]
+    fn add_cleans_new_password_when_config_save_fails() {
+        let mut config = SshwConfig::default();
+        let store = RecordingStore::default();
+        let mut prompter = TestPrompter;
+        let temp = tempfile::tempdir().unwrap();
+        let file_parent = temp.path().join("not-a-directory");
+        fs::write(&file_parent, "not a directory").unwrap();
+        let config_path = file_parent.join("servers.json");
+        let namespace = CredentialNamespace::profile("default");
+
+        let err = add_server(
+            AddArgs {
+                name: "web".to_string(),
+                host: "192.0.2.10".to_string(),
+                port: 22,
+                user: "deploy".to_string(),
+                auth: AuthArg::Password,
+                force: false,
+                password_stdin: false,
+                json: false,
+            },
+            &config_path,
+            &namespace,
+            &store,
+            &mut prompter,
+            &mut config,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("failed to save config"));
+        assert!(
+            store.values.borrow().is_empty(),
+            "new credential must be cleaned up when config save fails"
+        );
+        assert_eq!(
+            store.deleted.borrow().as_slice(),
+            [("sshw:default:web".to_string(), "deploy".to_string())]
+        );
     }
 }

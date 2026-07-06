@@ -97,6 +97,26 @@ fn session_only_store_falls_back_to_session_password() {
 }
 
 #[test]
+fn session_only_store_does_not_fallback_to_session_password_for_privilege_credentials() {
+    let store = SessionOnlyStore::with_session_password(Some("ssh-password".to_string()));
+
+    let err = store
+        .get_password("sshw:default:privilege:web", "root")
+        .unwrap_err();
+    assert!(err.to_string().contains("session-only"));
+
+    store
+        .set_password("sshw:default:privilege:web", "root", "root-password")
+        .unwrap();
+    assert_eq!(
+        store
+            .get_password("sshw:default:privilege:web", "root")
+            .unwrap(),
+        "root-password"
+    );
+}
+
+#[test]
 fn session_only_store_from_env_removes_password_from_environment_after_reading() {
     let _guard = ENV_LOCK.lock().unwrap();
     unsafe {

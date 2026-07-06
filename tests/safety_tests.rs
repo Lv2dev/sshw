@@ -34,6 +34,10 @@ fn blocks_service_and_permission_commands_without_yes() {
         "sudo systemctl restart app",
         "sudo\t systemctl restart app",
         "/usr/bin/sudo systemctl restart app",
+        "echo ok; sudo systemctl restart app",
+        "echo ok && /usr/bin/sudo systemctl restart app",
+        "SSHW_TEST=1 sudo systemctl restart app",
+        "env SSHW_TEST=1 sudo systemctl restart app",
         "chmod -R 755 /srv/app",
         "/bin/chmod -R 755 /srv/app",
         "chmod --recursive 755 /srv/app",
@@ -49,6 +53,17 @@ fn blocks_service_and_permission_commands_without_yes() {
                 SafetyDecision::Block { .. }
             ),
             "{command} should be blocked"
+        );
+    }
+}
+
+#[test]
+fn allows_sudo_mentions_that_are_not_commands() {
+    for command in ["echo sudo", "man sudo", "printf '%s\n' sudo"] {
+        assert_eq!(
+            classify_command(command, false),
+            SafetyDecision::Allow,
+            "{command} should be allowed"
         );
     }
 }

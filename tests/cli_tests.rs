@@ -505,7 +505,7 @@ fn remove_json_success_reports_state_change() {
 }
 
 #[test]
-fn remove_json_delete_failure_uses_error_envelope_and_keeps_config() {
+fn remove_json_delete_failure_uses_error_envelope_after_config_removal() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("servers.json");
     save_config(&path, &sample_config()).unwrap();
@@ -527,8 +527,8 @@ fn remove_json_delete_failure_uses_error_envelope_and_keeps_config() {
     assert_json_error(output, 4, "auth", "credential backend unavailable");
     let config = load_config(&path).unwrap();
     assert!(
-        config.servers.contains_key("server-alpha"),
-        "config must remain untouched when credential deletion fails"
+        !config.servers.contains_key("server-alpha"),
+        "config must not keep references after durable removal"
     );
 }
 
@@ -1405,7 +1405,7 @@ fn privilege_clear_removes_metadata_and_stored_password() {
 }
 
 #[test]
-fn privilege_clear_keeps_metadata_when_password_delete_fails() {
+fn privilege_clear_removes_metadata_when_password_delete_fails() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("servers.json");
     let mut config = sample_config();
@@ -1436,7 +1436,7 @@ fn privilege_clear_keeps_metadata_when_password_delete_fails() {
 
     assert!(err.to_string().contains("keyring delete failed"));
     assert!(
-        load_config(&path)
+        !load_config(&path)
             .unwrap()
             .privileges
             .contains_key("server-alpha")

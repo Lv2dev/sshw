@@ -64,6 +64,11 @@ impl CredentialStore for SessionOnlyStore {
         {
             return Ok(value.as_str().to_string());
         }
+        if !allows_session_password_fallback(credential) {
+            return Err(anyhow::anyhow!(
+                "session-only credential backend has no explicit password for {credential}; set the privilege password for this session or use the native backend"
+            ));
+        }
         self.session_password
             .as_ref()
             .map(|password| password.as_str().to_string())
@@ -97,4 +102,8 @@ impl CredentialStore for SessionOnlyStore {
     fn is_persistent(&self) -> bool {
         false
     }
+}
+
+fn allows_session_password_fallback(credential: &str) -> bool {
+    !credential.contains(":privilege:")
 }

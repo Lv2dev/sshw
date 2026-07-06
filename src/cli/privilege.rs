@@ -50,8 +50,17 @@ where
     let output_user = privilege.user.clone();
     let output_credential = privilege.credential.clone();
     credentials.set_password(&privilege.credential, &privilege.user, &password)?;
+    let stored_credential = (privilege.credential.clone(), privilege.user.clone());
+    let overwrote_previous = previous_privilege.as_ref().is_some_and(|previous| {
+        previous.credential == stored_credential.0 && previous.user == stored_credential.1
+    });
     config.privileges.insert(args.name.clone(), privilege);
-    save_config(config_path, config)?;
+    if let Err(err) = save_config(config_path, config) {
+        if !overwrote_previous {
+            let _ = credentials.delete_password(&stored_credential.0, &stored_credential.1);
+        }
+        return Err(err);
+    }
     if let Some(previous) = previous_privilege {
         let current = config
             .privileges
@@ -153,9 +162,9 @@ where
         return Err(anyhow::anyhow!("privilege clear cancelled"));
     }
 
-    credentials.delete_password(&privilege.credential, &privilege.user)?;
     config.privileges.remove(&args.name);
     save_config(config_path, config)?;
+    credentials.delete_password(&privilege.credential, &privilege.user)?;
     if args.json {
         let output = json!({
             "ok": true,
@@ -195,5 +204,170 @@ fn map_method(method: PrivilegeMethodArg) -> PrivilegeMethod {
     match method {
         PrivilegeMethodArg::Sudo => PrivilegeMethod::Sudo,
         PrivilegeMethodArg::Su => PrivilegeMethod::Su,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{AuthConfig, ServerConfig};
+    use crate::credentials::CredentialStoreHealth;
+    use std::cell::RefCell;
+    use std::collections::BTreeMap;
+    use std::fs;
+
+    #[derive(Default)]
+    struct RecordingStore {
+        values: RefCell<BTreeMap<(String, String), String>>,
+        deleted: RefCell<Vec<(String, String)>>,
+    }
+
+    impl CredentialStore for RecordingStore {
+        fn set_password(&self, credential: &str, user: &str, password: &str) -> anyhow::Result<()> {
+            self.values.borrow_mut().insert(
+                (credential.to_string(), user.to_string()),
+                password.to_string(),
+            );
+            Ok(())
+        }
+
+        fn get_password(&self, credential: &str, user: &str) -> anyhow::Result<String> {
+            self.values
+                .borrow()
+                .get(&(credential.to_string(), user.to_string()))
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("missing credential"))
+        }
+
+        fn delete_password(&self, credential: &str, user: &str) -> anyhow::Result<()> {
+            self.deleted
+                .borrow_mut()
+                .push((credential.to_string(), user.to_string()));
+            self.values
+                .borrow_mut()
+                .remove(&(credential.to_string(), user.to_string()));
+            Ok(())
+        }
+
+        fn health_check(&self) -> anyhow::Result<CredentialStoreHealth> {
+            Ok(CredentialStoreHealth {
+                backend: "recording".to_string(),
+                available: true,
+                message: "ok".to_string(),
+            })
+        }
+    }
+
+    struct TestPrompter;
+
+    impl Prompter for TestPrompter {
+        fn confirm(&mut self, _prompt: &str) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+
+        fn password(&mut self, _prompt: &str) -> anyhow::Result<String> {
+            Ok("NEW_PASSWORD".to_string())
+        }
+
+        fn password_stdin(&mut self) -> anyhow::Result<String> {
+            Ok("NEW_STDIN_PASSWORD".to_string())
+        }
+    }
+
+    fn sample_config() -> SshwConfig {
+        let mut config = SshwConfig {
+            default: Some("web".to_string()),
+            ..SshwConfig::default()
+        };
+        config.servers.insert(
+            "web".to_string(),
+            ServerConfig {
+                host: "192.0.2.10".to_string(),
+                port: 22,
+                user: "deploy".to_string(),
+                auth: AuthConfig::Password {
+                    credential: "sshw:default:web".to_string(),
+                },
+            },
+        );
+        config.privileges.insert(
+            "web".to_string(),
+            PrivilegeConfig {
+                method: PrivilegeMethod::Sudo,
+                user: "root".to_string(),
+                credential: "sshw:default:privilege:web".to_string(),
+            },
+        );
+        config
+    }
+
+    #[test]
+    fn clear_does_not_delete_password_when_config_save_fails() {
+        let mut config = sample_config();
+        let store = RecordingStore::default();
+        let mut prompter = TestPrompter;
+        let temp = tempfile::tempdir().unwrap();
+        let file_parent = temp.path().join("not-a-directory");
+        fs::write(&file_parent, "not a directory").unwrap();
+        let config_path = file_parent.join("servers.json");
+
+        let err = clear_privilege(
+            PrivilegeClearArgs {
+                name: "web".to_string(),
+                yes: true,
+                json: false,
+            },
+            &config_path,
+            &store,
+            &mut prompter,
+            &mut config,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("failed to save config"));
+        assert!(
+            store.deleted.borrow().is_empty(),
+            "privilege password must not be deleted before config removal is durable"
+        );
+    }
+
+    #[test]
+    fn set_cleans_new_password_when_config_save_fails() {
+        let mut config = sample_config();
+        config.privileges.clear();
+        let store = RecordingStore::default();
+        let mut prompter = TestPrompter;
+        let temp = tempfile::tempdir().unwrap();
+        let file_parent = temp.path().join("not-a-directory");
+        fs::write(&file_parent, "not a directory").unwrap();
+        let config_path = file_parent.join("servers.json");
+        let namespace = CredentialNamespace::profile("default");
+
+        let err = set_privilege(
+            PrivilegeSetArgs {
+                name: "web".to_string(),
+                method: PrivilegeMethodArg::Sudo,
+                user: "root".to_string(),
+                password_stdin: false,
+                force: false,
+                json: false,
+            },
+            &config_path,
+            &namespace,
+            &store,
+            &mut prompter,
+            &mut config,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("failed to save config"));
+        assert!(
+            store.values.borrow().is_empty(),
+            "new privilege credential must be cleaned up when config save fails"
+        );
+        assert_eq!(
+            store.deleted.borrow().as_slice(),
+            [("sshw:default:privilege:web".to_string(), "root".to_string())]
+        );
     }
 }
