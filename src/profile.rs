@@ -1,6 +1,6 @@
 use crate::home::{ResolvedHome, builtin_default_home, is_reserved_profile_id};
 use crate::storage::write_owner_only_atomic;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -37,8 +37,10 @@ pub fn load_registry(path: &Path) -> Result<ProfileRegistry> {
         return Ok(ProfileRegistry::default());
     }
 
-    let contents = fs::read_to_string(path)?;
-    Ok(serde_json::from_str(&contents)?)
+    let contents = fs::read_to_string(path)
+        .with_context(|| format!("failed to load profile registry at {}", path.display()))?;
+    serde_json::from_str(&contents)
+        .with_context(|| format!("failed to load profile registry at {}", path.display()))
 }
 
 pub fn save_registry(path: &Path, registry: &ProfileRegistry) -> Result<()> {

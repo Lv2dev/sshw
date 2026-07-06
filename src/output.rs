@@ -81,10 +81,11 @@ pub struct ErrorBody {
 /// are matched by type as a fall-back.
 const SAFETY_MARKER: &str = "requires --yes";
 const POLICY_MARKERS: [&str; 3] = ["blocked by policy", "policy file", "policy enforcement"];
-const CONFIG_MARKERS: [&str; 11] = [
+const CONFIG_MARKERS: [&str; 17] = [
     "unknown server",
     "no default server configured",
     "failed to load config",
+    "failed to load profile registry",
     "failed to save config",
     "profile '",
     "cannot use --home and --profile",
@@ -92,11 +93,16 @@ const CONFIG_MARKERS: [&str; 11] = [
     "profile add requires",
     "privilege configuration",
     "confirmation requires an interactive terminal",
-    "confirmation input ended before a response",
+    "add cancelled",
+    "trust cancelled",
+    "removal cancelled",
+    "privilege update cancelled",
+    "privilege clear cancelled",
+    "--password-stdin cannot be used with --auth agent",
 ];
 const AUTH_MARKERS: [&str; 5] = [
     "missing credential",
-    "credential store",
+    "credential backend unavailable",
     "authentication",
     "password cannot be empty",
     "must be a single line",
