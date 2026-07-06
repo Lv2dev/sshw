@@ -26,6 +26,20 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - run: cargo metadata --locked --format-version 1
+      - name: Check tag matches Cargo.toml version
+        shell: pwsh
+        run: |
+          $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
+          $package = $metadata.packages | Where-Object { $_.name -eq "sshw" } | Select-Object -First 1
+          if ($null -eq $package) {
+            Write-Error "package 'sshw' not found in cargo metadata"
+            exit 1
+          }
+          $expectedTag = "v$($package.version)"
+          if ($env:GITHUB_REF_NAME -ne $expectedTag) {
+            Write-Error "release tag '$env:GITHUB_REF_NAME' does not match Cargo.toml version '$($package.version)' (expected '$expectedTag')"
+            exit 1
+          }
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
