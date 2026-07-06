@@ -164,7 +164,7 @@ sshw run server-alpha "systemctl restart app" --as-root --yes
 
 `privilege set` stores only method, target user (default `root`), and credential key metadata in `servers.json`. The sudo/root password is stored in the active credential backend, never in CLI arguments or plaintext config. Without `--password-stdin`, `sshw` prompts with hidden input.
 
-`run --as-root` is explicit and always requires `--yes`. It first applies the normal safety and policy checks to the original command, then uses `sudo -S` with the privilege password passed through SSH channel stdin. The password is never embedded in the remote command string or audit detail. If the target user has a `NOPASSWD` sudoers rule, the command runs regardless of whether the stored password is correct, since `sudo` never consumes it — keep the stored secret accurate, but do not rely on it as an extra gate in that configuration. `method=su` runs `su - <user> -c ...` over a PTY and injects the stored password at the `Password:` prompt (echo disabled, prompt forced to English via `LC_ALL=C`). The command's output and exit code are framed by markers and extracted exactly. It is more environment-sensitive than `sudo`; where the prompt is not recognized it fails closed via a timeout rather than hanging.
+`run --as-root` is explicit and always requires `--yes`. It first applies the normal safety and policy checks to the original command, then uses `sudo -S` with the privilege password passed through SSH channel stdin. The password is never embedded in the remote command string or audit detail. If the target user has a `NOPASSWD` sudoers rule, the command runs regardless of whether the stored password is correct, since `sudo` never consumes it — keep the stored secret accurate, but do not rely on it as an extra gate in that configuration. A sudo password rejection is reported as the remote command's non-zero status (sshw exit `8`, with the real status in `run --json` as `exit_status`) because `sudo` ran remotely. `method=su` runs `su - <user> -c ...` over a PTY and injects the stored password at the `Password:` prompt (echo disabled, prompt forced to English via `LC_ALL=C`). The command's output and exit code are framed by markers and extracted exactly. It is more environment-sensitive than `sudo`; where the prompt is not recognized it fails closed via a timeout rather than hanging. A `su` prompt/auth failure before the completion marker is an sshw auth/setup failure and maps to exit code `4`.
 
 ### Host Trust Flow
 
@@ -180,21 +180,21 @@ sshw trust server-alpha --yes
 ### Commands
 
 ```bash
-sshw add <name> --host <host> --port <port> --user <user> [--auth password|agent] [--password-stdin] [--force]
+sshw add <name> --host <host> --port <port> --user <user> [--auth password|agent] [--password-stdin] [--force] [--json]
 sshw list [--json]
 sshw show <name> [--json]
 sshw default [<name>]
-sshw trust <name> [--yes]
+sshw trust <name> [--yes] [--json]
 sshw run [<name>] "<command>" [--json] [--yes] [--as-root]
 sshw put [<name>] <local> <remote> [--json] [--yes]
 sshw get [<name>] <remote> <local> [--json] [--yes]
-sshw remove <name> [--yes]
+sshw remove <name> [--yes] [--json]
 sshw doctor [--json]
-sshw privilege <set|show|clear> ...
+sshw privilege <set|show|clear> ... [--json]
 sshw profile <add|list|show|default|remove> ...
 ```
 
-`add` (and `profile add`) take `--force` to overwrite an existing entry without the interactive confirmation prompt — required when registering or updating an entry non-interactively (e.g. from an agent).
+`add` (and `profile add`) take `--force` to overwrite an existing entry without the interactive confirmation prompt — required when registering or updating an entry non-interactively (e.g. from an agent). Updating an existing server with `add` clears that server's privilege metadata and deletes the stale privilege password from the active credential backend, so run `sshw privilege set ...` again before the next `run --as-root`.
 
 Global flags (available on every command): `--home <path>`, `--profile <name>`, `--policy`, `--timeout <seconds>`.
 
@@ -251,7 +251,7 @@ sshw doctor --json
 
 ### JSON Error Contract
 
-Commands that support `--json` (`list`, `show`, `run`, `put`, `get`, `doctor`, `profile list`, `profile show`, `privilege show`) return a structured error envelope on runtime failures:
+Commands that support `--json` (`add`, `list`, `show`, `trust`, `run`, `put`, `get`, `remove`, `doctor`, `profile list`, `profile show`, `privilege set`, `privilege show`, `privilege clear`) return a structured error envelope on runtime failures:
 
 ```json
 {"ok":false,"error":{"kind":"config","message":"unknown server 'missing'","exit_code":3}}
@@ -274,9 +274,9 @@ Commands that support `--json` (`list`, `show`, `run`, `put`, `get`, `doctor`, `
 {"ok":true,"server":"server-alpha","local":"./app","remote":"/tmp/app","bytes":1234}
 ```
 
-Every single-object `--json` success response (`run`, `show`, `doctor`, `profile show`, `privilege show`, `put`, `get`) includes `"ok":true`, mirroring the `"ok":false` error envelope so a consumer can branch on `ok`. `list` and `profile list` return a JSON array on success (no wrapping object); on failure they emit the same `{"ok":false,...}` envelope.
+Every single-object `--json` success response (`add`, `show`, `trust`, `run`, `put`, `get`, `remove`, `doctor`, `profile show`, `privilege set`, `privilege show`, `privilege clear`) includes `"ok":true`, mirroring the `"ok":false` error envelope so a consumer can branch on `ok`. `list` and `profile list` return a JSON array on success (no wrapping object); on failure they emit the same `{"ok":false,...}` envelope.
 
-`add`, `trust`, `remove`, and `default` do not have a `--json` flag; they report human-readable errors on stderr with the same stable exit codes. Human output everywhere uses the same exit-code mapping.
+`default` and profile state changes (`profile add`, `profile default`, `profile remove`) do not have a `--json` flag; they report human-readable errors on stderr with the same stable exit codes. Human output everywhere uses the same exit-code mapping.
 
 Invalid CLI arguments exit with code `9` (`usage`), kept distinct from `safety` (2) so an agent can tell "called sshw wrong" apart from "a safety rail blocked the operation". With `--json`, a usage error is emitted as the same envelope on stdout (`{"ok":false,"error":{"kind":"usage",...}}`); otherwise the parser's message goes to stderr. `--help`/`--version` print to stdout and exit `0`.
 
@@ -484,7 +484,7 @@ sshw run server-alpha "systemctl restart app" --as-root --yes
 
 `privilege set`은 method, 대상 user(기본 `root`), credential key metadata만 `servers.json`에 저장합니다. sudo/root 비밀번호는 활성 credential backend에만 저장되며 CLI 인자나 평문 config에는 들어가지 않습니다. `--password-stdin`을 쓰지 않으면 숨김 입력 프롬프트로 받습니다.
 
-`run --as-root`는 명시적으로만 동작하며 항상 `--yes`가 필요합니다. 원래 명령에 기존 safety/policy 검사를 먼저 적용한 뒤, SSH channel stdin으로만 privilege 비밀번호를 전달하는 `sudo -S` 경로를 사용합니다. 비밀번호는 원격 command string이나 audit detail에 들어가지 않습니다. 대상 user에 `NOPASSWD` sudoers 규칙이 있으면 `sudo`가 비밀번호를 소비하지 않으므로, 저장된 비밀번호의 정확성과 무관하게 명령이 실행됩니다 — 이 경우 저장 비밀번호는 추가 게이트가 아닙니다. `method=su`는 `su - <user> -c ...`를 PTY로 실행하고 `Password:` 프롬프트가 나오면 저장된 비밀번호를 주입합니다(echo 비활성화, `LC_ALL=C`로 프롬프트를 영어로 고정). 명령 출력과 exit code는 marker로 정확히 추출되어 출력 라인이 누락되지 않습니다. `sudo`보다 환경에 민감하며, 프롬프트를 인식하지 못하면 무한 대기 대신 타임아웃으로 fail-closed됩니다.
+`run --as-root`는 명시적으로만 동작하며 항상 `--yes`가 필요합니다. 원래 명령에 기존 safety/policy 검사를 먼저 적용한 뒤, SSH channel stdin으로만 privilege 비밀번호를 전달하는 `sudo -S` 경로를 사용합니다. 비밀번호는 원격 command string이나 audit detail에 들어가지 않습니다. 대상 user에 `NOPASSWD` sudoers 규칙이 있으면 `sudo`가 비밀번호를 소비하지 않으므로, 저장된 비밀번호의 정확성과 무관하게 명령이 실행됩니다 — 이 경우 저장 비밀번호는 추가 게이트가 아닙니다. sudo 비밀번호 거부는 원격에서 실행된 `sudo` 명령의 non-zero 상태로 보고되므로 sshw exit `8`이며, 실제 상태는 `run --json`의 `exit_status`에 들어갑니다. `method=su`는 `su - <user> -c ...`를 PTY로 실행하고 `Password:` 프롬프트가 나오면 저장된 비밀번호를 주입합니다(echo 비활성화, `LC_ALL=C`로 프롬프트를 영어로 고정). 명령 출력과 exit code는 marker로 정확히 추출되어 출력 라인이 누락되지 않습니다. `sudo`보다 환경에 민감하며, 프롬프트를 인식하지 못하면 무한 대기 대신 타임아웃으로 fail-closed됩니다. completion marker 전에 발생한 `su` 프롬프트/인증 실패는 sshw의 auth/setup 실패로 간주되어 exit code `4`에 매핑됩니다.
 
 ### Host Trust Flow
 
@@ -500,21 +500,21 @@ sshw trust server-alpha --yes
 ### 명령
 
 ```bash
-sshw add <name> --host <host> --port <port> --user <user> [--auth password|agent] [--password-stdin] [--force]
+sshw add <name> --host <host> --port <port> --user <user> [--auth password|agent] [--password-stdin] [--force] [--json]
 sshw list [--json]
 sshw show <name> [--json]
 sshw default [<name>]
-sshw trust <name> [--yes]
+sshw trust <name> [--yes] [--json]
 sshw run [<name>] "<command>" [--json] [--yes] [--as-root]
 sshw put [<name>] <local> <remote> [--json] [--yes]
 sshw get [<name>] <remote> <local> [--json] [--yes]
-sshw remove <name> [--yes]
+sshw remove <name> [--yes] [--json]
 sshw doctor [--json]
-sshw privilege <set|show|clear> ...
+sshw privilege <set|show|clear> ... [--json]
 sshw profile <add|list|show|default|remove> ...
 ```
 
-`add`(및 `profile add`)는 `--force`로 기존 항목을 대화형 확인 프롬프트 없이 덮어씁니다 — 비대화형(예: 에이전트)에서 항목을 등록/갱신할 때 필요합니다.
+`add`(및 `profile add`)는 `--force`로 기존 항목을 대화형 확인 프롬프트 없이 덮어씁니다 — 비대화형(예: 에이전트)에서 항목을 등록/갱신할 때 필요합니다. 기존 서버를 `add`로 갱신하면 해당 서버의 privilege metadata와 활성 credential backend의 오래된 privilege 비밀번호가 삭제되므로, 다음 `run --as-root` 전에 `sshw privilege set ...`을 다시 실행해야 합니다.
 
 전역 플래그(모든 명령에서 사용): `--home <path>`, `--profile <name>`, `--policy`, `--timeout <seconds>`.
 
@@ -569,7 +569,7 @@ sshw doctor --json
 
 ### JSON 오류 계약
 
-`--json`을 지원하는 명령(`list`, `show`, `run`, `put`, `get`, `doctor`, `profile list`, `profile show`, `privilege show`)은 런타임 실패 시 구조화된 envelope를 반환합니다.
+`--json`을 지원하는 명령(`add`, `list`, `show`, `trust`, `run`, `put`, `get`, `remove`, `doctor`, `profile list`, `profile show`, `privilege set`, `privilege show`, `privilege clear`)은 런타임 실패 시 구조화된 envelope를 반환합니다.
 
 ```json
 {"ok":false,"error":{"kind":"config","message":"unknown server 'missing'","exit_code":3}}
@@ -592,9 +592,9 @@ sshw doctor --json
 {"ok":true,"server":"server-alpha","local":"./app","remote":"/tmp/app","bytes":1234}
 ```
 
-단일 object를 반환하는 `--json` 성공 응답(`run`, `show`, `doctor`, `profile show`, `privilege show`, `put`, `get`)은 모두 `"ok":true`를 포함해 오류 envelope의 `"ok":false`와 대칭을 이루므로, 소비자가 `ok`로 분기할 수 있습니다. `list`와 `profile list`는 성공 시 JSON 배열을 반환하며(래핑 object 없음), 실패 시에는 동일한 `{"ok":false,...}` envelope를 출력합니다.
+단일 object를 반환하는 `--json` 성공 응답(`add`, `show`, `trust`, `run`, `put`, `get`, `remove`, `doctor`, `profile show`, `privilege set`, `privilege show`, `privilege clear`)은 모두 `"ok":true`를 포함해 오류 envelope의 `"ok":false`와 대칭을 이루므로, 소비자가 `ok`로 분기할 수 있습니다. `list`와 `profile list`는 성공 시 JSON 배열을 반환하며(래핑 object 없음), 실패 시에는 동일한 `{"ok":false,...}` envelope를 출력합니다.
 
-`add`, `trust`, `remove`, `default`에는 `--json` 플래그가 없으며, 동일한 안정 exit code로 stderr에 사람용 메시지를 출력합니다. human 출력도 같은 exit code 매핑을 사용합니다.
+`default`와 profile 상태 변경(`profile add`, `profile default`, `profile remove`)에는 `--json` 플래그가 없으며, 동일한 안정 exit code로 stderr에 사람용 메시지를 출력합니다. human 출력도 같은 exit code 매핑을 사용합니다.
 
 잘못된 CLI 인자는 exit code `9`(`usage`)로 끝나며, `safety`(2)와 분리해 에이전트가 "sshw를 잘못 호출함"과 "safety rail이 차단함"을 구분할 수 있습니다. `--json`이면 usage 오류도 동일한 envelope로 stdout에 출력하고(`{"ok":false,"error":{"kind":"usage",...}}`), 아니면 파서 메시지를 stderr로 보냅니다. `--help`/`--version`은 stdout으로 출력하고 exit `0`입니다.
 
