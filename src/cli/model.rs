@@ -24,6 +24,11 @@ const AFTER_LONG_HELP: &str = r#"SECURITY MODEL:
     or when policy.json sets `enabled: true`. Output and audit redaction are
     best-effort.
 
+HOME SELECTION:
+  Home resolution order is `--home`, `SSHW_HOME`, then `--profile <name>`.
+  The `--profile` selection is after SSHW_HOME and before the registry default
+  profile, followed by the app default.
+
 EXIT CODES (stable; sshw's own operational failures):
   0  success
   1  unknown   failure not matched to a stable category
@@ -37,6 +42,8 @@ EXIT CODES (stable; sshw's own operational failures):
   8  is separate: a `run` that connected but whose REMOTE command exited
      non-zero exits 8, so a remote status is never mistaken for an sshw failure.
      The real remote status is in `run --json` (`exit_status`).
+  sudo password rejection is reported as the remote command's non-zero status (exit 8).
+  su prompt/auth failure maps to auth (exit 4) before completion.
 
 JSON OUTPUT:
   `--json` is accepted by: add, list, show, trust, run, put, get, remove,
@@ -85,8 +92,8 @@ pub struct Cli {
     /// with `--profile`.
     #[arg(long, global = true, value_name = "PATH")]
     pub home: Option<PathBuf>,
-    /// Select a registered profile by name (see `sshw profile`). Cannot be
-    /// combined with `--home`.
+    /// Select a registered profile by name after SSHW_HOME and before the
+    /// registry default (see `sshw profile`). Cannot be combined with `--home`.
     #[arg(long, global = true, value_name = "NAME")]
     pub profile: Option<String>,
     /// Force policy.json enforcement for this invocation. Enforcement is also
@@ -374,7 +381,9 @@ pub struct RunArgs {
     /// Run through the server's configured privilege path (`sshw privilege
     /// set`). Requires `--yes`; never automatic. Uses the stored method (`sudo`
     /// or `su`); with NOPASSWD sudoers the command runs even if the stored
-    /// password is wrong, since sudo does not consume it.
+    /// password is wrong, since sudo does not consume it. A sudo password
+    /// rejection reports the remote command's non-zero status (exit 8), while
+    /// a su prompt/auth failure maps to auth (exit 4).
     #[arg(long)]
     pub as_root: bool,
 }
@@ -449,6 +458,9 @@ mod tests {
             "`--json` is accepted by: add, list, show, trust, run, put, get, remove,",
             "doctor, profile list, profile show, privilege set/show/clear.",
             "default/profile state changes have no --json.",
+            "after SSHW_HOME and before the registry default",
+            "sudo password rejection is reported as the remote command's non-zero status",
+            "su prompt/auth failure maps to auth",
             "change:   {\"ok\":true,\"action\":\"added\",\"server\":\"web\"}",
             "{\"ok\":false,\"error\":",
             "EXAMPLES:",

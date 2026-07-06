@@ -8,6 +8,9 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 
 ## [Unreleased]
 
+### Documentation
+- README and `sshw --help` now document the v0.9.0 JSON state-change commands, `add` update privilege cleanup, `--profile` home-resolution priority, and the sudo/`su` authentication failure exit-code difference.
+
 ### Fixed
 - Several config/auth failures now map to their documented stable exit codes instead of `unknown` (1): unavailable native credential backends are `auth`/4, corrupt `profiles.json`, cancelled state-change confirmations, and `add --password-stdin --auth agent` are `config`/3.
 
