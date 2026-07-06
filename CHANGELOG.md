@@ -13,6 +13,7 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 
 ### Fixed
 - Several config/auth failures now map to their documented stable exit codes instead of `unknown` (1): unavailable native credential backends are `auth`/4, corrupt `profiles.json`, cancelled state-change confirmations, and `add --password-stdin --auth agent` are `config`/3.
+- `sshw run` now fails closed when the remote SSH channel reports signal termination without an exit status, and `sshw put` now rejects a non-zero remote scp sink exit status instead of reporting the upload as successful.
 
 ## [0.9.0] - 2026-07-06
 

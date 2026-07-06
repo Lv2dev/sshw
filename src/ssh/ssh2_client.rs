@@ -214,10 +214,12 @@ impl SshClient for Ssh2Client {
                 copied
             ));
         }
+        remote_file.write_all(&[0]).context("ssh transfer error")?;
         remote_file.send_eof().context("ssh transfer error")?;
         remote_file.wait_eof().context("ssh transfer error")?;
         remote_file.close().context("ssh transfer error")?;
         remote_file.wait_close().context("ssh transfer error")?;
+        ensure_scp_upload_succeeded(&remote_file)?;
 
         Ok(TransferResult {
             bytes: copied,
@@ -298,6 +300,7 @@ impl Ssh2Client {
 
         let (stdout, stderr) = read_channel_outputs(&session, &mut channel, self.op_timeout)?;
         channel.wait_close().context("ssh session error")?;
+        ensure_remote_command_not_signaled(&channel)?;
         let exit_status = channel.exit_status().context("ssh session error")?;
 
         Ok(RunResult {
@@ -359,6 +362,28 @@ impl Ssh2Client {
             duration_ms: started.elapsed().as_millis(),
         })
     }
+}
+
+fn ensure_scp_upload_succeeded(channel: &ssh2::Channel) -> anyhow::Result<()> {
+    let exit_status = channel.exit_status().context("ssh transfer error")?;
+    if exit_status != 0 {
+        anyhow::bail!("ssh transfer error: remote scp exited with status {exit_status}");
+    }
+    Ok(())
+}
+
+fn ensure_remote_command_not_signaled(channel: &ssh2::Channel) -> anyhow::Result<()> {
+    let signal = channel.exit_signal().context("ssh session error")?;
+    let Some(signal_name) = signal.exit_signal.filter(|name| !name.is_empty()) else {
+        return Ok(());
+    };
+
+    if let Some(remote_message) = signal.error_message.filter(|message| !message.is_empty()) {
+        anyhow::bail!(
+            "ssh session error: remote command terminated by signal {signal_name}: {remote_message}"
+        );
+    }
+    anyhow::bail!("ssh session error: remote command terminated by signal {signal_name}");
 }
 
 fn connect_verified_authenticated(

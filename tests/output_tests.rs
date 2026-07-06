@@ -84,7 +84,9 @@ fn filters_known_noninteractive_stty_startup_noise() {
 fn classifies_ssh_session_and_transfer_errors_as_ssh() {
     for message in [
         "ssh session error: channel failure",
+        "ssh session error: remote command terminated by signal TERM",
         "ssh transfer error: scp protocol error",
+        "ssh transfer error: remote scp exited with status 1",
         // ssh2_client::extract_su_output when the su END marker never arrives.
         "su output ended before the completion marker",
         // ssh2_client::extract_su_output when the END marker is incomplete.
