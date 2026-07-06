@@ -8,6 +8,8 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-07-06
+
 ### Added
 - `sshw add`, `sshw trust`, `sshw remove`, `sshw privilege set`, and `sshw privilege clear` now accept `--json`, returning `"ok":true` state-change objects on success and the standard `{"ok":false,"error":...}` envelope on failure.
 
@@ -18,6 +20,9 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
   the failed step; earlier successful steps should only be replayed when they
   are idempotent and safe, and repeated failures call for checking network,
   server, and host trust state.
+
+### Security
+- Updated the locked `anyhow` dependency to avoid RustSec advisory RUSTSEC-2026-0190.
 
 ## [0.8.1] - 2026-06-10
 
@@ -155,7 +160,8 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 
 - Initial public release: registered-server SSH `run`/`put`/`get` with secrets kept in the OS credential store, fail-closed `known_hosts` verification, and explicit `sshw trust`.
 
-[Unreleased]: https://github.com/Lv2dev/sshw/compare/v0.8.1...HEAD
+[Unreleased]: https://github.com/Lv2dev/sshw/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/Lv2dev/sshw/compare/v0.8.1...v0.9.0
 [0.8.1]: https://github.com/Lv2dev/sshw/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/Lv2dev/sshw/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/Lv2dev/sshw/compare/v0.6.2...v0.7.0
