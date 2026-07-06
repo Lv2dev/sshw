@@ -89,22 +89,14 @@ pub fn run() -> i32 {
         audit: &audit,
     };
 
-    // Select the credential backend from the home's config (default native).
-    let backend = load_config(&home.config_path)
-        .map(|config| config.credential_backend)
-        .unwrap_or_default();
-    let output = match backend {
-        CredentialBackend::Native => {
-            execute_for_runtime_with(cli, &ctx, &KeyringCredentialStore, &ssh, &mut prompter)
-        }
-        CredentialBackend::SessionOnly => execute_for_runtime_with(
-            cli,
-            &ctx,
-            &SessionOnlyStore::from_env(),
-            &ssh,
-            &mut prompter,
-        ),
-    };
+    let output = execute_for_runtime_selecting_backend(
+        cli,
+        &ctx,
+        &KeyringCredentialStore,
+        SessionOnlyStore::from_env,
+        &ssh,
+        &mut prompter,
+    );
 
     print_output(output)
 }
@@ -182,6 +174,35 @@ where
         audit: &audit,
     };
     execute_for_runtime_with(cli, &ctx, credentials, ssh, prompter)
+}
+
+fn execute_for_runtime_selecting_backend<N, E, S, P, MakeSession>(
+    cli: Cli,
+    ctx: &ExecContext,
+    native_credentials: &N,
+    make_session_credentials: MakeSession,
+    ssh: &S,
+    prompter: &mut P,
+) -> CommandOutput
+where
+    N: CredentialStore,
+    E: CredentialStore,
+    S: SshClient,
+    P: Prompter,
+    MakeSession: FnOnce() -> E,
+{
+    let backend = load_config(&ctx.home.config_path)
+        .map(|config| config.credential_backend)
+        .unwrap_or_default();
+    match backend {
+        CredentialBackend::Native => {
+            execute_for_runtime_with(cli, ctx, native_credentials, ssh, prompter)
+        }
+        CredentialBackend::SessionOnly => {
+            let session_credentials = make_session_credentials();
+            execute_for_runtime_with(cli, ctx, &session_credentials, ssh, prompter)
+        }
+    }
 }
 
 pub fn execute_for_runtime_with<C, S, P>(
@@ -979,6 +1000,180 @@ fn clap_usage_summary(rendered: &str) -> String {
         .find(|line| !line.is_empty())
         .map(|line| line.trim_start_matches("error: ").to_string())
         .unwrap_or_else(|| rendered.trim().to_string())
+}
+
+#[cfg(test)]
+mod runtime_backend_tests {
+    use super::*;
+    use crate::audit::NoopAudit;
+    use crate::config::{CredentialBackend, save_config};
+    use crate::credentials::{CredentialStore, CredentialStoreHealth};
+    use crate::home::ResolvedHome;
+    use crate::ssh::{HostKeyInfo, RunResult, TransferResult};
+    use std::cell::Cell;
+
+    struct NamedCredentialStore(&'static str);
+
+    impl CredentialStore for NamedCredentialStore {
+        fn set_password(
+            &self,
+            _credential: &str,
+            _user: &str,
+            _password: &str,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn get_password(&self, _credential: &str, _user: &str) -> anyhow::Result<String> {
+            Err(anyhow::anyhow!("missing credential"))
+        }
+
+        fn delete_password(&self, _credential: &str, _user: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn health_check(&self) -> anyhow::Result<CredentialStoreHealth> {
+            Ok(CredentialStoreHealth {
+                backend: self.0.to_string(),
+                available: true,
+                message: "ok".to_string(),
+            })
+        }
+    }
+
+    struct NoopSsh;
+
+    impl SshClient for NoopSsh {
+        fn host_key(&self, _server: &ServerConfig) -> anyhow::Result<HostKeyInfo> {
+            unreachable!("doctor does not query host keys")
+        }
+
+        fn trust_host(
+            &self,
+            _server_name: &str,
+            _server: &ServerConfig,
+            _expected_fingerprint_sha256: &str,
+        ) -> anyhow::Result<HostKeyInfo> {
+            unreachable!("doctor does not trust hosts")
+        }
+
+        fn run(
+            &self,
+            _server: &ServerConfig,
+            _auth: &AuthMaterial,
+            _command: &str,
+        ) -> anyhow::Result<RunResult> {
+            unreachable!("doctor does not run commands")
+        }
+
+        fn put(
+            &self,
+            _server: &ServerConfig,
+            _auth: &AuthMaterial,
+            _local: &Path,
+            _remote: &str,
+        ) -> anyhow::Result<TransferResult> {
+            unreachable!("doctor does not transfer files")
+        }
+
+        fn get(
+            &self,
+            _server: &ServerConfig,
+            _auth: &AuthMaterial,
+            _remote: &str,
+            _local: &Path,
+            _overwrite: bool,
+        ) -> anyhow::Result<TransferResult> {
+            unreachable!("doctor does not transfer files")
+        }
+    }
+
+    #[derive(Default)]
+    struct NoopPrompter;
+
+    impl Prompter for NoopPrompter {
+        fn confirm(&mut self, _prompt: &str) -> anyhow::Result<bool> {
+            unreachable!("doctor does not prompt")
+        }
+
+        fn password(&mut self, _prompt: &str) -> anyhow::Result<String> {
+            unreachable!("doctor does not prompt")
+        }
+
+        fn password_stdin(&mut self) -> anyhow::Result<String> {
+            unreachable!("doctor does not read stdin")
+        }
+    }
+
+    #[test]
+    fn session_only_config_routes_runtime_to_session_backend() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("servers.json");
+        let config = SshwConfig {
+            credential_backend: CredentialBackend::SessionOnly,
+            ..SshwConfig::default()
+        };
+        save_config(&path, &config).unwrap();
+        let home = ResolvedHome::from_config_path(&path);
+        let registry = temp.path().join("profiles.json");
+        let audit = NoopAudit;
+        let ctx = ExecContext {
+            home: &home,
+            registry_path: &registry,
+            policy_forced: false,
+            audit: &audit,
+        };
+        let mut prompter = NoopPrompter;
+
+        let output = execute_for_runtime_selecting_backend(
+            Cli::try_parse_from(["sshw", "doctor", "--json"]).unwrap(),
+            &ctx,
+            &NamedCredentialStore("native-probe"),
+            || NamedCredentialStore("session-probe"),
+            &NoopSsh,
+            &mut prompter,
+        );
+
+        let json: serde_json::Value = serde_json::from_str(output.stdout.trim()).unwrap();
+        assert_eq!(json["credential_backend"], json!("session-probe"));
+    }
+
+    #[test]
+    fn native_config_does_not_construct_session_backend() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("servers.json");
+        save_config(&path, &SshwConfig::default()).unwrap();
+        let home = ResolvedHome::from_config_path(&path);
+        let registry = temp.path().join("profiles.json");
+        let audit = NoopAudit;
+        let ctx = ExecContext {
+            home: &home,
+            registry_path: &registry,
+            policy_forced: false,
+            audit: &audit,
+        };
+        let session_constructed = Cell::new(false);
+        let mut prompter = NoopPrompter;
+
+        let output = execute_for_runtime_selecting_backend(
+            Cli::try_parse_from(["sshw", "doctor", "--json"]).unwrap(),
+            &ctx,
+            &NamedCredentialStore("native-probe"),
+            || {
+                session_constructed.set(true);
+                NamedCredentialStore("session-probe")
+            },
+            &NoopSsh,
+            &mut prompter,
+        );
+
+        let json: serde_json::Value = serde_json::from_str(output.stdout.trim()).unwrap();
+        assert_eq!(json["credential_backend"], json!("native-probe"));
+        assert!(
+            !session_constructed.get(),
+            "native homes must not read or clear SSHW_PASSWORD"
+        );
+    }
 }
 
 #[cfg(test)]
