@@ -78,13 +78,14 @@ The global profile registry maps profile names to homes:
 
 `<config_dir>` is `%AppData%\sshw` on Windows, `~/Library/Application Support/sshw` on macOS, and `~/.config/sshw` on Linux.
 
-Credential keyring entries are always namespaced so the same server name in different homes never collides:
+New credential keyring entries use a purpose-aware, generation-qualified v2 key so the same server name in different homes never collides and login credentials cannot be reused as privilege credentials:
 
 ```text
-sshw:<profile-id>:<server>     for registered/built-in profiles
-sshw:home_<hash>:<server>      for ad-hoc --home / SSHW_HOME
-sshw:<profile-id>:privilege:<server>     privileged sudo/su credential metadata
+sshw:v2:<encoded-namespace>:login:<encoded-server>:<generation>
+sshw:v2:<encoded-namespace>:privilege:<encoded-server>:<generation>
 ```
+
+The namespace and server components are base64url-encoded. Each credential update receives a new generation. Legacy v1 keys (`sshw:<namespace>:<server>` and `sshw:<namespace>:privilege:<server>`) remain readable only when they exactly match the active namespace, purpose, and server; new writes never use v1.
 
 ### Selecting A Home
 
@@ -404,13 +405,14 @@ done
 
 `<config_dir>`는 Windows `%AppData%\sshw`, macOS `~/Library/Application Support/sshw`, Linux `~/.config/sshw`입니다.
 
-credential keyring 키는 항상 namespaced이므로, 서로 다른 home에서 같은 서버 이름을 써도 충돌하지 않습니다.
+신규 credential keyring 키는 purpose와 generation을 포함한 v2 형식을 사용합니다. 따라서 서로 다른 home의 같은 서버 이름이 충돌하지 않고 login credential을 privilege credential로 재사용할 수도 없습니다.
 
 ```text
-sshw:<profile-id>:<server>     등록/내장 profile
-sshw:home_<hash>:<server>      ad-hoc --home / SSHW_HOME
-sshw:<profile-id>:privilege:<server>     privileged sudo/su credential metadata
+sshw:v2:<encoded-namespace>:login:<encoded-server>:<generation>
+sshw:v2:<encoded-namespace>:privilege:<encoded-server>:<generation>
 ```
+
+namespace와 server는 base64url로 인코딩하며 credential을 갱신할 때마다 새 generation을 발급합니다. legacy v1 키(`sshw:<namespace>:<server>`, `sshw:<namespace>:privilege:<server>`)는 active namespace, purpose, server가 정확히 일치할 때만 읽기 호환을 유지하며 신규 저장에는 사용하지 않습니다.
 
 ### home 선택
 
