@@ -1,0 +1,82 @@
+name: Bug report
+description: Report a reproducible sshw defect using synthetic data
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Do not include real credentials, hostnames, IP addresses, usernames, private keys, tokens, passphrases, configuration files, audit logs, or screenshots containing them. Replace all infrastructure details with synthetic values.
+
+        Suspected vulnerabilities must be reported privately through a GitHub Security Advisory, not in this form.
+  - type: input
+    id: version
+    attributes:
+      label: sshw version
+      description: Paste the output of `sshw --version`.
+      placeholder: sshw 0.9.1
+    validations:
+      required: true
+  - type: dropdown
+    id: operating-system
+    attributes:
+      label: Operating system
+      options:
+        - Windows
+        - Linux
+        - macOS
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: command
+    attributes:
+      label: Affected command
+      options:
+        - add or remove
+        - list or show
+        - trust
+        - run
+        - put or get
+        - profile or default
+        - privilege
+        - doctor
+        - release artifact or workflow
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the failure after replacing all private data with synthetic values.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Provide the smallest safe command sequence and synthetic setup that reproduces the issue.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Sanitized diagnostics
+      description: Include only redacted stderr or `--json` output. Do not attach state files.
+      render: text
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Data-safety confirmation
+      options:
+        - label: I replaced all real infrastructure and secret data with synthetic values.
+          required: true
+        - label: This report is not a suspected security vulnerability.
+          required: true

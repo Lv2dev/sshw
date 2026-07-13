@@ -1,0 +1,3 @@
+# The repository currently has one maintainer. Code-owner review is intentionally
+# not a required branch-protection gate so the owner cannot deadlock their own PR.
+* @Lv2dev
