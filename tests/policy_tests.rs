@@ -36,6 +36,43 @@ fn invalid_file_fails_closed_even_without_force() {
 }
 
 #[test]
+fn policy_rejects_unknown_fields_and_future_versions() {
+    let unknown_dir = tempfile::tempdir().unwrap();
+    let unknown = write_policy(
+        unknown_dir.path(),
+        r#"{"version":1,"enable":true,"allow_commands":["ls"]}"#,
+    );
+    let err = resolve_policy(&unknown, false).unwrap_err();
+    assert!(err.to_string().contains("unknown field"));
+
+    let future_dir = tempfile::tempdir().unwrap();
+    let future = write_policy(
+        future_dir.path(),
+        r#"{"version":2,"enabled":true,"allow_commands":["ls"]}"#,
+    );
+    let err = resolve_policy(&future, false).unwrap_err();
+    assert!(err.to_string().contains("unsupported policy version 2"));
+    assert!(err.to_string().contains("supported version is 1"));
+}
+
+#[cfg(unix)]
+#[test]
+fn dangling_policy_symlink_fails_closed() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("policy.json");
+    symlink(temp.path().join("missing-policy.json"), &path).unwrap();
+
+    let err = resolve_policy(&path, false).unwrap_err();
+
+    assert!(err.to_string().contains("failed to read policy file"));
+    let status = describe_policy(&path, false);
+    assert!(status.present);
+    assert!(!status.valid);
+}
+
+#[test]
 fn valid_enabled_file_enforces_allowlist() {
     let temp = tempfile::tempdir().unwrap();
     let path = write_policy(

@@ -8,7 +8,7 @@ db-urls = ["https://github.com/RustSec/advisory-db"]
 # Fail on any crate with a known RUSTSEC advisory or a yanked release.
 yanked = "deny"
 unmaintained = "all"
-unsound = "workspace"
+unsound = "all"
 unused-ignored-advisory = "deny"
 
 [licenses]

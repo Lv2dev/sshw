@@ -4,15 +4,20 @@ use super::{
     CommandOutput, PrivilegeClearArgs, PrivilegeMethodArg, PrivilegeSetArgs, PrivilegeShowArgs,
     Prompter, get_server, ok, unknown_server,
 };
-use crate::config::{PrivilegeConfig, PrivilegeMethod, SshwConfig, save_config};
+use crate::config::{
+    ConfigRevision, PrivilegeConfig, PrivilegeMethod, SshwConfig, save_config_if_unchanged,
+};
 use crate::credentials::CredentialStore;
-use crate::home::CredentialNamespace;
+use crate::error::{ResultErrorKindExt, app_error};
+use crate::home::{CredentialNamespace, CredentialPurpose, validate_server_name};
+use crate::output::ErrorKind;
 use serde_json::json;
 use std::path::Path;
 
 pub(super) fn set_privilege<C, P>(
     args: PrivilegeSetArgs,
     config_path: &Path,
+    revision: &ConfigRevision,
     namespace: &CredentialNamespace,
     credentials: &C,
     prompter: &mut P,
@@ -22,21 +27,26 @@ where
     C: CredentialStore,
     P: Prompter,
 {
+    validate_server_name(&args.name).with_error_kind(ErrorKind::Config)?;
     get_server(config, &args.name)?;
     if config.privileges.contains_key(&args.name)
         && !args.force
-        && !prompter.confirm(&format!(
-            "update privilege configuration for '{}'? [y/N] ",
-            args.name
-        ))?
+        && !prompter
+            .confirm(&format!(
+                "update privilege configuration for '{}'? [y/N] ",
+                args.name
+            ))
+            .with_error_kind(ErrorKind::Config)?
     {
-        return Err(anyhow::anyhow!("privilege update cancelled"));
+        return Err(app_error(ErrorKind::Config, "privilege update cancelled"));
     }
 
     let password = if args.password_stdin {
-        prompter.password_stdin()?
+        prompter.password_stdin().with_error_kind(ErrorKind::Auth)?
     } else {
-        prompter.password("Privilege password: ")?
+        prompter
+            .password("Privilege password: ")
+            .with_error_kind(ErrorKind::Auth)?
     };
     validate_privilege_password(&password)?;
 
@@ -44,20 +54,30 @@ where
     let privilege = PrivilegeConfig {
         method: map_method(args.method),
         user: args.user,
-        credential: namespace.privilege_credential_key(&args.name),
+        credential: namespace.new_credential_key(CredentialPurpose::Privilege, &args.name),
     };
     let output_method = privilege.method;
     let output_user = privilege.user.clone();
     let output_credential = privilege.credential.clone();
-    credentials.set_password(&privilege.credential, &privilege.user, &password)?;
+    credentials
+        .set_password_for(
+            CredentialPurpose::Privilege,
+            &privilege.credential,
+            &privilege.user,
+            &password,
+        )
+        .with_error_kind(ErrorKind::Auth)?;
     let stored_credential = (privilege.credential.clone(), privilege.user.clone());
-    let overwrote_previous = previous_privilege.as_ref().is_some_and(|previous| {
-        previous.credential == stored_credential.0 && previous.user == stored_credential.1
-    });
     config.privileges.insert(args.name.clone(), privilege);
-    if let Err(err) = save_config(config_path, config) {
-        if !overwrote_previous {
-            let _ = credentials.delete_password(&stored_credential.0, &stored_credential.1);
+    if let Err(err) =
+        save_config_if_unchanged(config_path, config, revision).with_error_kind(ErrorKind::Config)
+    {
+        if !crate::storage::write_was_published(&err) {
+            let _ = credentials.delete_password_for(
+                CredentialPurpose::Privilege,
+                &stored_credential.0,
+                &stored_credential.1,
+            );
         }
         return Err(err);
     }
@@ -67,13 +87,19 @@ where
             .get(&args.name)
             .expect("privilege just set");
         if previous.credential != current.credential || previous.user != current.user {
-            credentials.delete_password(&previous.credential, &previous.user)?;
+            credentials
+                .delete_password_for(
+                    CredentialPurpose::Privilege,
+                    &previous.credential,
+                    &previous.user,
+                )
+                .with_error_kind(ErrorKind::Auth)?;
         }
     }
 
     let warning = if !credentials.is_persistent() {
         Some(
-            "this credential backend does not persist privilege passwords; supply SSHW_PASSWORD at run time",
+            "this credential backend does not persist privilege passwords; supply SSHW_PRIVILEGE_PASSWORD at run time",
         )
     } else {
         None
@@ -136,6 +162,7 @@ pub(super) fn show_privilege(
 pub(super) fn clear_privilege<C, P>(
     args: PrivilegeClearArgs,
     config_path: &Path,
+    revision: &ConfigRevision,
     credentials: &C,
     prompter: &mut P,
     config: &mut SshwConfig,
@@ -154,17 +181,25 @@ where
         .ok_or_else(|| missing_privilege(&args.name))?;
 
     if !args.yes
-        && !prompter.confirm(&format!(
-            "clear privilege configuration for '{}'? [y/N] ",
-            args.name
-        ))?
+        && !prompter
+            .confirm(&format!(
+                "clear privilege configuration for '{}'? [y/N] ",
+                args.name
+            ))
+            .with_error_kind(ErrorKind::Config)?
     {
-        return Err(anyhow::anyhow!("privilege clear cancelled"));
+        return Err(app_error(ErrorKind::Config, "privilege clear cancelled"));
     }
 
     config.privileges.remove(&args.name);
-    save_config(config_path, config)?;
-    credentials.delete_password(&privilege.credential, &privilege.user)?;
+    save_config_if_unchanged(config_path, config, revision).with_error_kind(ErrorKind::Config)?;
+    credentials
+        .delete_password_for(
+            CredentialPurpose::Privilege,
+            &privilege.credential,
+            &privilege.user,
+        )
+        .with_error_kind(ErrorKind::Auth)?;
     if args.json {
         let output = json!({
             "ok": true,
@@ -178,8 +213,11 @@ where
 }
 
 pub(super) fn missing_privilege(server: &str) -> anyhow::Error {
-    anyhow::anyhow!(
-        "privilege configuration missing for server '{server}'; run 'sshw privilege set {server} --method sudo' first"
+    app_error(
+        ErrorKind::Config,
+        format!(
+            "privilege configuration missing for server '{server}'; run 'sshw privilege set {server} --method sudo' first"
+        ),
     )
 }
 
@@ -192,10 +230,13 @@ pub(super) fn method_label(method: PrivilegeMethod) -> &'static str {
 
 pub(super) fn validate_privilege_password(password: &str) -> anyhow::Result<()> {
     if password.is_empty() {
-        return Err(anyhow::anyhow!("password cannot be empty"));
+        return Err(app_error(ErrorKind::Auth, "password cannot be empty"));
     }
     if password.contains(['\n', '\r']) {
-        return Err(anyhow::anyhow!("privilege password must be a single line"));
+        return Err(app_error(
+            ErrorKind::Auth,
+            "privilege password must be a single line",
+        ));
     }
     Ok(())
 }
@@ -318,6 +359,7 @@ mod tests {
                 json: false,
             },
             &config_path,
+            &ConfigRevision::missing(),
             &store,
             &mut prompter,
             &mut config,
@@ -353,6 +395,7 @@ mod tests {
                 json: false,
             },
             &config_path,
+            &ConfigRevision::missing(),
             &namespace,
             &store,
             &mut prompter,
@@ -365,9 +408,115 @@ mod tests {
             store.values.borrow().is_empty(),
             "new privilege credential must be cleaned up when config save fails"
         );
-        assert_eq!(
-            store.deleted.borrow().as_slice(),
-            [("sshw:default:privilege:web".to_string(), "root".to_string())]
+        let deleted = store.deleted.borrow();
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(deleted[0].1, "root");
+        assert!(namespace.credential_key_matches(
+            crate::home::CredentialPurpose::Privilege,
+            "web",
+            &deleted[0].0
+        ));
+        assert_ne!(
+            deleted[0].0,
+            namespace.legacy_privilege_credential_key("web")
         );
+    }
+
+    #[test]
+    fn set_preserves_previous_password_when_config_save_fails() {
+        let mut config = sample_config();
+        let store = RecordingStore::default();
+        let namespace = CredentialNamespace::profile("default");
+        let previous_credential = namespace.legacy_privilege_credential_key("web");
+        store.values.borrow_mut().insert(
+            (previous_credential.clone(), "root".to_string()),
+            "OLD_PASSWORD".to_string(),
+        );
+        let mut prompter = TestPrompter;
+        let temp = tempfile::tempdir().unwrap();
+        let file_parent = temp.path().join("not-a-directory");
+        fs::write(&file_parent, "not a directory").unwrap();
+        let config_path = file_parent.join("servers.json");
+
+        let err = set_privilege(
+            PrivilegeSetArgs {
+                name: "web".to_string(),
+                method: PrivilegeMethodArg::Su,
+                user: "root".to_string(),
+                password_stdin: false,
+                force: true,
+                json: false,
+            },
+            &config_path,
+            &ConfigRevision::missing(),
+            &namespace,
+            &store,
+            &mut prompter,
+            &mut config,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("failed to save config"));
+        assert_eq!(
+            store
+                .values
+                .borrow()
+                .get(&(previous_credential.clone(), "root".to_string()))
+                .map(String::as_str),
+            Some("OLD_PASSWORD")
+        );
+        let deleted = store.deleted.borrow();
+        assert_eq!(deleted.len(), 1);
+        assert_ne!(deleted[0].0, previous_credential);
+        assert!(namespace.credential_key_matches(
+            crate::home::CredentialPurpose::Privilege,
+            "web",
+            &deleted[0].0
+        ));
+    }
+
+    #[test]
+    fn set_keeps_new_password_when_config_was_published_but_parent_sync_failed() {
+        let mut config = sample_config();
+        config.privileges.clear();
+        let store = RecordingStore::default();
+        let mut prompter = TestPrompter;
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("servers.json");
+        let namespace = CredentialNamespace::profile("default");
+        crate::storage::fail_next_parent_sync();
+
+        let err = set_privilege(
+            PrivilegeSetArgs {
+                name: "web".to_string(),
+                method: PrivilegeMethodArg::Sudo,
+                user: "root".to_string(),
+                password_stdin: false,
+                force: false,
+                json: false,
+            },
+            &config_path,
+            &ConfigRevision::missing(),
+            &namespace,
+            &store,
+            &mut prompter,
+            &mut config,
+        )
+        .unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("published"),
+            "error was: {err:#}"
+        );
+        let saved = crate::config::load_config(&config_path).unwrap();
+        let privilege = &saved.privileges["web"];
+        assert!(
+            store
+                .values
+                .borrow()
+                .contains_key(&(privilege.credential.clone(), "root".to_string())),
+            "a published privilege config must retain its credential"
+        );
+        assert!(store.deleted.borrow().is_empty());
     }
 }

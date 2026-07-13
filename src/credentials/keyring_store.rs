@@ -1,4 +1,6 @@
 use super::{CredentialStore, CredentialStoreHealth};
+use crate::error::ResultErrorKindExt;
+use crate::output::ErrorKind;
 use anyhow::Context;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -12,37 +14,42 @@ pub struct KeyringCredentialStore;
 
 impl CredentialStore for KeyringCredentialStore {
     fn set_password(&self, credential: &str, user: &str, password: &str) -> anyhow::Result<()> {
-        ensure_native_store()?;
-        let entry = keyring_core::Entry::new(credential, user)?;
-        entry.set_password(password)?;
+        ensure_native_store().with_error_kind(ErrorKind::Auth)?;
+        let entry = keyring_core::Entry::new(credential, user).with_error_kind(ErrorKind::Auth)?;
+        entry
+            .set_password(password)
+            .with_error_kind(ErrorKind::Auth)?;
         Ok(())
     }
 
     fn get_password(&self, credential: &str, user: &str) -> anyhow::Result<String> {
-        ensure_native_store()?;
-        let entry = keyring_core::Entry::new(credential, user)?;
-        Ok(entry.get_password()?)
+        ensure_native_store().with_error_kind(ErrorKind::Auth)?;
+        let entry = keyring_core::Entry::new(credential, user).with_error_kind(ErrorKind::Auth)?;
+        entry.get_password().with_error_kind(ErrorKind::Auth)
     }
 
     fn delete_password(&self, credential: &str, user: &str) -> anyhow::Result<()> {
-        ensure_native_store()?;
-        let entry = keyring_core::Entry::new(credential, user)?;
+        ensure_native_store().with_error_kind(ErrorKind::Auth)?;
+        let entry = keyring_core::Entry::new(credential, user).with_error_kind(ErrorKind::Auth)?;
         match entry.delete_credential() {
             Ok(()) => Ok(()),
             Err(keyring_core::Error::NoEntry) => Ok(()),
-            Err(err) => Err(err.into()),
+            Err(err) => Err(err).with_error_kind(ErrorKind::Auth),
         }
     }
 
     fn health_check(&self) -> anyhow::Result<CredentialStoreHealth> {
-        ensure_native_store()?;
+        ensure_native_store().with_error_kind(ErrorKind::Auth)?;
         let backend = backend_name().to_string();
         let probe = new_health_probe();
-        let entry = keyring_core::Entry::new(&probe.credential, probe.user)?;
-        entry.set_password(&probe.secret)?;
+        let entry = keyring_core::Entry::new(&probe.credential, probe.user)
+            .with_error_kind(ErrorKind::Auth)?;
+        entry
+            .set_password(&probe.secret)
+            .with_error_kind(ErrorKind::Auth)?;
         let value = entry.get_password();
-        cleanup_health_probe(entry.delete_credential())?;
-        let value = value?;
+        cleanup_health_probe(entry.delete_credential()).with_error_kind(ErrorKind::Auth)?;
+        let value = value.with_error_kind(ErrorKind::Auth)?;
         let available = value == probe.secret;
 
         Ok(CredentialStoreHealth {

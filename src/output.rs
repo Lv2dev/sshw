@@ -1,4 +1,5 @@
 use crate::config::{AuthConfig, ServerConfig};
+use crate::error::ClassifiedError;
 use serde::Serialize;
 
 const NONINTERACTIVE_STTY_NOISE: &str = "stty: 'standard input': Inappropriate ioctl for device";
@@ -51,11 +52,24 @@ pub struct ErrorResponse {
 impl ErrorResponse {
     pub fn from_error(err: &anyhow::Error) -> Self {
         let kind = classify_error(err);
+        let mut chain = err.chain().map(|cause| redact_secrets(&cause.to_string()));
+        let message = chain
+            .next()
+            .unwrap_or_else(|| redact_secrets(&err.to_string()));
+        let mut previous = message.clone();
+        let mut causes = Vec::new();
+        for cause in chain {
+            if cause != previous {
+                previous = cause.clone();
+                causes.push(cause);
+            }
+        }
         Self {
             ok: false,
             error: ErrorBody {
                 kind,
-                message: err.to_string(),
+                message,
+                causes,
                 exit_code: kind.exit_code(),
             },
         }
@@ -66,19 +80,15 @@ impl ErrorResponse {
 pub struct ErrorBody {
     pub kind: ErrorKind,
     pub message: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub causes: Vec<String>,
     pub exit_code: i32,
 }
 
-/// Substring markers that map a produced error message to a stable [`ErrorKind`].
-///
-/// These are an implicit contract with the modules that *produce* the messages
-/// (`safety`, `sandbox`, `policy`, `cli`, `cli::prompt`, `config`, `profile`):
-/// changing a produced message so it no longer contains its marker silently
-/// reclassifies the error to `Unknown`. Collecting the markers here makes that
-/// contract visible in one place, and `tests/output_tests.rs` drives the real
-/// produced messages through `classify_error` so a dropped marker fails a test
-/// instead of slipping through. `ssh2::Error`/`io::Error` carry no marker and
-/// are matched by type as a fall-back.
+/// Legacy substring markers retained for errors that have not yet crossed a
+/// typed application boundary. New production paths attach a [`ClassifiedError`]
+/// and therefore remain stable when their human-readable message changes.
+/// `ssh2::Error`/`io::Error` are also matched by type as a final fallback.
 const SAFETY_MARKER: &str = "requires --yes";
 const POLICY_MARKERS: [&str; 3] = ["blocked by policy", "policy file", "policy enforcement"];
 const CONFIG_MARKERS: [&str; 17] = [
@@ -122,9 +132,16 @@ const IO_MARKERS: [&str; 2] = ["local file already exists", "not a regular file"
 
 /// Map an error to a stable [`ErrorKind`] for agent consumption.
 ///
-/// Most kinds are inferred from substrings of the human-readable message; the
-/// marker constants above are the contract with the modules that produce them.
+/// Typed application errors take precedence. Legacy markers and concrete
+/// library error types remain as compatibility fallbacks.
 pub fn classify_error(err: &anyhow::Error) -> ErrorKind {
+    if let Some(classified) = err
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<ClassifiedError>())
+    {
+        return classified.kind();
+    }
+
     let message = format!("{err:#}").to_ascii_lowercase();
 
     if message.contains(SAFETY_MARKER) {

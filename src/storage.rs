@@ -1,18 +1,121 @@
+use crate::error::{ResultErrorKindExt, app_error};
+use crate::output::ErrorKind;
 use anyhow::Result;
+use std::fmt;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
+
+/// Process-wide/cross-process advisory exclusive lock backed by the platform's
+/// native whole-file lock. The default acquisition waits at most five seconds,
+/// and the lock is released when this guard is dropped.
+#[derive(Debug)]
+pub struct ExclusiveFileLock {
+    file: fs::File,
+}
+
+impl ExclusiveFileLock {
+    pub(crate) fn file_mut(&mut self) -> &mut fs::File {
+        &mut self.file
+    }
+}
+
+/// Signals that the atomic rename completed but syncing the containing
+/// directory failed. Callers that coordinate another store (such as the OS
+/// keyring) must not compensate by deleting data now referenced by the
+/// published file.
+#[derive(Debug)]
+struct PublishedWriteError {
+    path: PathBuf,
+    source: anyhow::Error,
+}
+
+impl fmt::Display for PublishedWriteError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "state at {} was published, but parent directory durability could not be confirmed: {}",
+            self.path.display(),
+            self.source
+        )
+    }
+}
+
+impl std::error::Error for PublishedWriteError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+pub(crate) fn write_was_published(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<PublishedWriteError>().is_some())
+}
+
+impl Drop for ExclusiveFileLock {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.file);
+    }
+}
+
+pub fn acquire_exclusive_lock(path: &Path) -> Result<ExclusiveFileLock> {
+    acquire_exclusive_lock_with_timeout(path, Duration::from_secs(5))
+}
+
+pub fn acquire_exclusive_lock_with_timeout(
+    path: &Path,
+    timeout: Duration,
+) -> Result<ExclusiveFileLock> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).append(true).create(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+
+    let file = options.open(path)?;
+    set_owner_only(path)?;
+    let started = Instant::now();
+    loop {
+        match fs2::FileExt::try_lock_exclusive(&file) {
+            Ok(()) => break,
+            Err(err) if lock_is_busy(&err) => {
+                if started.elapsed() >= timeout {
+                    return Err(anyhow::anyhow!(
+                        "timed out waiting for lock at {} after {} milliseconds",
+                        path.display(),
+                        timeout.as_millis()
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Ok(ExclusiveFileLock { file })
+}
+
+fn lock_is_busy(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::WouldBlock
+        || cfg!(windows) && error.raw_os_error() == Some(33)
+}
 
 /// Atomically write `contents` to `path`, creating parent directories and
 /// applying owner-only permissions on platforms that support them.
 ///
 /// The write goes to a sibling temp file which is then atomically persisted
 /// over the destination, so an interrupted write never leaves a truncated or
-/// missing destination. On Windows the permission step is a best-effort no-op
+/// missing destination. Permissions and temp-file data are finalized before
+/// publish; the parent directory is synced afterward where supported. A failed
+/// post-publish directory sync returns a detectable `PublishedWriteError`.
+/// On Windows the permission and directory-sync steps are best-effort no-ops
 /// (NTFS ACLs already restrict the per-user config directory).
 pub fn write_owner_only_atomic(path: &Path, contents: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
@@ -21,8 +124,19 @@ pub fn write_owner_only_atomic(path: &Path, contents: &str) -> Result<()> {
 
     let temp_path = temp_sibling_path(path);
     write_temp(&temp_path, contents)?;
+    set_owner_only(&temp_path)?;
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&temp_path)?
+        .sync_all()?;
     replace_atomic(&temp_path, path)?;
-    set_owner_only(path)?;
+    if let Err(source) = sync_parent_directory(path) {
+        return Err(anyhow::Error::new(PublishedWriteError {
+            path: path.to_path_buf(),
+            source,
+        }));
+    }
     Ok(())
 }
 
@@ -91,68 +205,160 @@ pub fn write_stream_owner_only_atomic(
     overwrite: bool,
     expected_len: Option<u64>,
 ) -> Result<u64> {
-    if !overwrite && path.exists() {
+    stage_stream_owner_only(path, reader, overwrite, expected_len)?.persist()
+}
+
+/// A complete local stream that is durable in a sibling temporary file but is
+/// not yet visible at its final destination. Dropping it removes the temporary
+/// file; [`persist`](Self::persist) is the only operation that publishes it.
+pub struct StagedStreamWrite {
+    temp: tempfile::NamedTempFile,
+    destination: PathBuf,
+    overwrite: bool,
+    bytes: u64,
+}
+
+impl StagedStreamWrite {
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    pub fn persist(self) -> Result<u64> {
+        self.persist_inner().with_error_kind(ErrorKind::Io)
+    }
+
+    fn persist_inner(self) -> Result<u64> {
+        let Self {
+            temp,
+            destination,
+            overwrite,
+            bytes,
+        } = self;
+        set_owner_only(temp.path())?;
+
+        let persisted = if overwrite {
+            temp.persist(&destination)
+        } else {
+            temp.persist_noclobber(&destination)
+        };
+        match persisted {
+            Ok(file) => drop(file),
+            Err(err) => {
+                let tempfile::PersistError { error, file } = err;
+                let already_exists = !overwrite
+                    && (error.kind() == std::io::ErrorKind::AlreadyExists
+                        || destination.try_exists().is_ok_and(|exists| exists));
+                drop(file);
+                if already_exists {
+                    return Err(already_exists_error(&destination));
+                }
+                return Err(anyhow::Error::new(error).context(format!(
+                    "failed to persist staged file at {}",
+                    destination.display()
+                )));
+            }
+        }
+        sync_parent_directory(&destination)?;
+        Ok(bytes)
+    }
+}
+
+pub fn stage_stream_owner_only(
+    path: &Path,
+    reader: &mut dyn Read,
+    overwrite: bool,
+    expected_len: Option<u64>,
+) -> Result<StagedStreamWrite> {
+    stage_stream_owner_only_inner(path, reader, overwrite, expected_len)
+        .with_error_kind(ErrorKind::Io)
+}
+
+fn stage_stream_owner_only_inner(
+    path: &Path,
+    reader: &mut dyn Read,
+    overwrite: bool,
+    expected_len: Option<u64>,
+) -> Result<StagedStreamWrite> {
+    if !overwrite && path.try_exists()? {
         return Err(already_exists_error(path));
     }
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        fs::create_dir_all(parent)?;
-    }
 
-    let temp_path = temp_sibling_path(path);
-    let bytes = match copy_stream_to_temp(&temp_path, reader) {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            // The destination was never touched; drop the partial temp file.
-            let _ = fs::remove_file(&temp_path);
-            return Err(err);
-        }
-    };
+    let parent = parent_directory(path);
+    fs::create_dir_all(parent)?;
+    let mut temp = tempfile::Builder::new()
+        .prefix(".sshw-download-")
+        .suffix(".tmp")
+        .tempfile_in(parent)?;
 
-    // Fail closed on a short transfer before persisting, so a truncated download
-    // never overwrites or creates the destination.
+    let bytes = std::io::copy(reader, temp.as_file_mut())?;
+    temp.as_file_mut().flush()?;
+    temp.as_file().sync_all()?;
+
     if let Some(expected) = expected_len
         && bytes != expected
     {
-        let _ = fs::remove_file(&temp_path);
         return Err(incomplete_transfer_error(expected, bytes));
     }
 
-    // Re-check in case the destination appeared during the download.
-    if !overwrite && path.exists() {
-        let _ = fs::remove_file(&temp_path);
-        return Err(already_exists_error(path));
-    }
-
-    replace_atomic(&temp_path, path)?;
-    set_owner_only(path)?;
-    Ok(bytes)
+    Ok(StagedStreamWrite {
+        temp,
+        destination: path.to_path_buf(),
+        overwrite,
+        bytes,
+    })
 }
 
-fn copy_stream_to_temp(temp_path: &Path, reader: &mut dyn Read) -> Result<u64> {
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    options.mode(0o600);
+fn parent_directory(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
 
-    let mut file = options.open(temp_path)?;
-    let bytes = std::io::copy(reader, &mut file)?;
-    file.flush()?;
-    file.sync_all()?;
-    Ok(bytes)
+fn sync_parent_directory(path: &Path) -> Result<()> {
+    #[cfg(test)]
+    if FAIL_NEXT_PARENT_SYNC.with(|fail| fail.replace(false)) {
+        return Err(anyhow::anyhow!("simulated parent directory sync failure"));
+    }
+    sync_parent_directory_platform(path)
+}
+
+#[cfg(unix)]
+fn sync_parent_directory_platform(path: &Path) -> Result<()> {
+    fs::File::open(parent_directory(path))?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory_platform(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_PARENT_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_parent_sync() {
+    FAIL_NEXT_PARENT_SYNC.with(|fail| fail.set(true));
 }
 
 fn already_exists_error(path: &Path) -> anyhow::Error {
-    anyhow::anyhow!(
-        "local file already exists: {}; pass --yes to overwrite",
-        path.display()
+    app_error(
+        ErrorKind::Io,
+        format!(
+            "local file already exists: {}; pass --yes to overwrite",
+            path.display()
+        ),
     )
 }
 
 fn incomplete_transfer_error(expected: u64, actual: u64) -> anyhow::Error {
-    anyhow::anyhow!(
-        "ssh transfer aborted: incomplete download (expected {expected} bytes, wrote {actual})"
+    app_error(
+        ErrorKind::Ssh,
+        format!(
+            "ssh transfer aborted: incomplete download (expected {expected} bytes, wrote {actual})"
+        ),
     )
 }
 
@@ -176,7 +382,10 @@ mod tests {
 
 #[cfg(test)]
 mod stream_tests {
-    use super::write_stream_owner_only_atomic;
+    use super::{
+        acquire_exclusive_lock, acquire_exclusive_lock_with_timeout, stage_stream_owner_only,
+        write_stream_owner_only_atomic,
+    };
     use std::fs;
     use std::io::{self, Read};
 
@@ -235,6 +444,71 @@ mod stream_tests {
 
         assert_eq!(bytes, 7);
         assert_eq!(fs::read_to_string(&dest).unwrap(), "NEWDATA");
+        assert_eq!(count_temp_files(dir.path()), 0);
+    }
+
+    #[test]
+    fn competing_lock_attempt_has_a_bounded_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.lock");
+        let _held = acquire_exclusive_lock(&path).unwrap();
+        let started = std::time::Instant::now();
+
+        let err = acquire_exclusive_lock_with_timeout(&path, std::time::Duration::from_millis(25))
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("timed out waiting for lock"),
+            "error was: {err:#}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn staged_stream_is_invisible_until_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("data.txt");
+        fs::write(&dest, "ORIGINAL").unwrap();
+        let mut reader = &b"NEWDATA"[..];
+
+        let staged = stage_stream_owner_only(&dest, &mut reader, true, Some(7)).unwrap();
+
+        assert_eq!(staged.bytes(), 7);
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "ORIGINAL");
+        assert_eq!(count_temp_files(dir.path()), 1);
+
+        let bytes = staged.persist().unwrap();
+        assert_eq!(bytes, 7);
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "NEWDATA");
+        assert_eq!(count_temp_files(dir.path()), 0);
+    }
+
+    #[test]
+    fn dropping_staged_stream_preserves_existing_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("data.txt");
+        fs::write(&dest, "ORIGINAL").unwrap();
+        let mut reader = &b"NEWDATA"[..];
+
+        let staged = stage_stream_owner_only(&dest, &mut reader, true, Some(7)).unwrap();
+        drop(staged);
+
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "ORIGINAL");
+        assert_eq!(count_temp_files(dir.path()), 0);
+    }
+
+    #[test]
+    fn no_clobber_persist_rejects_destination_created_after_stage() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("data.txt");
+        let mut reader = &b"NEWDATA"[..];
+        let staged = stage_stream_owner_only(&dest, &mut reader, false, Some(7)).unwrap();
+        fs::write(&dest, "COMPETING").unwrap();
+
+        let err = staged.persist().unwrap_err();
+
+        assert!(err.to_string().contains("already exists"));
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "COMPETING");
         assert_eq!(count_temp_files(dir.path()), 0);
     }
 

@@ -6,10 +6,13 @@ use super::{
     AddArgs, AuthArg, CommandOutput, DefaultArgs, ListArgs, Prompter, RemoveArgs, ShowArgs,
     TrustArgs, get_server, no_default_server_error, ok, unknown_server,
 };
-use crate::config::{AuthConfig, PrivilegeConfig, ServerConfig, SshwConfig, save_config};
+use crate::config::{
+    AuthConfig, ConfigRevision, PrivilegeConfig, ServerConfig, SshwConfig, save_config_if_unchanged,
+};
 use crate::credentials::CredentialStore;
-use crate::home::CredentialNamespace;
-use crate::output::ServerOutput;
+use crate::error::{ResultErrorKindExt, app_error};
+use crate::home::{CredentialNamespace, CredentialPurpose, validate_server_name};
+use crate::output::{ErrorKind, ServerOutput};
 use crate::ssh::SshClient;
 use serde_json::json;
 use std::path::Path;
@@ -17,6 +20,7 @@ use std::path::Path;
 pub(super) fn add_server<C, P>(
     args: AddArgs,
     config_path: &Path,
+    revision: &ConfigRevision,
     namespace: &CredentialNamespace,
     credentials: &C,
     prompter: &mut P,
@@ -26,34 +30,43 @@ where
     C: CredentialStore,
     P: Prompter,
 {
+    validate_server_name(&args.name).with_error_kind(ErrorKind::Config)?;
+
     let previous_server = config.servers.get(&args.name).cloned();
     if previous_server.is_some()
         && !args.force
-        && !prompter.confirm(&format!("update existing server '{}'? [y/N] ", args.name))?
+        && !prompter
+            .confirm(&format!("update existing server '{}'? [y/N] ", args.name))
+            .with_error_kind(ErrorKind::Config)?
     {
-        return Err(anyhow::anyhow!("add cancelled"));
+        return Err(app_error(ErrorKind::Config, "add cancelled"));
     }
 
     let mut new_password_credential = None;
     let auth = match args.auth {
         AuthArg::Password => {
-            let credential = namespace.credential_key(&args.name);
+            let credential = namespace.new_credential_key(CredentialPurpose::Login, &args.name);
             let password = if args.password_stdin {
-                prompter.password_stdin()?
+                prompter.password_stdin().with_error_kind(ErrorKind::Auth)?
             } else {
-                prompter.password("SSH password: ")?
+                prompter
+                    .password("SSH password: ")
+                    .with_error_kind(ErrorKind::Auth)?
             };
             if password.is_empty() {
-                return Err(anyhow::anyhow!("password cannot be empty"));
+                return Err(app_error(ErrorKind::Auth, "password cannot be empty"));
             }
-            credentials.set_password(&credential, &args.user, &password)?;
+            credentials
+                .set_password_for(CredentialPurpose::Login, &credential, &args.user, &password)
+                .with_error_kind(ErrorKind::Auth)?;
             new_password_credential = Some((credential.clone(), args.user.clone()));
             AuthConfig::Password { credential }
         }
         AuthArg::Agent => {
             if args.password_stdin {
-                return Err(anyhow::anyhow!(
-                    "--password-stdin cannot be used with --auth agent"
+                return Err(app_error(
+                    ErrorKind::Config,
+                    "--password-stdin cannot be used with --auth agent",
                 ));
             }
             AuthConfig::Agent
@@ -79,16 +92,20 @@ where
         config.default = Some(args.name.clone());
     }
 
-    if let Err(err) = save_config(config_path, config) {
-        if let Some((credential, user)) = new_password_credential.as_ref()
-            && !password_credential_matches(previous_server.as_ref(), credential, user)
+    if let Err(err) =
+        save_config_if_unchanged(config_path, config, revision).with_error_kind(ErrorKind::Config)
+    {
+        if !crate::storage::write_was_published(&err)
+            && let Some((credential, user)) = new_password_credential.as_ref()
         {
-            let _ = credentials.delete_password(credential, user);
+            let _ = credentials.delete_password_for(CredentialPurpose::Login, credential, user);
         }
         return Err(err);
     }
     if let Some((credential, user)) = stale_credential {
-        credentials.delete_password(&credential, &user)?;
+        credentials
+            .delete_password_for(CredentialPurpose::Login, &credential, &user)
+            .with_error_kind(ErrorKind::Auth)?;
     }
     if let Some(privilege) = stale_privilege {
         delete_privilege_password(credentials, &privilege)?;
@@ -179,6 +196,7 @@ pub(super) fn show_server(args: ShowArgs, config: &SshwConfig) -> anyhow::Result
 pub(super) fn default_server(
     args: DefaultArgs,
     config_path: &Path,
+    revision: &ConfigRevision,
     config: &mut SshwConfig,
 ) -> anyhow::Result<CommandOutput> {
     let Some(name) = args.name else {
@@ -194,7 +212,7 @@ pub(super) fn default_server(
     }
 
     config.default = Some(name.clone());
-    save_config(config_path, config)?;
+    save_config_if_unchanged(config_path, config, revision).with_error_kind(ErrorKind::Config)?;
     Ok(ok(format!("default set to {name}\n")))
 }
 
@@ -209,16 +227,22 @@ where
     P: Prompter,
 {
     let server = get_server(config, &args.name)?;
-    let host_key = ssh.host_key(server)?;
+    let host_key = ssh.host_key(server).with_error_kind(ErrorKind::Ssh)?;
     let prompt = format!(
         "trust {} {} {}? [y/N] ",
         args.name, host_key.algorithm, host_key.fingerprint_sha256
     );
-    if !args.yes && !prompter.confirm(&prompt)? {
-        return Err(anyhow::anyhow!("trust cancelled"));
+    if !args.yes
+        && !prompter
+            .confirm(&prompt)
+            .with_error_kind(ErrorKind::Config)?
+    {
+        return Err(app_error(ErrorKind::Config, "trust cancelled"));
     }
 
-    let trusted = ssh.trust_host(&args.name, server, &host_key.fingerprint_sha256)?;
+    let trusted = ssh
+        .trust_host(&args.name, server, &host_key.fingerprint_sha256)
+        .with_error_kind(ErrorKind::Ssh)?;
     if args.json {
         let output = json!({
             "ok": true,
@@ -238,6 +262,7 @@ where
 pub(super) fn remove_server<C, P>(
     args: RemoveArgs,
     config_path: &Path,
+    revision: &ConfigRevision,
     credentials: &C,
     prompter: &mut P,
     config: &mut SshwConfig,
@@ -248,8 +273,12 @@ where
 {
     let server = get_server(config, &args.name)?.clone();
     let privilege = config.privileges.get(&args.name).cloned();
-    if !args.yes && !prompter.confirm(&format!("remove server '{}'? [y/N] ", args.name))? {
-        return Err(anyhow::anyhow!("removal cancelled"));
+    if !args.yes
+        && !prompter
+            .confirm(&format!("remove server '{}'? [y/N] ", args.name))
+            .with_error_kind(ErrorKind::Config)?
+    {
+        return Err(app_error(ErrorKind::Config, "removal cancelled"));
     }
 
     config.servers.remove(&args.name);
@@ -258,7 +287,7 @@ where
         config.default = config.servers.keys().next().cloned();
     }
 
-    save_config(config_path, config)?;
+    save_config_if_unchanged(config_path, config, revision).with_error_kind(ErrorKind::Config)?;
     let mut cleanup_error = None;
     if let Some(privilege) = &privilege
         && let Err(err) = delete_privilege_password(credentials, privilege)
@@ -266,12 +295,13 @@ where
         cleanup_error = Some(err);
     }
     if let AuthConfig::Password { credential } = &server.auth
-        && let Err(err) = credentials.delete_password(credential, &server.user)
+        && let Err(err) =
+            credentials.delete_password_for(CredentialPurpose::Login, credential, &server.user)
     {
         cleanup_error.get_or_insert(err);
     }
     if let Some(err) = cleanup_error {
-        return Err(err);
+        return Err(crate::error::classified_error(ErrorKind::Auth, err));
     }
 
     if args.json {
@@ -318,27 +348,17 @@ fn stale_password_credential(
     }
 }
 
-fn password_credential_matches(
-    server: Option<&ServerConfig>,
-    credential: &str,
-    user: &str,
-) -> bool {
-    let Some(server) = server else {
-        return false;
-    };
-    match &server.auth {
-        AuthConfig::Password {
-            credential: previous,
-        } => previous == credential && server.user == user,
-        AuthConfig::Agent => false,
-    }
-}
-
 fn delete_privilege_password<C>(credentials: &C, privilege: &PrivilegeConfig) -> anyhow::Result<()>
 where
     C: CredentialStore,
 {
-    credentials.delete_password(&privilege.credential, &privilege.user)
+    credentials
+        .delete_password_for(
+            CredentialPurpose::Privilege,
+            &privilege.credential,
+            &privilege.user,
+        )
+        .with_error_kind(ErrorKind::Auth)
 }
 
 fn auth_label(auth: &crate::output::AuthOutput) -> &'static str {
@@ -459,6 +479,7 @@ mod tests {
                 json: false,
             },
             &config_path,
+            &ConfigRevision::missing(),
             &store,
             &mut prompter,
             &mut config,
@@ -495,6 +516,7 @@ mod tests {
                 json: false,
             },
             &config_path,
+            &ConfigRevision::missing(),
             &namespace,
             &store,
             &mut prompter,
@@ -507,9 +529,117 @@ mod tests {
             store.values.borrow().is_empty(),
             "new credential must be cleaned up when config save fails"
         );
-        assert_eq!(
-            store.deleted.borrow().as_slice(),
-            [("sshw:default:web".to_string(), "deploy".to_string())]
+        let deleted = store.deleted.borrow();
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(deleted[0].1, "deploy");
+        assert!(namespace.credential_key_matches(
+            crate::home::CredentialPurpose::Login,
+            "web",
+            &deleted[0].0
+        ));
+        assert_ne!(deleted[0].0, namespace.legacy_credential_key("web"));
+    }
+
+    #[test]
+    fn add_preserves_previous_password_when_config_save_fails() {
+        let mut config = sample_config();
+        let store = RecordingStore::default();
+        let namespace = CredentialNamespace::profile("default");
+        let previous_credential = namespace.legacy_credential_key("web");
+        store.values.borrow_mut().insert(
+            (previous_credential.clone(), "deploy".to_string()),
+            "OLD_PASSWORD".to_string(),
         );
+        let mut prompter = TestPrompter;
+        let temp = tempfile::tempdir().unwrap();
+        let file_parent = temp.path().join("not-a-directory");
+        fs::write(&file_parent, "not a directory").unwrap();
+        let config_path = file_parent.join("servers.json");
+
+        let err = add_server(
+            AddArgs {
+                name: "web".to_string(),
+                host: "192.0.2.20".to_string(),
+                port: 22,
+                user: "deploy".to_string(),
+                auth: AuthArg::Password,
+                force: true,
+                password_stdin: false,
+                json: false,
+            },
+            &config_path,
+            &ConfigRevision::missing(),
+            &namespace,
+            &store,
+            &mut prompter,
+            &mut config,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("failed to save config"));
+        assert_eq!(
+            store
+                .values
+                .borrow()
+                .get(&(previous_credential.clone(), "deploy".to_string()))
+                .map(String::as_str),
+            Some("OLD_PASSWORD")
+        );
+        let deleted = store.deleted.borrow();
+        assert_eq!(deleted.len(), 1);
+        assert_ne!(deleted[0].0, previous_credential);
+        assert!(namespace.credential_key_matches(
+            crate::home::CredentialPurpose::Login,
+            "web",
+            &deleted[0].0
+        ));
+    }
+
+    #[test]
+    fn add_keeps_new_password_when_config_was_published_but_parent_sync_failed() {
+        let mut config = SshwConfig::default();
+        let store = RecordingStore::default();
+        let mut prompter = TestPrompter;
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("servers.json");
+        let namespace = CredentialNamespace::profile("default");
+        crate::storage::fail_next_parent_sync();
+
+        let err = add_server(
+            AddArgs {
+                name: "web".to_string(),
+                host: "192.0.2.10".to_string(),
+                port: 22,
+                user: "deploy".to_string(),
+                auth: AuthArg::Password,
+                force: false,
+                password_stdin: false,
+                json: false,
+            },
+            &config_path,
+            &ConfigRevision::missing(),
+            &namespace,
+            &store,
+            &mut prompter,
+            &mut config,
+        )
+        .unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("published"),
+            "error was: {err:#}"
+        );
+        let saved = crate::config::load_config(&config_path).unwrap();
+        let AuthConfig::Password { credential } = &saved.servers["web"].auth else {
+            panic!("published server must retain password authentication");
+        };
+        assert!(
+            store
+                .values
+                .borrow()
+                .contains_key(&(credential.clone(), "deploy".to_string())),
+            "a published config must not point at a compensating-deleted credential"
+        );
+        assert!(store.deleted.borrow().is_empty());
     }
 }

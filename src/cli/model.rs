@@ -14,8 +14,9 @@ const AFTER_LONG_HELP: &str = r#"SECURITY MODEL:
   - Secrets (SSH passwords, privilege passwords, keys, tokens) are never passed
     on argv and never stored in config files. Password and privilege passwords
     live only in the OS credential store, or opt-in in a session-only in-memory
-    backend selected by `credential_backend: session_only` in servers.json and
-    fed via SSHW_PASSWORD. There is intentionally no `--password <value>`.
+    backend selected by `credential_backend: session_only` in servers.json.
+    Login and privilege secrets are fed separately via SSHW_PASSWORD and
+    SSHW_PRIVILEGE_PASSWORD. There is intentionally no `--password <value>`.
   - SSH host keys are verified fail-closed: an unknown or changed key is never
     accepted silently. Approve a host with `sshw trust <name>` before `run`/
     `put`/`get` can connect.
@@ -57,11 +58,16 @@ JSON OUTPUT:
   Failure (any --json command, including usage errors) uses one envelope:
     {"ok":false,"error":{"kind":"config","message":"unknown server 'x'","exit_code":3}}
   `kind` is one of safety/config/auth/ssh/io/policy/usage/unknown (see EXIT CODES).
+  An optional `causes` array preserves the redacted error chain when nested
+  causes exist; it is omitted when the chain has no additional messages.
 
 AUTOMATION:
   Chain dependent sshw calls with `&&`, not `;`, so a failed upload or trust
   step stops the sequence instead of running the next remote command against
   missing state.
+  If retained output exceeds 16 MiB, sshw fails the operation with exit 5; the
+  remote command may already have side effects, so do not blindly retry a
+  non-idempotent command.
   Exit 5 with a key-exchange or handshake message means SSH setup failed before
   the command ran. Example: `Unable to exchange encryption keys`.
   If this appears during rapid repeated connections, wait briefly and retry from
@@ -102,9 +108,10 @@ pub struct Cli {
     /// closed.
     #[arg(long, global = true)]
     pub policy: bool,
-    /// Inactivity timeout in seconds for remote operations (run/put/get) after
-    /// the connection is established. 0 means no timeout. Connection setup
-    /// always uses a fixed timeout. Default: no operation timeout.
+    /// Absolute timeout in seconds for remote operations (run/put/get) after
+    /// the connection is established. Progress does not extend it. 0 disables
+    /// the deadline. Default: 900 seconds. Exceeding the 16 MiB combined output
+    /// limit fails the operation even if the remote command already ran.
     #[arg(long, global = true, value_name = "SECONDS")]
     pub timeout: Option<u64>,
     #[command(subcommand)]
@@ -463,6 +470,7 @@ mod tests {
             "su prompt/auth failure maps to auth",
             "change:   {\"ok\":true,\"action\":\"added\",\"server\":\"web\"}",
             "{\"ok\":false,\"error\":",
+            "optional `causes` array preserves the redacted error chain",
             "EXAMPLES:",
             "AUTOMATION:",
             "Chain dependent sshw calls with `&&`, not `;`",
@@ -473,6 +481,7 @@ mod tests {
             "idempotent",
             "safe to repeat",
             "inspect network, server, and host trust",
+            "If retained output exceeds 16 MiB, sshw fails the operation",
             // Spot-check exact codes so a future renumber cannot pass silently.
             "0  success",
             "1  unknown",

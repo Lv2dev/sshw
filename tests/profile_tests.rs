@@ -1,7 +1,9 @@
 use sshw::profile::{
-    ProfileEntry, ProfileRegistry, load_registry, resolve_home_with_registry, save_registry,
+    ProfileEntry, ProfileRegistry, load_registry, load_registry_with_revision,
+    resolve_home_with_registry, save_registry, save_registry_if_unchanged,
 };
 use std::collections::BTreeMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 fn registry_with(name: &str, id: &str, home: &str) -> ProfileRegistry {
@@ -27,11 +29,140 @@ fn registry_round_trips_and_defaults_to_empty() {
 
     assert_eq!(load_registry(&path).unwrap(), ProfileRegistry::default());
 
-    let mut registry = registry_with("prod", "p_prod", "/homes/prod");
+    let home = temp.path().join("prod-home");
+    let mut registry = registry_with("prod", "p_prod", &home.to_string_lossy());
     registry.default = Some("prod".to_string());
     save_registry(&path, &registry).unwrap();
 
     assert_eq!(load_registry(&path).unwrap(), registry);
+}
+
+#[test]
+fn stale_registry_revision_cannot_overwrite_external_change() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("profiles.json");
+    save_registry(&path, &ProfileRegistry::default()).unwrap();
+
+    let (mut stale, revision) = load_registry_with_revision(&path).unwrap();
+    let external_home = temp.path().join("external");
+    let mut external = registry_with("external", "p_external", &external_home.to_string_lossy());
+    external.default = Some("external".to_string());
+    save_registry(&path, &external).unwrap();
+
+    stale.profiles.insert(
+        "stale".to_string(),
+        ProfileEntry {
+            id: "p_stale".to_string(),
+            home: temp.path().join("stale"),
+        },
+    );
+    let err = save_registry_if_unchanged(&path, &stale, &revision).unwrap_err();
+
+    assert!(err.to_string().contains("changed concurrently"));
+    assert_eq!(load_registry(&path).unwrap(), external);
+}
+
+#[test]
+fn registry_rejects_unknown_fields_and_future_versions() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("profiles.json");
+    fs::write(
+        &path,
+        r#"{"version":1,"default":null,"profiles":{},"unexpected":true}"#,
+    )
+    .unwrap();
+    assert!(
+        load_registry(&path)
+            .unwrap_err()
+            .to_string()
+            .contains("unknown field")
+    );
+
+    let nested = serde_json::json!({
+        "version": 1,
+        "default": null,
+        "profiles": {
+            "prod": {
+                "id": "p_prod",
+                "home": temp.path().join("prod"),
+                "unexpected": true
+            }
+        }
+    });
+    fs::write(&path, serde_json::to_vec(&nested).unwrap()).unwrap();
+    assert!(
+        load_registry(&path)
+            .unwrap_err()
+            .to_string()
+            .contains("unknown field")
+    );
+
+    fs::write(&path, r#"{"version":2,"default":null,"profiles":{}}"#).unwrap();
+    let err = load_registry(&path).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("unsupported profile registry version 2")
+    );
+    assert!(err.to_string().contains("supported version is 1"));
+}
+
+#[test]
+fn registry_rejects_relative_homes_and_duplicate_ids() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("profiles.json");
+    let relative = serde_json::json!({
+        "version": 1,
+        "default": "prod",
+        "profiles": {
+            "prod": { "id": "p_prod", "home": "relative/home" }
+        }
+    });
+    fs::write(&path, serde_json::to_vec(&relative).unwrap()).unwrap();
+    let err = load_registry(&path).unwrap_err();
+    assert!(err.to_string().contains("home must be absolute"));
+
+    let duplicate = serde_json::json!({
+        "version": 1,
+        "default": "prod",
+        "profiles": {
+            "prod": { "id": "p_shared", "home": temp.path().join("prod") },
+            "stage": { "id": "p_shared", "home": temp.path().join("stage") }
+        }
+    });
+    fs::write(&path, serde_json::to_vec(&duplicate).unwrap()).unwrap();
+    let err = load_registry(&path).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("duplicate credential namespace id")
+    );
+
+    let forged = serde_json::json!({
+        "version": 1,
+        "default": "prod",
+        "profiles": {
+            "prod": { "id": "p_prod:stage", "home": temp.path().join("prod") }
+        }
+    });
+    fs::write(&path, serde_json::to_vec(&forged).unwrap()).unwrap();
+    let err = load_registry(&path).unwrap_err();
+    assert!(
+        err.to_string().contains("invalid credential namespace id"),
+        "error was: {err:#}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn dangling_registry_symlink_is_not_treated_as_missing() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("profiles.json");
+    symlink(temp.path().join("missing-profiles.json"), &path).unwrap();
+
+    let err = load_registry(&path).unwrap_err();
+
+    assert!(err.to_string().contains("failed to load profile registry"));
 }
 
 #[test]

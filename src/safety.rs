@@ -117,6 +117,17 @@ fn has_sudo_command(command: &str) -> bool {
         .any(|word| command_name_is(word, "sudo"))
 }
 
+/// Return the first executable at shell command position, skipping leading
+/// environment assignments and common command-prefix words. Audit logging uses
+/// this same parser as the safety rails so assignment values are never mistaken
+/// for a program name and persisted.
+pub(crate) fn command_program(command: &str) -> Option<String> {
+    command_position_words(command)
+        .into_iter()
+        .next()
+        .and_then(|word| word.rsplit(['/', '\\']).next().map(str::to_string))
+}
+
 fn command_position_words(command: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut at_command_position = true;

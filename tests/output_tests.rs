@@ -1,9 +1,31 @@
 use sshw::config::{AuthConfig, ServerConfig};
+use sshw::error::{ResultErrorKindExt, app_error};
 use sshw::output::{
     ErrorKind, RunOutput, ServerOutput, classify_error, filter_startup_stderr_noise, redact_secrets,
 };
 use sshw::profile::load_registry;
 use sshw::safety::{SafetyDecision, classify_command, classify_remote_write_path};
+
+#[test]
+fn error_response_preserves_the_full_cause_chain() {
+    let err =
+        anyhow::Error::new(std::io::Error::other("disk offline")).context("failed to load config");
+
+    let response = sshw::output::ErrorResponse::from_error(&err);
+    let json = serde_json::to_value(&response).unwrap();
+
+    assert_eq!(response.error.message, "failed to load config");
+    assert_eq!(response.error.causes, ["disk offline"]);
+    assert_eq!(json["error"]["causes"], serde_json::json!(["disk offline"]));
+}
+
+#[test]
+fn error_response_omits_an_empty_cause_chain() {
+    let response = sshw::output::ErrorResponse::from_error(&anyhow::anyhow!("plain failure"));
+    let json = serde_json::to_value(response).unwrap();
+
+    assert!(json["error"].get("causes").is_none());
+}
 
 #[test]
 fn run_output_serializes_for_agents() {
@@ -235,6 +257,42 @@ fn classifies_io_errors_with_exit_code_6() {
         assert_eq!(kind, ErrorKind::Io, "message: {message}");
         assert_eq!(kind.exit_code(), 6);
     }
+}
+
+#[test]
+fn typed_error_kind_cannot_be_overridden_by_dynamic_message_text() {
+    let config = app_error(
+        ErrorKind::Config,
+        "unknown server 'blocked by policy: requires --yes'",
+    );
+    let io = app_error(
+        ErrorKind::Io,
+        "local file blocked by policy and requires --yes",
+    );
+
+    assert_eq!(classify_error(&config), ErrorKind::Config);
+    assert_eq!(classify_error(&io), ErrorKind::Io);
+}
+
+#[test]
+fn typed_ssh_boundary_overrides_inner_io_error() {
+    let err = Err::<(), _>(std::io::Error::other("socket read failed"))
+        .with_error_kind(ErrorKind::Ssh)
+        .unwrap_err();
+
+    assert_eq!(classify_error(&err), ErrorKind::Ssh);
+    assert_eq!(classify_error(&err).exit_code(), 5);
+}
+
+#[test]
+fn outer_boundary_preserves_an_inner_typed_error_kind() {
+    let inner = app_error(ErrorKind::Io, "local read failed");
+    let err = Err::<(), _>(inner)
+        .with_error_kind(ErrorKind::Ssh)
+        .unwrap_err();
+
+    assert_eq!(classify_error(&err), ErrorKind::Io);
+    assert_eq!(classify_error(&err).exit_code(), 6);
 }
 
 #[test]

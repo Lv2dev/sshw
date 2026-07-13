@@ -15,6 +15,7 @@ anyhow = "1.0.103"
 base64 = "0.22.1"
 clap = { version = "4.6.1", features = ["derive"] }
 directories = "6.0.0"
+fs2 = "0.4.3"
 keyring-core = "1.0.0"
 libssh2-sys = "0.3.1"
 rpassword = "7.5.3"
