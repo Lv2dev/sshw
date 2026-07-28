@@ -26,6 +26,18 @@ require_positive_integer "SSHW_DOCKER_BUILD_ATTEMPTS" "$build_attempts"
 
 if [[ -z "$ubuntu_mirror" && -r "$host_ubuntu_sources" ]]; then
   ubuntu_mirror="$(awk '$1 == "URIs:" { print $2; exit }' "$host_ubuntu_sources")"
+  if [[ "$ubuntu_mirror" == mirror+file:* ]]; then
+    mirror_file="${ubuntu_mirror#mirror+file:}"
+    if [[ ! -r "$mirror_file" ]]; then
+      echo "Ubuntu mirror list is not readable: $mirror_file" >&2
+      exit 2
+    fi
+    ubuntu_mirror="$(awk '$1 ~ /^https?:\/\// { print $1; exit }' "$mirror_file")"
+    if [[ -z "$ubuntu_mirror" ]]; then
+      echo "Ubuntu mirror list contains no HTTP(S) URL: $mirror_file" >&2
+      exit 2
+    fi
+  fi
 fi
 ubuntu_mirror="${ubuntu_mirror%/}"
 

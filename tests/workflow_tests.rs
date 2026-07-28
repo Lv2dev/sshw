@@ -101,6 +101,8 @@ fn integration_workflow_builds_password_fixture_once_with_bounded_retries() {
         "SSHW_DOCKER_BUILD_TIMEOUT_SECONDS",
         "SSHW_DOCKER_BUILD_ATTEMPTS",
         "/etc/apt/sources.list.d/ubuntu.sources",
+        "mirror+file:",
+        "${ubuntu_mirror#mirror+file:}",
         "UBUNTU_MIRROR=$ubuntu_mirror",
         "trap cleanup EXIT",
         "SSHW_DOCKER_PASSWORD_IMAGE=\"$image_tag\"",
