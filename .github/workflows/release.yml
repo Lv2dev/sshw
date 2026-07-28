@@ -4,12 +4,21 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to verify and publish
+        required: true
+        type: string
 
 permissions:
   contents: read
 
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -24,9 +33,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+          ref: refs/tags/${{ env.RELEASE_TAG }}
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master action code
         with:
           toolchain: "1.97.0"
+          components: rustfmt, clippy
       - run: cargo metadata --locked --format-version 1
       - name: Check tag matches Cargo.toml version
         shell: pwsh
@@ -38,8 +49,8 @@ jobs:
             exit 1
           }
           $expectedTag = "v$($package.version)"
-          if ($env:GITHUB_REF_NAME -ne $expectedTag) {
-            Write-Error "release tag '$env:GITHUB_REF_NAME' does not match Cargo.toml version '$($package.version)' (expected '$expectedTag')"
+          if ($env:RELEASE_TAG -ne $expectedTag) {
+            Write-Error "release tag '$env:RELEASE_TAG' does not match Cargo.toml version '$($package.version)' (expected '$expectedTag')"
             exit 1
           }
       - run: cargo fmt --check
@@ -78,6 +89,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+          ref: refs/tags/${{ env.RELEASE_TAG }}
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master action code
         with:
           toolchain: "1.97.0"
@@ -141,4 +153,4 @@ jobs:
             echo "no release artifacts found" >&2
             exit 1
           fi
-          gh release create "$GITHUB_REF_NAME" "${files[@]}" SHA256SUMS --generate-notes --repo "$GITHUB_REPOSITORY"
+          gh release create "$RELEASE_TAG" "${files[@]}" SHA256SUMS --generate-notes --repo "$GITHUB_REPOSITORY"
