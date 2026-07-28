@@ -1,0 +1,41 @@
+name: Feature request
+description: Propose a focused improvement to sshw
+title: "[Feature]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the user problem without including real infrastructure or credentials. Report security vulnerabilities privately through a GitHub Security Advisory.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What workflow is difficult or impossible today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the smallest user-visible behavior that would solve the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Which existing commands or external tools have you tried?
+  - type: textarea
+    id: security
+    attributes:
+      label: Security and compatibility impact
+      description: Note any change to credentials, trust, policy, audit, JSON, exit codes, or platform behavior.
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Data-safety confirmation
+      options:
+        - label: I did not include real credentials or private infrastructure details.
+          required: true

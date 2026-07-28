@@ -49,6 +49,38 @@ fn file_sink_appends_jsonl_and_redacts_detail() {
 }
 
 #[test]
+fn audit_record_gives_up_promptly_when_record_lock_is_busy() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("audit.jsonl");
+    std::fs::write(&path, "").unwrap();
+    let lock = sshw::storage::acquire_exclusive_lock(&path).unwrap();
+    let thread_path = path.clone();
+    let (sender, receiver) = std::sync::mpsc::channel();
+
+    let worker = std::thread::spawn(move || {
+        let sink = FileAuditSink::new(thread_path);
+        let result = sink.record(&AuditRecord {
+            action: "run".to_string(),
+            server: Some("server-alpha".to_string()),
+            detail: Some("printf".to_string()),
+            status: AuditStatus::Ok,
+            exit_code: 0,
+        });
+        sender.send(result).unwrap();
+    });
+
+    let result = receiver
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("best-effort audit must not wait indefinitely for its lock");
+    let err = result.expect_err("busy audit lock should skip the record");
+    assert!(err.to_string().contains("timed out waiting for lock"));
+    drop(lock);
+    worker.join().unwrap();
+
+    assert!(std::fs::read_to_string(path).unwrap().is_empty());
+}
+
+#[test]
 fn noop_sink_records_nothing() {
     NoopAudit
         .record(&record("run", None, AuditStatus::Ok, 0))

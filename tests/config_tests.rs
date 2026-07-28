@@ -1,7 +1,10 @@
 use sshw::config::{
     AuthConfig, CredentialBackend, PrivilegeConfig, PrivilegeMethod, ServerConfig, SshwConfig,
-    load_config, save_config,
+    load_config, load_config_with_revision, save_config, save_config_if_unchanged,
+    validate_config_credential_references,
 };
+use sshw::home::{CredentialNamespace, CredentialPurpose};
+use std::fs;
 
 #[test]
 fn new_config_starts_empty() {
@@ -108,6 +111,133 @@ fn corrupt_config_reports_config_error() {
 }
 
 #[test]
+fn config_rejects_unknown_fields_at_root_and_nested_levels() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    fs::write(
+        &path,
+        r#"{
+            "version": 1,
+            "default": null,
+            "servers": {},
+            "credentials_backend": "session_only"
+        }"#,
+    )
+    .unwrap();
+
+    let root_err = load_config(&path).unwrap_err();
+    assert!(root_err.to_string().contains("unknown field"));
+
+    fs::write(
+        &path,
+        r#"{
+            "version": 1,
+            "default": "web",
+            "servers": {
+                "web": {
+                    "host": "192.0.2.10",
+                    "port": 22,
+                    "user": "deploy",
+                    "auth": { "type": "agent", "unexpected": true }
+                }
+            }
+        }"#,
+    )
+    .unwrap();
+    let nested_err = load_config(&path).unwrap_err();
+    assert!(nested_err.to_string().contains("unknown field"));
+
+    fs::write(
+        &path,
+        r#"{
+            "version": 1,
+            "default": "web",
+            "servers": {
+                "web": {
+                    "host": "192.0.2.10",
+                    "port": 22,
+                    "user": "deploy",
+                    "auth": { "type": "agent" },
+                    "unexpected": true
+                }
+            },
+            "privileges": {
+                "web": {
+                    "method": "sudo",
+                    "user": "root",
+                    "credential": "synthetic",
+                    "unexpected": true
+                }
+            }
+        }"#,
+    )
+    .unwrap();
+    let nested_err = load_config(&path).unwrap_err();
+    assert!(nested_err.to_string().contains("unknown field"));
+
+    fs::write(
+        &path,
+        r#"{
+            "version": 1,
+            "default": "web",
+            "servers": {
+                "web": {
+                    "host": "192.0.2.10",
+                    "port": 22,
+                    "user": "deploy",
+                    "auth": { "type": "agent" }
+                }
+            },
+            "privileges": {
+                "web": {
+                    "method": "sudo",
+                    "user": "root",
+                    "credential": "synthetic",
+                    "unexpected": true
+                }
+            }
+        }"#,
+    )
+    .unwrap();
+    let privilege_err = load_config(&path).unwrap_err();
+    assert!(privilege_err.to_string().contains("unknown field"));
+}
+
+#[test]
+fn config_rejects_unsupported_future_version() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    fs::write(
+        &path,
+        r#"{
+            "version": 2,
+            "default": null,
+            "servers": {}
+        }"#,
+    )
+    .unwrap();
+
+    let err = load_config(&path).unwrap_err();
+
+    assert!(err.to_string().contains("unsupported config version 2"));
+    assert!(err.to_string().contains("supported version is 1"));
+}
+
+#[cfg(unix)]
+#[test]
+fn dangling_config_symlink_is_not_treated_as_missing() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    symlink(temp.path().join("missing-servers.json"), &path).unwrap();
+
+    let err = load_config(&path).unwrap_err();
+
+    assert!(err.to_string().contains("failed to load config"));
+}
+
+#[test]
 fn config_saves_and_loads_round_trip() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("nested").join("servers.json");
@@ -133,6 +263,184 @@ fn config_saves_and_loads_round_trip() {
     let loaded = load_config(&path).unwrap();
 
     assert_eq!(loaded, config);
+}
+
+#[test]
+fn stale_config_revision_cannot_overwrite_external_change() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &SshwConfig::default()).unwrap();
+
+    let (mut stale, revision) = load_config_with_revision(&path).unwrap();
+    let external = SshwConfig {
+        default: Some("external".to_string()),
+        ..SshwConfig::default()
+    };
+    save_config(&path, &external).unwrap();
+
+    stale.default = Some("stale".to_string());
+    let err = save_config_if_unchanged(&path, &stale, &revision).unwrap_err();
+
+    assert!(err.to_string().contains("changed concurrently"));
+    assert_eq!(load_config(&path).unwrap(), external);
+}
+
+#[test]
+fn credential_references_accept_expected_legacy_and_v2_keys() {
+    let namespace = CredentialNamespace::profile("default");
+    let mut config = SshwConfig::default();
+    config.servers.insert(
+        "legacy".to_string(),
+        ServerConfig {
+            host: "192.0.2.10".to_string(),
+            port: 22,
+            user: "deploy".to_string(),
+            auth: AuthConfig::Password {
+                credential: namespace.legacy_credential_key("legacy"),
+            },
+        },
+    );
+    config.servers.insert(
+        "modern".to_string(),
+        ServerConfig {
+            host: "192.0.2.11".to_string(),
+            port: 22,
+            user: "deploy".to_string(),
+            auth: AuthConfig::Password {
+                credential: namespace.credential_key_v2(
+                    CredentialPurpose::Login,
+                    "modern",
+                    "0000000000000001",
+                ),
+            },
+        },
+    );
+    config.privileges.insert(
+        "modern".to_string(),
+        PrivilegeConfig {
+            method: PrivilegeMethod::Sudo,
+            user: "root".to_string(),
+            credential: namespace.credential_key_v2(
+                CredentialPurpose::Privilege,
+                "modern",
+                "0000000000000002",
+            ),
+        },
+    );
+
+    validate_config_credential_references(&config, &namespace).unwrap();
+}
+
+#[test]
+fn config_relationships_reject_dangling_default_and_orphan_privilege() {
+    let namespace = CredentialNamespace::profile("default");
+    let mut config = SshwConfig {
+        default: Some("missing".to_string()),
+        ..SshwConfig::default()
+    };
+
+    let dangling_default = validate_config_credential_references(&config, &namespace).unwrap_err();
+    assert!(
+        dangling_default
+            .to_string()
+            .contains("default server 'missing' is not present")
+    );
+
+    config.default = None;
+    config.privileges.insert(
+        "web".to_string(),
+        PrivilegeConfig {
+            method: PrivilegeMethod::Sudo,
+            user: "root".to_string(),
+            credential: namespace.legacy_privilege_credential_key("web"),
+        },
+    );
+
+    let orphan_privilege = validate_config_credential_references(&config, &namespace).unwrap_err();
+    assert!(
+        orphan_privilege
+            .to_string()
+            .contains("privilege configuration for server 'web' has no matching server")
+    );
+}
+
+#[test]
+fn credential_references_reject_cross_namespace_keys() {
+    let namespace = CredentialNamespace::profile("default");
+    let other = CredentialNamespace::profile("other");
+    let mut config = SshwConfig::default();
+    config.servers.insert(
+        "web".to_string(),
+        ServerConfig {
+            host: "192.0.2.10".to_string(),
+            port: 22,
+            user: "deploy".to_string(),
+            auth: AuthConfig::Password {
+                credential: other.credential_key_v2(
+                    CredentialPurpose::Login,
+                    "web",
+                    "0000000000000001",
+                ),
+            },
+        },
+    );
+
+    let err = validate_config_credential_references(&config, &namespace).unwrap_err();
+
+    assert!(
+        err.to_string()
+            .contains("does not belong to the active home")
+    );
+}
+
+#[test]
+fn credential_references_reject_legacy_reserved_alias_collisions() {
+    let namespace = CredentialNamespace::profile("default");
+    let shared = namespace.legacy_credential_key("privilege:web");
+    assert_eq!(shared, namespace.legacy_privilege_credential_key("web"));
+    let mut config = SshwConfig::default();
+    config.servers.insert(
+        "privilege:web".to_string(),
+        ServerConfig {
+            host: "192.0.2.10".to_string(),
+            port: 22,
+            user: "deploy".to_string(),
+            auth: AuthConfig::Password {
+                credential: shared.clone(),
+            },
+        },
+    );
+    config.privileges.insert(
+        "web".to_string(),
+        PrivilegeConfig {
+            method: PrivilegeMethod::Sudo,
+            user: "root".to_string(),
+            credential: shared,
+        },
+    );
+
+    let err = validate_config_credential_references(&config, &namespace).unwrap_err();
+
+    assert!(err.to_string().contains("reserved 'privilege:' prefix"));
+}
+
+#[test]
+fn credential_references_reject_control_characters_in_aliases() {
+    let namespace = CredentialNamespace::profile("default");
+    let mut config = SshwConfig::default();
+    config.servers.insert(
+        "web\ninjected".to_string(),
+        ServerConfig {
+            host: "192.0.2.10".to_string(),
+            port: 22,
+            user: "deploy".to_string(),
+            auth: AuthConfig::Agent,
+        },
+    );
+
+    let err = validate_config_credential_references(&config, &namespace).unwrap_err();
+
+    assert!(err.to_string().contains("invalid server name"));
 }
 
 #[cfg(unix)]

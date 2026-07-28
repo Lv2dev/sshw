@@ -20,6 +20,7 @@ use sshw::config::{
 };
 use sshw::credentials::session_store::SessionOnlyStore;
 use sshw::credentials::{AuthMaterial, CredentialStore};
+use sshw::home::{CredentialPurpose, ResolvedHome};
 use sshw::ssh::SshClient;
 use sshw::ssh::ssh2_client::Ssh2Client;
 use std::fs;
@@ -66,15 +67,25 @@ impl TestServer {
     fn start() -> TestServer {
         let dir = tempfile::tempdir().expect("tempdir");
         let known_hosts = dir.path().join("known_hosts");
-        Self::start_in(dir, known_hosts)
+        Self::start_in(dir, known_hosts, None)
     }
 
     fn start_with_known_hosts(known_hosts: PathBuf) -> TestServer {
         let dir = tempfile::tempdir().expect("tempdir");
-        Self::start_in(dir, known_hosts)
+        Self::start_in(dir, known_hosts, None)
     }
 
-    fn start_in(dir: TempDir, known_hosts: PathBuf) -> TestServer {
+    fn start_with_force_command_script(contents: &str) -> TestServer {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let known_hosts = dir.path().join("known_hosts");
+        let script = dir.path().join("force-command.sh");
+        fs::write(&script, contents).expect("write force command");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700))
+            .expect("chmod force command");
+        Self::start_in(dir, known_hosts, Some(script))
+    }
+
+    fn start_in(dir: TempDir, known_hosts: PathBuf, force_command: Option<PathBuf>) -> TestServer {
         let root = dir.path().to_path_buf();
         let user = std::env::var("USER")
             .or_else(|_| std::env::var("LOGNAME"))
@@ -94,6 +105,10 @@ impl TestServer {
         let port = free_port();
         let pid_file = root.join("sshd.pid");
         let config = root.join("sshd_config");
+        let force_command = force_command
+            .as_ref()
+            .map(|path| format!("ForceCommand {}\n", path.display()))
+            .unwrap_or_default();
         fs::write(
             &config,
             format!(
@@ -108,7 +123,8 @@ impl TestServer {
                  UsePAM no\n\
                  StrictModes no\n\
                  LogLevel ERROR\n\
-                 Subsystem sftp internal-sftp\n",
+                 Subsystem sftp internal-sftp\n\
+                 {force_command}",
                 host = host_key.display(),
                 pid = pid_file.display(),
                 auth = authorized.display(),
@@ -389,6 +405,34 @@ fn password_server_config(port: u16) -> ServerConfig {
     }
 }
 
+fn docker_privileged_config(
+    path: &Path,
+    srv: &DockerPasswordServer,
+    method: PrivilegeMethod,
+) -> (SshwConfig, String, String) {
+    let namespace = ResolvedHome::from_config_path(path).namespace;
+    let login_credential = namespace.legacy_credential_key("docker-password");
+    let privilege_credential = namespace.legacy_privilege_credential_key("docker-password");
+    let mut server = srv.server();
+    server.auth = AuthConfig::Password {
+        credential: login_credential.clone(),
+    };
+    let mut config = SshwConfig {
+        default: Some("docker-password".to_string()),
+        ..SshwConfig::default()
+    };
+    config.servers.insert("docker-password".to_string(), server);
+    config.privileges.insert(
+        "docker-password".to_string(),
+        PrivilegeConfig {
+            method,
+            user: "root".to_string(),
+            credential: privilege_credential.clone(),
+        },
+    );
+    (config, login_credential, privilege_credential)
+}
+
 fn docker_available() -> bool {
     Command::new("docker")
         .args(["version", "--format", "{{.Server.Version}}"])
@@ -453,6 +497,98 @@ fn run_executes_remote_command() {
 
     assert_eq!(result.exit_status, 0);
     assert_eq!(result.stdout.trim(), "hello");
+}
+
+#[test]
+#[ignore = "spawns a real sshd; run with --ignored --test-threads=1"]
+fn run_without_stdin_sends_eof() {
+    let srv = TestServer::start();
+    srv.trust();
+    let client = srv.client().with_op_timeout(Some(Duration::from_secs(2)));
+
+    let result = client
+        .run(
+            &srv.server(),
+            &AuthMaterial::Agent,
+            "cat; printf eof-observed",
+        )
+        .expect("run should close stdin without caller input");
+
+    assert_eq!(result.exit_status, 0);
+    assert_eq!(result.stdout, "eof-observed");
+}
+
+#[test]
+#[ignore = "spawns a real sshd; run with --ignored --test-threads=1"]
+fn pty_password_input_sends_eof_after_the_secret_line() {
+    let srv = TestServer::start();
+    srv.trust();
+    let client = srv.client().with_op_timeout(Some(Duration::from_secs(2)));
+    let nonce = "feedface";
+    let command = "sh -c 'printf \"Password: \"; IFS= read -r ignored; printf \"\\n__SSHW_BEGIN_feedface__\\n\"; cat; status=$?; printf \"__SSHW_END_feedface_%s__\\n\" \"$status\"'";
+
+    let result = client
+        .run_with_pty_password(
+            &srv.server(),
+            &AuthMaterial::Agent,
+            command,
+            "synthetic-password",
+            nonce,
+        )
+        .expect("PTY command should observe EOF after the password line");
+
+    assert_eq!(result.exit_status, 0);
+    assert_eq!(result.stdout, "");
+    assert!(!result.stdout.contains("synthetic-password"));
+}
+
+#[test]
+#[ignore = "spawns a real sshd; run with --ignored --test-threads=1"]
+fn op_timeout_is_absolute_despite_continuous_output() {
+    let srv = TestServer::start();
+    srv.trust();
+    let client = srv
+        .client()
+        .with_op_timeout(Some(Duration::from_millis(500)));
+
+    let started = Instant::now();
+    let err = client
+        .run(
+            &srv.server(),
+            &AuthMaterial::Agent,
+            "i=0; while [ \"$i\" -lt 100 ]; do printf x; i=$((i+1)); sleep 0.05; done",
+        )
+        .expect_err("continuous output must not extend the absolute deadline");
+
+    assert!(err.to_string().contains("timed out"), "error was: {err:#}");
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "absolute timeout did not fire promptly: {err:#}"
+    );
+}
+
+#[test]
+#[ignore = "spawns a real sshd; run with --ignored --test-threads=1"]
+fn run_rejects_output_over_limit() {
+    let srv = TestServer::start();
+    srv.trust();
+    let client = srv
+        .client()
+        .with_op_timeout(Some(Duration::from_secs(5)))
+        .with_output_limit(1024);
+
+    let err = client
+        .run(
+            &srv.server(),
+            &AuthMaterial::Agent,
+            "head -c 4096 /dev/zero",
+        )
+        .expect_err("oversized output must fail closed");
+
+    assert!(
+        err.to_string().contains("output exceeded 1024-byte limit"),
+        "error was: {err:#}"
+    );
 }
 
 #[test]
@@ -560,29 +696,26 @@ fn run_as_root_uses_sudo_against_real_sshd_without_forwarding_password_stdin() {
 
     let temp = tempfile::tempdir().expect("tempdir");
     let path = temp.path().join("servers.json");
-    let mut config = SshwConfig {
-        default: Some("docker-password".to_string()),
-        ..SshwConfig::default()
-    };
-    config
-        .servers
-        .insert("docker-password".to_string(), srv.server());
-    config.privileges.insert(
-        "docker-password".to_string(),
-        PrivilegeConfig {
-            method: PrivilegeMethod::Sudo,
-            user: "root".to_string(),
-            credential: "docker-privilege".to_string(),
-        },
-    );
+    let (config, login_credential, privilege_credential) =
+        docker_privileged_config(&path, &srv, PrivilegeMethod::Sudo);
     save_config(&path, &config).expect("save config");
 
     let store = SessionOnlyStore::new();
     store
-        .set_password("docker-password", TEST_USER, TEST_PASSWORD)
+        .set_password_for(
+            CredentialPurpose::Login,
+            &login_credential,
+            TEST_USER,
+            TEST_PASSWORD,
+        )
         .expect("store ssh password");
     store
-        .set_password("docker-privilege", "root", TEST_PASSWORD)
+        .set_password_for(
+            CredentialPurpose::Privilege,
+            &privilege_credential,
+            "root",
+            TEST_PASSWORD,
+        )
         .expect("store privilege password");
     let mut prompter = NoopPrompter;
 
@@ -618,29 +751,26 @@ fn run_as_root_uses_su_against_real_sshd_with_pty_password() {
 
     let temp = tempfile::tempdir().expect("tempdir");
     let path = temp.path().join("servers.json");
-    let mut config = SshwConfig {
-        default: Some("docker-password".to_string()),
-        ..SshwConfig::default()
-    };
-    config
-        .servers
-        .insert("docker-password".to_string(), srv.server());
-    config.privileges.insert(
-        "docker-password".to_string(),
-        PrivilegeConfig {
-            method: PrivilegeMethod::Su,
-            user: "root".to_string(),
-            credential: "docker-privilege".to_string(),
-        },
-    );
+    let (config, login_credential, privilege_credential) =
+        docker_privileged_config(&path, &srv, PrivilegeMethod::Su);
     save_config(&path, &config).expect("save config");
 
     let store = SessionOnlyStore::new();
     store
-        .set_password("docker-password", TEST_USER, TEST_PASSWORD)
+        .set_password_for(
+            CredentialPurpose::Login,
+            &login_credential,
+            TEST_USER,
+            TEST_PASSWORD,
+        )
         .expect("store ssh password");
     store
-        .set_password("docker-privilege", "root", ROOT_PASSWORD)
+        .set_password_for(
+            CredentialPurpose::Privilege,
+            &privilege_credential,
+            "root",
+            ROOT_PASSWORD,
+        )
         .expect("store privilege password");
     let mut prompter = NoopPrompter;
 
@@ -688,29 +818,26 @@ fn run_as_root_su_preserves_output_mentioning_password() {
 
     let temp = tempfile::tempdir().expect("tempdir");
     let path = temp.path().join("servers.json");
-    let mut config = SshwConfig {
-        default: Some("docker-password".to_string()),
-        ..SshwConfig::default()
-    };
-    config
-        .servers
-        .insert("docker-password".to_string(), srv.server());
-    config.privileges.insert(
-        "docker-password".to_string(),
-        PrivilegeConfig {
-            method: PrivilegeMethod::Su,
-            user: "root".to_string(),
-            credential: "docker-privilege".to_string(),
-        },
-    );
+    let (config, login_credential, privilege_credential) =
+        docker_privileged_config(&path, &srv, PrivilegeMethod::Su);
     save_config(&path, &config).expect("save config");
 
     let store = SessionOnlyStore::new();
     store
-        .set_password("docker-password", TEST_USER, TEST_PASSWORD)
+        .set_password_for(
+            CredentialPurpose::Login,
+            &login_credential,
+            TEST_USER,
+            TEST_PASSWORD,
+        )
         .expect("store ssh password");
     store
-        .set_password("docker-privilege", "root", ROOT_PASSWORD)
+        .set_password_for(
+            CredentialPurpose::Privilege,
+            &privilege_credential,
+            "root",
+            ROOT_PASSWORD,
+        )
         .expect("store privilege password");
     let mut prompter = NoopPrompter;
 
@@ -770,6 +897,101 @@ fn put_then_get_roundtrip() {
     assert_eq!(fs::read(&dest).expect("read dest"), payload);
 
     let _ = client.run(&server, &AuthMaterial::Agent, &format!("rm -f {remote}"));
+}
+
+#[test]
+#[ignore = "spawns a real sshd; run with --ignored --test-threads=1"]
+fn get_rejects_nonzero_scp_source_after_full_announced_payload() {
+    let srv = TestServer::start_with_force_command_script(
+        r#"#!/bin/sh
+dd bs=1 count=1 of=/dev/null 2>/dev/null
+printf 'T0 0 0 0\n'
+dd bs=1 count=1 of=/dev/null 2>/dev/null
+printf 'C0600 7 payload\n'
+dd bs=1 count=1 of=/dev/null 2>/dev/null
+printf 'NEWDATA'
+printf '\000'
+dd bs=1 count=1 of=/dev/null 2>/dev/null
+exit 1
+"#,
+    );
+    srv.trust();
+    let local_dir = tempfile::tempdir().unwrap();
+    let destination = local_dir.path().join("download.txt");
+    fs::write(&destination, "ORIGINAL").unwrap();
+
+    let err = srv
+        .client()
+        .get(
+            &srv.server(),
+            &AuthMaterial::Agent,
+            "/ignored",
+            &destination,
+            true,
+        )
+        .unwrap_err();
+
+    assert!(err.to_string().contains("status 1"), "error was: {err:#}");
+    assert_eq!(fs::read_to_string(&destination).unwrap(), "ORIGINAL");
+    assert_eq!(
+        fs::read_dir(local_dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .count(),
+        0
+    );
+
+    fs::remove_file(&destination).unwrap();
+    let err = srv
+        .client()
+        .get(
+            &srv.server(),
+            &AuthMaterial::Agent,
+            "/ignored",
+            &destination,
+            false,
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("status 1"), "error was: {err:#}");
+    assert!(!destination.exists());
+}
+
+#[test]
+#[ignore = "spawns a real sshd; run with --ignored --test-threads=1"]
+fn get_rejects_truncated_scp_source_and_preserves_destination() {
+    let srv = TestServer::start_with_force_command_script(
+        r#"#!/bin/sh
+dd bs=1 count=1 of=/dev/null 2>/dev/null
+printf 'T0 0 0 0\n'
+dd bs=1 count=1 of=/dev/null 2>/dev/null
+printf 'C0600 7 payload\n'
+dd bs=1 count=1 of=/dev/null 2>/dev/null
+printf 'NEW'
+exit 1
+"#,
+    );
+    srv.trust();
+    let local_dir = tempfile::tempdir().unwrap();
+    let destination = local_dir.path().join("download.txt");
+    fs::write(&destination, "ORIGINAL").unwrap();
+
+    let err = srv
+        .client()
+        .get(
+            &srv.server(),
+            &AuthMaterial::Agent,
+            "/ignored",
+            &destination,
+            true,
+        )
+        .unwrap_err();
+
+    assert!(
+        err.to_string().contains("incomplete download"),
+        "error was: {err:#}"
+    );
+    assert_eq!(fs::read_to_string(&destination).unwrap(), "ORIGINAL");
 }
 
 #[test]

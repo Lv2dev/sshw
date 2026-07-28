@@ -40,7 +40,7 @@ The binary will be at `target/release/sshw` (`sshw.exe` on Windows).
 
 ### Release Builds
 
-Tagged releases build GitHub release artifacts for `x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`, `x86_64-apple-darwin`, and `aarch64-apple-darwin`. Each release includes a `SHA256SUMS` file. Release workflows pin GitHub Actions by commit SHA.
+Tagged releases build GitHub release artifacts for `x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`, `x86_64-apple-darwin`, and `aarch64-apple-darwin`. Each release includes a `SHA256SUMS` file. Release workflows pin GitHub Actions by commit SHA and the release compiler to Rust 1.97.0. ZIP and tar.gz packaging uses deterministic archive metadata derived from the release commit timestamp, so the same binary and timestamp produce the same archive bytes. This is not a claim that separately compiled binaries are bit-for-bit reproducible; see `SECURITY.md`.
 
 ```bash
 git tag vX.Y.Z
@@ -78,13 +78,14 @@ The global profile registry maps profile names to homes:
 
 `<config_dir>` is `%AppData%\sshw` on Windows, `~/Library/Application Support/sshw` on macOS, and `~/.config/sshw` on Linux.
 
-Credential keyring entries are always namespaced so the same server name in different homes never collides:
+New credential keyring entries use a purpose-aware, generation-qualified v2 key so the same server name in different homes never collides and login credentials cannot be reused as privilege credentials:
 
 ```text
-sshw:<profile-id>:<server>     for registered/built-in profiles
-sshw:home_<hash>:<server>      for ad-hoc --home / SSHW_HOME
-sshw:<profile-id>:privilege:<server>     privileged sudo/su credential metadata
+sshw:v2:<encoded-namespace>:login:<encoded-server>:<generation>
+sshw:v2:<encoded-namespace>:privilege:<encoded-server>:<generation>
 ```
+
+The namespace and server components are base64url-encoded. Each credential update receives a new generation. Legacy v1 keys (`sshw:<namespace>:<server>` and `sshw:<namespace>:privilege:<server>`) remain readable only when they exactly match the active namespace, purpose, and server; new writes never use v1.
 
 ### Selecting A Home
 
@@ -116,7 +117,9 @@ sshw profile default prod
 sshw profile remove prod                  # removes the registry entry only; home dir and credentials are left intact
 ```
 
-Each profile stores a stable id and its home path. The first profile added becomes the default.
+Each profile stores a stable id and its home path. The first profile added becomes the default. `profile add --force` preserves the existing id when the normalized home is unchanged; moving the name to a different home creates a fresh namespace. The selection mechanism is part of the credential boundary: opening a profile-owned directory with `--home` does not reuse that profile's credentials. Removing a profile leaves its directory and native keyring entries physically intact, but removes the trusted namespace binding; re-adding a removed profile creates a fresh credential namespace and requires credentials to be registered again. Use `--force` instead of remove/re-add when updating the same profile and home.
+
+Registries are validated strictly. If an older release stored a relative profile home, normal selection/list/show/default operations fail closed. `sshw doctor` reports `registry_valid: false` and an actionable `registry_message`; `sshw profile remove <affected-name>` is the only recovery exception and succeeds only when removing that exact entry leaves a fully valid registry. It never resolves or migrates the relative path against the current working directory.
 
 ### Password Auth
 
@@ -149,7 +152,7 @@ Agent auth stores no secret; it uses the active SSH agent.
 The home's `servers.json` selects the credential backend via `credential_backend` (default `native`):
 
 - `native` — the OS keyring (Windows Credential Manager, macOS Keychain, Linux Secret Service).
-- `session_only` — never touches the keyring. `set_password` stays in memory for the process only; at run time the password is taken from the `SSHW_PASSWORD` environment variable and then removed from this process environment. Suited to ephemeral/CI use. Environment variables can still be visible before `sshw` starts or in the parent shell, so treat `SSHW_PASSWORD` as sensitive. `add --auth password` warns that the password is not persisted.
+- `session_only` — never touches the keyring. `set_password` stays in memory for the process only. At run time, login passwords come from `SSHW_PASSWORD` and privilege passwords come from `SSHW_PRIVILEGE_PASSWORD`; both variables are removed from this process environment after reading. Suited to ephemeral/CI use. Environment variables can still be visible before `sshw` starts or in the parent shell, so treat both as sensitive. `add --auth password` and `privilege set` warn that their passwords are not persisted.
 
 An external-helper backend is a planned extension behind the same `CredentialStore` trait.
 
@@ -198,9 +201,37 @@ sshw profile <add|list|show|default|remove> ...
 
 Global flags (available on every command): `--home <path>`, `--profile <name>`, `--policy`, `--timeout <seconds>`.
 
-`--timeout` sets an inactivity timeout (seconds) for the remote operation phase of `run`/`put`/`get` after the connection is established; `0` or omitting it means no operation timeout, so long-running or quiet commands are not killed (matching `ssh`). Connection setup always uses a fixed timeout regardless. `run` drains stdout and stderr concurrently; `--timeout` is still useful in automated or untrusted contexts to bound commands that stop producing output or never close.
+`--timeout` sets an absolute timeout (seconds) for the remote operation phase of `run`/`put`/`get` after the connection is established; output or transfer progress does not extend it. Omitting the flag uses the 900-second default, while `0` explicitly disables the deadline. DNS resolution, all resolved-address attempts, TCP setup, and the SSH handshake share one 15-second connection deadline. `run` closes channel stdin even when no input was supplied and drains stdout and stderr concurrently. Exceeding the 16 MiB limit fails the operation with exit 5 instead of returning truncated output; the remote command may already have run, so do not blindly retry non-idempotent work.
 
 When the name is omitted for `run`/`put`/`get`, the configured default server is used.
+
+### Windows Shell Paths
+
+Git Bash/MSYS automatically converts path-like arguments passed to native Windows executables. That conversion can rewrite a remote POSIX path such as `/tmp/artifact.tgz` into a local Windows path before `sshw` sees it, producing an SSH failure (exit 5). Disable argument conversion for the invocation and write the local path in Windows form:
+
+```bash
+MSYS2_ARG_CONV_EXCL='*' sshw put server-alpha \
+  'C:/path/artifact.tgz' \
+  '/tmp/artifact.tgz'
+```
+
+The same rule applies to `get`. In PowerShell, use a normal Windows local path and quote the remote path:
+
+```powershell
+sshw put server-alpha 'C:\path\artifact.tgz' '/tmp/artifact.tgz'
+```
+
+Windows accepts both `C:\path\file` and `C:/path/file` as local paths; backslashes are shown for the native PowerShell form. A missing or unreadable local file is an I/O failure (exit 6), while a converted remote path can surface later as an SSH failure (exit 5).
+
+To transfer the tracked source tree, create the archive from Git instead of archiving the working directory or `target`:
+
+```powershell
+$archive = Join-Path $env:TEMP 'sshw-src.tgz'
+git archive --format=tar.gz --output="$archive" HEAD
+sshw put server-alpha "$archive" '/tmp/sshw-src.tgz'
+```
+
+`git archive` includes only files tracked in the selected commit, so it excludes `.git`, `target`, untracked files, and uncommitted changes. This also avoids depending on whether the shell resolves `tar` to Windows bsdtar, Git's GNU tar, or a WSL executable.
 
 ### Safety Rails
 
@@ -222,23 +253,23 @@ Policy is **off by default**. Turn it on for an invocation with `--policy`, or p
 
 When enforcing, `run` commands must match `allow_commands` and `put`/`get` paths must be under `allow_put_paths`/`allow_get_paths`. A command containing shell metacharacters (`;`, `&`, `|`, `` ` ``, `$`, `(`, `)`, `<`, `>`) only matches an **exact** allowlist entry. Transfer paths containing `..` are rejected. Denied operations return exit code 7 (`policy`).
 
-Policy fails closed: with `--policy`, a missing policy file is an error, and a present-but-unparseable file is always an error.
+Policy fails closed: with `--policy`, a missing policy file is an error, and a present-but-invalid file is always an error. An inactive policy file (`"enabled": false`) is still rejected when it has an unknown field or unsupported version; rename or remove an intentionally unused invalid file before running remote operations.
 
 See the Security Boundary note: `allow_commands` delegates whole-program execution. It does not restrict arguments, file paths, or subprocess behavior inside the allowed program. `allow_put_paths`/`allow_get_paths` match remote paths by lexical prefix and reject `..`, but they do not resolve remote symlinks or canonicalize paths, so a symlink under an allowed prefix can still point elsewhere on the host — the path allowlist is a guardrail, not a remote sandbox.
 
 ### Audit Log
 
-Mutating/active operations (`add`, `remove`, `trust`, `default`, `run`, `put`, `get`, `privilege set`, `privilege clear`) are appended to the home's `audit.jsonl`, one JSON object per line:
+Mutating/active operations (`add`, `remove`, `trust`, `default`, `profile add`, `profile default`, `profile remove`, `run`, `put`, `get`, `privilege set`, `privilege clear`) are appended to `audit.jsonl`, one JSON object per line. Home-scoped operations use the active home's log; global profile-registry mutations consistently use the built-in default home's log regardless of the profile being added, selected, or removed:
 
 ```json
 {"time_ms":1700000000000,"action":"run","server":"web","status":"ok","exit_code":0,"detail":"uptime"}
 ```
 
-`detail` for `run` is only the program name (not its arguments). Server names, paths, and details are redacted on a best-effort basis. Read-only commands (`list`, `show`, `doctor`, `profile`) are not audited. Audit writes are best-effort and never fail the operation; the file is owner-only on Unix (best-effort on Windows). The log is append-only but not tamper-evident — it has no integrity chain or signing, and anyone who can write the home can edit or delete entries. Treat `audit.jsonl` as sensitive.
+`detail` for `run` is only the program name (not its arguments). Server names, paths, and details are redacted on a best-effort basis. Attempted `run`/`put`/`get` operations, including policy setup failures, are recorded with an error status. Read-only commands (`list`, `show`, `doctor`, `profile list`, `profile show`) are not audited. Audit writes are best-effort: a busy record lock is retried for 100 milliseconds and then that record is skipped without failing the operation. The file is owner-only on Unix (best-effort on Windows). The log is append-only but not tamper-evident — it has no integrity chain or signing, and anyone who can write the home can edit or delete entries. Treat `audit.jsonl` as sensitive.
 
 ### Output Redaction
 
-`run` stdout, stderr, and the echoed command are passed through best-effort redaction that masks PEM private-key blocks, `keyword=value`/`keyword: value` assignments for common secret keywords, and bearer tokens. For `run --as-root`, the configured privilege password is also redacted if it appears verbatim in stdout/stderr. This does not understand shell semantics: a secret passed as a flag value (`mysql -phunter2`) or split across lines may not be masked. Do not pass secrets inline; remote command output is otherwise returned verbatim.
+`run` stdout, stderr, and the echoed JSON command are passed through best-effort redaction that masks PEM private-key blocks, `keyword=value`/`keyword: value` assignments for common secret keywords, and bearer tokens. When loaded for an operation, the exact login password and configured privilege password are also redacted wherever they appear in those fields. Very short or common exact passwords can therefore over-redact unrelated output; secrecy takes priority over output fidelity. This does not understand every shell representation, and secrets split across lines may not be masked. Do not pass secrets inline.
 
 ### Doctor
 
@@ -247,7 +278,7 @@ sshw doctor
 sshw doctor --json
 ```
 
-`doctor` reports the resolved home and how it was selected, the registry / config / known_hosts / policy / audit paths, whether the config file exists, the operating system, the linked libssh2 and OpenSSL version/status, the credential namespace, whether policy is present/valid/enabled, whether the audit log is writable, the credential backend health, and any configured servers whose credentials are missing (`missing_credentials`). On Windows default builds, `openssl_version` may report `not linked (Windows WinCNG backend)` because libssh2 uses WinCNG instead of OpenSSL.
+`doctor` reports the resolved home and how it was selected, the registry / config / known_hosts / policy / audit paths, registry validity and diagnostics (`registry_valid`, `registry_message`), whether the config file exists, the operating system, the linked libssh2 and OpenSSL version/status, the credential namespace, whether policy is present/valid/enabled, whether the audit log is writable, the credential backend health, and any configured servers whose credentials are missing (`missing_credentials`). A corrupt registry does not prevent `doctor` from running; it diagnoses the registry from the built-in default home unless an explicit home already resolves. On Windows default builds, `openssl_version` may report `not linked (Windows WinCNG backend)` because libssh2 uses WinCNG instead of OpenSSL.
 
 ### JSON Error Contract
 
@@ -256,6 +287,8 @@ Commands that support `--json` (`add`, `list`, `show`, `trust`, `run`, `put`, `g
 ```json
 {"ok":false,"error":{"kind":"config","message":"unknown server 'missing'","exit_code":3}}
 ```
+
+When wrapped source errors exist, `error` includes an optional `causes` array containing the full redacted cause chain, ordered from the immediate cause outward. The field is omitted when there are no additional causes. Consumers should treat it as diagnostic text rather than a stable machine-readable taxonomy.
 
 | Kind | Exit code | Meaning |
 | --- | ---: | --- |
@@ -284,9 +317,9 @@ These codes are sshw's own operational failures. When `run` connects and the rem
 
 ### File Permissions And Atomicity
 
-New `servers.json`, `policy.json`, `audit.jsonl`, and the profile registry are created owner-only on platforms that support it. Config and registry writes are atomic (write-temp-then-rename). On Windows, permissions are best-effort (NTFS ACLs on the per-user directory provide the protection) and the atomic replace preserves the existing file if the write is interrupted.
+New `servers.json`, `policy.json`, `audit.jsonl`, profile registry, and mutation lock files are created owner-only on platforms that support it. Config and registry writes finalize permissions and sync the temporary file before atomic rename, then sync the parent directory where supported. If the rename succeeds but parent sync fails, sshw reports that the state was published but durability was not confirmed; credential updates retain both generations instead of deleting a key that either the old or new config may need after a crash. On Windows, permissions and directory sync are best-effort (NTFS ACLs on the per-user directory provide the protection).
 
-Writes within a home are not coordinated across processes: there is no file locking, so two `sshw` processes mutating the same `servers.json`, registry, or policy concurrently will lose one update (last writer wins). Run mutating commands one at a time per home.
+Cooperating `sshw` processes serialize home mutations with `.sshw.lock`, profile registry mutations with `.profiles.lock`, and complete audit records by locking `audit.jsonl`. A state-mutation lock waits at most 5 seconds before returning an actionable config error; audit uses the shorter best-effort bound above. Config and registry writes also reject a stale loaded revision. These locks are advisory: another program or same-user process that ignores them can still race or edit the files, so this is coordination rather than tamper protection.
 
 ### Coding Agent Usage
 
@@ -315,6 +348,8 @@ cargo run --locked -- doctor
 ```
 
 On constrained local machines, limit Cargo parallelism per invocation instead of committing a repo-wide config, for example `CARGO_BUILD_JOBS=1 cargo test --locked`.
+
+See `CONTRIBUTING.md` for dependency-audit commands, integration-test expectations, and safe issue/PR data handling.
 
 ### Security Reports
 
@@ -360,7 +395,7 @@ cargo build --locked --release
 
 ### 릴리스 빌드
 
-태그 릴리스는 `x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`, `x86_64-apple-darwin`, `aarch64-apple-darwin`용 GitHub Release 산출물과 `SHA256SUMS`를 생성합니다. 릴리스 워크플로우는 GitHub Actions를 commit SHA로 pin합니다.
+태그 릴리스는 `x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`, `x86_64-apple-darwin`, `aarch64-apple-darwin`용 GitHub Release 산출물과 `SHA256SUMS`를 생성합니다. 릴리스 워크플로우는 GitHub Actions를 commit SHA로, 릴리스 컴파일러를 Rust 1.97.0으로 pin합니다. ZIP과 tar.gz는 릴리스 commit timestamp에서 가져온 결정적 metadata로 패키징하므로 같은 바이너리와 timestamp는 같은 archive bytes를 만듭니다. 별도로 컴파일한 바이너리까지 bit-for-bit 재현된다는 보장은 아니며 자세한 내용은 `SECURITY.md`를 참고하세요.
 
 ```bash
 git tag vX.Y.Z
@@ -398,13 +433,14 @@ done
 
 `<config_dir>`는 Windows `%AppData%\sshw`, macOS `~/Library/Application Support/sshw`, Linux `~/.config/sshw`입니다.
 
-credential keyring 키는 항상 namespaced이므로, 서로 다른 home에서 같은 서버 이름을 써도 충돌하지 않습니다.
+신규 credential keyring 키는 purpose와 generation을 포함한 v2 형식을 사용합니다. 따라서 서로 다른 home의 같은 서버 이름이 충돌하지 않고 login credential을 privilege credential로 재사용할 수도 없습니다.
 
 ```text
-sshw:<profile-id>:<server>     등록/내장 profile
-sshw:home_<hash>:<server>      ad-hoc --home / SSHW_HOME
-sshw:<profile-id>:privilege:<server>     privileged sudo/su credential metadata
+sshw:v2:<encoded-namespace>:login:<encoded-server>:<generation>
+sshw:v2:<encoded-namespace>:privilege:<encoded-server>:<generation>
 ```
+
+namespace와 server는 base64url로 인코딩하며 credential을 갱신할 때마다 새 generation을 발급합니다. legacy v1 키(`sshw:<namespace>:<server>`, `sshw:<namespace>:privilege:<server>`)는 active namespace, purpose, server가 정확히 일치할 때만 읽기 호환을 유지하며 신규 저장에는 사용하지 않습니다.
 
 ### home 선택
 
@@ -436,7 +472,9 @@ sshw profile default prod
 sshw profile remove prod                  # registry 항목만 제거. home 디렉터리와 credential은 보존
 ```
 
-각 profile은 stable id와 home 경로를 저장합니다. 처음 추가한 profile이 default가 됩니다.
+각 profile은 stable id와 home 경로를 저장합니다. 처음 추가한 profile이 default가 됩니다. 정규화된 home이 같으면 `profile add --force`는 기존 id를 보존하고, 다른 home으로 바꾸면 새 namespace를 만듭니다. profile 선택 방식 자체가 credential 경계이므로 profile 소유 디렉터리를 `--home`으로 열어도 그 profile credential을 재사용하지 않습니다. profile을 제거하면 디렉터리와 native keyring 항목은 물리적으로 남지만 신뢰된 namespace 연결은 사라집니다. 제거한 profile을 다시 추가하면 새 credential namespace가 만들어지므로 credential을 다시 등록해야 합니다. 같은 profile/home 갱신에는 remove/re-add 대신 `--force`를 사용하세요.
+
+registry는 엄격하게 검증합니다. 이전 릴리스가 상대경로 profile home을 저장한 경우 일반 선택/list/show/default 작업은 fail-closed합니다. `sshw doctor`는 `registry_valid: false`와 조치 가능한 `registry_message`를 보고합니다. 유일한 복구 예외인 `sshw profile remove <문제-profile>`은 그 항목을 제거한 뒤 나머지 registry가 완전히 유효할 때만 성공하며, 상대경로를 현재 작업 디렉터리 기준으로 해석하거나 자동 이동하지 않습니다.
 
 ### 비밀번호 인증
 
@@ -469,7 +507,7 @@ agent auth는 비밀을 저장하지 않고 활성 SSH agent를 사용합니다.
 home의 `servers.json`이 `credential_backend`(기본 `native`)로 백엔드를 선택합니다.
 
 - `native` — OS keyring(Windows Credential Manager, macOS Keychain, Linux Secret Service).
-- `session_only` — keyring을 쓰지 않습니다. `set_password`는 프로세스 메모리에만 유지되고, 실행 시 비밀번호는 `SSHW_PASSWORD` 환경변수에서 가져온 뒤 이 프로세스 환경에서 제거합니다. ephemeral/CI에 적합합니다. 환경변수는 `sshw` 시작 전이나 부모 셸에는 노출될 수 있으므로 `SSHW_PASSWORD`를 민감하게 취급하세요. `add --auth password`는 비밀번호가 영속되지 않는다고 경고합니다.
+- `session_only` — keyring을 쓰지 않습니다. `set_password`는 프로세스 메모리에만 유지됩니다. 실행 시 login 비밀번호는 `SSHW_PASSWORD`, privilege 비밀번호는 `SSHW_PRIVILEGE_PASSWORD`에서 가져오며, 읽은 두 환경변수는 이 프로세스 환경에서 제거합니다. ephemeral/CI에 적합합니다. 환경변수는 `sshw` 시작 전이나 부모 셸에는 노출될 수 있으므로 둘 다 민감하게 취급하세요. `add --auth password`와 `privilege set`은 비밀번호가 영속되지 않는다고 경고합니다.
 
 external-helper 백엔드는 동일한 `CredentialStore` trait 뒤의 후속 확장점입니다.
 
@@ -518,7 +556,37 @@ sshw profile <add|list|show|default|remove> ...
 
 전역 플래그(모든 명령에서 사용): `--home <path>`, `--profile <name>`, `--policy`, `--timeout <seconds>`.
 
-`--timeout`은 연결 수립 이후 `run`/`put`/`get`의 원격 작업 단계에 적용되는 무진행(inactivity) 타임아웃(초)입니다. `0`이거나 생략하면 작업 타임아웃이 없어, 오래 걸리거나 조용한 명령이 강제 종료되지 않습니다(`ssh`와 동일). 연결 수립 단계는 항상 고정 타임아웃을 사용합니다. `run`은 stdout과 stderr를 동시에 배출합니다. 그래도 자동화/비신뢰 환경에서는 출력이 멈추거나 닫히지 않는 명령을 제한하기 위해 `--timeout`으로 상한을 둘 수 있습니다.
+`--timeout`은 연결 수립 이후 `run`/`put`/`get`의 원격 작업 단계에 적용되는 절대 타임아웃(초)이며, 출력이나 전송 진행이 있어도 기한이 연장되지 않습니다. 플래그를 생략하면 기본 900초, `0`은 기한을 명시적으로 해제합니다. DNS 해석, 해석된 모든 주소에 대한 연결 시도, TCP 수립, SSH handshake는 하나의 15초 연결 deadline을 공유합니다. `run`은 입력이 없어도 채널 stdin을 닫고 stdout/stderr를 동시에 배출합니다. 두 출력 합계가 16 MiB를 넘으면 잘린 성공 출력을 반환하지 않고 exit 5로 실패합니다. 원격 명령의 부작용은 이미 발생했을 수 있으므로 비멱등 작업을 무작정 재시도하지 마세요.
+
+`run`/`put`/`get`에서 이름을 생략하면 설정된 기본 서버를 사용합니다.
+
+### Windows 셸 경로
+
+Git Bash/MSYS는 Windows 네이티브 실행 파일에 전달하는 경로 형태의 인자를 자동 변환합니다. 이 과정에서 `/tmp/artifact.tgz` 같은 원격 POSIX 경로가 `sshw`에 도달하기 전에 로컬 Windows 경로로 바뀌어 SSH 실패(exit 5)가 발생할 수 있습니다. 호출 단위로 인자 변환을 끄고 로컬 경로를 Windows 형식으로 작성하세요.
+
+```bash
+MSYS2_ARG_CONV_EXCL='*' sshw put server-alpha \
+  'C:/path/artifact.tgz' \
+  '/tmp/artifact.tgz'
+```
+
+`get`에도 같은 규칙이 적용됩니다. PowerShell에서는 일반 Windows 로컬 경로를 사용하고 원격 경로를 따옴표로 감쌉니다.
+
+```powershell
+sshw put server-alpha 'C:\path\artifact.tgz' '/tmp/artifact.tgz'
+```
+
+Windows는 로컬 경로로 `C:\path\file`과 `C:/path/file`을 모두 허용합니다. 위 예시는 PowerShell의 네이티브 표기인 역슬래시를 사용했습니다. 로컬 파일이 없거나 읽을 수 없으면 I/O 실패(exit 6)이고, 변환된 원격 경로는 이후 SSH 실패(exit 5)로 나타날 수 있습니다.
+
+추적 중인 소스 트리를 전송할 때는 작업 디렉터리나 `target`을 직접 압축하지 말고 Git에서 아카이브를 생성하세요.
+
+```powershell
+$archive = Join-Path $env:TEMP 'sshw-src.tgz'
+git archive --format=tar.gz --output="$archive" HEAD
+sshw put server-alpha "$archive" '/tmp/sshw-src.tgz'
+```
+
+`git archive`는 선택한 커밋에서 Git이 추적하는 파일만 포함하므로 `.git`, `target`, 미추적 파일, 커밋하지 않은 변경 사항은 제외됩니다. 셸이 `tar`를 Windows bsdtar, Git의 GNU tar, WSL 실행 파일 중 무엇으로 해석하는지에도 의존하지 않습니다.
 
 ### Safety Rails
 
@@ -540,23 +608,23 @@ policy는 **기본 off**입니다. 호출별로 `--policy`로 켜거나, home의
 
 적용 시 `run` 명령은 `allow_commands`에, `put`/`get` 경로는 `allow_put_paths`/`allow_get_paths` 하위에 매칭돼야 합니다. 쉘 메타문자(`;`, `&`, `|`, `` ` ``, `$`, `(`, `)`, `<`, `>`)를 포함한 명령은 **정확히 일치하는** allowlist 항목에만 매칭됩니다. `..`를 포함한 전송 경로는 거부됩니다. 거부된 작업은 exit code 7(`policy`)을 반환합니다.
 
-policy는 fail-closed입니다. `--policy`인데 파일이 없으면 에러이고, 파일이 있으나 파싱 불가면 항상 에러입니다.
+policy는 fail-closed입니다. `--policy`인데 파일이 없으면 에러이고, 파일이 있으나 유효하지 않으면 항상 에러입니다. `"enabled": false`인 비활성 policy도 unknown field나 지원하지 않는 version이 있으면 거부됩니다. 의도적으로 사용하지 않는 잘못된 파일은 원격 작업 전에 이름을 바꾸거나 제거하세요.
 
 보안 경계 참고: `allow_commands`는 프로그램 실행권 전체를 위임합니다. 허용된 프로그램 내부의 인자, 파일 경로, 하위 프로세스 동작은 제한하지 않습니다. `allow_put_paths`/`allow_get_paths`는 원격 경로를 lexical prefix로 매칭하고 `..`를 거부하지만, 원격 symlink를 따라가거나 canonical 경로로 검증하지는 않습니다. 허용된 prefix 아래의 symlink가 호스트의 다른 위치를 가리킬 수 있으므로 path allowlist는 원격 sandbox가 아니라 guardrail입니다.
 
 ### Audit Log
 
-변경/실행 작업(`add`, `remove`, `trust`, `default`, `run`, `put`, `get`, `privilege set`, `privilege clear`)은 home의 `audit.jsonl`에 줄당 JSON 객체로 append됩니다.
+변경/실행 작업(`add`, `remove`, `trust`, `default`, `profile add`, `profile default`, `profile remove`, `run`, `put`, `get`, `privilege set`, `privilege clear`)은 `audit.jsonl`에 줄당 JSON 객체로 append됩니다. home 범위 작업은 active home의 로그를 사용하고, 전역 profile registry 변경은 추가·선택·제거 대상과 무관하게 내장 default home의 로그에 일관되게 기록됩니다.
 
 ```json
 {"time_ms":1700000000000,"action":"run","server":"web","status":"ok","exit_code":0,"detail":"uptime"}
 ```
 
-`run`의 `detail`은 인자가 아닌 프로그램 이름만 기록합니다. 서버명·경로·detail은 best-effort로 redaction됩니다. read-only 명령(`list`, `show`, `doctor`, `profile`)은 기록하지 않습니다. audit 쓰기는 best-effort이며 작업을 실패시키지 않습니다. 파일은 Unix에서 owner-only(Windows는 best-effort)입니다. append-only이지만 tamper-evident가 아닙니다 — 무결성 체인이나 서명이 없고, home을 쓸 수 있는 누구나 항목을 수정·삭제할 수 있습니다. `audit.jsonl`은 민감 파일로 취급하세요.
+`run`의 `detail`은 인자가 아닌 프로그램 이름만 기록합니다. 서버명·경로·detail은 best-effort로 redaction됩니다. 시도한 `run`/`put`/`get`의 policy 준비가 실패한 경우도 error 상태로 기록합니다. read-only 명령(`list`, `show`, `doctor`, `profile list`, `profile show`)은 기록하지 않습니다. audit 쓰기는 best-effort입니다. record lock이 바쁘면 100밀리초 동안 재시도한 뒤 해당 레코드를 생략하며 작업 자체는 실패시키지 않습니다. 파일은 Unix에서 owner-only(Windows는 best-effort)입니다. append-only이지만 tamper-evident가 아닙니다 — 무결성 체인이나 서명이 없고, home을 쓸 수 있는 누구나 항목을 수정·삭제할 수 있습니다. `audit.jsonl`은 민감 파일로 취급하세요.
 
 ### 출력 redaction
 
-`run`의 stdout/stderr/echo된 command는 best-effort redaction을 거칩니다. PEM 개인키 블록, 흔한 비밀 keyword의 `keyword=value`/`keyword: value`, bearer 토큰을 마스킹합니다. `run --as-root`에서는 설정된 privilege 비밀번호가 stdout/stderr에 그대로 나타나면 추가로 마스킹합니다. 쉘 의미는 이해하지 못하므로, 플래그 값으로 전달된 비밀(`mysql -phunter2`)이나 여러 줄에 걸친 비밀은 마스킹되지 않을 수 있습니다. 비밀을 인라인으로 넘기지 마세요. 그 외 원격 출력은 그대로 반환됩니다.
+`run`의 stdout/stderr/JSON에 echo된 command는 best-effort redaction을 거칩니다. PEM 개인키 블록, 흔한 비밀 keyword의 `keyword=value`/`keyword: value`, bearer 토큰을 마스킹합니다. 작업을 위해 읽은 정확한 login 비밀번호와 설정된 privilege 비밀번호가 이 필드에 그대로 나타나면 추가로 마스킹합니다. 매우 짧거나 흔한 비밀번호는 관련 없는 출력까지 과도하게 마스킹할 수 있으며, 이 경우 출력 충실도보다 비밀 보호를 우선합니다. 모든 쉘 표현을 이해하지는 못하고 여러 줄에 걸친 비밀은 마스킹되지 않을 수 있으므로 비밀을 인라인으로 넘기지 마세요.
 
 ### Doctor
 
@@ -565,7 +633,7 @@ sshw doctor
 sshw doctor --json
 ```
 
-`doctor`는 해석된 home과 선택 경위, registry/config/known_hosts/policy/audit 경로, config 파일 존재 여부, 운영체제, 연결된 libssh2 및 OpenSSL 버전/상태, credential namespace, policy present/valid/enabled, audit 쓰기 가능 여부, credential backend 상태, 그리고 credential이 없는 등록 서버 목록(`missing_credentials`)을 보고합니다. Windows 기본 빌드에서는 libssh2가 OpenSSL 대신 WinCNG를 사용하므로 `openssl_version`이 `not linked (Windows WinCNG backend)`로 표시될 수 있습니다.
+`doctor`는 해석된 home과 선택 경위, registry/config/known_hosts/policy/audit 경로, registry 유효성과 진단(`registry_valid`, `registry_message`), config 파일 존재 여부, 운영체제, 연결된 libssh2 및 OpenSSL 버전/상태, credential namespace, policy present/valid/enabled, audit 쓰기 가능 여부, credential backend 상태, 그리고 credential이 없는 등록 서버 목록(`missing_credentials`)을 보고합니다. 손상된 registry도 `doctor` 실행을 막지 않으며, 명시적 home이 이미 해석되지 않았다면 내장 default home에서 registry 오류를 진단합니다. Windows 기본 빌드에서는 libssh2가 OpenSSL 대신 WinCNG를 사용하므로 `openssl_version`이 `not linked (Windows WinCNG backend)`로 표시될 수 있습니다.
 
 ### JSON 오류 계약
 
@@ -574,6 +642,8 @@ sshw doctor --json
 ```json
 {"ok":false,"error":{"kind":"config","message":"unknown server 'missing'","exit_code":3}}
 ```
+
+래핑된 source error가 있으면 `error`에 immediate cause부터 바깥쪽 순서로 전체 redacted cause chain을 담은 선택적 `causes` 배열이 추가됩니다. 추가 cause가 없으면 이 필드는 생략됩니다. 이 값은 안정된 기계 판독 taxonomy가 아니라 진단용 문자열로 취급하세요.
 
 | Kind | Exit code | 의미 |
 | --- | ---: | --- |
@@ -602,9 +672,9 @@ sshw doctor --json
 
 ### 파일 권한과 원자성
 
-새로 만드는 `servers.json`, `policy.json`, `audit.jsonl`, profile registry는 지원 플랫폼에서 owner-only로 생성됩니다. config·registry 저장은 atomic(temp 작성 후 rename)입니다. Windows에서는 권한이 best-effort(사용자별 디렉터리의 NTFS ACL이 보호)이며, atomic 교체는 쓰기 중단 시 기존 파일을 보존합니다.
+새로 만드는 `servers.json`, `policy.json`, `audit.jsonl`, profile registry, mutation lock 파일은 지원 플랫폼에서 owner-only로 생성됩니다. config·registry 저장은 temp 파일의 권한과 sync를 먼저 완료하고 atomic rename한 뒤, 지원 플랫폼에서 parent directory를 sync합니다. rename 성공 뒤 parent sync가 실패하면 state는 공개됐지만 내구성을 확인하지 못했다고 오류를 반환하며, credential 갱신은 crash 뒤 old/new config 어느 쪽에도 대응하도록 두 세대를 보존합니다. Windows에서는 권한과 directory sync가 best-effort입니다.
 
-한 home 안의 쓰기는 프로세스 간 조율되지 않습니다. 파일 잠금이 없으므로 두 `sshw` 프로세스가 같은 `servers.json`·registry·policy를 동시에 변경하면 한쪽 변경이 손실됩니다(마지막에 쓴 쪽이 이김). 변경 명령은 home별로 한 번에 하나씩 실행하세요.
+서로 협력하는 `sshw` 프로세스는 home 변경을 `.sshw.lock`, profile registry 변경을 `.profiles.lock`으로 직렬화하고, 완전한 audit 레코드는 `audit.jsonl` 자체를 잠가 기록합니다. state mutation lock은 최대 5초만 기다린 뒤 config 오류를 반환하며, audit은 위의 더 짧은 best-effort 상한을 사용합니다. config와 registry 저장은 처음 읽은 revision이 바뀌었으면 거부합니다. 잠금은 advisory이므로 이를 무시하는 다른 프로그램이나 동일 사용자 프로세스의 경쟁·사후 편집까지 막는 변조 방지는 아닙니다.
 
 ### 코딩 에이전트 사용 예
 
@@ -633,6 +703,8 @@ cargo run --locked -- doctor
 ```
 
 로컬 머신 부담이 크면 저장소 전체 설정을 커밋하지 말고 호출별로 Cargo 병렬도를 제한하세요. 예: `CARGO_BUILD_JOBS=1 cargo test --locked`.
+
+dependency audit 명령, integration test 기대사항, 이슈/PR에서의 안전한 데이터 취급은 `CONTRIBUTING.md`를 참고하세요.
 
 ### 보안 제보
 

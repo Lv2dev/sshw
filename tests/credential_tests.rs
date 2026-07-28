@@ -1,5 +1,6 @@
 use sshw::credentials::session_store::SessionOnlyStore;
 use sshw::credentials::{AuthMaterial, CredentialStore, CredentialStoreHealth};
+use sshw::home::CredentialPurpose;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -98,21 +99,47 @@ fn session_only_store_falls_back_to_session_password() {
 
 #[test]
 fn session_only_store_does_not_fallback_to_session_password_for_privilege_credentials() {
-    let store = SessionOnlyStore::with_session_password(Some("ssh-password".to_string()));
+    let store = SessionOnlyStore::with_session_passwords(Some("ssh-password".to_string()), None);
 
     let err = store
-        .get_password("sshw:default:privilege:web", "root")
+        .get_password_for(CredentialPurpose::Privilege, "custom-key", "root")
         .unwrap_err();
     assert!(err.to_string().contains("session-only"));
 
     store
-        .set_password("sshw:default:privilege:web", "root", "root-password")
+        .set_password_for(
+            CredentialPurpose::Privilege,
+            "custom-key",
+            "root",
+            "root-password",
+        )
         .unwrap();
     assert_eq!(
         store
-            .get_password("sshw:default:privilege:web", "root")
+            .get_password_for(CredentialPurpose::Privilege, "custom-key", "root")
             .unwrap(),
         "root-password"
+    );
+}
+
+#[test]
+fn session_only_store_separates_login_and_privilege_fallbacks() {
+    let store = SessionOnlyStore::with_session_passwords(
+        Some("login-password".to_string()),
+        Some("privilege-password".to_string()),
+    );
+
+    assert_eq!(
+        store
+            .get_password_for(CredentialPurpose::Login, "opaque-key", "deploy")
+            .unwrap(),
+        "login-password"
+    );
+    assert_eq!(
+        store
+            .get_password_for(CredentialPurpose::Privilege, "opaque-key", "root")
+            .unwrap(),
+        "privilege-password"
     );
 }
 
@@ -121,6 +148,7 @@ fn session_only_store_from_env_removes_password_from_environment_after_reading()
     let _guard = ENV_LOCK.lock().unwrap();
     unsafe {
         std::env::set_var("SSHW_PASSWORD", "from-env");
+        std::env::set_var("SSHW_PRIVILEGE_PASSWORD", "privilege-from-env");
     }
 
     let store = SessionOnlyStore::from_env();
@@ -129,7 +157,14 @@ fn session_only_store_from_env_removes_password_from_environment_after_reading()
         store.get_password("sshw:default:web", "deploy").unwrap(),
         "from-env"
     );
+    assert_eq!(
+        store
+            .get_password_for(CredentialPurpose::Privilege, "custom-key", "root")
+            .unwrap(),
+        "privilege-from-env"
+    );
     assert!(std::env::var_os("SSHW_PASSWORD").is_none());
+    assert!(std::env::var_os("SSHW_PRIVILEGE_PASSWORD").is_none());
 }
 
 #[test]

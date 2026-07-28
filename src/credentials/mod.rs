@@ -47,6 +47,34 @@ pub trait CredentialStore {
     fn delete_password(&self, credential: &str, user: &str) -> anyhow::Result<()>;
     fn health_check(&self) -> anyhow::Result<CredentialStoreHealth>;
 
+    fn set_password_for(
+        &self,
+        _purpose: crate::home::CredentialPurpose,
+        credential: &str,
+        user: &str,
+        password: &str,
+    ) -> anyhow::Result<()> {
+        self.set_password(credential, user, password)
+    }
+
+    fn get_password_for(
+        &self,
+        _purpose: crate::home::CredentialPurpose,
+        credential: &str,
+        user: &str,
+    ) -> anyhow::Result<String> {
+        self.get_password(credential, user)
+    }
+
+    fn delete_password_for(
+        &self,
+        _purpose: crate::home::CredentialPurpose,
+        credential: &str,
+        user: &str,
+    ) -> anyhow::Result<()> {
+        self.delete_password(credential, user)
+    }
+
     /// Whether `set_password` durably persists the secret across invocations.
     /// Non-persistent backends (e.g. session-only) let the CLI warn that a
     /// stored password will not survive the process.

@@ -8,6 +8,40 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 
 ## [Unreleased]
 
+### Added
+- JSON failures now include an optional `causes` array with the full redacted cause chain while preserving the existing top-level `kind`, `message`, and `exit_code` contract.
+- Remote operations now have a 900-second absolute default deadline and fail if retained stdout plus stderr exceeds 16 MiB; `--timeout 0` remains an explicit operation-deadline opt-out.
+- A scheduled security workflow audits the locked root and fuzz dependency graphs, and repository governance now includes contribution guidance, issue/PR templates, and CODEOWNERS.
+
+### Changed
+- Config, profile-registry, and policy documents now use strict versioned schemas that reject unknown fields, unsupported versions, malformed names, forged profile ids, and invalid privilege or credential metadata. Present but inactive policy files are validated too.
+- Credential identities are derived from the canonical home namespace and typed login/privilege purpose. Active-namespace v1 references remain readable; later `add`/`privilege set` updates rotate that target to a fresh v2 key after the config commit. Credential/config mutations use compensating cleanup without deleting a generation that a published-but-not-yet-durable config may reference.
+- Cooperating processes now serialize home, profile, and audit mutations with bounded advisory locks; config and profile saves also reject stale loaded revisions. Re-applying `profile add --force` to the same normalized home preserves its credential namespace id.
+- Release jobs pin Rust 1.97.0 and create deterministic release archives from normalized metadata and the release commit timestamp.
+
+### Security
+- Login and privilege session credentials use separate environment variables and typed lookups, are removed from the child environment after reading, and exact loaded login/privilege passwords are masked in run stdout, stderr, and the echoed JSON command.
+- Overlapping exact login/privilege secrets are deduplicated and masked longest-first, preventing a longer secret's suffix from remaining after a shorter prefix is redacted.
+- Config validation now rejects dangling default servers and privilege metadata without a matching server, preventing stale privilege credentials from being rebound when the same alias is added later.
+- DNS resolution, all resolved-address connection attempts, TCP setup, and the SSH handshake now share one decreasing 15-second connection budget.
+- Policy and profile mutations fail closed before side effects, profile mutation attempts and policy-setup failures are audited, and read-only commands avoid unnecessary credential-backend construction.
+- `cargo-deny` now rejects unsound advisories across the full transitive graph; GitHub Actions use immutable SHA pins with explicit toolchains, publishing uses a protected release environment, and tag/release protections are enabled in repository settings.
+
+### Fixed
+- Global `profile add/default/remove` audit records now use one deterministic built-in-default-home log instead of moving between the added, current-default, and recovery homes.
+- `doctor` now diagnoses an invalid profile registry instead of being blocked by it, and a legacy relative-home entry can be removed with targeted `profile remove` only when the remaining registry is valid; other profile and runtime paths remain fail-closed.
+- `get` downloads into an owner-only staging file, validates SCP completion, refuses a final-path race unless overwrite was approved, atomically installs the result, and syncs the file and parent directory before success. Local staging/persist failures remain `io`/6 through the outer SSH boundary.
+- `put` and state-file writes now verify remote/local completion and parent-directory durability where supported; state persistence finalizes permissions before visibility, distinguishes post-publish durability uncertainty, and keeps the prior file intact on interrupted replacement.
+- SSH channel input now sends EOF/VEOF correctly, stdout and stderr are drained together, remote non-zero notes always start on a new line, and signal/missing-marker/timeout/output-limit failures map to typed errors.
+- Piped output ending in a broken pipe no longer panics: successful output remains exit 0 while an intended failure keeps its original non-zero code. Other output I/O failures use exit code 6, and raw `--json` detection no longer scans past `--`.
+- JSON and human output redact exact loaded login credentials in addition to privilege credentials, and remote failures preserve their full redacted cause chain for diagnostics.
+- On Windows under Git Bash/MSYS, `put` and `get` SSH failures caused by automatic remote-path argument conversion now include an actionable `MSYS2_ARG_CONV_EXCL='*'` hint without changing the typed `ssh` error or exit code 5.
+
+### Documentation
+- README, `sshw --help`, and `SECURITY.md` now describe the total connection budget, operation bounds, audit coverage, JSON cause chains, deterministic packaging limits, and a dated residual-risk register.
+- Added contributor and report templates that prohibit real credentials or private infrastructure data and document the complete local verification flow.
+- README now documents safe Git Bash and PowerShell transfer paths and a shell-independent `git archive` workflow that excludes build output.
+
 ## [0.9.1] - 2026-07-06
 
 ### Documentation

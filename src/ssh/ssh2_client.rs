@@ -1,17 +1,23 @@
 use super::{HostKeyInfo, RunResult, SshClient, TransferResult};
 use crate::config::ServerConfig;
 use crate::credentials::AuthMaterial;
+use crate::error::{ResultErrorKindExt, app_error, classified_error, classified_io_error};
+use crate::output::ErrorKind;
 use anyhow::Context;
 use base64::Engine;
 use directories::BaseDirs;
 use ssh2::{CheckResult, HashType, HostKeyType, KnownHostFileKind, KnownHostKeyFormat, Session};
 use std::fs;
-use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::io::{self, Read, Write};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const DEFAULT_OPERATION_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const DEFAULT_OUTPUT_LIMIT: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RuntimeLibraryVersions {
@@ -34,6 +40,7 @@ pub(crate) fn runtime_library_versions() -> RuntimeLibraryVersions {
 pub struct Ssh2Client {
     connect_timeout: Duration,
     op_timeout: Option<Duration>,
+    output_limit: usize,
     known_hosts_path: Option<PathBuf>,
 }
 
@@ -41,7 +48,8 @@ impl Default for Ssh2Client {
     fn default() -> Self {
         Self {
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
-            op_timeout: None,
+            op_timeout: Some(DEFAULT_OPERATION_TIMEOUT),
+            output_limit: DEFAULT_OUTPUT_LIMIT,
             known_hosts_path: None,
         }
     }
@@ -52,10 +60,9 @@ impl Ssh2Client {
         self.connect_timeout
     }
 
-    /// Inactivity timeout for remote operations (run/put/get) applied *after*
-    /// the connection is established. `None` (the default) means no operation
-    /// timeout, matching `ssh`'s behavior so long-running or quiet commands are
-    /// not killed. Connection setup always uses `connect_timeout`.
+    /// Absolute timeout for remote operations (run/put/get) applied after the
+    /// connection is established. `None` explicitly disables this bound;
+    /// otherwise progress does not extend the deadline.
     pub fn with_op_timeout(mut self, op_timeout: Option<Duration>) -> Self {
         self.op_timeout = op_timeout;
         self
@@ -63,6 +70,16 @@ impl Ssh2Client {
 
     pub fn op_timeout(&self) -> Option<Duration> {
         self.op_timeout
+    }
+
+    /// Maximum combined stdout/stderr bytes retained for one remote command.
+    pub fn with_output_limit(mut self, output_limit: usize) -> Self {
+        self.output_limit = output_limit;
+        self
+    }
+
+    pub fn output_limit(&self) -> usize {
+        self.output_limit
     }
 
     /// Use an explicit `known_hosts` file (e.g. the active profile home's file)
@@ -86,8 +103,8 @@ impl Ssh2Client {
 
 impl SshClient for Ssh2Client {
     fn host_key(&self, server: &ServerConfig) -> anyhow::Result<HostKeyInfo> {
-        let session = connect(server, self.connect_timeout)?;
-        host_key_info(&session)
+        let session = connect(server, self.connect_timeout).with_error_kind(ErrorKind::Ssh)?;
+        host_key_info(&session).with_error_kind(ErrorKind::Ssh)
     }
 
     fn trust_host(
@@ -96,7 +113,7 @@ impl SshClient for Ssh2Client {
         server: &ServerConfig,
         expected_fingerprint_sha256: &str,
     ) -> anyhow::Result<HostKeyInfo> {
-        let session = connect(server, self.connect_timeout)?;
+        let session = connect(server, self.connect_timeout).with_error_kind(ErrorKind::Ssh)?;
         let (key, key_type) = session
             .host_key()
             .ok_or_else(|| anyhow::anyhow!("server did not provide a host key"))?;
@@ -134,7 +151,7 @@ impl SshClient for Ssh2Client {
                 known_hosts.add(
                     &host_entry,
                     key,
-                    server_name,
+                    known_host_comment(server_name),
                     KnownHostKeyFormat::from(key_type),
                 )?;
                 write_known_hosts_file(&known_hosts, &known_hosts_path)?;
@@ -180,14 +197,9 @@ impl SshClient for Ssh2Client {
         local: &Path,
         remote: &str,
     ) -> anyhow::Result<TransferResult> {
-        let metadata = fs::metadata(local)
-            .with_context(|| format!("local file not found: {}", local.display()))?;
-        if !metadata.is_file() {
-            return Err(anyhow::anyhow!(
-                "local path is not a regular file: {}",
-                local.display()
-            ));
-        }
+        // Open first, then inspect metadata on that exact handle. A path or
+        // symlink replacement during network setup cannot change what is sent.
+        let (mut local_file, metadata) = open_regular_local_file(local)?;
 
         let known_hosts = self.resolved_known_hosts_path()?;
         let session = connect_verified_authenticated(
@@ -197,16 +209,23 @@ impl SshClient for Ssh2Client {
             self.op_timeout,
             &known_hosts,
         )?;
-        let local_file = fs::File::open(local)?;
+        let deadline = OperationDeadline::new(self.op_timeout);
+        deadline.apply(&session)?;
         let mut remote_file = session
             .scp_send(Path::new(remote), 0o600, metadata.len(), None)
-            .context("ssh transfer error")?;
+            .context("ssh transfer error")
+            .with_error_kind(ErrorKind::Ssh)?;
         // scp promised `metadata.len()` bytes up front. Cap the reader at that
         // length so a file that grows mid-transfer never writes past the
         // declared size, and fail closed below if fewer bytes were sent (the
         // file shrank), so a truncated upload is never reported as a success.
-        let mut bounded = local_file.take(metadata.len());
-        let copied = std::io::copy(&mut bounded, &mut remote_file)?;
+        let copied = copy_file_with_deadline(
+            &mut local_file,
+            &mut remote_file,
+            metadata.len(),
+            &session,
+            &deadline,
+        )?;
         if copied != metadata.len() {
             return Err(anyhow::anyhow!(
                 "ssh transfer aborted: local file changed during transfer (expected {} bytes, sent {})",
@@ -214,12 +233,32 @@ impl SshClient for Ssh2Client {
                 copied
             ));
         }
-        remote_file.write_all(&[0]).context("ssh transfer error")?;
-        remote_file.send_eof().context("ssh transfer error")?;
-        remote_file.wait_eof().context("ssh transfer error")?;
-        remote_file.close().context("ssh transfer error")?;
-        remote_file.wait_close().context("ssh transfer error")?;
-        ensure_scp_upload_succeeded(&remote_file)?;
+        deadline.apply(&session)?;
+        remote_file
+            .write_all(&[0])
+            .context("ssh transfer error")
+            .with_error_kind(ErrorKind::Ssh)?;
+        deadline.apply(&session)?;
+        remote_file
+            .send_eof()
+            .context("ssh transfer error")
+            .with_error_kind(ErrorKind::Ssh)?;
+        deadline.apply(&session)?;
+        remote_file
+            .wait_eof()
+            .context("ssh transfer error")
+            .with_error_kind(ErrorKind::Ssh)?;
+        deadline.apply(&session)?;
+        remote_file
+            .close()
+            .context("ssh transfer error")
+            .with_error_kind(ErrorKind::Ssh)?;
+        deadline.apply(&session)?;
+        remote_file
+            .wait_close()
+            .context("ssh transfer error")
+            .with_error_kind(ErrorKind::Ssh)?;
+        ensure_scp_transfer_succeeded(&remote_file)?;
 
         Ok(TransferResult {
             bytes: copied,
@@ -244,25 +283,57 @@ impl SshClient for Ssh2Client {
             self.op_timeout,
             &known_hosts,
         )?;
+        let deadline = OperationDeadline::new(self.op_timeout);
+        deadline.apply(&session)?;
         let (mut remote_file, stat) = session
             .scp_recv(Path::new(remote))
-            .context("ssh transfer error")?;
+            .context("ssh transfer error")
+            .with_error_kind(ErrorKind::Ssh)?;
 
-        // Download to a sibling temp file and persist on success so a failed
-        // transfer never truncates or replaces an existing local file. Pass the
-        // SCP-announced size so a short/truncated download fails closed before
-        // persisting, mirroring the upload truncation guard in `put`.
-        let bytes = crate::storage::write_stream_owner_only_atomic(
-            local,
-            &mut remote_file,
-            overwrite,
-            Some(stat.size()),
-        )?;
+        // Stage locally first. The final path stays untouched until both the
+        // announced size and the remote SCP channel completion are verified.
+        let staged = {
+            let mut reader = DeadlineReader::new(&mut remote_file, &session, &deadline);
+            crate::storage::stage_stream_owner_only(
+                local,
+                &mut reader,
+                overwrite,
+                Some(stat.size()),
+            )?
+        };
 
-        remote_file.send_eof().context("ssh transfer error")?;
-        remote_file.wait_eof().context("ssh transfer error")?;
-        remote_file.close().context("ssh transfer error")?;
-        remote_file.wait_close().context("ssh transfer error")?;
+        let bytes = persist_after_scp_completion(staged, || {
+            // `ssh2::Session::scp_recv` caps reads at the announced file size,
+            // hiding SCP's trailing status byte. Acknowledge the completed file
+            // so a normal source can exit 0; source-side errors still surface in
+            // the SSH channel's non-zero exit status below.
+            deadline.apply(&session)?;
+            remote_file
+                .write_all(&[0])
+                .context("ssh transfer error")
+                .with_error_kind(ErrorKind::Ssh)?;
+            deadline.apply(&session)?;
+            remote_file
+                .send_eof()
+                .context("ssh transfer error")
+                .with_error_kind(ErrorKind::Ssh)?;
+            deadline.apply(&session)?;
+            remote_file
+                .wait_eof()
+                .context("ssh transfer error")
+                .with_error_kind(ErrorKind::Ssh)?;
+            deadline.apply(&session)?;
+            remote_file
+                .close()
+                .context("ssh transfer error")
+                .with_error_kind(ErrorKind::Ssh)?;
+            deadline.apply(&session)?;
+            remote_file
+                .wait_close()
+                .context("ssh transfer error")
+                .with_error_kind(ErrorKind::Ssh)?;
+            ensure_scp_transfer_succeeded(&remote_file)
+        })?;
 
         Ok(TransferResult {
             bytes,
@@ -289,16 +360,23 @@ impl Ssh2Client {
             self.op_timeout,
             &known_hosts,
         )?;
+        let deadline = OperationDeadline::new(self.op_timeout);
+        deadline.apply(&session)?;
         let mut channel = session.channel_session().context("ssh session error")?;
+        deadline.apply(&session)?;
         channel.exec(command).context("ssh session error")?;
         if let Some(stdin) = stdin {
+            deadline.apply(&session)?;
             channel
                 .write_all(stdin.as_bytes())
                 .context("ssh session error")?;
-            channel.send_eof().context("ssh session error")?;
         }
+        deadline.apply(&session)?;
+        channel.send_eof().context("ssh session error")?;
 
-        let (stdout, stderr) = read_channel_outputs(&session, &mut channel, self.op_timeout)?;
+        let (stdout, stderr) =
+            read_channel_outputs(&session, &mut channel, &deadline, self.output_limit)?;
+        deadline.apply(&session)?;
         channel.wait_close().context("ssh session error")?;
         ensure_remote_command_not_signaled(&channel)?;
         let exit_status = channel.exit_status().context("ssh session error")?;
@@ -328,6 +406,8 @@ impl Ssh2Client {
             self.op_timeout,
             &known_hosts,
         )?;
+        let deadline = OperationDeadline::new(self.op_timeout);
+        deadline.apply(&session)?;
         let mut channel = session.channel_session().context("ssh session error")?;
         // Disable PTY echo so the injected password is never echoed back into
         // the output stream we collect.
@@ -336,6 +416,7 @@ impl Ssh2Client {
         channel
             .request_pty("xterm", Some(modes), None)
             .context("ssh session error")?;
+        deadline.apply(&session)?;
         channel.exec(command).context("ssh session error")?;
 
         let begin_marker = su_begin_marker(marker_nonce);
@@ -343,9 +424,11 @@ impl Ssh2Client {
             &session,
             &mut channel,
             password,
-            self.op_timeout,
+            &deadline,
             &begin_marker,
+            self.output_limit,
         )?;
+        deadline.apply(&session)?;
         channel.wait_close().context("ssh session error")?;
         // The PTY channel exit status is unreliable (a signal-killed process can
         // report 0), so the command's real exit code comes from the END marker
@@ -364,26 +447,94 @@ impl Ssh2Client {
     }
 }
 
-fn ensure_scp_upload_succeeded(channel: &ssh2::Channel) -> anyhow::Result<()> {
-    let exit_status = channel.exit_status().context("ssh transfer error")?;
+fn open_regular_local_file(local: &Path) -> anyhow::Result<(fs::File, fs::Metadata)> {
+    let file = fs::File::open(local)
+        .with_context(|| format!("local file not found: {}", local.display()))
+        .with_error_kind(ErrorKind::Io)?;
+    let metadata = file.metadata().with_error_kind(ErrorKind::Io)?;
+    if !metadata.is_file() {
+        return Err(app_error(
+            ErrorKind::Io,
+            format!("local path is not a regular file: {}", local.display()),
+        ));
+    }
+    Ok((file, metadata))
+}
+
+fn ensure_scp_transfer_succeeded(channel: &ssh2::Channel) -> anyhow::Result<()> {
+    let signal = channel
+        .exit_signal()
+        .context("ssh transfer error")
+        .with_error_kind(ErrorKind::Ssh)?;
+    let exit_status = channel
+        .exit_status()
+        .context("ssh transfer error")
+        .with_error_kind(ErrorKind::Ssh)?;
+    validate_scp_completion(
+        signal.exit_signal.as_deref(),
+        signal.error_message.as_deref(),
+        exit_status,
+    )
+}
+
+fn validate_scp_completion(
+    exit_signal: Option<&str>,
+    error_message: Option<&str>,
+    exit_status: i32,
+) -> anyhow::Result<()> {
+    if let Some(signal) = exit_signal.filter(|signal| !signal.is_empty()) {
+        if let Some(message) = error_message.filter(|message| !message.is_empty()) {
+            return Err(app_error(
+                ErrorKind::Ssh,
+                format!("ssh transfer error: remote scp terminated by signal {signal}: {message}"),
+            ));
+        }
+        return Err(app_error(
+            ErrorKind::Ssh,
+            format!("ssh transfer error: remote scp terminated by signal {signal}"),
+        ));
+    }
     if exit_status != 0 {
-        anyhow::bail!("ssh transfer error: remote scp exited with status {exit_status}");
+        return Err(app_error(
+            ErrorKind::Ssh,
+            format!("ssh transfer error: remote scp exited with status {exit_status}"),
+        ));
     }
     Ok(())
 }
 
+fn persist_after_scp_completion<F>(
+    staged: crate::storage::StagedStreamWrite,
+    complete: F,
+) -> anyhow::Result<u64>
+where
+    F: FnOnce() -> anyhow::Result<()>,
+{
+    complete()?;
+    staged.persist()
+}
+
 fn ensure_remote_command_not_signaled(channel: &ssh2::Channel) -> anyhow::Result<()> {
-    let signal = channel.exit_signal().context("ssh session error")?;
+    let signal = channel
+        .exit_signal()
+        .context("ssh session error")
+        .with_error_kind(ErrorKind::Ssh)?;
     let Some(signal_name) = signal.exit_signal.filter(|name| !name.is_empty()) else {
         return Ok(());
     };
 
     if let Some(remote_message) = signal.error_message.filter(|message| !message.is_empty()) {
-        anyhow::bail!(
-            "ssh session error: remote command terminated by signal {signal_name}: {remote_message}"
-        );
+        return Err(app_error(
+            ErrorKind::Ssh,
+            format!(
+                "ssh session error: remote command terminated by signal {signal_name}: {remote_message}"
+            ),
+        ));
     }
-    anyhow::bail!("ssh session error: remote command terminated by signal {signal_name}");
+    Err(app_error(
+        ErrorKind::Ssh,
+        format!("ssh session error: remote command terminated by signal {signal_name}"),
+    ))
 }
 
 fn connect_verified_authenticated(
@@ -393,31 +544,37 @@ fn connect_verified_authenticated(
     op_timeout: Option<Duration>,
     known_hosts_path: &Path,
 ) -> anyhow::Result<Session> {
-    let session = connect(server, connect_timeout)?;
-    verify_known_host(&session, server, known_hosts_path)?;
-    authenticate(&session, server, auth)?;
-    // Switch from the connect-phase timeout to the operation timeout (0 = no
-    // timeout) so long-running or quiet remote commands are not killed by the
-    // connection setup timeout.
+    let session = connect(server, connect_timeout).with_error_kind(ErrorKind::Ssh)?;
+    verify_known_host(&session, server, known_hosts_path).with_error_kind(ErrorKind::Ssh)?;
+    authenticate(&session, server, auth).with_error_kind(ErrorKind::Auth)?;
+    // Switch from the connect-phase timeout to the operation budget (0 = an
+    // explicit opt-out). Individual operation steps tighten this to the
+    // absolute deadline's remaining time.
     session.set_timeout(op_timeout_millis(op_timeout));
     Ok(session)
 }
 
 fn connect(server: &ServerConfig, timeout: Duration) -> anyhow::Result<Session> {
     let address = format!("{}:{}", server.host, server.port);
+    let deadline = ConnectDeadline::new(timeout);
+    let resolver_address = address.clone();
+    let socket_addrs = resolve_with_deadline(&deadline, move || {
+        resolver_address
+            .to_socket_addrs()
+            .map(|addresses| addresses.collect())
+    })
+    .with_context(|| format!("failed to resolve {address}"))?;
     let mut last_error = None;
     let mut resolved_any = false;
-    for socket_addr in address
-        .to_socket_addrs()
-        .with_context(|| format!("failed to resolve {address}"))?
-    {
+    for socket_addr in socket_addrs {
         resolved_any = true;
-        match TcpStream::connect_timeout(&socket_addr, timeout) {
+        let remaining = deadline.remaining()?;
+        match TcpStream::connect_timeout(&socket_addr, remaining) {
             Ok(tcp) => {
-                tcp.set_read_timeout(Some(timeout))?;
-                tcp.set_write_timeout(Some(timeout))?;
+                tcp.set_read_timeout(Some(deadline.remaining()?))?;
+                tcp.set_write_timeout(Some(deadline.remaining()?))?;
                 let mut session = Session::new()?;
-                session.set_timeout(timeout_millis(timeout));
+                session.set_timeout(timeout_millis(deadline.remaining()?));
                 session.set_tcp_stream(tcp);
                 session.handshake()?;
                 return Ok(session);
@@ -443,8 +600,67 @@ fn connect(server: &ServerConfig, timeout: Duration) -> anyhow::Result<Session> 
     })
 }
 
+#[derive(Debug)]
+struct ConnectDeadline {
+    started: Instant,
+    timeout: Duration,
+}
+
+impl ConnectDeadline {
+    fn new(timeout: Duration) -> Self {
+        Self {
+            started: Instant::now(),
+            timeout,
+        }
+    }
+
+    fn remaining(&self) -> anyhow::Result<Duration> {
+        let elapsed = self.started.elapsed();
+        if elapsed >= self.timeout {
+            return Err(self.timeout_error());
+        }
+        Ok(self.timeout - elapsed)
+    }
+
+    fn timeout_error(&self) -> anyhow::Error {
+        app_error(
+            ErrorKind::Ssh,
+            format!(
+                "ssh connect phase timed out after {} milliseconds",
+                self.timeout.as_millis()
+            ),
+        )
+    }
+}
+
+fn resolve_with_deadline<F>(
+    deadline: &ConnectDeadline,
+    resolver: F,
+) -> anyhow::Result<Vec<SocketAddr>>
+where
+    F: FnOnce() -> io::Result<Vec<SocketAddr>> + Send + 'static,
+{
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::Builder::new()
+        .name("sshw-dns-resolver".to_string())
+        .spawn(move || {
+            let _ = sender.send(resolver());
+        })
+        .with_error_kind(ErrorKind::Ssh)?;
+
+    match receiver.recv_timeout(deadline.remaining()?) {
+        Ok(Ok(addresses)) => Ok(addresses),
+        Ok(Err(err)) => Err(anyhow::Error::new(err)),
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(deadline.timeout_error()),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(app_error(
+            ErrorKind::Ssh,
+            "failed to resolve address because the resolver stopped unexpectedly",
+        )),
+    }
+}
+
 fn timeout_millis(timeout: Duration) -> u32 {
-    timeout.as_millis().min(u32::MAX as u128) as u32
+    timeout.as_millis().clamp(1, u32::MAX as u128) as u32
 }
 
 /// libssh2 blocking timeout in milliseconds for the operation phase. `None`
@@ -453,20 +669,144 @@ fn op_timeout_millis(op_timeout: Option<Duration>) -> u32 {
     op_timeout.map(timeout_millis).unwrap_or(0)
 }
 
+#[derive(Debug, Clone, Copy)]
+struct OperationDeadline {
+    started: Instant,
+    timeout: Option<Duration>,
+}
+
+impl OperationDeadline {
+    fn new(timeout: Option<Duration>) -> Self {
+        Self {
+            started: Instant::now(),
+            timeout,
+        }
+    }
+
+    fn remaining(&self) -> anyhow::Result<Option<Duration>> {
+        let Some(timeout) = self.timeout else {
+            return Ok(None);
+        };
+        let elapsed = self.started.elapsed();
+        if elapsed >= timeout {
+            return Err(app_error(
+                ErrorKind::Ssh,
+                format!(
+                    "ssh operation timed out after {} milliseconds",
+                    timeout.as_millis()
+                ),
+            ));
+        }
+        Ok(Some(timeout - elapsed))
+    }
+
+    fn apply(&self, session: &Session) -> anyhow::Result<()> {
+        session.set_timeout(op_timeout_millis(self.remaining()?));
+        Ok(())
+    }
+
+    fn apply_io(&self, session: &Session) -> io::Result<()> {
+        let remaining = self
+            .remaining()
+            .map_err(|err| classified_io_error(ErrorKind::Ssh, io::ErrorKind::TimedOut, err))?;
+        session.set_timeout(op_timeout_millis(remaining));
+        Ok(())
+    }
+}
+
+struct DeadlineReader<'a, R> {
+    inner: &'a mut R,
+    session: &'a Session,
+    deadline: &'a OperationDeadline,
+}
+
+impl<'a, R> DeadlineReader<'a, R> {
+    fn new(inner: &'a mut R, session: &'a Session, deadline: &'a OperationDeadline) -> Self {
+        Self {
+            inner,
+            session,
+            deadline,
+        }
+    }
+}
+
+impl<R: Read> Read for DeadlineReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.deadline.apply_io(self.session)?;
+        self.inner.read(buf).map_err(|error| {
+            let kind = error.kind();
+            classified_io_error(ErrorKind::Ssh, kind, anyhow::Error::new(error))
+        })
+    }
+}
+
+fn copy_file_with_deadline(
+    local: &mut fs::File,
+    remote: &mut ssh2::Channel,
+    expected: u64,
+    session: &Session,
+    deadline: &OperationDeadline,
+) -> anyhow::Result<u64> {
+    let mut copied = 0u64;
+    let mut buffer = [0u8; 32 * 1024];
+
+    while copied < expected {
+        deadline.apply(session).with_error_kind(ErrorKind::Ssh)?;
+        let remaining = (expected - copied).min(buffer.len() as u64) as usize;
+        let read = local
+            .read(&mut buffer[..remaining])
+            .with_error_kind(ErrorKind::Io)?;
+        if read == 0 {
+            break;
+        }
+
+        let mut written = 0;
+        while written < read {
+            deadline.apply(session).with_error_kind(ErrorKind::Ssh)?;
+            let count = remote
+                .write(&buffer[written..read])
+                .context("ssh transfer error")
+                .with_error_kind(ErrorKind::Ssh)?;
+            if count == 0 {
+                return Err(classified_error(
+                    ErrorKind::Ssh,
+                    anyhow::Error::new(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "failed to write the complete local file to the SSH channel",
+                    ))
+                    .context("ssh transfer error"),
+                ));
+            }
+            written += count;
+        }
+        copied += read as u64;
+    }
+
+    Ok(copied)
+}
+
 /// Drive a PTY-backed `su` execution: read the merged PTY output non-blocking,
 /// inject `password` (plus a newline) exactly once when the password prompt is
-/// detected, then collect the rest until EOF. PTY echo is disabled and the
-/// prompt locale is forced to English (LC_ALL=C) by the caller, so the password
-/// is not reflected back. `op_timeout` is the same inactivity budget as `run`.
+/// detected, close channel input, then collect the rest until EOF. PTY echo is
+/// disabled and the prompt locale is forced to English (LC_ALL=C) by the
+/// caller, so the password is not reflected back.
 fn pty_collect_with_password(
     session: &Session,
     channel: &mut ssh2::Channel,
     password: &str,
-    op_timeout: Option<Duration>,
+    deadline: &OperationDeadline,
     begin_marker: &str,
+    output_limit: usize,
 ) -> anyhow::Result<String> {
     session.set_blocking(false);
-    let collected = pty_collect_loop(session, channel, password, op_timeout, begin_marker);
+    let collected = pty_collect_loop(
+        session,
+        channel,
+        password,
+        deadline,
+        begin_marker,
+        output_limit,
+    );
     session.set_blocking(true);
     let out = collected?;
     Ok(decode_remote_output_lossy(out))
@@ -476,29 +816,37 @@ fn pty_collect_loop(
     session: &Session,
     channel: &mut ssh2::Channel,
     password: &str,
-    op_timeout: Option<Duration>,
+    deadline: &OperationDeadline,
     begin_marker: &str,
+    output_limit: usize,
 ) -> anyhow::Result<Vec<u8>> {
     // Upper bound on the prompt/auth phase (before the command's BEGIN marker
     // appears) so a missing or unrecognized password prompt cannot hang forever
-    // even when op_timeout is None.
+    // even when the caller explicitly disables the operation deadline.
     const PROMPT_WAIT: Duration = Duration::from_secs(30);
     let mut out = Vec::new();
     let mut buf = [0u8; 32 * 1024];
     let mut injected = false;
+    let mut input_closed = false;
     let mut command_started = false;
-    let mut last_progress = Instant::now();
+    let prompt_started = Instant::now();
 
     loop {
+        deadline.remaining()?;
         let mut progressed = false;
         match channel.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
-                out.extend_from_slice(&buf[..n]);
+                append_output_bounded(&mut out, &buf[..n], 0, output_limit)?;
                 progressed = true;
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(e) => return Err(anyhow::Error::new(e).context("ssh session error")),
+            Err(e) => {
+                return Err(classified_error(
+                    ErrorKind::Ssh,
+                    anyhow::Error::new(e).context("ssh session error"),
+                ));
+            }
         }
 
         if !command_started && contains_subslice(&out, begin_marker.as_bytes()) {
@@ -507,35 +855,43 @@ fn pty_collect_loop(
             command_started = true;
         }
 
-        if !injected && !command_started && output_has_password_prompt(&out) {
-            // The password is short; switch to blocking for an atomic write,
-            // then restore non-blocking reads.
+        let should_inject = !injected && !command_started && output_has_password_prompt(&out);
+        if !input_closed && (should_inject || command_started) {
+            // Complete the one allowed input exchange and explicitly close
+            // stdin. This lets commands that read to EOF terminate instead of
+            // waiting forever on an open PTY channel.
             session.set_blocking(true);
-            let write = channel
-                .write_all(password.as_bytes())
-                .and_then(|()| channel.write_all(b"\n"));
+            let write = (|| -> anyhow::Result<()> {
+                deadline.apply(session)?;
+                if should_inject {
+                    channel
+                        .write_all(password.as_bytes())
+                        .and_then(|()| channel.write_all(b"\n"))
+                        .context("ssh session error")?;
+                }
+                // SSH channel EOF alone does not make a PTY's canonical line
+                // discipline return EOF. Queue the terminal VEOF character so
+                // the privileged command cannot block reading stdin forever.
+                channel.write_all(&[0x04]).context("ssh session error")?;
+                channel.flush().context("ssh session error")?;
+                deadline.apply(session)?;
+                channel.send_eof().context("ssh session error")?;
+                Ok(())
+            })();
             session.set_blocking(false);
-            write.context("ssh session error")?;
-            injected = true;
+            write?;
+            injected |= should_inject;
+            input_closed = true;
             progressed = true;
         }
 
-        if progressed {
-            last_progress = Instant::now();
-        } else {
-            // Before the command starts (prompt/auth phase) always bound the
-            // wait, even when op_timeout is None; after it starts, honor
-            // op_timeout (None = unlimited, like `run`).
-            let deadline = if command_started {
-                op_timeout
-            } else {
-                Some(op_timeout.map_or(PROMPT_WAIT, |t| t.min(PROMPT_WAIT)))
-            };
-            if deadline.is_some_and(|t| last_progress.elapsed() >= t) {
-                return Err(anyhow::anyhow!(
-                    "ssh session timed out waiting for the su password prompt or output"
-                ));
-            }
+        if !command_started && prompt_started.elapsed() >= PROMPT_WAIT {
+            return Err(app_error(
+                ErrorKind::Ssh,
+                "ssh session timed out waiting for the su password prompt or output",
+            ));
+        }
+        if !progressed {
             std::thread::sleep(Duration::from_millis(5));
         }
     }
@@ -613,7 +969,10 @@ fn extract_su_output(raw: &str, marker_nonce: &str) -> anyhow::Result<(String, i
     let begin_marker = su_begin_marker(marker_nonce);
     let end_prefix = su_end_prefix(marker_nonce);
     let begin = raw.find(&begin_marker).ok_or_else(|| {
-        anyhow::anyhow!("su authentication failed or password prompt was not answered")
+        app_error(
+            ErrorKind::Auth,
+            "su authentication failed or password prompt was not answered",
+        )
     })?;
     let after_begin = begin + begin_marker.len();
     // Body starts after the newline that follows the BEGIN marker.
@@ -621,9 +980,12 @@ fn extract_su_output(raw: &str, marker_nonce: &str) -> anyhow::Result<(String, i
         .find('\n')
         .map(|nl| after_begin + nl + 1)
         .unwrap_or(after_begin);
-    let end_rel = raw[body_start..]
-        .find(&end_prefix)
-        .ok_or_else(|| anyhow::anyhow!("su output ended before the completion marker"))?;
+    let end_rel = raw[body_start..].find(&end_prefix).ok_or_else(|| {
+        app_error(
+            ErrorKind::Ssh,
+            "su output ended before the completion marker",
+        )
+    })?;
     let end_abs = body_start + end_rel;
     let body = &raw[body_start..end_abs];
     // Exit-code digits follow the END prefix (terminated by `__`).
@@ -634,11 +996,15 @@ fn extract_su_output(raw: &str, marker_nonce: &str) -> anyhow::Result<(String, i
         .take_while(|b| b.is_ascii_digit())
         .count();
     if digit_len == 0 || !marker_tail[digit_len..].starts_with("__") {
-        anyhow::bail!("su output ended with a malformed completion marker");
+        return Err(app_error(
+            ErrorKind::Ssh,
+            "su output ended with a malformed completion marker",
+        ));
     }
     let exit_code = marker_tail[..digit_len]
         .parse::<i32>()
-        .context("su output ended with a malformed completion marker")?;
+        .context("su output ended with a malformed completion marker")
+        .with_error_kind(ErrorKind::Ssh)?;
     let stdout = body.replace("\r\n", "\n").replace('\r', "\n");
     Ok((stdout, exit_code))
 }
@@ -651,16 +1017,16 @@ fn extract_su_output(raw: &str, marker_nonce: &str) -> anyhow::Result<(String, i
 ///
 /// Switches the session to non-blocking, drains both streams round-robin until
 /// each reaches EOF, then restores blocking mode for the caller's `wait_close`.
-/// `op_timeout` is an *inactivity* budget matching the connection's operation
-/// timeout: it fires only when neither stream makes progress for that long.
-/// `None` waits indefinitely.
+/// Progress never extends the absolute operation deadline, and stdout plus
+/// stderr may not exceed `output_limit` bytes in total.
 fn read_channel_outputs(
     session: &Session,
     channel: &mut ssh2::Channel,
-    op_timeout: Option<Duration>,
+    deadline: &OperationDeadline,
+    output_limit: usize,
 ) -> anyhow::Result<(String, String)> {
     session.set_blocking(false);
-    let drained = drain_both_streams(channel, op_timeout);
+    let drained = drain_both_streams(channel, deadline, output_limit);
     session.set_blocking(true);
     let (out, err) = drained?;
     let stdout = decode_remote_output_lossy(out);
@@ -670,27 +1036,33 @@ fn read_channel_outputs(
 
 fn drain_both_streams(
     channel: &mut ssh2::Channel,
-    op_timeout: Option<Duration>,
+    deadline: &OperationDeadline,
+    output_limit: usize,
 ) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
     let mut out = Vec::new();
     let mut err = Vec::new();
     let mut out_done = false;
     let mut err_done = false;
     let mut buf = [0u8; 32 * 1024];
-    let mut last_progress = Instant::now();
 
     while !(out_done && err_done) {
+        deadline.remaining()?;
         let mut progressed = false;
 
         if !out_done {
             match channel.read(&mut buf) {
                 Ok(0) => out_done = true,
                 Ok(n) => {
-                    out.extend_from_slice(&buf[..n]);
+                    append_output_bounded(&mut out, &buf[..n], err.len(), output_limit)?;
                     progressed = true;
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(e) => return Err(anyhow::Error::new(e).context("ssh session error")),
+                Err(e) => {
+                    return Err(classified_error(
+                        ErrorKind::Ssh,
+                        anyhow::Error::new(e).context("ssh session error"),
+                    ));
+                }
             }
         }
 
@@ -698,26 +1070,48 @@ fn drain_both_streams(
             match channel.stderr().read(&mut buf) {
                 Ok(0) => err_done = true,
                 Ok(n) => {
-                    err.extend_from_slice(&buf[..n]);
+                    append_output_bounded(&mut err, &buf[..n], out.len(), output_limit)?;
                     progressed = true;
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(e) => return Err(anyhow::Error::new(e).context("ssh session error")),
+                Err(e) => {
+                    return Err(classified_error(
+                        ErrorKind::Ssh,
+                        anyhow::Error::new(e).context("ssh session error"),
+                    ));
+                }
             }
         }
 
-        if progressed {
-            last_progress = Instant::now();
-        } else if !(out_done && err_done) {
-            if op_timeout.is_some_and(|timeout| last_progress.elapsed() >= timeout) {
-                return Err(anyhow::anyhow!("ssh session timed out waiting for output"));
-            }
+        if !(progressed || out_done && err_done) {
             std::thread::sleep(Duration::from_millis(5));
         }
     }
 
     Ok((out, err))
 }
+
+fn append_output_bounded(
+    target: &mut Vec<u8>,
+    bytes: &[u8],
+    other_len: usize,
+    output_limit: usize,
+) -> anyhow::Result<()> {
+    let combined = target
+        .len()
+        .checked_add(other_len)
+        .and_then(|len| len.checked_add(bytes.len()))
+        .unwrap_or(usize::MAX);
+    if combined > output_limit {
+        return Err(app_error(
+            ErrorKind::Ssh,
+            format!("ssh session output exceeded {output_limit}-byte limit"),
+        ));
+    }
+    target.extend_from_slice(bytes);
+    Ok(())
+}
+
 fn verify_known_host(
     session: &Session,
     server: &ServerConfig,
@@ -864,6 +1258,10 @@ fn known_host_name(host: &str, port: u16) -> String {
     }
 }
 
+fn known_host_comment(_server_name: &str) -> &'static str {
+    "sshw"
+}
+
 fn unknown_host_key_error(server: &ServerConfig) -> anyhow::Error {
     anyhow::anyhow!(
         "host key for {}:{} is not trusted; run `sshw trust <name>` first",
@@ -875,6 +1273,8 @@ fn unknown_host_key_error(server: &ServerConfig) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use crate::config::{AuthConfig, ServerConfig};
+    use crate::error::ResultErrorKindExt;
+    use crate::output::ErrorKind;
     use ssh2::CheckResult;
     use std::fs;
 
@@ -891,8 +1291,46 @@ example.test ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB9zU1OEQ2tzYhrXq4/DEjvRNvKv6cU
     }
 
     #[test]
-    fn default_client_has_no_op_timeout() {
-        assert_eq!(super::Ssh2Client::default().op_timeout(), None);
+    fn resolver_wait_is_bounded_by_the_total_connect_deadline() {
+        let deadline = super::ConnectDeadline::new(std::time::Duration::from_millis(25));
+        let started = std::time::Instant::now();
+        let err = super::resolve_with_deadline(&deadline, || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            Ok(vec!["127.0.0.1:22".parse().unwrap()])
+        })
+        .unwrap_err();
+
+        assert!(err.to_string().contains("connect phase timed out"));
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(150),
+            "resolver wait exceeded the total deadline: {err:#}"
+        );
+    }
+
+    #[test]
+    fn connect_deadline_budget_decreases_across_attempts() {
+        let deadline = super::ConnectDeadline::new(std::time::Duration::from_millis(200));
+        let first = deadline.remaining().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let second = deadline.remaining().unwrap();
+
+        assert!(second < first);
+    }
+
+    #[test]
+    fn default_client_has_bounded_op_timeout() {
+        assert_eq!(
+            super::Ssh2Client::default().op_timeout(),
+            Some(std::time::Duration::from_secs(15 * 60))
+        );
+    }
+
+    #[test]
+    fn default_client_has_bounded_output() {
+        assert_eq!(
+            super::Ssh2Client::default().output_limit(),
+            16 * 1024 * 1024
+        );
     }
 
     #[test]
@@ -904,6 +1342,50 @@ example.test ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB9zU1OEQ2tzYhrXq4/DEjvRNvKv6cU
             client.op_timeout(),
             Some(std::time::Duration::from_secs(30))
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opened_local_file_keeps_original_identity_after_path_replacement() {
+        use std::io::Read;
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        let local = temp.path().join("local");
+        std::fs::write(&first, b"first").unwrap();
+        std::fs::write(&second, b"second").unwrap();
+        symlink(&first, &local).unwrap();
+
+        let (mut opened, metadata) = super::open_regular_local_file(&local).unwrap();
+        std::fs::remove_file(&local).unwrap();
+        symlink(&second, &local).unwrap();
+
+        let mut contents = String::new();
+        opened.read_to_string(&mut contents).unwrap();
+        assert_eq!(metadata.len(), 5);
+        assert_eq!(contents, "first");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn opens_windows_local_path_with_forward_slashes() {
+        use std::io::Read;
+        use std::path::Path;
+
+        let temp = tempfile::tempdir().unwrap();
+        let local = temp.path().join("artifact.bin");
+        std::fs::write(&local, b"sshw").unwrap();
+        let forward_slash_path = local.to_string_lossy().replace('\\', "/");
+
+        let (mut opened, metadata) =
+            super::open_regular_local_file(Path::new(&forward_slash_path)).unwrap();
+        let mut contents = Vec::new();
+        opened.read_to_end(&mut contents).unwrap();
+
+        assert_eq!(metadata.len(), 4);
+        assert_eq!(contents, b"sshw");
     }
 
     #[test]
@@ -966,6 +1448,76 @@ example.test ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB9zU1OEQ2tzYhrXq4/DEjvRNvKv6cU
             fs::read_to_string(&known_hosts_path).unwrap(),
             KNOWN_HOSTS_LINE
         );
+    }
+
+    #[test]
+    fn known_hosts_comment_never_contains_server_alias() {
+        let alias = "web\ninjected.example ssh-ed25519 SYNTHETIC";
+
+        assert_eq!(super::known_host_comment(alias), "sshw");
+        assert!(!super::known_host_comment(alias).contains(['\r', '\n']));
+    }
+
+    #[test]
+    fn scp_completion_accepts_only_clean_zero_exit() {
+        super::validate_scp_completion(None, None, 0).unwrap();
+
+        let status = super::validate_scp_completion(None, None, 1).unwrap_err();
+        assert!(status.to_string().contains("status 1"));
+
+        let signal =
+            super::validate_scp_completion(Some("TERM"), Some("terminated"), 0).unwrap_err();
+        assert!(signal.to_string().contains("signal TERM"));
+        assert!(signal.to_string().contains("terminated"));
+    }
+
+    #[test]
+    fn failed_scp_completion_drops_stage_and_preserves_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("download.txt");
+        fs::write(&destination, "ORIGINAL").unwrap();
+        let mut source = &b"NEWDATA"[..];
+        let staged =
+            crate::storage::stage_stream_owner_only(&destination, &mut source, true, Some(7))
+                .unwrap();
+
+        let err = super::persist_after_scp_completion(staged, || {
+            super::validate_scp_completion(None, None, 1)
+        })
+        .unwrap_err();
+
+        assert!(err.to_string().contains("status 1"));
+        assert_eq!(fs::read_to_string(&destination).unwrap(), "ORIGINAL");
+        assert_eq!(
+            fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn local_noclobber_race_remains_io_through_the_ssh_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("download.txt");
+        let mut source = &b"NEWDATA"[..];
+        let staged =
+            crate::storage::stage_stream_owner_only(&destination, &mut source, false, Some(7))
+                .unwrap();
+        fs::write(&destination, "COMPETING").unwrap();
+
+        let local_error = super::persist_after_scp_completion(staged, || Ok(())).unwrap_err();
+        let boundary_error = Err::<(), _>(local_error)
+            .with_error_kind(ErrorKind::Ssh)
+            .unwrap_err();
+
+        assert_eq!(
+            crate::output::classify_error(&boundary_error),
+            ErrorKind::Io
+        );
+        assert_eq!(fs::read_to_string(destination).unwrap(), "COMPETING");
     }
 
     #[test]

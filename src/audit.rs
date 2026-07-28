@@ -4,10 +4,7 @@ use serde::Serialize;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
-
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuditStatus {
@@ -91,13 +88,15 @@ impl AuditSink for FileAuditSink {
         };
         let json = serde_json::to_string(&line)?;
 
-        let mut options = OpenOptions::new();
-        options.create(true).append(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-
-        let mut file = options.open(&self.path)?;
-        writeln!(file, "{json}")?;
+        let mut lock = crate::storage::acquire_exclusive_lock_with_timeout(
+            &self.path,
+            Duration::from_millis(100),
+        )?;
+        let mut record_bytes = json.into_bytes();
+        record_bytes.push(b'\n');
+        let file = lock.file_mut();
+        file.write_all(&record_bytes)?;
+        file.flush()?;
         Ok(())
     }
 }

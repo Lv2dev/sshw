@@ -1,18 +1,19 @@
 use crate::audit::{self, AuditRecord, AuditSink, AuditStatus, FileAuditSink, NoopAudit};
 use crate::config::{
-    AuthConfig, CredentialBackend, PrivilegeConfig, PrivilegeMethod, ServerConfig, SshwConfig,
-    load_config,
+    AuthConfig, ConfigRevision, CredentialBackend, PrivilegeConfig, PrivilegeMethod, ServerConfig,
+    SshwConfig, load_config, load_config_with_revision, validate_config_credential_references,
 };
 use crate::credentials::keyring_store::KeyringCredentialStore;
 use crate::credentials::session_store::SessionOnlyStore;
 use crate::credentials::{AuthMaterial, CredentialStore, CredentialStoreHealth};
-use crate::home::{ResolvedHome, sshw_base_dir};
+use crate::error::{ResultErrorKindExt, app_error};
+use crate::home::{CredentialPurpose, ResolvedHome, builtin_default_home, sshw_base_dir};
 use crate::output::{
     ErrorKind, ErrorResponse, RunOutput, filter_startup_stderr_noise, redact_secrets,
 };
 use crate::policy::{Policy, describe_policy, resolve_policy};
 use crate::profile::{load_registry, resolve_home_with_registry};
-use crate::safety::{SafetyDecision, classify_command};
+use crate::safety::{SafetyDecision, classify_command, command_program};
 use crate::sandbox::{NoopSandbox, PolicyOnlySandbox, Sandbox, SandboxDecision};
 use crate::ssh::SshClient;
 use crate::ssh::ssh2_client::{
@@ -21,6 +22,8 @@ use crate::ssh::ssh2_client::{
 use anyhow::Context;
 use clap::Parser;
 use serde_json::json;
+use std::ffi::OsStr;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use zeroize::Zeroizing;
@@ -72,16 +75,14 @@ pub fn run() -> i32 {
         Ok(resolved) => resolved,
         Err(err) => return print_output(error_output(&err, json_errors)),
     };
-    // Connection setup keeps the fixed connect timeout; the operation phase
-    // uses the optional `--timeout` (0/absent = no timeout).
-    let op_timeout = cli
-        .timeout
-        .and_then(|secs| (secs > 0).then(|| Duration::from_secs(secs)));
-    let ssh = Ssh2Client::default()
-        .with_known_hosts(home.known_hosts_path.clone())
-        .with_op_timeout(op_timeout);
+    // Omission preserves the client's bounded default. `--timeout 0` is the
+    // only explicit opt-out; a positive value replaces the absolute deadline.
+    let mut ssh = Ssh2Client::default().with_known_hosts(home.known_hosts_path.clone());
+    if let Some(op_timeout) = operation_timeout_override(cli.timeout) {
+        ssh = ssh.with_op_timeout(op_timeout);
+    }
     let mut prompter = TerminalPrompter;
-    let audit = FileAuditSink::new(home.audit_path.clone());
+    let audit = FileAuditSink::new(runtime_audit_path(&cli, &home, &registry_path));
     let ctx = ExecContext {
         home: &home,
         registry_path: &registry_path,
@@ -101,18 +102,84 @@ pub fn run() -> i32 {
     print_output(output)
 }
 
+fn operation_timeout_override(timeout: Option<u64>) -> Option<Option<Duration>> {
+    timeout.map(|seconds| (seconds > 0).then(|| Duration::from_secs(seconds)))
+}
+
+fn runtime_audit_path(cli: &Cli, home: &ResolvedHome, registry_path: &Path) -> PathBuf {
+    if matches!(&cli.command, Command::Profile(_))
+        && let Some(sshw_base) = registry_path.parent()
+    {
+        return builtin_default_home(sshw_base).audit_path;
+    }
+    home.audit_path.clone()
+}
+
 fn resolve_runtime(cli: &Cli) -> anyhow::Result<(ResolvedHome, PathBuf)> {
-    let sshw_base = sshw_base_dir()?;
-    let registry_path = sshw_base.join("profiles.json");
-    let registry = load_registry(&registry_path)?;
+    let sshw_base = sshw_base_dir().with_error_kind(ErrorKind::Config)?;
     let env_home = std::env::var_os("SSHW_HOME").filter(|value| !value.is_empty());
+    resolve_runtime_with_base(cli, &sshw_base, env_home.as_deref())
+}
+
+fn resolve_runtime_with_base(
+    cli: &Cli,
+    sshw_base: &Path,
+    env_home: Option<&std::ffi::OsStr>,
+) -> anyhow::Result<(ResolvedHome, PathBuf)> {
+    let registry_path = sshw_base.join("profiles.json");
+
+    if matches!(
+        &cli.command,
+        Command::Profile(ProfileArgs {
+            command: ProfileCommand::Remove(_)
+        })
+    ) && cli.profile.is_none()
+    {
+        let home = resolve_home_with_registry(
+            cli.home.as_deref(),
+            env_home,
+            None,
+            &crate::profile::ProfileRegistry::default(),
+            sshw_base,
+        )
+        .with_error_kind(ErrorKind::Config)?;
+        return Ok((home, registry_path));
+    }
+
+    match resolve_runtime_with_base_strict(cli, sshw_base, env_home) {
+        Ok(resolved) => Ok(resolved),
+        Err(_err)
+            if matches!(&cli.command, Command::Doctor(_))
+                && !(cli.home.is_some() && cli.profile.is_some())
+                && load_registry(&registry_path).is_err() =>
+        {
+            Ok((builtin_default_home(sshw_base), registry_path))
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn resolve_runtime_with_base_strict(
+    cli: &Cli,
+    sshw_base: &Path,
+    env_home: Option<&std::ffi::OsStr>,
+) -> anyhow::Result<(ResolvedHome, PathBuf)> {
+    let registry_path = sshw_base.join("profiles.json");
+    let needs_registry =
+        matches!(&cli.command, Command::Profile(_)) || (cli.home.is_none() && env_home.is_none());
+    let registry = if needs_registry {
+        load_registry(&registry_path).with_error_kind(ErrorKind::Config)?
+    } else {
+        crate::profile::ProfileRegistry::default()
+    };
     let home = resolve_home_with_registry(
         cli.home.as_deref(),
-        env_home.as_deref(),
+        env_home,
         cli.profile.as_deref(),
         &registry,
-        &sshw_base,
-    )?;
+        sshw_base,
+    )
+    .with_error_kind(ErrorKind::Config)?;
     Ok((home, registry_path))
 }
 
@@ -191,9 +258,13 @@ where
     P: Prompter,
     MakeSession: FnOnce() -> E,
 {
-    let backend = load_config(&ctx.home.config_path)
-        .map(|config| config.credential_backend)
-        .unwrap_or_default();
+    let backend = if matches!(&cli.command, Command::Profile(_)) {
+        CredentialBackend::Native
+    } else {
+        load_config(&ctx.home.config_path)
+            .map(|config| config.credential_backend)
+            .unwrap_or_default()
+    };
     match backend {
         CredentialBackend::Native => {
             execute_for_runtime_with(cli, ctx, native_credentials, ssh, prompter)
@@ -245,7 +316,33 @@ where
     } = cli;
 
     let config_path = ctx.home.config_path.as_path();
-    let mut config = load_config(config_path)?;
+    let command = match command {
+        Command::Profile(args) => {
+            let descriptor = profile_audit_descriptor(&args.command);
+            let result = profile::run_profile(args, ctx.registry_path, home_flag.as_deref());
+            record_audit_result(ctx.audit, descriptor, &result);
+            return result;
+        }
+        Command::Doctor(args) => {
+            return doctor(
+                args,
+                ctx.home,
+                ctx.registry_path,
+                ctx.policy_forced,
+                credentials,
+            );
+        }
+        command => command,
+    };
+    let _home_lock = if command_mutates_home(&command) {
+        Some(
+            crate::storage::acquire_exclusive_lock(&ctx.home.root.join(".sshw.lock"))
+                .with_error_kind(ErrorKind::Config)?,
+        )
+    } else {
+        None
+    };
+    let (mut config, revision) = load_active_config_with_revision(ctx.home)?;
 
     let descriptor = audit_descriptor(&command, &config);
     // Captured before `command` is consumed by dispatch: used to remap a remote
@@ -257,6 +354,7 @@ where
         Command::Add(args) => server::add_server(
             args,
             config_path,
+            &revision,
             &ctx.home.namespace,
             credentials,
             prompter,
@@ -264,71 +362,126 @@ where
         ),
         Command::List(args) => server::list_servers(args, &config),
         Command::Show(args) => server::show_server(args, &config),
-        Command::Default(args) => server::default_server(args, config_path, &mut config),
+        Command::Default(args) => server::default_server(args, config_path, &revision, &mut config),
         Command::Trust(args) => server::trust_server(args, ssh, prompter, &config),
-        Command::Run(args) => {
-            let sandbox = build_sandbox(&ctx.home.policy_path, ctx.policy_forced)?;
-            run_remote(args, sandbox.as_ref(), credentials, ssh, &config)
-        }
+        Command::Run(args) => build_sandbox(&ctx.home.policy_path, ctx.policy_forced)
+            .and_then(|sandbox| run_remote(args, sandbox.as_ref(), credentials, ssh, &config)),
         Command::Put(args) => {
-            let sandbox = build_sandbox(&ctx.home.policy_path, ctx.policy_forced)?;
-            transfer::put_file(args, sandbox.as_ref(), credentials, ssh, &config)
+            build_sandbox(&ctx.home.policy_path, ctx.policy_forced).and_then(|sandbox| {
+                transfer::put_file(args, sandbox.as_ref(), credentials, ssh, &config)
+            })
         }
         Command::Get(args) => {
-            let sandbox = build_sandbox(&ctx.home.policy_path, ctx.policy_forced)?;
-            transfer::get_file(args, sandbox.as_ref(), credentials, ssh, &config)
+            build_sandbox(&ctx.home.policy_path, ctx.policy_forced).and_then(|sandbox| {
+                transfer::get_file(args, sandbox.as_ref(), credentials, ssh, &config)
+            })
         }
-        Command::Remove(args) => {
-            server::remove_server(args, config_path, credentials, prompter, &mut config)
-        }
-        Command::Doctor(args) => doctor(
+        Command::Remove(args) => server::remove_server(
             args,
-            ctx.home,
-            ctx.registry_path,
-            ctx.policy_forced,
+            config_path,
+            &revision,
             credentials,
-            &config,
+            prompter,
+            &mut config,
         ),
+        Command::Doctor(_) => unreachable!("doctor is dispatched before config enforcement"),
         Command::Privilege(args) => match args.command {
             PrivilegeCommand::Set(args) => privilege::set_privilege(
                 args,
                 config_path,
+                &revision,
                 &ctx.home.namespace,
                 credentials,
                 prompter,
                 &mut config,
             ),
             PrivilegeCommand::Show(args) => privilege::show_privilege(args, &config),
-            PrivilegeCommand::Clear(args) => {
-                privilege::clear_privilege(args, config_path, credentials, prompter, &mut config)
-            }
+            PrivilegeCommand::Clear(args) => privilege::clear_privilege(
+                args,
+                config_path,
+                &revision,
+                credentials,
+                prompter,
+                &mut config,
+            ),
         },
-        Command::Profile(args) => {
-            profile::run_profile(args, ctx.registry_path, home_flag.as_deref())
-        }
+        Command::Profile(_) => unreachable!("profile is dispatched before config loading"),
     };
 
-    if let Some((action, server, detail)) = descriptor {
-        let (status, exit_code) = match &result {
-            Ok(output) => (AuditStatus::Ok, output.exit_code),
-            Err(err) => (
-                AuditStatus::Error,
-                ErrorResponse::from_error(err).error.exit_code,
-            ),
-        };
-        // Best-effort: an audit write failure must not fail the operation.
-        let _ = ctx.audit.record(&AuditRecord {
-            action: action.to_string(),
-            server,
-            detail,
-            status,
-            exit_code,
-        });
-    }
+    record_audit_result(ctx.audit, descriptor, &result);
 
     // Remap a remote command's non-zero exit (recorded above) so it cannot be
     // confused with sshw's own operational exit codes.
     result.map(|output| remap_remote_nonzero_exit(output, is_run, run_json))
+}
+
+type AuditDescriptor = (&'static str, Option<String>, Option<String>);
+
+fn record_audit_result(
+    audit: &dyn AuditSink,
+    descriptor: Option<AuditDescriptor>,
+    result: &anyhow::Result<CommandOutput>,
+) {
+    let Some((action, server, detail)) = descriptor else {
+        return;
+    };
+    let (status, exit_code) = match result {
+        Ok(output) => (AuditStatus::Ok, output.exit_code),
+        Err(err) => (
+            AuditStatus::Error,
+            ErrorResponse::from_error(err).error.exit_code,
+        ),
+    };
+    // Best-effort: an audit write failure must not fail the operation.
+    let _ = audit.record(&AuditRecord {
+        action: action.to_string(),
+        server,
+        detail,
+        status,
+        exit_code,
+    });
+}
+
+fn profile_audit_descriptor(command: &ProfileCommand) -> Option<AuditDescriptor> {
+    match command {
+        ProfileCommand::Add(args) => Some(("profile", None, Some(format!("add:{}", args.name)))),
+        ProfileCommand::Default(args) => {
+            Some(("profile", None, Some(format!("default:{}", args.name))))
+        }
+        ProfileCommand::Remove(args) => {
+            Some(("profile", None, Some(format!("remove:{}", args.name))))
+        }
+        ProfileCommand::List(_) | ProfileCommand::Show(_) => None,
+    }
+}
+
+fn command_mutates_home(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Add(_) | Command::Trust(_) | Command::Remove(_)
+    ) || matches!(command, Command::Default(args) if args.name.is_some())
+        || matches!(
+            command,
+            Command::Privilege(PrivilegeArgs {
+                command: PrivilegeCommand::Set(_) | PrivilegeCommand::Clear(_),
+            })
+        )
+}
+
+fn load_active_config(home: &ResolvedHome) -> anyhow::Result<SshwConfig> {
+    load_active_config_with_revision(home).map(|(config, _revision)| config)
+}
+
+fn load_active_config_with_revision(
+    home: &ResolvedHome,
+) -> anyhow::Result<(SshwConfig, ConfigRevision)> {
+    let config_path = home.config_path.as_path();
+    let (config, revision) =
+        load_config_with_revision(config_path).with_error_kind(ErrorKind::Config)?;
+    validate_config_credential_references(&config, &home.namespace)
+        .map_err(|err| anyhow::anyhow!("failed to load config at {}: {err}", config_path.display()))
+        .with_error_kind(ErrorKind::Config)?;
+    Ok((config, revision))
 }
 
 /// Remap a remote command's non-zero exit to [`crate::output::REMOTE_NONZERO_EXIT_CODE`]
@@ -339,6 +492,9 @@ where
 fn remap_remote_nonzero_exit(mut output: CommandOutput, is_run: bool, json: bool) -> CommandOutput {
     if is_run && output.exit_code != 0 {
         if !json {
+            if !output.stderr.is_empty() && !output.stderr.ends_with('\n') {
+                output.stderr.push('\n');
+            }
             output.stderr.push_str(&format!(
                 "note: remote command exited with status {}\n",
                 output.exit_code
@@ -352,10 +508,7 @@ fn remap_remote_nonzero_exit(mut output: CommandOutput, is_run: bool, json: bool
 /// Best-effort `(action, server, detail)` for the auditable commands. Returns
 /// `None` for read-only commands (list/show/doctor/profile) that are not
 /// audited. `detail` is redacted by the sink before being written.
-fn audit_descriptor(
-    command: &Command,
-    config: &SshwConfig,
-) -> Option<(&'static str, Option<String>, Option<String>)> {
+fn audit_descriptor(command: &Command, config: &SshwConfig) -> Option<AuditDescriptor> {
     let default = || config.default.clone();
     match command {
         Command::Add(a) => Some(("add", Some(a.name.clone()), None)),
@@ -373,10 +526,7 @@ fn audit_descriptor(
             };
             // Record only the program name, never the full argument string, so
             // secrets passed inline (e.g. `mysql -phunter2`) are not persisted.
-            let program = command
-                .as_deref()
-                .and_then(|c| c.split_whitespace().next())
-                .map(str::to_string);
+            let program = command.as_deref().and_then(command_program);
             let detail = if a.as_root {
                 let program = program.unwrap_or_else(|| "unknown".to_string());
                 let marker = server
@@ -437,7 +587,7 @@ fn audit_descriptor(
 }
 
 fn build_sandbox(policy_path: &Path, forced: bool) -> anyhow::Result<Box<dyn Sandbox>> {
-    match resolve_policy(policy_path, forced)? {
+    match resolve_policy(policy_path, forced).with_error_kind(ErrorKind::Policy)? {
         Policy::Disabled => Ok(Box::new(NoopSandbox)),
         Policy::Enabled(rules) => Ok(Box::new(PolicyOnlySandbox::new(rules))),
     }
@@ -463,18 +613,19 @@ where
     let (server_name, command) = resolve_run_target(target, config)?;
 
     if as_root && !yes {
-        return Err(anyhow::anyhow!(
-            "root privilege escalation requires --yes; review the command and rerun with --yes"
+        return Err(app_error(
+            ErrorKind::Safety,
+            "root privilege escalation requires --yes; review the command and rerun with --yes",
         ));
     }
 
     match classify_command(&command, yes) {
         SafetyDecision::Allow => {}
-        SafetyDecision::Block { reason } => return Err(anyhow::anyhow!("{reason}")),
+        SafetyDecision::Block { reason } => return Err(app_error(ErrorKind::Safety, reason)),
     }
 
     if let SandboxDecision::Deny { reason } = sandbox.check_command(&command) {
-        return Err(anyhow::anyhow!("{reason}"));
+        return Err(app_error(ErrorKind::Policy, reason));
     }
 
     let server = get_server(config, &server_name)?;
@@ -497,7 +648,8 @@ where
         .as_ref()
         .and_then(|execution| execution.stdin.as_ref())
     {
-        ssh.run_with_stdin(server, &auth, remote_command, stdin.as_str())?
+        ssh.run_with_stdin(server, &auth, remote_command, stdin.as_str())
+            .with_error_kind(ErrorKind::Ssh)?
     } else if let Some(password) = privileged
         .as_ref()
         .and_then(|execution| execution.pty_password.as_ref())
@@ -512,23 +664,31 @@ where
             remote_command,
             password.as_str(),
             marker_nonce,
-        )?
+        )
+        .with_error_kind(ErrorKind::Ssh)?
     } else {
-        ssh.run(server, &auth, remote_command)?
+        ssh.run(server, &auth, remote_command)
+            .with_error_kind(ErrorKind::Ssh)?
     };
     let exit_code = result.exit_status;
-    let secret = privileged
+    let login_secret = match &auth {
+        AuthMaterial::Password(password) => Some(password.as_str()),
+        AuthMaterial::Agent => None,
+    };
+    let privilege_secret = privileged
         .as_ref()
         .and_then(|execution| execution.redact_secret.as_ref())
         .map(|secret| secret.as_str());
-    let stdout = redact_with_known_secret(&result.stdout, secret);
-    let stderr = redact_with_known_secret(&filter_startup_stderr_noise(&result.stderr), secret);
+    let secrets = [login_secret, privilege_secret];
+    let redacted_command = redact_with_known_secrets(&command, &secrets);
+    let stdout = redact_with_known_secrets(&result.stdout, &secrets);
+    let stderr = redact_with_known_secrets(&filter_startup_stderr_noise(&result.stderr), &secrets);
 
     if json {
         let output = RunOutput {
             ok: true,
             server: server_name,
-            command: redact_secrets(&command),
+            command: redacted_command,
             exit_status: result.exit_status,
             stdout,
             stderr,
@@ -592,7 +752,12 @@ where
 {
     let password = Zeroizing::new(
         credentials
-            .get_password(&privilege.credential, &privilege.user)
+            .get_password_for(
+                CredentialPurpose::Privilege,
+                &privilege.credential,
+                &privilege.user,
+            )
+            .with_error_kind(ErrorKind::Auth)
             .with_context(|| {
                 format!(
                     "missing credential entry for {} and privilege user {}",
@@ -703,12 +868,20 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
-fn redact_with_known_secret(input: &str, secret: Option<&str>) -> String {
-    let redacted = redact_secrets(input);
-    match secret.filter(|value| !value.is_empty()) {
-        Some(secret) => redacted.replace(secret, "<redacted>"),
-        None => redacted,
+fn redact_with_known_secrets(input: &str, secrets: &[Option<&str>]) -> String {
+    let mut redacted = redact_secrets(input);
+    let mut known_secrets: Vec<_> = secrets
+        .iter()
+        .filter_map(|secret| *secret)
+        .filter(|secret| !secret.is_empty())
+        .collect();
+    known_secrets
+        .sort_unstable_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
+    known_secrets.dedup();
+    for secret in known_secrets {
+        redacted = redacted.replace(secret, "<redacted>");
     }
+    redacted
 }
 
 fn doctor<C>(
@@ -717,12 +890,27 @@ fn doctor<C>(
     registry_path: &Path,
     policy_forced: bool,
     credentials: &C,
-    config: &SshwConfig,
 ) -> anyhow::Result<CommandOutput>
 where
     C: CredentialStore,
 {
     let config_path = home.config_path.as_path();
+    let registry_result = load_registry(registry_path);
+    let registry_valid = registry_result.is_ok();
+    let registry_message = registry_result
+        .as_ref()
+        .map(|_| "ok".to_string())
+        .unwrap_or_else(|err| err.to_string());
+    let config_result = load_active_config(home);
+    let config_valid = config_result.is_ok();
+    let config_message = config_result
+        .as_ref()
+        .map(|_| "ok".to_string())
+        .unwrap_or_else(|err| err.to_string());
+    let config_exists = match std::fs::symlink_metadata(config_path) {
+        Ok(_) => true,
+        Err(err) => err.kind() != std::io::ErrorKind::NotFound,
+    };
     let policy = describe_policy(&home.policy_path, policy_forced);
     let audit_writable = audit::is_writable(&home.audit_path);
     let health = credentials
@@ -732,7 +920,10 @@ where
             available: false,
             message: format!("credential store unavailable: {err}"),
         });
-    let missing_credentials = missing_credentials(credentials, config);
+    let missing_credentials = config_result
+        .as_ref()
+        .map(|config| missing_credentials(credentials, config))
+        .unwrap_or_default();
     let library_versions = runtime_library_versions();
 
     if args.json {
@@ -741,8 +932,12 @@ where
             "home": home.root,
             "home_source": home.description,
             "registry_path": registry_path,
+            "registry_valid": registry_valid,
+            "registry_message": registry_message,
             "config_path": config_path,
-            "config_exists": config_path.exists(),
+            "config_exists": config_exists,
+            "config_valid": config_valid,
+            "config_message": config_message,
             "known_hosts_path": home.known_hosts_path,
             "policy_path": home.policy_path,
             "policy_present": policy.present,
@@ -763,12 +958,16 @@ where
     }
 
     let mut stdout = format!(
-        "home: {}\nhome source: {}\nregistry path: {}\nconfig path: {}\nconfig exists: {}\nknown_hosts path: {}\npolicy path: {}\npolicy present: {}\npolicy valid: {}\npolicy enabled: {}\naudit path: {}\naudit writable: {}\ncredential namespace: {}\nos: {}\nlibssh2 version: {}\nopenssl version: {}\ncredential backend: {}\ncredential available: {}\ncredential message: {}\n",
+        "home: {}\nhome source: {}\nregistry path: {}\nregistry valid: {}\nregistry message: {}\nconfig path: {}\nconfig exists: {}\nconfig valid: {}\nconfig message: {}\nknown_hosts path: {}\npolicy path: {}\npolicy present: {}\npolicy valid: {}\npolicy enabled: {}\naudit path: {}\naudit writable: {}\ncredential namespace: {}\nos: {}\nlibssh2 version: {}\nopenssl version: {}\ncredential backend: {}\ncredential available: {}\ncredential message: {}\n",
         home.root.display(),
         home.description,
         registry_path.display(),
+        registry_valid,
+        registry_message,
         config_path.display(),
-        config_path.exists(),
+        config_exists,
+        config_valid,
+        config_message,
         home.known_hosts_path.display(),
         home.policy_path.display(),
         policy.present,
@@ -800,7 +999,8 @@ where
     match &server.auth {
         AuthConfig::Password { credential } => {
             let password = credentials
-                .get_password(credential, &server.user)
+                .get_password_for(CredentialPurpose::Login, credential, &server.user)
+                .with_error_kind(ErrorKind::Auth)
                 .with_context(|| {
                     format!(
                         "missing credential entry for {} and user {}",
@@ -841,8 +1041,8 @@ fn resolve_run_target(
     target: Vec<String>,
     config: &SshwConfig,
 ) -> anyhow::Result<(String, String)> {
-    let (name, rest) =
-        split_target(&target, 1).ok_or_else(|| anyhow::anyhow!("run expects [name] <command>"))?;
+    let (name, rest) = split_target(&target, 1)
+        .ok_or_else(|| app_error(ErrorKind::Config, "run expects [name] <command>"))?;
     Ok((resolve_target_server(name, config)?, rest[0].clone()))
 }
 
@@ -851,8 +1051,9 @@ fn default_server_name(config: &SshwConfig) -> anyhow::Result<String> {
 }
 
 fn no_default_server_error() -> anyhow::Error {
-    anyhow::anyhow!(
-        "no default server configured; run 'sshw default <name>' to set one or pass an explicit server name"
+    app_error(
+        ErrorKind::Config,
+        "no default server configured; run 'sshw default <name>' to set one or pass an explicit server name",
     )
 }
 
@@ -861,7 +1062,7 @@ fn get_server<'a>(config: &'a SshwConfig, name: &str) -> anyhow::Result<&'a Serv
 }
 
 fn unknown_server(name: &str) -> anyhow::Error {
-    anyhow::anyhow!("unknown server '{name}'")
+    app_error(ErrorKind::Config, format!("unknown server '{name}'"))
 }
 
 fn missing_credentials<C>(credentials: &C, config: &SshwConfig) -> Vec<String>
@@ -873,7 +1074,7 @@ where
         .iter()
         .filter_map(|(name, server)| match &server.auth {
             AuthConfig::Password { credential } => credentials
-                .get_password(credential, &server.user)
+                .get_password_for(CredentialPurpose::Login, credential, &server.user)
                 .err()
                 .map(|_| name.clone()),
             AuthConfig::Agent => None,
@@ -917,6 +1118,7 @@ fn error_json_line(response: &ErrorResponse) -> String {
                 error: crate::output::ErrorBody {
                     kind: ErrorKind::Unknown,
                     message: format!("failed to serialize error response: {err}"),
+                    causes: Vec::new(),
                     exit_code: ErrorKind::Unknown.exit_code(),
                 },
             };
@@ -931,16 +1133,57 @@ fn error_json_line(response: &ErrorResponse) -> String {
 }
 
 fn print_output(output: CommandOutput) -> i32 {
-    print!("{}", output.stdout);
-    eprint!("{}", output.stderr);
-    output.exit_code
+    let stdout = io::stdout();
+    let stderr = io::stderr();
+    let result = write_command_output(&output, &mut stdout.lock(), &mut stderr.lock());
+    output_exit_code(output.exit_code, result)
+}
+
+fn write_command_output<W, E>(
+    output: &CommandOutput,
+    stdout: &mut W,
+    stderr: &mut E,
+) -> io::Result<()>
+where
+    W: Write,
+    E: Write,
+{
+    stdout.write_all(output.stdout.as_bytes())?;
+    stdout.flush()?;
+    stderr.write_all(output.stderr.as_bytes())?;
+    stderr.flush()
+}
+
+fn output_exit_code(intended: i32, write_result: io::Result<()>) -> i32 {
+    match write_result {
+        Ok(()) => intended,
+        Err(err) if err.kind() == io::ErrorKind::BrokenPipe => intended,
+        Err(_) => ErrorKind::Io.exit_code(),
+    }
 }
 
 /// Whether `--json` appears in the process arguments. Parsing already failed by
 /// the time this is consulted, so the raw args are scanned directly to decide
 /// how to format a clap usage error.
 fn json_requested_in_args() -> bool {
-    std::env::args().skip(1).any(|arg| arg == "--json")
+    json_requested_in_args_iter(std::env::args_os().skip(1))
+}
+
+fn json_requested_in_args_iter<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    for arg in args {
+        let arg = arg.as_ref();
+        if arg == OsStr::new("--") {
+            return false;
+        }
+        if arg == OsStr::new("--json") {
+            return true;
+        }
+    }
+    false
 }
 
 /// Map a clap parse failure to a [`CommandOutput`]. Help/version requests are
@@ -974,6 +1217,7 @@ fn parse_error_output(err: clap::Error, json: bool) -> CommandOutput {
             error: crate::output::ErrorBody {
                 kind,
                 message: clap_usage_summary(&rendered),
+                causes: Vec::new(),
                 exit_code,
             },
         };
@@ -1174,12 +1418,121 @@ mod runtime_backend_tests {
             "native homes must not read or clear SSHW_PASSWORD"
         );
     }
+
+    #[test]
+    fn timeout_override_preserves_default_and_supports_explicit_opt_out() {
+        assert_eq!(operation_timeout_override(None), None);
+        assert_eq!(operation_timeout_override(Some(0)), Some(None));
+        assert_eq!(
+            operation_timeout_override(Some(12)),
+            Some(Some(Duration::from_secs(12)))
+        );
+    }
+
+    #[test]
+    fn explicit_home_resolution_does_not_load_corrupt_registry() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("profiles.json"), "{").unwrap();
+        let home = temp.path().join("ad-hoc");
+        let cli = Cli::try_parse_from(["sshw", "--home", home.to_str().unwrap(), "list"]).unwrap();
+
+        let (resolved, registry_path) = resolve_runtime_with_base(&cli, temp.path(), None).unwrap();
+
+        assert_eq!(resolved.root, home);
+        assert_eq!(registry_path, temp.path().join("profiles.json"));
+    }
+
+    #[test]
+    fn doctor_falls_back_only_when_the_registry_is_invalid() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("profiles.json"),
+            r#"{"version":1,"default":"legacy","profiles":{"legacy":{"id":"p_legacy","home":"relative/home"}}}"#,
+        )
+        .unwrap();
+
+        let doctor = Cli::try_parse_from(["sshw", "doctor", "--json"]).unwrap();
+        let (resolved, _) = resolve_runtime_with_base(&doctor, temp.path(), None).unwrap();
+        assert_eq!(resolved.root, temp.path().join("profiles").join("default"));
+
+        let explicit_home = temp.path().join("explicit");
+        let conflicting = Cli::try_parse_from([
+            "sshw",
+            "--home",
+            explicit_home.to_str().unwrap(),
+            "--profile",
+            "legacy",
+            "doctor",
+        ])
+        .unwrap();
+        assert!(resolve_runtime_with_base(&conflicting, temp.path(), None).is_err());
+
+        let list = Cli::try_parse_from(["sshw", "list"]).unwrap();
+        assert!(resolve_runtime_with_base(&list, temp.path(), None).is_err());
+
+        std::fs::write(
+            temp.path().join("profiles.json"),
+            r#"{"version":1,"default":null,"profiles":{}}"#,
+        )
+        .unwrap();
+        let unknown = Cli::try_parse_from(["sshw", "--profile", "missing", "doctor"]).unwrap();
+        assert!(resolve_runtime_with_base(&unknown, temp.path(), None).is_err());
+    }
+
+    #[test]
+    fn profile_remove_reaches_the_recovery_loader() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("profiles.json"), "{").unwrap();
+        let remove = Cli::try_parse_from(["sshw", "profile", "remove", "legacy"]).unwrap();
+
+        let (resolved, _) = resolve_runtime_with_base(&remove, temp.path(), None).unwrap();
+
+        assert_eq!(resolved.root, temp.path().join("profiles").join("default"));
+    }
+
+    #[test]
+    fn all_profile_commands_use_the_global_profile_audit_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = temp.path().join("profiles.json");
+        let active =
+            ResolvedHome::ad_hoc(&temp.path().join("active"), "active test home".to_string());
+        let expected = temp
+            .path()
+            .join("profiles")
+            .join("default")
+            .join("audit.jsonl");
+        let profile_home = temp.path().join("prod");
+        let commands = [
+            Cli::try_parse_from([
+                "sshw",
+                "--home",
+                profile_home.to_str().unwrap(),
+                "profile",
+                "add",
+                "prod",
+            ])
+            .unwrap(),
+            Cli::try_parse_from(["sshw", "profile", "default", "prod"]).unwrap(),
+            Cli::try_parse_from(["sshw", "profile", "remove", "prod"]).unwrap(),
+        ];
+
+        for cli in commands {
+            assert_eq!(runtime_audit_path(&cli, &active, &registry), expected);
+        }
+
+        let list = Cli::try_parse_from(["sshw", "list"]).unwrap();
+        assert_eq!(
+            runtime_audit_path(&list, &active, &registry),
+            active.audit_path
+        );
+    }
 }
 
 #[cfg(test)]
 mod parse_error_tests {
     use super::*;
     use crate::output::ErrorKind;
+    use std::io::{self, Write};
 
     fn parse_err(args: &[&str]) -> clap::Error {
         Cli::try_parse_from(args).unwrap_err()
@@ -1212,6 +1565,55 @@ mod parse_error_tests {
         assert_eq!(out.exit_code, 0);
         assert!(!out.stdout.is_empty());
         assert!(out.stderr.is_empty());
+    }
+
+    #[test]
+    fn raw_json_detection_stops_at_the_end_of_options_marker() {
+        assert!(json_requested_in_args_iter(["run", "--json"]));
+        assert!(!json_requested_in_args_iter(["run", "--", "--json"]));
+    }
+
+    struct BrokenPipeWriter;
+
+    impl Write for BrokenPipeWriter {
+        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed pipe"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn broken_pipe_preserves_an_intended_failure_exit() {
+        let output = CommandOutput {
+            stdout: "payload".to_string(),
+            stderr: String::new(),
+            exit_code: 7,
+        };
+        let result = write_command_output(&output, &mut BrokenPipeWriter, &mut Vec::new());
+
+        assert_eq!(output_exit_code(output.exit_code, result), 7);
+    }
+
+    #[test]
+    fn broken_pipe_is_normal_termination_for_successful_output() {
+        let output = CommandOutput {
+            stdout: "payload".to_string(),
+            stderr: String::new(),
+            exit_code: 0,
+        };
+        let result = write_command_output(&output, &mut BrokenPipeWriter, &mut Vec::new());
+
+        assert_eq!(output_exit_code(output.exit_code, result), 0);
+    }
+
+    #[test]
+    fn non_pipe_output_failure_is_an_io_error() {
+        let result = Err(io::Error::other("console unavailable"));
+
+        assert_eq!(output_exit_code(0, result), ErrorKind::Io.exit_code());
     }
 }
 

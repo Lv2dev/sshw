@@ -1,4 +1,4 @@
-use sshw::home::ResolvedHome;
+use sshw::home::{CredentialNamespace, CredentialPurpose, ResolvedHome, validate_server_name};
 use sshw::profile::{ProfileRegistry, resolve_home_with_registry};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -102,4 +102,92 @@ fn from_config_path_treats_parent_directory_as_home() {
     assert_eq!(resolved.policy_path, PathBuf::from("/tmp/x/policy.json"));
     assert_eq!(resolved.audit_path, PathBuf::from("/tmp/x/audit.jsonl"));
     assert!(resolved.namespace.token().starts_with("home_"));
+}
+
+#[test]
+fn v2_credential_keys_are_typed_and_delimiter_safe() {
+    let namespace = CredentialNamespace::profile("default");
+
+    let login = namespace.credential_key_v2(
+        CredentialPurpose::Login,
+        "privilege:web",
+        "0000000000000001",
+    );
+    let privilege =
+        namespace.credential_key_v2(CredentialPurpose::Privilege, "web", "0000000000000001");
+
+    assert_ne!(login, privilege);
+    assert!(!login.contains(":privilege:web:"));
+    assert!(namespace.credential_key_matches(CredentialPurpose::Login, "privilege:web", &login));
+    assert!(namespace.credential_key_matches(CredentialPurpose::Privilege, "web", &privilege));
+}
+
+#[test]
+fn v2_credential_keys_are_injective_across_alias_and_purpose_pairs() {
+    let namespace = CredentialNamespace::profile("profile:with:delimiters");
+    let aliases = ["web", "db", "a:b", "privilege:web", "server-alpha"];
+    let purposes = [CredentialPurpose::Login, CredentialPurpose::Privilege];
+
+    for left_alias in aliases {
+        for left_purpose in purposes {
+            let left = namespace.credential_key_v2(left_purpose, left_alias, "0000000000000001");
+            for right_alias in aliases {
+                for right_purpose in purposes {
+                    let right =
+                        namespace.credential_key_v2(right_purpose, right_alias, "0000000000000001");
+                    assert_eq!(
+                        left == right,
+                        left_alias == right_alias && left_purpose == right_purpose,
+                        "left={left_purpose:?}:{left_alias}, right={right_purpose:?}:{right_alias}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn v2_credential_key_validation_rejects_cross_boundary_references() {
+    let namespace = CredentialNamespace::profile("profile-a");
+    let other = CredentialNamespace::profile("profile-b");
+    let key = namespace.credential_key_v2(CredentialPurpose::Login, "web", "0000000000000001");
+
+    assert!(!other.credential_key_matches(CredentialPurpose::Login, "web", &key));
+    assert!(!namespace.credential_key_matches(CredentialPurpose::Privilege, "web", &key));
+    assert!(!namespace.credential_key_matches(CredentialPurpose::Login, "db", &key));
+    assert!(!namespace.credential_key_matches(CredentialPurpose::Login, "web", "sshw:v2:broken"));
+}
+
+#[test]
+fn legacy_credential_keys_are_accepted_only_for_the_expected_owner() {
+    let namespace = CredentialNamespace::profile("default");
+    let login = namespace.legacy_credential_key("web");
+    let privilege = namespace.legacy_privilege_credential_key("web");
+
+    assert!(namespace.credential_key_matches(CredentialPurpose::Login, "web", &login));
+    assert!(namespace.credential_key_matches(CredentialPurpose::Privilege, "web", &privilege));
+    assert!(!namespace.credential_key_matches(CredentialPurpose::Login, "db", &login));
+}
+
+#[test]
+fn generated_credential_keys_use_distinct_generations() {
+    let namespace = CredentialNamespace::profile("default");
+
+    let first = namespace.new_credential_key(CredentialPurpose::Login, "web");
+    let second = namespace.new_credential_key(CredentialPurpose::Login, "web");
+
+    assert_ne!(first, second);
+    assert!(namespace.credential_key_matches(CredentialPurpose::Login, "web", &first));
+    assert!(namespace.credential_key_matches(CredentialPurpose::Login, "web", &second));
+}
+
+#[test]
+fn server_names_reject_empty_control_and_reserved_forms() {
+    assert!(validate_server_name("web").is_ok());
+    assert!(validate_server_name("서버-alpha").is_ok());
+    assert!(validate_server_name("").is_err());
+    assert!(validate_server_name("privilege:web").is_err());
+    assert!(validate_server_name("line\nbreak").is_err());
+    assert!(validate_server_name("carriage\rreturn").is_err());
+    assert!(validate_server_name("nul\0byte").is_err());
 }

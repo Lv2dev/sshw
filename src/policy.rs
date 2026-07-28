@@ -3,11 +3,14 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 
+const POLICY_VERSION: u32 = 1;
+
 /// On-disk policy document (`<home>/policy.json`). Every field defaults so a
 /// minimal `{ "enabled": true, "allow_commands": ["ls"] }` parses.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyFile {
-    #[serde(default)]
+    #[serde(default = "current_policy_version")]
     pub version: u32,
     #[serde(default)]
     pub enabled: bool,
@@ -17,6 +20,22 @@ pub struct PolicyFile {
     pub allow_put_paths: Vec<String>,
     #[serde(default)]
     pub allow_get_paths: Vec<String>,
+}
+
+impl Default for PolicyFile {
+    fn default() -> Self {
+        Self {
+            version: POLICY_VERSION,
+            enabled: false,
+            allow_commands: Vec::new(),
+            allow_put_paths: Vec::new(),
+            allow_get_paths: Vec::new(),
+        }
+    }
+}
+
+fn current_policy_version() -> u32 {
+    POLICY_VERSION
 }
 
 /// Resolved enforcement state for an invocation.
@@ -84,7 +103,7 @@ pub struct PolicyStatus {
 /// Otherwise enforcement is enabled when `--policy` is set or the file's
 /// `enabled` flag is true.
 pub fn resolve_policy(policy_path: &Path, force_enable: bool) -> Result<Policy> {
-    if !policy_path.exists() {
+    let Some(contents) = read_optional_policy(policy_path)? else {
         if force_enable {
             return Err(anyhow::anyhow!(
                 "policy enforcement requested (--policy) but no policy file at {}",
@@ -92,17 +111,8 @@ pub fn resolve_policy(policy_path: &Path, force_enable: bool) -> Result<Policy> 
             ));
         }
         return Ok(Policy::Disabled);
-    }
-
-    let contents = fs::read_to_string(policy_path).map_err(|err| {
-        anyhow::anyhow!(
-            "failed to read policy file at {}: {err}",
-            policy_path.display()
-        )
-    })?;
-    let file: PolicyFile = serde_json::from_str(&contents).map_err(|err| {
-        anyhow::anyhow!("invalid policy file at {}: {err}", policy_path.display())
-    })?;
+    };
+    let file = parse_policy_file(policy_path, &contents)?;
 
     if force_enable || file.enabled {
         Ok(Policy::Enabled(PolicyRules {
@@ -117,29 +127,68 @@ pub fn resolve_policy(policy_path: &Path, force_enable: bool) -> Result<Policy> 
 
 /// Describe the policy file without enforcing or erroring, for `doctor`.
 pub fn describe_policy(policy_path: &Path, force_enable: bool) -> PolicyStatus {
-    if !policy_path.exists() {
-        return PolicyStatus {
+    match read_optional_policy(policy_path) {
+        Ok(None) => PolicyStatus {
             present: false,
             valid: true,
             enabled: force_enable,
-        };
-    }
-
-    match fs::read_to_string(policy_path)
-        .ok()
-        .and_then(|contents| serde_json::from_str::<PolicyFile>(&contents).ok())
-    {
-        Some(file) => PolicyStatus {
-            present: true,
-            valid: true,
-            enabled: force_enable || file.enabled,
         },
-        None => PolicyStatus {
+        Ok(Some(contents)) => match parse_policy_file(policy_path, &contents) {
+            Ok(file) => PolicyStatus {
+                present: true,
+                valid: true,
+                enabled: force_enable || file.enabled,
+            },
+            Err(_) => PolicyStatus {
+                present: true,
+                valid: false,
+                enabled: force_enable,
+            },
+        },
+        Err(_) => PolicyStatus {
             present: true,
             valid: false,
             enabled: force_enable,
         },
     }
+}
+
+fn read_optional_policy(path: &Path) -> Result<Option<String>> {
+    match fs::read_to_string(path) {
+        Ok(contents) => Ok(Some(contents)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            match fs::symlink_metadata(path) {
+                Err(metadata_err) if metadata_err.kind() == std::io::ErrorKind::NotFound => {
+                    Ok(None)
+                }
+                Err(metadata_err) => Err(anyhow::anyhow!(
+                    "failed to read policy file at {}: {metadata_err}",
+                    path.display()
+                )),
+                Ok(_) => Err(anyhow::anyhow!(
+                    "failed to read policy file at {}: {err}",
+                    path.display()
+                )),
+            }
+        }
+        Err(err) => Err(anyhow::anyhow!(
+            "failed to read policy file at {}: {err}",
+            path.display()
+        )),
+    }
+}
+
+fn parse_policy_file(path: &Path, contents: &str) -> Result<PolicyFile> {
+    let file: PolicyFile = serde_json::from_str(contents)
+        .map_err(|err| anyhow::anyhow!("invalid policy file at {}: {err}", path.display()))?;
+    if file.version != POLICY_VERSION {
+        return Err(anyhow::anyhow!(
+            "invalid policy file at {}: unsupported policy version {}; supported version is {POLICY_VERSION}",
+            path.display(),
+            file.version
+        ));
+    }
+    Ok(file)
 }
 
 fn command_matches_simple(entry: &str, command: &str) -> bool {

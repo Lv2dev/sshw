@@ -1,13 +1,29 @@
 use anyhow::Result;
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use directories::BaseDirs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialPurpose {
+    Login,
+    Privilege,
+}
+
+impl CredentialPurpose {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Login => "login",
+            Self::Privilege => "privilege",
+        }
+    }
+}
 
 /// Keyring namespace for a resolved home/profile.
 ///
-/// Credential entries are always namespaced as `sshw:<token>:<server>` so that
-/// the same server name in different profiles/homes never collides in the OS
-/// credential store.
+/// New credential entries use an encoded, purpose-aware, generation-qualified
+/// v2 key. Legacy v1 keys remain recognizable for existing configurations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CredentialNamespace {
     token: String,
@@ -33,13 +49,118 @@ impl CredentialNamespace {
         &self.token
     }
 
-    pub fn credential_key(&self, server: &str) -> String {
+    pub fn legacy_credential_key(&self, server: &str) -> String {
         format!("sshw:{}:{}", self.token, server)
     }
 
-    pub fn privilege_credential_key(&self, server: &str) -> String {
+    pub fn legacy_privilege_credential_key(&self, server: &str) -> String {
         format!("sshw:{}:privilege:{}", self.token, server)
     }
+
+    /// Backward-compatible name for callers that still need the v1 login key.
+    pub fn credential_key(&self, server: &str) -> String {
+        self.legacy_credential_key(server)
+    }
+
+    /// Backward-compatible name for callers that still need the v1 privilege key.
+    pub fn privilege_credential_key(&self, server: &str) -> String {
+        self.legacy_privilege_credential_key(server)
+    }
+
+    pub fn new_credential_key(&self, purpose: CredentialPurpose, server: &str) -> String {
+        self.credential_key_v2(purpose, server, &credential_generation())
+    }
+
+    pub fn credential_key_v2(
+        &self,
+        purpose: CredentialPurpose,
+        server: &str,
+        generation: &str,
+    ) -> String {
+        let token = URL_SAFE_NO_PAD.encode(self.token.as_bytes());
+        let server = URL_SAFE_NO_PAD.encode(server.as_bytes());
+        format!("sshw:v2:{token}:{}:{server}:{generation}", purpose.label())
+    }
+
+    pub fn credential_key_matches(
+        &self,
+        purpose: CredentialPurpose,
+        server: &str,
+        credential: &str,
+    ) -> bool {
+        let legacy = match purpose {
+            CredentialPurpose::Login => self.legacy_credential_key(server),
+            CredentialPurpose::Privilege => self.legacy_privilege_credential_key(server),
+        };
+        if credential == legacy {
+            return true;
+        }
+
+        let mut parts = credential.split(':');
+        let (
+            Some(prefix),
+            Some(version),
+            Some(token),
+            Some(key_purpose),
+            Some(key_server),
+            Some(generation),
+        ) = (
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+        )
+        else {
+            return false;
+        };
+        if parts.next().is_some()
+            || prefix != "sshw"
+            || version != "v2"
+            || key_purpose != purpose.label()
+            || generation.is_empty()
+            || !generation.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return false;
+        }
+
+        let Ok(token) = URL_SAFE_NO_PAD.decode(token) else {
+            return false;
+        };
+        let Ok(key_server) = URL_SAFE_NO_PAD.decode(key_server) else {
+            return false;
+        };
+        token == self.token.as_bytes() && key_server == server.as_bytes()
+    }
+}
+
+pub fn validate_server_name(name: &str) -> Result<()> {
+    if name.trim().is_empty() {
+        return Err(anyhow::anyhow!("server name cannot be empty"));
+    }
+    if name.chars().any(char::is_control) {
+        return Err(anyhow::anyhow!(
+            "server name must not contain control characters"
+        ));
+    }
+    if name.starts_with("privilege:") {
+        return Err(anyhow::anyhow!(
+            "server name must not use the reserved 'privilege:' prefix"
+        ));
+    }
+    Ok(())
+}
+
+fn credential_generation() -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+    fnv1a_hex(&format!("{nanos}|{}|{counter}", std::process::id()))
 }
 
 /// Filesystem layout + credential namespace for the active home.

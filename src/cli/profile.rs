@@ -8,9 +8,15 @@ use super::{
     CommandOutput, ProfileAddArgs, ProfileArgs, ProfileCommand, ProfileDefaultArgs,
     ProfileListArgs, ProfileRemoveArgs, ProfileShowArgs, ok,
 };
+use crate::error::ResultErrorKindExt;
 use crate::home::generate_profile_id;
-use crate::profile::{ProfileEntry, ProfileRegistry, load_registry, save_registry};
+use crate::output::ErrorKind;
+use crate::profile::{
+    ProfileEntry, ProfileRegistry, RegistryRevision, load_registry_for_removal_with_revision,
+    load_registry_with_revision, save_registry_if_unchanged, validate_profile_name,
+};
 use serde_json::json;
+use std::fs;
 use std::path::Path;
 
 pub(super) fn run_profile(
@@ -18,23 +24,55 @@ pub(super) fn run_profile(
     registry_path: &Path,
     home_flag: Option<&Path>,
 ) -> anyhow::Result<CommandOutput> {
-    let mut registry = load_registry(registry_path)?;
+    run_profile_inner(args, registry_path, home_flag).with_error_kind(ErrorKind::Config)
+}
+
+fn run_profile_inner(
+    args: ProfileArgs,
+    registry_path: &Path,
+    home_flag: Option<&Path>,
+) -> anyhow::Result<CommandOutput> {
+    let _registry_lock = if profile_command_mutates_registry(&args.command) {
+        Some(crate::storage::acquire_exclusive_lock(
+            &registry_path.with_file_name(".profiles.lock"),
+        )?)
+    } else {
+        None
+    };
+    let (mut registry, revision) = match &args.command {
+        ProfileCommand::Remove(args) => {
+            load_registry_for_removal_with_revision(registry_path, &args.name)?
+        }
+        _ => load_registry_with_revision(registry_path)?,
+    };
     match args.command {
-        ProfileCommand::Add(a) => profile_add(a, home_flag, registry_path, &mut registry),
+        ProfileCommand::Add(a) => {
+            profile_add(a, home_flag, registry_path, &revision, &mut registry)
+        }
         ProfileCommand::List(a) => profile_list(a, &registry),
         ProfileCommand::Show(a) => profile_show(a, &registry),
-        ProfileCommand::Default(a) => profile_default(a, registry_path, &mut registry),
-        ProfileCommand::Remove(a) => profile_remove(a, registry_path, &mut registry),
+        ProfileCommand::Default(a) => profile_default(a, registry_path, &revision, &mut registry),
+        ProfileCommand::Remove(a) => profile_remove(a, registry_path, &revision, &mut registry),
     }
+}
+
+fn profile_command_mutates_registry(command: &ProfileCommand) -> bool {
+    matches!(
+        command,
+        ProfileCommand::Add(_) | ProfileCommand::Default(_) | ProfileCommand::Remove(_)
+    )
 }
 
 fn profile_add(
     args: ProfileAddArgs,
     home_flag: Option<&Path>,
     registry_path: &Path,
+    revision: &RegistryRevision,
     registry: &mut ProfileRegistry,
 ) -> anyhow::Result<CommandOutput> {
+    validate_profile_name(&args.name)?;
     let home = home_flag.ok_or_else(|| anyhow::anyhow!("profile add requires --home <path>"))?;
+    let home = normalize_profile_home(home)?;
     if registry.profiles.contains_key(&args.name) && !args.force {
         return Err(anyhow::anyhow!(
             "profile '{}' already exists; pass --force to overwrite",
@@ -42,24 +80,56 @@ fn profile_add(
         ));
     }
 
-    let id = generate_profile_id(&args.name, home);
+    let id = registry
+        .profiles
+        .get(&args.name)
+        .filter(|entry| same_profile_home(&entry.home, &home))
+        .map(|entry| entry.id.clone())
+        .unwrap_or_else(|| generate_profile_id(&args.name, &home));
     registry.profiles.insert(
         args.name.clone(),
         ProfileEntry {
             id,
-            home: home.to_path_buf(),
+            home: home.clone(),
         },
     );
     if registry.default.is_none() {
         registry.default = Some(args.name.clone());
     }
 
-    save_registry(registry_path, registry)?;
+    save_registry_if_unchanged(registry_path, registry, revision)?;
     Ok(ok(format!(
         "added profile {} -> {}\n",
         args.name,
         home.display()
     )))
+}
+
+fn same_profile_home(existing: &Path, requested: &Path) -> bool {
+    if existing == requested {
+        return true;
+    }
+    match (fs::canonicalize(existing), fs::canonicalize(requested)) {
+        (Ok(existing), Ok(requested)) => existing == requested,
+        _ => false,
+    }
+}
+
+fn normalize_profile_home(home: &Path) -> anyhow::Result<std::path::PathBuf> {
+    let absolute = std::path::absolute(home).map_err(|err| {
+        anyhow::anyhow!(
+            "profile add requires a valid --home path '{}': {err}",
+            home.display()
+        )
+    })?;
+    match fs::canonicalize(&absolute) {
+        Ok(canonical) => Ok(canonical),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(absolute),
+        Err(err) => Err(anyhow::anyhow!(
+            "failed to resolve profile home '{}': {err}",
+            absolute.display()
+        )),
+    }
 }
 
 fn profile_list(
@@ -131,6 +201,7 @@ fn profile_show(
 fn profile_default(
     args: ProfileDefaultArgs,
     registry_path: &Path,
+    revision: &RegistryRevision,
     registry: &mut ProfileRegistry,
 ) -> anyhow::Result<CommandOutput> {
     if !registry.profiles.contains_key(&args.name) {
@@ -138,13 +209,14 @@ fn profile_default(
     }
 
     registry.default = Some(args.name.clone());
-    save_registry(registry_path, registry)?;
+    save_registry_if_unchanged(registry_path, registry, revision)?;
     Ok(ok(format!("default profile set to {}\n", args.name)))
 }
 
 fn profile_remove(
     args: ProfileRemoveArgs,
     registry_path: &Path,
+    revision: &RegistryRevision,
     registry: &mut ProfileRegistry,
 ) -> anyhow::Result<CommandOutput> {
     if registry.profiles.remove(&args.name).is_none() {
@@ -154,9 +226,9 @@ fn profile_remove(
         registry.default = registry.profiles.keys().next().cloned();
     }
 
-    save_registry(registry_path, registry)?;
+    save_registry_if_unchanged(registry_path, registry, revision)?;
     Ok(ok(format!(
-        "removed profile {} (home directory and credentials left intact)\n",
+        "removed profile {} (home and keyring entries left intact; re-adding creates a fresh credential namespace)\n",
         args.name
     )))
 }
