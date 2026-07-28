@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
 
 const RUST_TOOLCHAIN_ACTION: &str =
-    "dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88";
+    "dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c";
 const WORKFLOWS: &[&str] = &[
     ".github/workflows/ci.yml",
     ".github/workflows/fuzz.yml",
