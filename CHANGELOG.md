@@ -35,10 +35,12 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 - SSH channel input now sends EOF/VEOF correctly, stdout and stderr are drained together, remote non-zero notes always start on a new line, and signal/missing-marker/timeout/output-limit failures map to typed errors.
 - Piped output ending in a broken pipe no longer panics: successful output remains exit 0 while an intended failure keeps its original non-zero code. Other output I/O failures use exit code 6, and raw `--json` detection no longer scans past `--`.
 - JSON and human output redact exact loaded login credentials in addition to privilege credentials, and remote failures preserve their full redacted cause chain for diagnostics.
+- On Windows under Git Bash/MSYS, `put` and `get` SSH failures caused by automatic remote-path argument conversion now include an actionable `MSYS2_ARG_CONV_EXCL='*'` hint without changing the typed `ssh` error or exit code 5.
 
 ### Documentation
 - README, `sshw --help`, and `SECURITY.md` now describe the total connection budget, operation bounds, audit coverage, JSON cause chains, deterministic packaging limits, and a dated residual-risk register.
 - Added contributor and report templates that prohibit real credentials or private infrastructure data and document the complete local verification flow.
+- README now documents safe Git Bash and PowerShell transfer paths and a shell-independent `git archive` workflow that excludes build output.
 
 ## [0.9.1] - 2026-07-06
 

@@ -205,6 +205,34 @@ Global flags (available on every command): `--home <path>`, `--profile <name>`, 
 
 When the name is omitted for `run`/`put`/`get`, the configured default server is used.
 
+### Windows Shell Paths
+
+Git Bash/MSYS automatically converts path-like arguments passed to native Windows executables. That conversion can rewrite a remote POSIX path such as `/tmp/artifact.tgz` into a local Windows path before `sshw` sees it, producing an SSH failure (exit 5). Disable argument conversion for the invocation and write the local path in Windows form:
+
+```bash
+MSYS2_ARG_CONV_EXCL='*' sshw put server-alpha \
+  'C:/path/artifact.tgz' \
+  '/tmp/artifact.tgz'
+```
+
+The same rule applies to `get`. In PowerShell, use a normal Windows local path and quote the remote path:
+
+```powershell
+sshw put server-alpha 'C:\path\artifact.tgz' '/tmp/artifact.tgz'
+```
+
+Windows accepts both `C:\path\file` and `C:/path/file` as local paths; backslashes are shown for the native PowerShell form. A missing or unreadable local file is an I/O failure (exit 6), while a converted remote path can surface later as an SSH failure (exit 5).
+
+To transfer the tracked source tree, create the archive from Git instead of archiving the working directory or `target`:
+
+```powershell
+$archive = Join-Path $env:TEMP 'sshw-src.tgz'
+git archive --format=tar.gz --output="$archive" HEAD
+sshw put server-alpha "$archive" '/tmp/sshw-src.tgz'
+```
+
+`git archive` includes only files tracked in the selected commit, so it excludes `.git`, `target`, untracked files, and uncommitted changes. This also avoids depending on whether the shell resolves `tar` to Windows bsdtar, Git's GNU tar, or a WSL executable.
+
 ### Safety Rails
 
 Dangerous commands such as `rm -rf`, `sudo`, `chmod -R`, `chown -R`, `pm2 delete`, and obvious writes to `/etc` require `--yes`. `sshw get` will not overwrite an existing local file without `--yes`. `sshw put` creates remote files with owner-only permissions where the server honors SCP modes. These are safety rails, not a security sandbox.
@@ -529,6 +557,36 @@ sshw profile <add|list|show|default|remove> ...
 전역 플래그(모든 명령에서 사용): `--home <path>`, `--profile <name>`, `--policy`, `--timeout <seconds>`.
 
 `--timeout`은 연결 수립 이후 `run`/`put`/`get`의 원격 작업 단계에 적용되는 절대 타임아웃(초)이며, 출력이나 전송 진행이 있어도 기한이 연장되지 않습니다. 플래그를 생략하면 기본 900초, `0`은 기한을 명시적으로 해제합니다. DNS 해석, 해석된 모든 주소에 대한 연결 시도, TCP 수립, SSH handshake는 하나의 15초 연결 deadline을 공유합니다. `run`은 입력이 없어도 채널 stdin을 닫고 stdout/stderr를 동시에 배출합니다. 두 출력 합계가 16 MiB를 넘으면 잘린 성공 출력을 반환하지 않고 exit 5로 실패합니다. 원격 명령의 부작용은 이미 발생했을 수 있으므로 비멱등 작업을 무작정 재시도하지 마세요.
+
+`run`/`put`/`get`에서 이름을 생략하면 설정된 기본 서버를 사용합니다.
+
+### Windows 셸 경로
+
+Git Bash/MSYS는 Windows 네이티브 실행 파일에 전달하는 경로 형태의 인자를 자동 변환합니다. 이 과정에서 `/tmp/artifact.tgz` 같은 원격 POSIX 경로가 `sshw`에 도달하기 전에 로컬 Windows 경로로 바뀌어 SSH 실패(exit 5)가 발생할 수 있습니다. 호출 단위로 인자 변환을 끄고 로컬 경로를 Windows 형식으로 작성하세요.
+
+```bash
+MSYS2_ARG_CONV_EXCL='*' sshw put server-alpha \
+  'C:/path/artifact.tgz' \
+  '/tmp/artifact.tgz'
+```
+
+`get`에도 같은 규칙이 적용됩니다. PowerShell에서는 일반 Windows 로컬 경로를 사용하고 원격 경로를 따옴표로 감쌉니다.
+
+```powershell
+sshw put server-alpha 'C:\path\artifact.tgz' '/tmp/artifact.tgz'
+```
+
+Windows는 로컬 경로로 `C:\path\file`과 `C:/path/file`을 모두 허용합니다. 위 예시는 PowerShell의 네이티브 표기인 역슬래시를 사용했습니다. 로컬 파일이 없거나 읽을 수 없으면 I/O 실패(exit 6)이고, 변환된 원격 경로는 이후 SSH 실패(exit 5)로 나타날 수 있습니다.
+
+추적 중인 소스 트리를 전송할 때는 작업 디렉터리나 `target`을 직접 압축하지 말고 Git에서 아카이브를 생성하세요.
+
+```powershell
+$archive = Join-Path $env:TEMP 'sshw-src.tgz'
+git archive --format=tar.gz --output="$archive" HEAD
+sshw put server-alpha "$archive" '/tmp/sshw-src.tgz'
+```
+
+`git archive`는 선택한 커밋에서 Git이 추적하는 파일만 포함하므로 `.git`, `target`, 미추적 파일, 커밋하지 않은 변경 사항은 제외됩니다. 셸이 `tar`를 Windows bsdtar, Git의 GNU tar, WSL 실행 파일 중 무엇으로 해석하는지에도 의존하지 않습니다.
 
 ### Safety Rails
 

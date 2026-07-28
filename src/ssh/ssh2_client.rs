@@ -1368,6 +1368,26 @@ example.test ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB9zU1OEQ2tzYhrXq4/DEjvRNvKv6cU
         assert_eq!(contents, "first");
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn opens_windows_local_path_with_forward_slashes() {
+        use std::io::Read;
+        use std::path::Path;
+
+        let temp = tempfile::tempdir().unwrap();
+        let local = temp.path().join("artifact.bin");
+        std::fs::write(&local, b"sshw").unwrap();
+        let forward_slash_path = local.to_string_lossy().replace('\\', "/");
+
+        let (mut opened, metadata) =
+            super::open_regular_local_file(Path::new(&forward_slash_path)).unwrap();
+        let mut contents = Vec::new();
+        opened.read_to_end(&mut contents).unwrap();
+
+        assert_eq!(metadata.len(), 4);
+        assert_eq!(contents, b"sshw");
+    }
+
     #[test]
     fn op_timeout_millis_maps_none_to_unlimited_and_clamps() {
         assert_eq!(super::op_timeout_millis(None), 0);
