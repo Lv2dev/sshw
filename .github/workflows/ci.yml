@@ -59,7 +59,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends openssh-server openssh-client
           sudo mkdir -p /run/sshd
-      - run: cargo test --test integration_ssh --locked -- --ignored --test-threads=1
+      - name: Run integration tests
+        run: bash .github/scripts/run_ssh_integration.sh
 
   audit:
     runs-on: ubuntu-latest

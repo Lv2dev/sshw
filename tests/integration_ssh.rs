@@ -5,7 +5,7 @@
 //! them on Linux with:
 //!
 //! ```sh
-//! cargo test --test integration_ssh -- --ignored --test-threads=1
+//! bash .github/scripts/run_ssh_integration.sh
 //! ```
 //!
 //! `--test-threads=1` is required: the harness sets `SSH_AUTH_SOCK` in the
@@ -224,7 +224,6 @@ impl Drop for TestServer {
 struct DockerPasswordServer {
     _dir: TempDir,
     container_id: String,
-    image_tag: String,
     port: u16,
     known_hosts: PathBuf,
 }
@@ -239,23 +238,25 @@ impl DockerPasswordServer {
             return None;
         }
 
+        let image_tag = match std::env::var("SSHW_DOCKER_PASSWORD_IMAGE") {
+            Ok(value) if !value.trim().is_empty() => value,
+            _ if docker_required() => {
+                panic!(
+                    "a prebuilt password SSH image is required; run \
+                     bash .github/scripts/run_ssh_integration.sh"
+                );
+            }
+            _ => {
+                eprintln!(
+                    "skipping password auth integration test: run \
+                     bash .github/scripts/run_ssh_integration.sh to build the fixture"
+                );
+                return None;
+            }
+        };
+
         let dir = tempfile::tempdir().expect("tempdir");
         let known_hosts = dir.path().join("known_hosts");
-        let image_tag = format!("sshw-password-sshd:integration-{}", std::process::id());
-        let fixture_dir =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/password-sshd");
-
-        let build = Command::new("docker")
-            .args(["build", "-q", "-t"])
-            .arg(&image_tag)
-            .arg(&fixture_dir)
-            .output()
-            .expect("docker build");
-        assert!(
-            build.status.success(),
-            "docker build failed:\n{}",
-            String::from_utf8_lossy(&build.stderr)
-        );
 
         let port = free_port();
         let run = Command::new("docker")
@@ -290,7 +291,6 @@ impl DockerPasswordServer {
         Some(DockerPasswordServer {
             _dir: dir,
             container_id,
-            image_tag,
             port,
             known_hosts,
         })
@@ -319,12 +319,6 @@ impl Drop for DockerPasswordServer {
         let _ = Command::new("docker")
             .args(["rm", "-f"])
             .arg(&self.container_id)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        let _ = Command::new("docker")
-            .args(["rmi", "-f"])
-            .arg(&self.image_tag)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
