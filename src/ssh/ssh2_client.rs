@@ -1292,19 +1292,16 @@ example.test ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB9zU1OEQ2tzYhrXq4/DEjvRNvKv6cU
 
     #[test]
     fn resolver_wait_is_bounded_by_the_total_connect_deadline() {
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
         let deadline = super::ConnectDeadline::new(std::time::Duration::from_millis(25));
-        let started = std::time::Instant::now();
-        let err = super::resolve_with_deadline(&deadline, || {
-            std::thread::sleep(std::time::Duration::from_millis(200));
+        let err = super::resolve_with_deadline(&deadline, move || {
+            release_receiver.recv().unwrap();
             Ok(vec!["127.0.0.1:22".parse().unwrap()])
         })
         .unwrap_err();
+        release_sender.send(()).unwrap();
 
         assert!(err.to_string().contains("connect phase timed out"));
-        assert!(
-            started.elapsed() < std::time::Duration::from_millis(150),
-            "resolver wait exceeded the total deadline: {err:#}"
-        );
     }
 
     #[test]
