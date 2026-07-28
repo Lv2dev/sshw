@@ -8,6 +8,8 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-07-28
+
 ### Added
 - JSON failures now include an optional `causes` array with the full redacted cause chain while preserving the existing top-level `kind`, `message`, and `exit_code` contract.
 - Remote operations now have a 900-second absolute default deadline and fail if retained stdout plus stderr exceeds 16 MiB; `--timeout 0` remains an explicit operation-deadline opt-out.
@@ -26,6 +28,7 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 - DNS resolution, all resolved-address connection attempts, TCP setup, and the SSH handshake now share one decreasing 15-second connection budget.
 - Policy and profile mutations fail closed before side effects, profile mutation attempts and policy-setup failures are audited, and read-only commands avoid unnecessary credential-backend construction.
 - `cargo-deny` now rejects unsound advisories across the full transitive graph; GitHub Actions use immutable SHA pins with explicit toolchains, publishing uses a protected release environment, and tag/release protections are enabled in repository settings.
+- The direct `base64` dependency disables default features and enables only `std`, keeping the optional unsafe SIMD implementation out of the credential-namespace and fingerprint encoding paths.
 
 ### Fixed
 - Global `profile add/default/remove` audit records now use one deterministic built-in-default-home log instead of moving between the added, current-default, and recovery homes.
@@ -209,7 +212,8 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 
 - Initial public release: registered-server SSH `run`/`put`/`get` with secrets kept in the OS credential store, fail-closed `known_hosts` verification, and explicit `sshw trust`.
 
-[Unreleased]: https://github.com/Lv2dev/sshw/compare/v0.9.1...HEAD
+[Unreleased]: https://github.com/Lv2dev/sshw/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/Lv2dev/sshw/compare/v0.9.1...v0.10.0
 [0.9.1]: https://github.com/Lv2dev/sshw/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/Lv2dev/sshw/compare/v0.8.1...v0.9.0
 [0.8.1]: https://github.com/Lv2dev/sshw/compare/v0.8.0...v0.8.1
