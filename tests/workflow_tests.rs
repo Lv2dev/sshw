@@ -80,6 +80,65 @@ fn security_workflow_runs_locked_root_and_fuzz_audits_on_a_schedule() {
 }
 
 #[test]
+fn integration_workflow_builds_password_fixture_once_with_bounded_retries() {
+    let workflow = read_workflow(".github/workflows/ci.yml");
+    assert!(workflow.contains("run: bash .github/scripts/run_ssh_integration.sh"));
+
+    let script_path = repository_file(".github/scripts/run_ssh_integration.sh");
+    assert!(
+        script_path.is_file(),
+        "integration test runner script is missing"
+    );
+    let script = read_workflow(".github/scripts/run_ssh_integration.sh");
+    assert_eq!(
+        script.matches("docker build").count(),
+        1,
+        "the fixture build must have one shared call site"
+    );
+    for marker in [
+        "docker build --progress=plain",
+        "timeout --signal=TERM --kill-after=10s",
+        "SSHW_DOCKER_BUILD_TIMEOUT_SECONDS",
+        "SSHW_DOCKER_BUILD_ATTEMPTS",
+        "/etc/apt/sources.list.d/ubuntu.sources",
+        "mirror+file:",
+        "${ubuntu_mirror#mirror+file:}",
+        "UBUNTU_MIRROR=$ubuntu_mirror",
+        "trap cleanup EXIT",
+        "SSHW_DOCKER_PASSWORD_IMAGE=\"$image_tag\"",
+        "cargo test --test integration_ssh --locked -- --ignored --test-threads=1",
+    ] {
+        assert!(
+            script.contains(marker),
+            "integration test runner is missing {marker:?}"
+        );
+    }
+
+    let harness = read_workflow("tests/integration_ssh.rs");
+    assert!(harness.contains("std::env::var(\"SSHW_DOCKER_PASSWORD_IMAGE\")"));
+    assert!(
+        !harness.contains(".args([\"build\""),
+        "the Rust harness must consume the shared prebuilt image"
+    );
+    assert!(
+        !harness.contains(".args([\"rmi\""),
+        "the wrapper owns shared image cleanup"
+    );
+
+    let dockerfile = read_workflow("tests/fixtures/password-sshd/Dockerfile");
+    for marker in [
+        "ARG UBUNTU_MIRROR",
+        "Acquire::Retries=3",
+        "Acquire::http::Timeout=20",
+    ] {
+        assert!(
+            dockerfile.contains(marker),
+            "password fixture Dockerfile is missing {marker:?}"
+        );
+    }
+}
+
+#[test]
 fn release_publish_job_uses_protected_environment() {
     let workflow = read_workflow(".github/workflows/release.yml");
     let publish = workflow
