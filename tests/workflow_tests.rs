@@ -100,6 +100,8 @@ fn integration_workflow_builds_password_fixture_once_with_bounded_retries() {
         "timeout --signal=TERM --kill-after=10s",
         "SSHW_DOCKER_BUILD_TIMEOUT_SECONDS",
         "SSHW_DOCKER_BUILD_ATTEMPTS",
+        "/etc/apt/sources.list.d/ubuntu.sources",
+        "UBUNTU_MIRROR=$ubuntu_mirror",
         "trap cleanup EXIT",
         "SSHW_DOCKER_PASSWORD_IMAGE=\"$image_tag\"",
         "cargo test --test integration_ssh --locked -- --ignored --test-threads=1",
@@ -120,6 +122,18 @@ fn integration_workflow_builds_password_fixture_once_with_bounded_retries() {
         !harness.contains(".args([\"rmi\""),
         "the wrapper owns shared image cleanup"
     );
+
+    let dockerfile = read_workflow("tests/fixtures/password-sshd/Dockerfile");
+    for marker in [
+        "ARG UBUNTU_MIRROR",
+        "Acquire::Retries=3",
+        "Acquire::http::Timeout=20",
+    ] {
+        assert!(
+            dockerfile.contains(marker),
+            "password fixture Dockerfile is missing {marker:?}"
+        );
+    }
 }
 
 #[test]
