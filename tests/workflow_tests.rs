@@ -108,6 +108,18 @@ fn cargo_deny_rejects_unsound_advisories_in_transitive_dependencies() {
 }
 
 #[test]
+fn base64_dependency_disables_default_unsafe_simd_feature() {
+    let manifest = read_workflow("Cargo.toml");
+    let dependency = manifest
+        .lines()
+        .find(|line| line.starts_with("base64 = "))
+        .expect("base64 dependency is missing");
+
+    assert!(dependency.contains("default-features = false"));
+    assert!(dependency.contains(r#"features = ["std"]"#));
+}
+
+#[test]
 fn release_packaging_is_deterministic_for_the_same_binary_and_epoch() {
     let script = repository_file(".github/scripts/package_release.py");
     assert!(script.is_file(), "release packaging script is missing");
