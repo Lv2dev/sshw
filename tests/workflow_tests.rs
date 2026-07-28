@@ -155,6 +155,36 @@ fn release_publish_job_uses_protected_environment() {
 }
 
 #[test]
+fn release_workflow_installs_validation_components_and_recovers_exact_tags() {
+    let workflow = read_workflow(".github/workflows/release.yml");
+
+    for marker in [
+        "  workflow_dispatch:\n",
+        "  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}",
+        "  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}",
+        "          components: rustfmt, clippy",
+        "$env:RELEASE_TAG",
+        r#"gh release create "$RELEASE_TAG""#,
+    ] {
+        assert!(
+            workflow.contains(marker),
+            "release workflow is missing recovery contract {marker:?}"
+        );
+    }
+    assert_eq!(
+        workflow
+            .matches("          ref: refs/tags/${{ env.RELEASE_TAG }}")
+            .count(),
+        2,
+        "verify and build must both checkout the exact release tag"
+    );
+    assert!(
+        !workflow.contains("$GITHUB_REF_NAME"),
+        "release commands must use the normalized release tag"
+    );
+}
+
+#[test]
 fn cargo_deny_rejects_unsound_advisories_in_transitive_dependencies() {
     let config = fs::read_to_string(repository_file("deny.toml")).unwrap();
 
