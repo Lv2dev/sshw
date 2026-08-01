@@ -4,6 +4,8 @@ use std::process::Command as ProcessCommand;
 
 const RUST_TOOLCHAIN_ACTION: &str =
     "dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c";
+const CRATES_IO_AUTH_ACTION: &str =
+    "rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18";
 const WORKFLOWS: &[&str] = &[
     ".github/workflows/ci.yml",
     ".github/workflows/fuzz.yml",
@@ -155,6 +157,43 @@ fn release_publish_job_uses_protected_environment() {
 }
 
 #[test]
+fn release_publish_job_uses_checksum_gated_oidc_authentication() {
+    let workflow = read_workflow(".github/workflows/release.yml");
+    let publish = workflow
+        .split("\n  publish:\n")
+        .nth(1)
+        .expect("release workflow must contain a publish job");
+
+    for marker in [
+        "      id-token: write",
+        "          ref: refs/tags/${{ env.RELEASE_TAG }}",
+        CRATES_IO_AUTH_ACTION,
+        "        id: crates-io-auth",
+        "$published.version.checksum",
+        "$localChecksum",
+        "should_publish=true",
+        "should_publish=false",
+        "if: steps.crate-state.outputs.should_publish == 'true'",
+        "CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}",
+        "cargo publish --locked",
+    ] {
+        assert!(
+            publish.contains(marker),
+            "release publish job is missing OIDC contract {marker:?}"
+        );
+    }
+    assert_eq!(
+        workflow.matches("rust-lang/crates-io-auth-action@").count(),
+        1,
+        "release workflow must use one exact-pinned crates.io auth action"
+    );
+    assert!(
+        !workflow.contains("CRATES_IO_TOKEN") && !workflow.contains("CARGO_TOKEN"),
+        "release workflow must not depend on a long-lived crates.io secret"
+    );
+}
+
+#[test]
 fn release_workflow_installs_validation_components_and_recovers_exact_tags() {
     let workflow = read_workflow(".github/workflows/release.yml");
 
@@ -176,8 +215,8 @@ fn release_workflow_installs_validation_components_and_recovers_exact_tags() {
         workflow
             .matches("          ref: refs/tags/${{ env.RELEASE_TAG }}")
             .count(),
-        2,
-        "verify and build must both checkout the exact release tag"
+        3,
+        "verify, build, and publish must checkout the exact release tag"
     );
     assert!(
         !workflow.contains("$GITHUB_REF_NAME"),

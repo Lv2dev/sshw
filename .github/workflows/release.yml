@@ -135,6 +135,63 @@ jobs:
       attestations: write
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master action code
+        with:
+          toolchain: "1.97.0"
+      - name: Check crates.io publish state
+        id: crate-state
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
+          $rootPackageId = $metadata.workspace_default_members | Select-Object -First 1
+          $package = $metadata.packages | Where-Object { $_.id -eq $rootPackageId } | Select-Object -First 1
+          if ($null -eq $package) {
+            throw "workspace root package not found in cargo metadata"
+          }
+
+          cargo package --locked
+          if ($LASTEXITCODE -ne 0) {
+            throw "cargo package failed"
+          }
+          $cratePath = "target/package/$($package.name)-$($package.version).crate"
+          $localChecksum = (Get-FileHash -Algorithm SHA256 $cratePath).Hash.ToLowerInvariant()
+          $headers = @{
+            "User-Agent" = "sshw-release/$env:RELEASE_TAG (https://github.com/$env:GITHUB_REPOSITORY)"
+          }
+          $uri = "https://crates.io/api/v1/crates/$($package.name)/$($package.version)"
+
+          try {
+            $published = Invoke-RestMethod -Uri $uri -Headers $headers
+          } catch {
+            if ([int]$_.Exception.Response.StatusCode -eq 404) {
+              "should_publish=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+              exit 0
+            }
+            throw
+          }
+
+          $publishedChecksum = $published.version.checksum.ToLowerInvariant()
+          if ($publishedChecksum -ne $localChecksum) {
+            throw "published crate checksum does not match the exact release tag package"
+          }
+          if ($published.version.yanked) {
+            throw "the matching crates.io version is yanked"
+          }
+          "should_publish=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+      - name: Authenticate to crates.io
+        if: steps.crate-state.outputs.should_publish == 'true'
+        id: crates-io-auth
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+      - name: Publish crate to crates.io
+        if: steps.crate-state.outputs.should_publish == 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
+        run: cargo publish --locked
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: artifacts
