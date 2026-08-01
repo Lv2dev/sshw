@@ -8,6 +8,19 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-08-01
+
+### Added
+- Added a crates.io distribution package named `sshw-agent` that installs the existing `sshw` executable and preserves the `sshw` library target.
+- CI now packages the publishable source, installs the extracted package, and runs an installed-binary version smoke test on Linux, macOS, and Windows.
+
+### Changed
+- Restricted Cargo publishing to crates.io and reduced the `.crate` contents to source and user-facing build/license/security documents.
+- Release tag validation now identifies the workspace root package by Cargo package id instead of depending on the historical package name.
+
+### Documentation
+- Documented `cargo install sshw-agent --locked`, the package/executable naming difference, MSRV, native build prerequisites, and the Linux Secret Service runtime requirement in English and Korean.
+
 ## [0.10.0] - 2026-07-28
 
 ### Added
@@ -212,7 +225,8 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 
 - Initial public release: registered-server SSH `run`/`put`/`get` with secrets kept in the OS credential store, fail-closed `known_hosts` verification, and explicit `sshw trust`.
 
-[Unreleased]: https://github.com/Lv2dev/sshw/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/Lv2dev/sshw/compare/v0.10.1...HEAD
+[0.10.1]: https://github.com/Lv2dev/sshw/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/Lv2dev/sshw/compare/v0.9.1...v0.10.0
 [0.9.1]: https://github.com/Lv2dev/sshw/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/Lv2dev/sshw/compare/v0.8.1...v0.9.0

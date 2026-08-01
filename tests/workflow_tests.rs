@@ -163,6 +163,7 @@ fn release_workflow_installs_validation_components_and_recovers_exact_tags() {
         "  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}",
         "  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}",
         "          components: rustfmt, clippy",
+        "      - run: cargo package --locked",
         "$env:RELEASE_TAG",
         r#"gh release create "$RELEASE_TAG""#,
     ] {
@@ -182,6 +183,107 @@ fn release_workflow_installs_validation_components_and_recovers_exact_tags() {
         !workflow.contains("$GITHUB_REF_NAME"),
         "release commands must use the normalized release tag"
     );
+    assert!(
+        workflow.contains(
+            "$rootPackageId = $metadata.workspace_default_members | Select-Object -First 1"
+        ),
+        "release version validation must select the workspace root package id"
+    );
+    assert!(
+        workflow.contains("Where-Object { $_.id -eq $rootPackageId }"),
+        "release version validation must resolve the package by id"
+    );
+    assert!(
+        !workflow.contains("Where-Object { $_.name -eq \"sshw\" }"),
+        "release version validation must not depend on the historical package name"
+    );
+}
+
+#[test]
+fn crates_io_package_preserves_sshw_targets_and_excludes_repository_only_files() {
+    let manifest = read_workflow("Cargo.toml");
+    for marker in [
+        r#"name = "sshw-agent""#,
+        r#"publish = ["crates-io"]"#,
+        "autobins = false",
+        "[lib]",
+        "[[bin]]",
+        r#"sshw = { package = "sshw-agent", path = ".." }"#,
+    ] {
+        let source = if marker.starts_with("sshw =") {
+            read_workflow("fuzz/Cargo.toml")
+        } else {
+            manifest.clone()
+        };
+        assert!(
+            source.contains(marker),
+            "crates.io package contract is missing {marker:?}"
+        );
+    }
+    assert_eq!(
+        manifest.matches(r#"name = "sshw""#).count(),
+        2,
+        "library and binary targets must both retain the sshw name"
+    );
+
+    let output = ProcessCommand::new("cargo")
+        .current_dir(repository_file("."))
+        .args(["package", "--list", "--locked", "--allow-dirty"])
+        .output()
+        .expect("cargo package --list must run");
+    assert!(
+        output.status.success(),
+        "cargo package --list failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let files: Vec<_> = String::from_utf8(output.stdout)
+        .expect("cargo package file names must be UTF-8")
+        .lines()
+        .map(|line| line.replace('\\', "/"))
+        .collect();
+
+    for required in [
+        "Cargo.toml",
+        "Cargo.lock",
+        "README.md",
+        "LICENSE",
+        "build.rs",
+    ] {
+        assert!(
+            files.iter().any(|file| file == required),
+            "packaged crate is missing {required}"
+        );
+    }
+    for excluded in [
+        ".github/",
+        ".ai/",
+        "fuzz/",
+        "tests/",
+        "CONTRIBUTING.md",
+        "deny.toml",
+    ] {
+        assert!(
+            files.iter().all(|file| !file.starts_with(excluded)),
+            "packaged crate unexpectedly contains {excluded}"
+        );
+    }
+}
+
+#[test]
+fn ci_installs_and_smokes_the_packaged_crate_on_all_supported_host_os() {
+    let workflow = read_workflow(".github/workflows/ci.yml");
+    for marker in [
+        "matrix:\n        os: [ubuntu-latest, macos-latest, windows-latest]",
+        "cargo package --locked",
+        "cargo install --path $packagePath --locked --root $installRoot",
+        "$expectedVersion = \"sshw $($package.version)\"",
+        "$actualVersion = & $binary --version",
+    ] {
+        assert!(
+            workflow.contains(marker),
+            "CI packaged-install contract is missing {marker:?}"
+        );
+    }
 }
 
 #[test]
@@ -305,6 +407,18 @@ fn public_docs_cover_hardening_contracts_and_residual_risks() {
     ] {
         assert!(readme.contains(marker), "README is missing {marker:?}");
     }
+    assert_eq!(
+        readme.matches("cargo install sshw-agent --locked").count(),
+        2,
+        "README must document the crates.io install command in English and Korean"
+    );
+    assert_eq!(
+        readme.matches("Visual C++ Build Tools/Windows SDK").count(),
+        2,
+        "README must document Windows native build prerequisites in both languages"
+    );
+    assert!(readme.contains("The crates.io package is named `sshw-agent`"));
+    assert!(readme.contains("crates.io 패키지명은 `sshw-agent`"));
 
     let security = read_workflow("SECURITY.md");
     for marker in [
@@ -331,6 +445,7 @@ fn public_docs_cover_hardening_contracts_and_residual_risks() {
         "### Documentation",
         "deterministic release archives",
         "full redacted cause chain",
+        "crates.io distribution package named `sshw-agent`",
     ] {
         assert!(
             changelog.contains(marker),

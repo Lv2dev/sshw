@@ -1038,8 +1038,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "sshw"
-version = "0.10.0"
+name = "sshw-agent"
+version = "0.10.1"
 dependencies = [
  "anyhow",
  "apple-native-keyring-store",
@@ -1067,7 +1067,7 @@ version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
  "serde_json",
- "sshw",
+ "sshw-agent",
 ]
 
 [[package]]

@@ -12,7 +12,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 serde_json = "1.0"
-sshw = { path = ".." }
+sshw = { package = "sshw-agent", path = ".." }
 
 [[bin]]
 name = "redact_secrets"

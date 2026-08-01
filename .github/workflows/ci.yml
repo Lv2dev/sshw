@@ -31,6 +31,42 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
+      - name: Verify packaged Cargo install
+        shell: pwsh
+        run: |
+          cargo package --locked
+          if ($LASTEXITCODE -ne 0) {
+            throw "cargo package failed"
+          }
+
+          $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
+          $rootPackageId = $metadata.workspace_default_members | Select-Object -First 1
+          $package = $metadata.packages | Where-Object { $_.id -eq $rootPackageId } | Select-Object -First 1
+          if ($null -eq $package) {
+            throw "workspace root package not found in cargo metadata"
+          }
+
+          $packagePath = Join-Path "target/package" "$($package.name)-$($package.version)"
+          if (-not (Test-Path -LiteralPath $packagePath -PathType Container)) {
+            throw "packaged source directory not found: $packagePath"
+          }
+
+          $installRoot = Join-Path $env:RUNNER_TEMP "sshw-cargo-install"
+          cargo install --path $packagePath --locked --root $installRoot
+          if ($LASTEXITCODE -ne 0) {
+            throw "installing packaged crate failed"
+          }
+
+          $binaryName = if ("${{ runner.os }}" -eq "Windows") { "sshw.exe" } else { "sshw" }
+          $binary = Join-Path (Join-Path $installRoot "bin") $binaryName
+          $actualVersion = & $binary --version
+          if ($LASTEXITCODE -ne 0) {
+            throw "installed sshw version smoke failed"
+          }
+          $expectedVersion = "sshw $($package.version)"
+          if ($actualVersion -ne $expectedVersion) {
+            throw "installed version mismatch: expected '$expectedVersion', got '$actualVersion'"
+          }
 
   msrv:
     runs-on: ubuntu-latest
