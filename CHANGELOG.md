@@ -8,6 +8,9 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 
 ## [Unreleased]
 
+### Security
+- Future crates.io releases use a short-lived GitHub Actions OIDC token from an exact-pinned official action; recovery runs skip an existing version only when its registry checksum matches the package rebuilt from the immutable release tag.
+
 ## [0.10.1] - 2026-08-01
 
 ### Added
