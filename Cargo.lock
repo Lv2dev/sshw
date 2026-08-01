@@ -992,8 +992,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "sshw"
-version = "0.10.0"
+name = "sshw-agent"
+version = "0.10.1"
 dependencies = [
  "anyhow",
  "apple-native-keyring-store",

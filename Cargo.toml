@@ -1,6 +1,6 @@
 [package]
-name = "sshw"
-version = "0.10.0"
+name = "sshw-agent"
+version = "0.10.1"
 edition = "2024"
 rust-version = "1.88"
 description = "Cross-platform SSH helper for delegated local coding-agent access without plaintext secrets."
@@ -9,6 +9,25 @@ repository = "https://github.com/Lv2dev/sshw"
 readme = "README.md"
 keywords = ["ssh", "cli", "keyring", "automation"]
 categories = ["command-line-utilities", "authentication"]
+publish = ["crates-io"]
+autobins = false
+include = [
+    "src/**",
+    "build.rs",
+    "Cargo.lock",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    "SECURITY.md",
+]
+
+[lib]
+name = "sshw"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sshw"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.103"

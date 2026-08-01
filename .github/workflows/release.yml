@@ -43,9 +43,14 @@ jobs:
         shell: pwsh
         run: |
           $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
-          $package = $metadata.packages | Where-Object { $_.name -eq "sshw" } | Select-Object -First 1
+          $rootPackageId = $metadata.workspace_default_members | Select-Object -First 1
+          if ($null -eq $rootPackageId) {
+            Write-Error "workspace root package id not found in cargo metadata"
+            exit 1
+          }
+          $package = $metadata.packages | Where-Object { $_.id -eq $rootPackageId } | Select-Object -First 1
           if ($null -eq $package) {
-            Write-Error "package 'sshw' not found in cargo metadata"
+            Write-Error "workspace root package not found in cargo metadata"
             exit 1
           }
           $expectedTag = "v$($package.version)"
@@ -56,6 +61,7 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
+      - run: cargo package --locked
 
   build:
     needs: verify

@@ -30,6 +30,19 @@ It is **not a strong OS sandbox**. Specifically:
 
 `sshw` never stores passwords, private keys, passphrases, or tokens in its config files. Password auth stores the password only through the native OS credential store (or, opt-in, a session-only in-memory backend). Agent auth stores no secret and uses the user's active SSH agent.
 
+### Install With Cargo
+
+The crates.io package is named `sshw-agent`; it installs the `sshw` executable. Rust 1.88 or newer is required.
+
+```bash
+cargo install sshw-agent --locked
+sshw --version
+```
+
+Run the same `cargo install` command to upgrade when a newer version is available. `--locked` uses the dependency versions tested and published with the binary crate.
+
+Cargo installation compiles native dependencies. Unix builds require a C toolchain plus OpenSSL libraries and headers discoverable through `pkg-config` or the documented `OPENSSL_*` variables. Windows builds require the Rust MSVC toolchain and Visual C++ Build Tools/Windows SDK. macOS builds require Xcode Command Line Tools and a discoverable OpenSSL installation. On Linux, the native credential backend also requires a working Secret Service provider such as GNOME Keyring or KWallet at runtime.
+
 ### Install From Source
 
 ```bash
@@ -384,6 +397,19 @@ MIT
 - redaction과 audit redaction은 **best-effort**입니다. 흔한 형태(PEM 키, `keyword=value`, bearer 토큰)는 잡지만, 플래그로 전달된 비밀(`-p`, `-a`, 위치 인자 토큰)이나 여러 줄에 걸친 비밀은 못 잡을 수 있습니다. 비밀을 명령줄에 인라인으로 넘기지 말고 저장된 credential을 사용하세요.
 
 `sshw`는 비밀번호·개인키·패스프레이즈·토큰을 설정 파일에 저장하지 않습니다. password auth는 native OS credential store(또는 opt-in session-only in-memory backend)에만 저장하며, agent auth는 비밀을 저장하지 않고 사용자의 활성 SSH agent를 사용합니다.
+
+### Cargo로 설치
+
+crates.io 패키지명은 `sshw-agent`이고, 설치되는 실행 파일명은 `sshw`입니다. Rust 1.88 이상이 필요합니다.
+
+```bash
+cargo install sshw-agent --locked
+sshw --version
+```
+
+새 버전이 공개된 뒤 같은 `cargo install` 명령을 실행하면 업데이트됩니다. `--locked`는 binary crate와 함께 검증·게시된 dependency 버전을 사용합니다.
+
+Cargo 설치는 native dependency를 소스에서 컴파일합니다. Unix 빌드에는 C toolchain과 `pkg-config` 또는 문서화된 `OPENSSL_*` 환경 변수로 찾을 수 있는 OpenSSL library/header가 필요합니다. Windows 빌드에는 Rust MSVC toolchain과 Visual C++ Build Tools/Windows SDK가 필요합니다. macOS 빌드에는 Xcode Command Line Tools와 탐색 가능한 OpenSSL 설치가 필요합니다. Linux의 native credential backend는 실행 시 GNOME Keyring 또는 KWallet 같은 동작 중인 Secret Service provider도 필요합니다.
 
 ### 소스에서 설치
 
