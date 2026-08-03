@@ -8,6 +8,9 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 
 ## [Unreleased]
 
+### Changed
+- Raised the minimum supported Rust version from 1.88 to 1.89 and replaced the `fs2` advisory-lock dependency with Rust standard-library file locks while preserving the bounded audit and state-mutation lock behavior.
+
 ### Security
 - Future crates.io releases use a short-lived GitHub Actions OIDC token from an exact-pinned official action; recovery runs skip an existing version only when its registry checksum matches the package rebuilt from the immutable release tag.
 

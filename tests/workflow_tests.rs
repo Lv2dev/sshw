@@ -67,6 +67,39 @@ fn rust_toolchain_action_uses_master_history_pin_and_explicit_toolchain() {
 }
 
 #[test]
+fn msrv_uses_standard_file_locks_without_fs2() {
+    let root_manifest = read_workflow("Cargo.toml");
+    let fuzz_manifest = read_workflow("fuzz/Cargo.toml");
+    let ci = read_workflow(".github/workflows/ci.yml");
+    let storage = read_workflow("src/storage.rs");
+    let readme = read_workflow("README.md");
+    let contributing = read_workflow("CONTRIBUTING.md");
+
+    assert!(root_manifest.contains("rust-version = \"1.89\""));
+    assert!(fuzz_manifest.contains("rust-version = \"1.89\""));
+    assert!(ci.contains("toolchain: \"1.89\""));
+    assert_eq!(readme.matches("Rust 1.89").count(), 2);
+    assert!(contributing.contains("Rust 1.89 or newer"));
+    assert!(!root_manifest.contains("fs2 ="));
+    assert!(!storage.contains("fs2::"));
+    assert!(!storage.contains("raw_os_error() == Some(33)"));
+    assert!(storage.contains("TryLockError::WouldBlock"));
+    assert!(storage.contains("file.try_lock()"));
+    assert!(storage.contains("self.file.unlock()"));
+    for lockfile in ["Cargo.lock", "fuzz/Cargo.lock"] {
+        let lock = read_workflow(lockfile);
+        assert!(
+            !lock.contains("name = \"fs2\""),
+            "{lockfile} still contains fs2"
+        );
+        assert!(
+            !lock.contains("name = \"winapi\"\nversion = \"0.3.9\""),
+            "{lockfile} still contains fs2's legacy winapi dependency"
+        );
+    }
+}
+
+#[test]
 fn security_workflow_runs_locked_root_and_fuzz_audits_on_a_schedule() {
     let workflow = read_workflow(".github/workflows/security.yml");
 
@@ -462,7 +495,7 @@ fn public_docs_cover_hardening_contracts_and_residual_risks() {
     let security = read_workflow("SECURITY.md");
     for marker in [
         "## Residual Risk Register",
-        "Next review: 2026-10-11",
+        "Next review: 2026-11-03",
         "resolver worker",
         "bit-for-bit reproducibility",
         "pre-existing releases",
@@ -470,7 +503,7 @@ fn public_docs_cover_hardening_contracts_and_residual_risks() {
         "Short exact secrets",
         "Profile namespace rebinding",
         "100 milliseconds",
-        "MSRV-compatible advisory locks",
+        "standard-library file locks",
     ] {
         assert!(security.contains(marker), "SECURITY is missing {marker:?}");
     }

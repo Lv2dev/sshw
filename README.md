@@ -32,7 +32,7 @@ It is **not a strong OS sandbox**. Specifically:
 
 ### Install With Cargo
 
-The crates.io package is named `sshw-agent`; it installs the `sshw` executable. Rust 1.88 or newer is required.
+The crates.io package is named `sshw-agent`; it installs the `sshw` executable. Rust 1.89 or newer is required.
 
 ```bash
 cargo install sshw-agent --locked
@@ -400,7 +400,7 @@ MIT
 
 ### Cargo로 설치
 
-crates.io 패키지명은 `sshw-agent`이고, 설치되는 실행 파일명은 `sshw`입니다. Rust 1.88 이상이 필요합니다.
+crates.io 패키지명은 `sshw-agent`이고, 설치되는 실행 파일명은 `sshw`입니다. Rust 1.89 이상이 필요합니다.
 
 ```bash
 cargo install sshw-agent --locked
