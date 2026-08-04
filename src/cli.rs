@@ -552,7 +552,7 @@ fn audit_descriptor(command: &Command, config: &SshwConfig) -> Option<AuditDescr
             let (server, detail) = match split_target(&a.target, 2) {
                 Some((name, rest)) => (
                     name.map(str::to_string).or_else(default),
-                    Some(rest[1].clone()),
+                    Some(transfer::remote_path_for_audit(&rest[1])),
                 ),
                 None => (default(), None),
             };
@@ -563,7 +563,7 @@ fn audit_descriptor(command: &Command, config: &SshwConfig) -> Option<AuditDescr
             let (server, detail) = match split_target(&a.target, 2) {
                 Some((name, rest)) => (
                     name.map(str::to_string).or_else(default),
-                    Some(rest[0].clone()),
+                    Some(transfer::remote_path_for_audit(&rest[0])),
                 ),
                 None => (default(), None),
             };

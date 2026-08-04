@@ -8,10 +8,14 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 
 ## [Unreleased]
 
+### Added
+- Added a `remote:<absolute-path>` literal for `put` and `get`, allowing POSIX, Windows drive, and UNC remote absolute paths to survive Git Bash/MSYS argument conversion.
+
 ### Changed
 - Raised the minimum supported Rust version from 1.88 to 1.89 and replaced the `fs2` advisory-lock dependency with Rust standard-library file locks while preserving the bounded audit and state-mutation lock behavior.
 
 ### Security
+- Remote path literals are decoded before safety and policy checks, invalid or relative literal values fail closed as config errors, and audit/JSON/SSH use the same decoded path.
 - Future crates.io releases use a short-lived GitHub Actions OIDC token from an exact-pinned official action; recovery runs skip an existing version only when its registry checksum matches the package rebuilt from the immutable release tag.
 
 ## [0.10.1] - 2026-08-01

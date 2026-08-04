@@ -16,6 +16,19 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 #[test]
+fn transfer_help_documents_remote_absolute_literal() {
+    for command in ["put", "get"] {
+        let help = Cli::try_parse_from(["sshw", command, "--help"])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            help.contains("remote:/path"),
+            "{command} help did not document the remote literal: {help}"
+        );
+    }
+}
+
+#[test]
 fn parses_add_with_default_password_auth() {
     let cli = Cli::try_parse_from([
         "sshw",
@@ -2562,6 +2575,293 @@ fn get_json_reports_transfer_result() {
 }
 
 #[test]
+fn remote_absolute_literal_is_decoded_for_put_and_get() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &sample_config(&path)).unwrap();
+    let upload = temp.path().join("upload.bin");
+    let download = temp.path().join("download.bin");
+    std::fs::write(&upload, "binary").unwrap();
+    let store = FakeCredentialStore::default();
+    store
+        .set_password(
+            &login_credential(&path, "server-alpha"),
+            "deploy",
+            "YOUR_PASSWORD",
+        )
+        .unwrap();
+    let ssh = FakeSshClient::default();
+
+    let put = execute(
+        Cli::try_parse_from([
+            "sshw",
+            "put",
+            "server-alpha",
+            upload.to_str().unwrap(),
+            "remote:/tmp/upload.bin",
+            "--json",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut FakePrompter::default(),
+    )
+    .unwrap();
+    let put_json: serde_json::Value = serde_json::from_str(put.stdout.trim()).unwrap();
+    assert_eq!(put_json["remote"], "/tmp/upload.bin");
+    assert_eq!(ssh.put_calls.borrow().as_slice(), ["/tmp/upload.bin"]);
+
+    let get = execute(
+        Cli::try_parse_from([
+            "sshw",
+            "get",
+            "server-alpha",
+            "remote:/var/log/app.log",
+            download.to_str().unwrap(),
+            "--json",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut FakePrompter::default(),
+    )
+    .unwrap();
+    let get_json: serde_json::Value = serde_json::from_str(get.stdout.trim()).unwrap();
+    assert_eq!(get_json["remote"], "/var/log/app.log");
+    assert_eq!(
+        ssh.get_remote_calls.borrow().as_slice(),
+        ["/var/log/app.log"]
+    );
+}
+
+#[test]
+fn remote_absolute_literal_rejects_empty_and_relative_paths_before_ssh() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &sample_config(&path)).unwrap();
+    let upload = temp.path().join("upload.bin");
+    std::fs::write(&upload, "binary").unwrap();
+    let ssh = FakeSshClient::default();
+
+    let put = execute_for_runtime(
+        Cli::try_parse_from([
+            "sshw",
+            "put",
+            "server-alpha",
+            upload.to_str().unwrap(),
+            "remote:relative/file",
+            "--json",
+        ])
+        .unwrap(),
+        &path,
+        &FakeCredentialStore::default(),
+        &ssh,
+        &mut FakePrompter::default(),
+    );
+    let put_json: serde_json::Value = serde_json::from_str(put.stdout.trim()).unwrap();
+    assert_eq!(put.exit_code, 3);
+    assert_eq!(put_json["error"]["kind"], "config");
+
+    let get = execute_for_runtime(
+        Cli::try_parse_from([
+            "sshw",
+            "get",
+            "server-alpha",
+            "remote:",
+            temp.path().join("download.bin").to_str().unwrap(),
+            "--json",
+        ])
+        .unwrap(),
+        &path,
+        &FakeCredentialStore::default(),
+        &ssh,
+        &mut FakePrompter::default(),
+    );
+    let get_json: serde_json::Value = serde_json::from_str(get.stdout.trim()).unwrap();
+    assert_eq!(get.exit_code, 3);
+    assert_eq!(get_json["error"]["kind"], "config");
+    assert!(ssh.put_calls.borrow().is_empty());
+    assert!(ssh.get_remote_calls.borrow().is_empty());
+}
+
+#[test]
+fn remote_absolute_literal_cannot_bypass_safety_or_policy() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &sample_config(&path)).unwrap();
+    let upload = temp.path().join("upload.bin");
+    std::fs::write(&upload, "binary").unwrap();
+    let ssh = FakeSshClient::default();
+
+    let safety = execute_for_runtime(
+        Cli::try_parse_from([
+            "sshw",
+            "put",
+            "server-alpha",
+            upload.to_str().unwrap(),
+            "remote:/usr/bin/app",
+            "--json",
+        ])
+        .unwrap(),
+        &path,
+        &FakeCredentialStore::default(),
+        &ssh,
+        &mut FakePrompter::default(),
+    );
+    let safety_json: serde_json::Value = serde_json::from_str(safety.stdout.trim()).unwrap();
+    assert_eq!(safety.exit_code, 2);
+    assert_eq!(safety_json["error"]["kind"], "safety");
+
+    write_policy(
+        temp.path(),
+        r#"{"enabled":true,"allow_put_paths":["/srv/app"],"allow_get_paths":["/var/log"]}"#,
+    );
+    let store = FakeCredentialStore::default();
+    store
+        .set_password(
+            &login_credential(&path, "server-alpha"),
+            "deploy",
+            "YOUR_PASSWORD",
+        )
+        .unwrap();
+
+    execute(
+        Cli::try_parse_from([
+            "sshw",
+            "put",
+            "--policy",
+            "server-alpha",
+            upload.to_str().unwrap(),
+            "remote:/srv/app/upload.bin",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut FakePrompter::default(),
+    )
+    .unwrap();
+    execute(
+        Cli::try_parse_from([
+            "sshw",
+            "get",
+            "--policy",
+            "server-alpha",
+            "remote:/var/log/app.log",
+            temp.path().join("download.bin").to_str().unwrap(),
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut FakePrompter::default(),
+    )
+    .unwrap();
+
+    let traversal = execute_for_runtime(
+        Cli::try_parse_from([
+            "sshw",
+            "put",
+            "--policy",
+            "--yes",
+            "server-alpha",
+            upload.to_str().unwrap(),
+            "remote:/srv/app/../../etc/passwd",
+            "--json",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut FakePrompter::default(),
+    );
+    let traversal_json: serde_json::Value = serde_json::from_str(traversal.stdout.trim()).unwrap();
+    assert_eq!(traversal.exit_code, 7);
+    assert_eq!(traversal_json["error"]["kind"], "policy");
+    assert_eq!(ssh.put_calls.borrow().as_slice(), ["/srv/app/upload.bin"]);
+    assert_eq!(
+        ssh.get_remote_calls.borrow().as_slice(),
+        ["/var/log/app.log"]
+    );
+}
+
+#[test]
+fn remote_absolute_literal_audit_records_the_decoded_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &sample_config(&path)).unwrap();
+    let upload = temp.path().join("upload.bin");
+    std::fs::write(&upload, "binary").unwrap();
+    let store = FakeCredentialStore::default();
+    store
+        .set_password(
+            &login_credential(&path, "server-alpha"),
+            "deploy",
+            "YOUR_PASSWORD",
+        )
+        .unwrap();
+    let audit_path = temp.path().join("audit.jsonl");
+    let audit = FileAuditSink::new(audit_path.clone());
+    let home = ResolvedHome::from_config_path(&path);
+    let registry = temp.path().join("profiles.json");
+    let ctx = ExecContext {
+        home: &home,
+        registry_path: &registry,
+        policy_forced: false,
+        audit: &audit,
+    };
+
+    execute_with(
+        Cli::try_parse_from([
+            "sshw",
+            "put",
+            "server-alpha",
+            upload.to_str().unwrap(),
+            "remote:/tmp/upload.bin",
+        ])
+        .unwrap(),
+        &ctx,
+        &store,
+        &FakeSshClient::default(),
+        &mut FakePrompter::default(),
+    )
+    .unwrap();
+
+    let error = execute_with(
+        Cli::try_parse_from([
+            "sshw",
+            "get",
+            "server-alpha",
+            "remote:relative/file",
+            temp.path().join("download.bin").to_str().unwrap(),
+        ])
+        .unwrap(),
+        &ctx,
+        &store,
+        &FakeSshClient::default(),
+        &mut FakePrompter::default(),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("must contain an absolute path"));
+
+    let records: Vec<serde_json::Value> = std::fs::read_to_string(audit_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0]["action"], "put");
+    assert_eq!(records[0]["detail"], "/tmp/upload.bin");
+    assert_eq!(records[0]["status"], "ok");
+    assert_eq!(records[1]["action"], "get");
+    assert_eq!(records[1]["detail"], "remote:relative/file");
+    assert_eq!(records[1]["status"], "error");
+    assert_eq!(records[1]["exit_code"], 3);
+}
+
+#[test]
 fn get_json_failure_uses_error_envelope() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("servers.json");
@@ -4362,6 +4662,7 @@ struct FakeSshClient {
     trusted_expected_fingerprints: RefCell<Vec<String>>,
     put_calls: RefCell<Vec<String>>,
     get_calls: RefCell<Vec<bool>>,
+    get_remote_calls: RefCell<Vec<String>>,
     host_key_fingerprint: String,
     stdout: Option<String>,
     stderr: String,
@@ -4527,6 +4828,7 @@ impl SshClient for FakeSshClient {
         overwrite: bool,
     ) -> anyhow::Result<TransferResult> {
         self.get_calls.borrow_mut().push(overwrite);
+        self.get_remote_calls.borrow_mut().push(remote.to_string());
         if let Some(message) = &self.transfer_error {
             return Err(anyhow::anyhow!(message.clone()));
         }

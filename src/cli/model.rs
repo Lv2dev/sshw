@@ -398,7 +398,8 @@ pub struct RunArgs {
 #[derive(Debug, Args)]
 pub struct PutArgs {
     /// Grammar: `[server] <local> <remote>`. With two values the default server
-    /// is used; with three, the first is the server name.
+    /// is used; with three, the first is the server name. In Git Bash/MSYS,
+    /// write an absolute remote path as `remote:/path` to prevent conversion.
     #[arg(value_name = "TARGET", num_args = 2..=3)]
     pub target: Vec<String>,
     /// Confirm writes to system paths non-interactively.
@@ -412,7 +413,8 @@ pub struct PutArgs {
 #[derive(Debug, Args)]
 pub struct GetArgs {
     /// Grammar: `[server] <remote> <local>`. With two values the default server
-    /// is used; with three, the first is the server name.
+    /// is used; with three, the first is the server name. In Git Bash/MSYS,
+    /// write an absolute remote path as `remote:/path` to prevent conversion.
     #[arg(value_name = "TARGET", num_args = 2..=3)]
     pub target: Vec<String>,
     /// Confirm overwriting an existing local file non-interactively.
