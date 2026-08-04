@@ -14,7 +14,14 @@ use crate::ssh::SshClient;
 use serde_json::json;
 use std::path::PathBuf;
 
-const MSYS_REMOTE_PATH_HINT: &str = "Git Bash/MSYS may have converted the remote path into a Windows path; retry with MSYS2_ARG_CONV_EXCL='*' and pass the local path in Windows form (for example C:/path/file)";
+const MSYS_REMOTE_PATH_HINT: &str = "Git Bash/MSYS may have converted the remote path into a Windows path; prefix the remote absolute path with 'remote:' (for example remote:/tmp/file), or retry with MSYS2_ARG_CONV_EXCL='*'";
+const REMOTE_PATH_LITERAL_PREFIX: &str = "remote:";
+
+#[derive(Debug)]
+struct RemotePath {
+    value: String,
+    explicit_literal: bool,
+}
 
 pub(super) fn put_file<C, S>(
     args: PutArgs,
@@ -30,22 +37,22 @@ where
     let PutArgs { target, yes, json } = args;
     let (server_name, local, remote) = resolve_put_target(target, config)?;
 
-    match classify_remote_write_path(&remote, yes) {
+    match classify_remote_write_path(&remote.value, yes) {
         SafetyDecision::Allow => {}
         SafetyDecision::Block { reason } => return Err(app_error(ErrorKind::Safety, reason)),
     }
 
-    if let SandboxDecision::Deny { reason } = sandbox.check_put(&remote) {
+    if let SandboxDecision::Deny { reason } = sandbox.check_put(&remote.value) {
         return Err(app_error(ErrorKind::Policy, reason));
     }
 
     let server = get_server(config, &server_name)?;
     let auth = resolve_auth(server, credentials)?;
     let result = with_msys_remote_path_hint(
-        ssh.put(server, &auth, &local, &remote)
+        ssh.put(server, &auth, &local, &remote.value)
             .with_error_kind(ErrorKind::Ssh),
-        &remote,
-        windows_msys_argument_conversion_active(),
+        &remote.value,
+        windows_msys_argument_conversion_active() && !remote.explicit_literal,
     )?;
     if json {
         let output = json!({
@@ -79,7 +86,7 @@ where
     let (server_name, remote, local) = resolve_get_target(target, config)?;
 
     let server = get_server(config, &server_name)?;
-    if let SandboxDecision::Deny { reason } = sandbox.check_get(&remote) {
+    if let SandboxDecision::Deny { reason } = sandbox.check_get(&remote.value) {
         return Err(app_error(ErrorKind::Policy, reason));
     }
 
@@ -95,10 +102,10 @@ where
 
     let auth = resolve_auth(server, credentials)?;
     let result = with_msys_remote_path_hint(
-        ssh.get(server, &auth, &remote, &local, yes)
+        ssh.get(server, &auth, &remote.value, &local, yes)
             .with_error_kind(ErrorKind::Ssh),
-        &remote,
-        windows_msys_argument_conversion_active(),
+        &remote.value,
+        windows_msys_argument_conversion_active() && !remote.explicit_literal,
     )?;
     if json {
         let output = json!({
@@ -120,23 +127,60 @@ where
 fn resolve_put_target(
     target: Vec<String>,
     config: &SshwConfig,
-) -> anyhow::Result<(String, PathBuf, String)> {
+) -> anyhow::Result<(String, PathBuf, RemotePath)> {
     // target is `[name] <local> <remote>`.
     let (name, rest) = split_target(&target, 2)
         .ok_or_else(|| app_error(ErrorKind::Config, "put expects [name] <local> <remote>"))?;
     let server = resolve_target_server(name, config)?;
-    Ok((server, PathBuf::from(&rest[0]), rest[1].clone()))
+    Ok((
+        server,
+        PathBuf::from(&rest[0]),
+        decode_remote_path(&rest[1])?,
+    ))
 }
 
 fn resolve_get_target(
     target: Vec<String>,
     config: &SshwConfig,
-) -> anyhow::Result<(String, String, PathBuf)> {
+) -> anyhow::Result<(String, RemotePath, PathBuf)> {
     // target is `[name] <remote> <local>`.
     let (name, rest) = split_target(&target, 2)
         .ok_or_else(|| app_error(ErrorKind::Config, "get expects [name] <remote> <local>"))?;
     let server = resolve_target_server(name, config)?;
-    Ok((server, rest[0].clone(), PathBuf::from(&rest[1])))
+    Ok((
+        server,
+        decode_remote_path(&rest[0])?,
+        PathBuf::from(&rest[1]),
+    ))
+}
+
+fn decode_remote_path(path: &str) -> anyhow::Result<RemotePath> {
+    let Some(value) = path.strip_prefix(REMOTE_PATH_LITERAL_PREFIX) else {
+        return Ok(RemotePath {
+            value: path.to_string(),
+            explicit_literal: false,
+        });
+    };
+    if !is_remote_absolute(value) {
+        return Err(app_error(
+            ErrorKind::Config,
+            "remote path literal must contain an absolute path after 'remote:'",
+        ));
+    }
+    Ok(RemotePath {
+        value: value.to_string(),
+        explicit_literal: true,
+    })
+}
+
+pub(super) fn remote_path_for_audit(path: &str) -> String {
+    decode_remote_path(path)
+        .map(|remote| remote.value)
+        .unwrap_or_else(|_| path.to_string())
+}
+
+fn is_remote_absolute(path: &str) -> bool {
+    path.starts_with('/') || path.starts_with(r"\\") || is_windows_drive_absolute(path)
 }
 
 fn with_msys_remote_path_hint<T>(
@@ -243,5 +287,38 @@ mod tests {
         assert!(!is_windows_drive_absolute("C:relative"));
         assert!(!is_windows_drive_absolute("/tmp/remote-file"));
         assert!(!is_windows_drive_absolute("remote-file"));
+    }
+
+    #[test]
+    fn remote_literal_accepts_posix_windows_and_unc_absolute_paths() {
+        for (input, expected) in [
+            ("remote:/tmp/file", "/tmp/file"),
+            ("remote:C:/Data/file", "C:/Data/file"),
+            (r"remote:C:\Data\file", r"C:\Data\file"),
+            (r"remote:\\server\share\file", r"\\server\share\file"),
+        ] {
+            let decoded = decode_remote_path(input).unwrap();
+            assert_eq!(decoded.value, expected);
+            assert!(decoded.explicit_literal);
+        }
+    }
+
+    #[test]
+    fn remote_literal_rejects_non_absolute_values_and_preserves_raw_paths() {
+        for input in ["remote:", "remote:relative/file", "remote:C:relative"] {
+            let error = decode_remote_path(input).unwrap_err();
+            assert_eq!(classify_error(&error), ErrorKind::Config);
+        }
+
+        for input in [
+            "/tmp/file",
+            "relative/file",
+            "./remote:relative/file",
+            "C:/Data/file",
+        ] {
+            let decoded = decode_remote_path(input).unwrap();
+            assert_eq!(decoded.value, input);
+            assert!(!decoded.explicit_literal);
+        }
     }
 }

@@ -220,28 +220,30 @@ When the name is omitted for `run`/`put`/`get`, the configured default server is
 
 ### Windows Shell Paths
 
-Git Bash/MSYS automatically converts path-like arguments passed to native Windows executables. That conversion can rewrite a remote POSIX path such as `/tmp/artifact.tgz` into a local Windows path before `sshw` sees it, producing an SSH failure (exit 5). Disable argument conversion for the invocation and write the local path in Windows form:
+Git Bash/MSYS automatically converts path-like arguments passed to native Windows executables. That conversion can rewrite a remote POSIX path such as `/tmp/artifact.tgz` into a local Windows path before `sshw` sees it. Prefix an absolute remote path with `remote:` to pass it literally; sshw removes the prefix before applying safety, policy, audit, JSON, and SSH handling:
 
 ```bash
-MSYS2_ARG_CONV_EXCL='*' sshw put server-alpha \
-  'C:/path/artifact.tgz' \
-  '/tmp/artifact.tgz'
+sshw put server-alpha 'C:/path/artifact.tgz' 'remote:/tmp/artifact.tgz'
+sshw get server-alpha 'remote:/var/log/app.log' 'C:/path/app.log'
 ```
 
-The same rule applies to `get`. In PowerShell, use a normal Windows local path and quote the remote path:
+The suffix must be an absolute POSIX path (`remote:/tmp/file`), Windows drive path (`remote:C:/Data/file` or `remote:C:\Data\file`), or UNC path. An empty or relative literal such as `remote:` or `remote:tmp/file` fails as config error 3 before SSH. Prefix-free absolute and relative remote paths keep their existing behavior. The leading `remote:` form is reserved; use `./remote:name` when a literal relative filename itself starts with `remote:`.
+
+Alternatively, disable conversion for the whole Git Bash invocation with `MSYS2_ARG_CONV_EXCL='*'`. In PowerShell no conversion occurs, so both a raw remote absolute path and the explicit literal work:
 
 ```powershell
 sshw put server-alpha 'C:\path\artifact.tgz' '/tmp/artifact.tgz'
+sshw put server-alpha 'C:\path\artifact.tgz' 'remote:/tmp/artifact.tgz'
 ```
 
-Windows accepts both `C:\path\file` and `C:/path/file` as local paths; backslashes are shown for the native PowerShell form. A missing or unreadable local file is an I/O failure (exit 6), while a converted remote path can surface later as an SSH failure (exit 5).
+Windows accepts both `C:\path\file` and `C:/path/file` as local paths; backslashes are shown for the native PowerShell form. A missing or unreadable local file is an I/O failure (exit 6). A raw remote path already converted by MSYS can still surface later as an SSH failure (exit 5), with a hint to use `remote:` or disable conversion.
 
 To transfer the tracked source tree, create the archive from Git instead of archiving the working directory or `target`:
 
 ```powershell
 $archive = Join-Path $env:TEMP 'sshw-src.tgz'
 git archive --format=tar.gz --output="$archive" HEAD
-sshw put server-alpha "$archive" '/tmp/sshw-src.tgz'
+sshw put server-alpha "$archive" 'remote:/tmp/sshw-src.tgz'
 ```
 
 `git archive` includes only files tracked in the selected commit, so it excludes `.git`, `target`, untracked files, and uncommitted changes. This also avoids depending on whether the shell resolves `tar` to Windows bsdtar, Git's GNU tar, or a WSL executable.
@@ -588,28 +590,30 @@ sshw profile <add|list|show|default|remove> ...
 
 ### Windows 셸 경로
 
-Git Bash/MSYS는 Windows 네이티브 실행 파일에 전달하는 경로 형태의 인자를 자동 변환합니다. 이 과정에서 `/tmp/artifact.tgz` 같은 원격 POSIX 경로가 `sshw`에 도달하기 전에 로컬 Windows 경로로 바뀌어 SSH 실패(exit 5)가 발생할 수 있습니다. 호출 단위로 인자 변환을 끄고 로컬 경로를 Windows 형식으로 작성하세요.
+Git Bash/MSYS는 Windows 네이티브 실행 파일에 전달하는 경로 형태의 인자를 자동 변환합니다. 이 과정에서 `/tmp/artifact.tgz` 같은 원격 POSIX 경로가 `sshw`에 도달하기 전에 로컬 Windows 경로로 바뀔 수 있습니다. 원격 절대경로 앞에 `remote:`를 붙이면 인자를 리터럴로 전달할 수 있습니다. sshw는 prefix를 제거한 뒤 safety, policy, audit, JSON, SSH 처리를 적용합니다.
 
 ```bash
-MSYS2_ARG_CONV_EXCL='*' sshw put server-alpha \
-  'C:/path/artifact.tgz' \
-  '/tmp/artifact.tgz'
+sshw put server-alpha 'C:/path/artifact.tgz' 'remote:/tmp/artifact.tgz'
+sshw get server-alpha 'remote:/var/log/app.log' 'C:/path/app.log'
 ```
 
-`get`에도 같은 규칙이 적용됩니다. PowerShell에서는 일반 Windows 로컬 경로를 사용하고 원격 경로를 따옴표로 감쌉니다.
+suffix는 POSIX 절대경로(`remote:/tmp/file`), Windows drive 절대경로(`remote:C:/Data/file` 또는 `remote:C:\Data\file`), UNC 경로여야 합니다. `remote:` 또는 `remote:tmp/file`처럼 비어 있거나 상대경로인 리터럴은 SSH 전에 config 오류 3으로 거부됩니다. prefix가 없는 기존 절대·상대 원격경로 동작은 유지됩니다. 선두 `remote:` 형식은 예약되어 있으므로 실제 상대 파일명이 `remote:`로 시작하면 `./remote:name`으로 작성합니다.
+
+대안으로 Git Bash 호출 전체에 `MSYS2_ARG_CONV_EXCL='*'`를 설정할 수 있습니다. PowerShell에서는 경로 변환이 없으므로 raw 원격 절대경로와 명시적 리터럴을 모두 사용할 수 있습니다.
 
 ```powershell
 sshw put server-alpha 'C:\path\artifact.tgz' '/tmp/artifact.tgz'
+sshw put server-alpha 'C:\path\artifact.tgz' 'remote:/tmp/artifact.tgz'
 ```
 
-Windows는 로컬 경로로 `C:\path\file`과 `C:/path/file`을 모두 허용합니다. 위 예시는 PowerShell의 네이티브 표기인 역슬래시를 사용했습니다. 로컬 파일이 없거나 읽을 수 없으면 I/O 실패(exit 6)이고, 변환된 원격 경로는 이후 SSH 실패(exit 5)로 나타날 수 있습니다.
+Windows는 로컬 경로로 `C:\path\file`과 `C:/path/file`을 모두 허용합니다. 위 예시는 PowerShell의 네이티브 표기인 역슬래시를 사용했습니다. 로컬 파일이 없거나 읽을 수 없으면 I/O 실패(exit 6)입니다. MSYS가 이미 변환한 raw 원격경로는 이후 SSH 실패(exit 5)로 나타날 수 있으며, 이때 `remote:` 또는 변환 비활성화 힌트를 제공합니다.
 
 추적 중인 소스 트리를 전송할 때는 작업 디렉터리나 `target`을 직접 압축하지 말고 Git에서 아카이브를 생성하세요.
 
 ```powershell
 $archive = Join-Path $env:TEMP 'sshw-src.tgz'
 git archive --format=tar.gz --output="$archive" HEAD
-sshw put server-alpha "$archive" '/tmp/sshw-src.tgz'
+sshw put server-alpha "$archive" 'remote:/tmp/sshw-src.tgz'
 ```
 
 `git archive`는 선택한 커밋에서 Git이 추적하는 파일만 포함하므로 `.git`, `target`, 미추적 파일, 커밋하지 않은 변경 사항은 제외됩니다. 셸이 `tar`를 Windows bsdtar, Git의 GNU tar, WSL 실행 파일 중 무엇으로 해석하는지에도 의존하지 않습니다.
