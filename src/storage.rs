@@ -59,7 +59,7 @@ pub(crate) fn write_was_published(error: &anyhow::Error) -> bool {
 
 impl Drop for ExclusiveFileLock {
     fn drop(&mut self) {
-        let _ = fs2::FileExt::unlock(&self.file);
+        let _ = self.file.unlock();
     }
 }
 
@@ -84,9 +84,9 @@ pub fn acquire_exclusive_lock_with_timeout(
     set_owner_only(path)?;
     let started = Instant::now();
     loop {
-        match fs2::FileExt::try_lock_exclusive(&file) {
+        match file.try_lock() {
             Ok(()) => break,
-            Err(err) if lock_is_busy(&err) => {
+            Err(fs::TryLockError::WouldBlock) => {
                 if started.elapsed() >= timeout {
                     return Err(anyhow::anyhow!(
                         "timed out waiting for lock at {} after {} milliseconds",
@@ -96,15 +96,10 @@ pub fn acquire_exclusive_lock_with_timeout(
                 }
                 std::thread::sleep(Duration::from_millis(5));
             }
-            Err(err) => return Err(err.into()),
+            Err(fs::TryLockError::Error(err)) => return Err(err.into()),
         }
     }
     Ok(ExclusiveFileLock { file })
-}
-
-fn lock_is_busy(error: &std::io::Error) -> bool {
-    error.kind() == std::io::ErrorKind::WouldBlock
-        || cfg!(windows) && error.raw_os_error() == Some(33)
 }
 
 /// Atomically write `contents` to `path`, creating parent directories and
