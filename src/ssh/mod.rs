@@ -25,6 +25,18 @@ pub struct HostKeyInfo {
     pub fingerprint_sha256: String,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct SshTarget<'a> {
+    pub server: &'a ServerConfig,
+    pub user: &'a str,
+}
+
+impl<'a> SshTarget<'a> {
+    pub fn new(server: &'a ServerConfig, user: &'a str) -> Self {
+        Self { server, user }
+    }
+}
+
 pub trait SshClient {
     fn host_key(&self, server: &ServerConfig) -> anyhow::Result<HostKeyInfo>;
     fn trust_host(
@@ -35,7 +47,7 @@ pub trait SshClient {
     ) -> anyhow::Result<HostKeyInfo>;
     fn run(
         &self,
-        server: &ServerConfig,
+        target: &SshTarget<'_>,
         auth: &AuthMaterial,
         command: &str,
     ) -> anyhow::Result<RunResult>;
@@ -50,12 +62,12 @@ pub trait SshClient {
     /// the backend as unsupported.
     fn run_with_stdin(
         &self,
-        server: &ServerConfig,
+        target: &SshTarget<'_>,
         auth: &AuthMaterial,
         command: &str,
         stdin: &str,
     ) -> anyhow::Result<RunResult> {
-        let _ = (server, auth, command, stdin);
+        let _ = (target, auth, command, stdin);
         Err(anyhow::anyhow!(
             "ssh session stdin is unsupported by this backend"
         ))
@@ -72,27 +84,27 @@ pub trait SshClient {
     /// default implementation reports the backend as unsupported.
     fn run_with_pty_password(
         &self,
-        server: &ServerConfig,
+        target: &SshTarget<'_>,
         auth: &AuthMaterial,
         command: &str,
         password: &str,
         marker_nonce: &str,
     ) -> anyhow::Result<RunResult> {
-        let _ = (server, auth, command, password, marker_nonce);
+        let _ = (target, auth, command, password, marker_nonce);
         Err(anyhow::anyhow!(
             "ssh pty password injection is unsupported by this backend"
         ))
     }
     fn put(
         &self,
-        server: &ServerConfig,
+        target: &SshTarget<'_>,
         auth: &AuthMaterial,
         local: &Path,
         remote: &str,
     ) -> anyhow::Result<TransferResult>;
     fn get(
         &self,
-        server: &ServerConfig,
+        target: &SshTarget<'_>,
         auth: &AuthMaterial,
         remote: &str,
         local: &Path,

@@ -1,4 +1,4 @@
-use super::{HostKeyInfo, RunResult, SshClient, TransferResult};
+use super::{HostKeyInfo, RunResult, SshClient, SshTarget, TransferResult};
 use crate::config::ServerConfig;
 use crate::credentials::AuthMaterial;
 use crate::error::{ResultErrorKindExt, app_error, classified_error, classified_io_error};
@@ -162,37 +162,37 @@ impl SshClient for Ssh2Client {
 
     fn run(
         &self,
-        server: &ServerConfig,
+        target: &SshTarget<'_>,
         auth: &AuthMaterial,
         command: &str,
     ) -> anyhow::Result<RunResult> {
-        self.run_inner(server, auth, command, None)
+        self.run_inner(target, auth, command, None)
     }
 
     fn run_with_stdin(
         &self,
-        server: &ServerConfig,
+        target: &SshTarget<'_>,
         auth: &AuthMaterial,
         command: &str,
         stdin: &str,
     ) -> anyhow::Result<RunResult> {
-        self.run_inner(server, auth, command, Some(stdin))
+        self.run_inner(target, auth, command, Some(stdin))
     }
 
     fn run_with_pty_password(
         &self,
-        server: &ServerConfig,
+        target: &SshTarget<'_>,
         auth: &AuthMaterial,
         command: &str,
         password: &str,
         marker_nonce: &str,
     ) -> anyhow::Result<RunResult> {
-        self.run_pty_inner(server, auth, command, password, marker_nonce)
+        self.run_pty_inner(target, auth, command, password, marker_nonce)
     }
 
     fn put(
         &self,
-        server: &ServerConfig,
+        target: &SshTarget<'_>,
         auth: &AuthMaterial,
         local: &Path,
         remote: &str,
@@ -203,7 +203,8 @@ impl SshClient for Ssh2Client {
 
         let known_hosts = self.resolved_known_hosts_path()?;
         let session = connect_verified_authenticated(
-            server,
+            target.server,
+            target.user,
             auth,
             self.connect_timeout,
             self.op_timeout,
@@ -269,7 +270,7 @@ impl SshClient for Ssh2Client {
 
     fn get(
         &self,
-        server: &ServerConfig,
+        target: &SshTarget<'_>,
         auth: &AuthMaterial,
         remote: &str,
         local: &Path,
@@ -277,7 +278,8 @@ impl SshClient for Ssh2Client {
     ) -> anyhow::Result<TransferResult> {
         let known_hosts = self.resolved_known_hosts_path()?;
         let session = connect_verified_authenticated(
-            server,
+            target.server,
+            target.user,
             auth,
             self.connect_timeout,
             self.op_timeout,
@@ -346,7 +348,7 @@ impl SshClient for Ssh2Client {
 impl Ssh2Client {
     fn run_inner(
         &self,
-        server: &ServerConfig,
+        target: &SshTarget<'_>,
         auth: &AuthMaterial,
         command: &str,
         stdin: Option<&str>,
@@ -354,7 +356,8 @@ impl Ssh2Client {
         let started = Instant::now();
         let known_hosts = self.resolved_known_hosts_path()?;
         let session = connect_verified_authenticated(
-            server,
+            target.server,
+            target.user,
             auth,
             self.connect_timeout,
             self.op_timeout,
@@ -391,7 +394,7 @@ impl Ssh2Client {
 
     fn run_pty_inner(
         &self,
-        server: &ServerConfig,
+        target: &SshTarget<'_>,
         auth: &AuthMaterial,
         command: &str,
         password: &str,
@@ -400,7 +403,8 @@ impl Ssh2Client {
         let started = Instant::now();
         let known_hosts = self.resolved_known_hosts_path()?;
         let session = connect_verified_authenticated(
-            server,
+            target.server,
+            target.user,
             auth,
             self.connect_timeout,
             self.op_timeout,
@@ -539,6 +543,7 @@ fn ensure_remote_command_not_signaled(channel: &ssh2::Channel) -> anyhow::Result
 
 fn connect_verified_authenticated(
     server: &ServerConfig,
+    user: &str,
     auth: &AuthMaterial,
     connect_timeout: Duration,
     op_timeout: Option<Duration>,
@@ -546,7 +551,7 @@ fn connect_verified_authenticated(
 ) -> anyhow::Result<Session> {
     let session = connect(server, connect_timeout).with_error_kind(ErrorKind::Ssh)?;
     verify_known_host(&session, server, known_hosts_path).with_error_kind(ErrorKind::Ssh)?;
-    authenticate(&session, server, auth).with_error_kind(ErrorKind::Auth)?;
+    authenticate(&session, user, auth).with_error_kind(ErrorKind::Auth)?;
     // Switch from the connect-phase timeout to the operation budget (0 = an
     // explicit opt-out). Individual operation steps tighten this to the
     // absolute deadline's remaining time.
@@ -1180,20 +1185,16 @@ fn known_host_verification_result(
     }
 }
 
-fn authenticate(
-    session: &Session,
-    server: &ServerConfig,
-    auth: &AuthMaterial,
-) -> anyhow::Result<()> {
+fn authenticate(session: &Session, user: &str, auth: &AuthMaterial) -> anyhow::Result<()> {
     match auth {
         AuthMaterial::Password(password) => {
             session
-                .userauth_password(&server.user, password)
+                .userauth_password(user, password)
                 .context("SSH authentication failed")?;
         }
         AuthMaterial::Agent => {
             session
-                .userauth_agent(&server.user)
+                .userauth_agent(user)
                 .context("SSH agent authentication failed")?;
         }
     }
@@ -1658,11 +1659,6 @@ example.test ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB9zU1OEQ2tzYhrXq4/DEjvRNvKv6cU
     }
 
     fn server_config() -> ServerConfig {
-        ServerConfig {
-            host: "192.0.2.10".to_string(),
-            port: 2222,
-            user: "deploy".to_string(),
-            auth: AuthConfig::Agent,
-        }
+        ServerConfig::single_account("192.0.2.10", 2222, "deploy", AuthConfig::Agent)
     }
 }

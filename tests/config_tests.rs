@@ -1,6 +1,6 @@
 use sshw::config::{
-    AuthConfig, CredentialBackend, PrivilegeConfig, PrivilegeMethod, ServerConfig, SshwConfig,
-    load_config, load_config_with_revision, save_config, save_config_if_unchanged,
+    AccountConfig, AuthConfig, CredentialBackend, PrivilegeConfig, PrivilegeMethod, ServerConfig,
+    SshwConfig, load_config, load_config_with_revision, save_config, save_config_if_unchanged,
     validate_config_credential_references,
 };
 use sshw::home::{CredentialNamespace, CredentialPurpose};
@@ -10,10 +10,9 @@ use std::fs;
 fn new_config_starts_empty() {
     let config = SshwConfig::default();
 
-    assert_eq!(config.version, 1);
+    assert_eq!(config.version, 2);
     assert!(config.default.is_none());
     assert!(config.servers.is_empty());
-    assert!(config.privileges.is_empty());
 }
 
 #[test]
@@ -21,32 +20,30 @@ fn config_serializes_password_and_agent_auth_without_secrets() {
     let mut config = SshwConfig::default();
     config.servers.insert(
         "server-alpha".to_string(),
-        ServerConfig {
-            host: "192.0.2.10".to_string(),
-            port: 2222,
-            user: "deploy".to_string(),
-            auth: AuthConfig::Password {
+        ServerConfig::single_account(
+            "192.0.2.10",
+            2222,
+            "deploy",
+            AuthConfig::Password {
                 credential: "sshw:server-alpha".to_string(),
             },
-        },
+        ),
     );
     config.servers.insert(
         "server-beta".to_string(),
-        ServerConfig {
-            host: "192.0.2.11".to_string(),
-            port: 2222,
-            user: "deploy".to_string(),
-            auth: AuthConfig::Agent,
-        },
+        ServerConfig::single_account("192.0.2.11", 2222, "deploy", AuthConfig::Agent),
     );
-    config.privileges.insert(
-        "server-alpha".to_string(),
-        PrivilegeConfig {
-            method: PrivilegeMethod::Sudo,
-            user: "root".to_string(),
-            credential: "sshw:default:privilege:server-alpha".to_string(),
-        },
-    );
+    config
+        .servers
+        .get_mut("server-alpha")
+        .unwrap()
+        .account_mut("deploy")
+        .unwrap()
+        .privilege = Some(PrivilegeConfig {
+        method: PrivilegeMethod::Sudo,
+        user: "root".to_string(),
+        credential: "sshw:default:privilege:server-alpha".to_string(),
+    });
 
     let json = serde_json::to_string_pretty(&config).unwrap();
 
@@ -83,7 +80,7 @@ fn config_defaults_to_native_backend_and_round_trips_session() {
     let legacy: SshwConfig =
         serde_json::from_str(r#"{"version":1,"default":null,"servers":{}}"#).unwrap();
     assert_eq!(legacy.credential_backend, CredentialBackend::Native);
-    assert!(legacy.privileges.is_empty());
+    assert_eq!(legacy.version, 2);
 
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("servers.json");
@@ -201,6 +198,30 @@ fn config_rejects_unknown_fields_at_root_and_nested_levels() {
     .unwrap();
     let privilege_err = load_config(&path).unwrap_err();
     assert!(privilege_err.to_string().contains("unknown field"));
+
+    fs::write(
+        &path,
+        r#"{
+            "version": 2,
+            "default": "web",
+            "servers": {
+                "web": {
+                    "host": "192.0.2.10",
+                    "port": 22,
+                    "default_user": "deploy",
+                    "accounts": {
+                        "deploy": {
+                            "auth": { "type": "agent" },
+                            "unexpected": true
+                        }
+                    }
+                }
+            }
+        }"#,
+    )
+    .unwrap();
+    let account_err = load_config(&path).unwrap_err();
+    assert!(account_err.to_string().contains("unknown field"));
 }
 
 #[test]
@@ -210,7 +231,7 @@ fn config_rejects_unsupported_future_version() {
     fs::write(
         &path,
         r#"{
-            "version": 2,
+            "version": 3,
             "default": null,
             "servers": {}
         }"#,
@@ -219,8 +240,8 @@ fn config_rejects_unsupported_future_version() {
 
     let err = load_config(&path).unwrap_err();
 
-    assert!(err.to_string().contains("unsupported config version 2"));
-    assert!(err.to_string().contains("supported version is 1"));
+    assert!(err.to_string().contains("unsupported config version 3"));
+    assert!(err.to_string().contains("supported versions are 1 and 2"));
 }
 
 #[cfg(unix)]
@@ -244,14 +265,14 @@ fn config_saves_and_loads_round_trip() {
     let mut servers = std::collections::BTreeMap::new();
     servers.insert(
         "server-alpha".to_string(),
-        ServerConfig {
-            host: "192.0.2.10".to_string(),
-            port: 2222,
-            user: "deploy".to_string(),
-            auth: AuthConfig::Password {
+        ServerConfig::single_account(
+            "192.0.2.10",
+            2222,
+            "deploy",
+            AuthConfig::Password {
                 credential: "sshw:server-alpha".to_string(),
             },
-        },
+        ),
     );
     let config = SshwConfig {
         default: Some("server-alpha".to_string()),
@@ -291,48 +312,51 @@ fn credential_references_accept_expected_legacy_and_v2_keys() {
     let mut config = SshwConfig::default();
     config.servers.insert(
         "legacy".to_string(),
-        ServerConfig {
-            host: "192.0.2.10".to_string(),
-            port: 22,
-            user: "deploy".to_string(),
-            auth: AuthConfig::Password {
+        ServerConfig::single_account(
+            "192.0.2.10",
+            22,
+            "deploy",
+            AuthConfig::Password {
                 credential: namespace.legacy_credential_key("legacy"),
             },
-        },
+        ),
     );
     config.servers.insert(
         "modern".to_string(),
-        ServerConfig {
-            host: "192.0.2.11".to_string(),
-            port: 22,
-            user: "deploy".to_string(),
-            auth: AuthConfig::Password {
+        ServerConfig::single_account(
+            "192.0.2.11",
+            22,
+            "deploy",
+            AuthConfig::Password {
                 credential: namespace.credential_key_v2(
                     CredentialPurpose::Login,
                     "modern",
                     "0000000000000001",
                 ),
             },
-        },
+        ),
     );
-    config.privileges.insert(
-        "modern".to_string(),
-        PrivilegeConfig {
-            method: PrivilegeMethod::Sudo,
-            user: "root".to_string(),
-            credential: namespace.credential_key_v2(
-                CredentialPurpose::Privilege,
-                "modern",
-                "0000000000000002",
-            ),
-        },
-    );
+    config
+        .servers
+        .get_mut("modern")
+        .unwrap()
+        .account_mut("deploy")
+        .unwrap()
+        .privilege = Some(PrivilegeConfig {
+        method: PrivilegeMethod::Sudo,
+        user: "root".to_string(),
+        credential: namespace.credential_key_v2(
+            CredentialPurpose::Privilege,
+            "modern",
+            "0000000000000002",
+        ),
+    });
 
     validate_config_credential_references(&config, &namespace).unwrap();
 }
 
 #[test]
-fn config_relationships_reject_dangling_default_and_orphan_privilege() {
+fn config_relationships_reject_dangling_server_and_user_defaults() {
     let namespace = CredentialNamespace::profile("default");
     let mut config = SshwConfig {
         default: Some("missing".to_string()),
@@ -346,21 +370,18 @@ fn config_relationships_reject_dangling_default_and_orphan_privilege() {
             .contains("default server 'missing' is not present")
     );
 
-    config.default = None;
-    config.privileges.insert(
+    config.default = Some("web".to_string());
+    config.servers.insert(
         "web".to_string(),
-        PrivilegeConfig {
-            method: PrivilegeMethod::Sudo,
-            user: "root".to_string(),
-            credential: namespace.legacy_privilege_credential_key("web"),
-        },
+        ServerConfig::single_account("192.0.2.10", 22, "deploy", AuthConfig::Agent),
     );
+    config.servers.get_mut("web").unwrap().default_user = "missing".to_string();
 
-    let orphan_privilege = validate_config_credential_references(&config, &namespace).unwrap_err();
+    let dangling_user = validate_config_credential_references(&config, &namespace).unwrap_err();
     assert!(
-        orphan_privilege
+        dangling_user
             .to_string()
-            .contains("privilege configuration for server 'web' has no matching server")
+            .contains("default user 'missing' is not registered for server 'web'")
     );
 }
 
@@ -371,26 +392,25 @@ fn credential_references_reject_cross_namespace_keys() {
     let mut config = SshwConfig::default();
     config.servers.insert(
         "web".to_string(),
-        ServerConfig {
-            host: "192.0.2.10".to_string(),
-            port: 22,
-            user: "deploy".to_string(),
-            auth: AuthConfig::Password {
+        ServerConfig::single_account(
+            "192.0.2.10",
+            22,
+            "deploy",
+            AuthConfig::Password {
                 credential: other.credential_key_v2(
                     CredentialPurpose::Login,
                     "web",
                     "0000000000000001",
                 ),
             },
-        },
+        ),
     );
 
     let err = validate_config_credential_references(&config, &namespace).unwrap_err();
 
-    assert!(
-        err.to_string()
-            .contains("does not belong to the active home")
-    );
+    let message = err.to_string();
+    assert!(message.contains("does not belong to account 'web/deploy'"));
+    assert!(message.contains("active home"));
 }
 
 #[test]
@@ -401,22 +421,14 @@ fn credential_references_reject_legacy_reserved_alias_collisions() {
     let mut config = SshwConfig::default();
     config.servers.insert(
         "privilege:web".to_string(),
-        ServerConfig {
-            host: "192.0.2.10".to_string(),
-            port: 22,
-            user: "deploy".to_string(),
-            auth: AuthConfig::Password {
+        ServerConfig::single_account(
+            "192.0.2.10",
+            22,
+            "deploy",
+            AuthConfig::Password {
                 credential: shared.clone(),
             },
-        },
-    );
-    config.privileges.insert(
-        "web".to_string(),
-        PrivilegeConfig {
-            method: PrivilegeMethod::Sudo,
-            user: "root".to_string(),
-            credential: shared,
-        },
+        ),
     );
 
     let err = validate_config_credential_references(&config, &namespace).unwrap_err();
@@ -430,12 +442,7 @@ fn credential_references_reject_control_characters_in_aliases() {
     let mut config = SshwConfig::default();
     config.servers.insert(
         "web\ninjected".to_string(),
-        ServerConfig {
-            host: "192.0.2.10".to_string(),
-            port: 22,
-            user: "deploy".to_string(),
-            auth: AuthConfig::Agent,
-        },
+        ServerConfig::single_account("192.0.2.10", 22, "deploy", AuthConfig::Agent),
     );
 
     let err = validate_config_credential_references(&config, &namespace).unwrap_err();
@@ -455,4 +462,138 @@ fn config_save_uses_owner_only_permissions() {
 
     let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600);
+}
+
+#[test]
+fn v1_config_loads_as_v2_accounts_without_rewriting_the_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    let original = r#"{
+        "version": 1,
+        "default": "web",
+        "servers": {
+            "web": {
+                "host": "192.0.2.10",
+                "port": 22,
+                "user": "deploy",
+                "auth": { "type": "password", "credential": "sshw:default:web" }
+            }
+        },
+        "privileges": {
+            "web": {
+                "method": "sudo",
+                "user": "root",
+                "credential": "sshw:default:privilege:web"
+            }
+        }
+    }"#;
+    fs::write(&path, original).unwrap();
+
+    let config = load_config(&path).unwrap();
+
+    assert_eq!(config.version, 2);
+    let server = &config.servers["web"];
+    assert_eq!(server.default_user, "deploy");
+    assert_eq!(server.accounts.len(), 1);
+    let account = &server.accounts["deploy"];
+    assert!(matches!(account.auth, AuthConfig::Password { .. }));
+    assert_eq!(account.privilege.as_ref().unwrap().user, "root");
+    assert_eq!(fs::read_to_string(&path).unwrap(), original);
+}
+
+#[test]
+fn v2_config_round_trip_preserves_multiple_accounts() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    let namespace = CredentialNamespace::profile("default");
+    let mut accounts = std::collections::BTreeMap::new();
+    accounts.insert(
+        "deploy".to_string(),
+        AccountConfig {
+            auth: AuthConfig::Agent,
+            privilege: None,
+        },
+    );
+    accounts.insert(
+        "ops".to_string(),
+        AccountConfig {
+            auth: AuthConfig::Password {
+                credential: namespace.credential_key_v3(
+                    CredentialPurpose::Login,
+                    "web",
+                    "ops",
+                    "0000000000000001",
+                ),
+            },
+            privilege: Some(PrivilegeConfig {
+                method: PrivilegeMethod::Sudo,
+                user: "root".to_string(),
+                credential: namespace.credential_key_v3(
+                    CredentialPurpose::Privilege,
+                    "web",
+                    "ops",
+                    "0000000000000002",
+                ),
+            }),
+        },
+    );
+    let mut config = SshwConfig {
+        default: Some("web".to_string()),
+        ..SshwConfig::default()
+    };
+    config.servers.insert(
+        "web".to_string(),
+        ServerConfig {
+            host: "192.0.2.10".to_string(),
+            port: 22,
+            default_user: "deploy".to_string(),
+            accounts,
+        },
+    );
+
+    save_config(&path, &config).unwrap();
+
+    let loaded = load_config(&path).unwrap();
+    assert_eq!(loaded, config);
+    validate_config_credential_references(&loaded, &namespace).unwrap();
+}
+
+#[test]
+fn account_relationships_and_credentials_fail_closed() {
+    let namespace = CredentialNamespace::profile("default");
+    let mut accounts = std::collections::BTreeMap::new();
+    accounts.insert(
+        "ops".to_string(),
+        AccountConfig {
+            auth: AuthConfig::Password {
+                credential: namespace.credential_key_v3(
+                    CredentialPurpose::Login,
+                    "web",
+                    "deploy",
+                    "0000000000000001",
+                ),
+            },
+            privilege: None,
+        },
+    );
+    let mut config = SshwConfig::default();
+    config.servers.insert(
+        "web".to_string(),
+        ServerConfig {
+            host: "192.0.2.10".to_string(),
+            port: 22,
+            default_user: "missing".to_string(),
+            accounts,
+        },
+    );
+
+    let err = validate_config_credential_references(&config, &namespace).unwrap_err();
+    assert!(err.to_string().contains("default user 'missing'"));
+
+    config.servers.get_mut("web").unwrap().default_user = "ops".to_string();
+    let err = validate_config_credential_references(&config, &namespace).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("does not belong to account 'web/ops'")
+    );
 }

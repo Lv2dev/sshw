@@ -4,6 +4,7 @@ fn record(action: &str, detail: Option<&str>, status: AuditStatus, exit_code: i3
     AuditRecord {
         action: action.to_string(),
         server: Some("web".to_string()),
+        user: Some("ops".to_string()),
         detail: detail.map(str::to_string),
         status,
         exit_code,
@@ -33,6 +34,7 @@ fn file_sink_appends_jsonl_and_redacts_detail() {
     let first: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
     assert_eq!(first["action"], "run");
     assert_eq!(first["server"], "web");
+    assert_eq!(first["user"], "ops");
     assert_eq!(first["status"], "ok");
     assert_eq!(first["exit_code"], 0);
     assert!(first["time_ms"].is_number());
@@ -62,6 +64,7 @@ fn audit_record_gives_up_promptly_when_record_lock_is_busy() {
         let result = sink.record(&AuditRecord {
             action: "run".to_string(),
             server: Some("server-alpha".to_string()),
+            user: Some("deploy".to_string()),
             detail: Some("printf".to_string()),
             status: AuditStatus::Ok,
             exit_code: 0,

@@ -1,16 +1,17 @@
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
 use std::fs;
 use std::path::Path;
 
-const POLICY_VERSION: u32 = 1;
+const POLICY_VERSION: u32 = 2;
+const LEGACY_POLICY_VERSION: u32 = 1;
 
 /// On-disk policy document (`<home>/policy.json`). Every field defaults so a
 /// minimal `{ "enabled": true, "allow_commands": ["ls"] }` parses.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PolicyFile {
-    #[serde(default = "current_policy_version")]
     pub version: u32,
     #[serde(default)]
     pub enabled: bool,
@@ -20,6 +21,8 @@ pub struct PolicyFile {
     pub allow_put_paths: Vec<String>,
     #[serde(default)]
     pub allow_get_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow_accounts: Vec<AccountRule>,
 }
 
 impl Default for PolicyFile {
@@ -30,12 +33,100 @@ impl Default for PolicyFile {
             allow_commands: Vec::new(),
             allow_put_paths: Vec::new(),
             allow_get_paths: Vec::new(),
+            allow_accounts: Vec::new(),
         }
     }
 }
 
-fn current_policy_version() -> u32 {
-    POLICY_VERSION
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AccountRule {
+    pub server: String,
+    pub user: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PolicyV1Wire {
+    #[serde(default = "legacy_policy_version")]
+    version: u32,
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    allow_commands: Vec<String>,
+    #[serde(default)]
+    allow_put_paths: Vec<String>,
+    #[serde(default)]
+    allow_get_paths: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PolicyV2Wire {
+    version: u32,
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    allow_commands: Vec<String>,
+    #[serde(default)]
+    allow_put_paths: Vec<String>,
+    #[serde(default)]
+    allow_get_paths: Vec<String>,
+    #[serde(default)]
+    allow_accounts: Vec<AccountRule>,
+}
+
+impl<'de> Deserialize<'de> for PolicyFile {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        let version = match value.get("version") {
+            Some(value) => value
+                .as_u64()
+                .ok_or_else(|| serde::de::Error::custom("policy version must be an integer"))?,
+            None => u64::from(LEGACY_POLICY_VERSION),
+        };
+        let version = u32::try_from(version)
+            .map_err(|_| serde::de::Error::custom("policy version is out of range"))?;
+
+        match version {
+            LEGACY_POLICY_VERSION => {
+                let wire: PolicyV1Wire =
+                    serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+                debug_assert_eq!(wire.version, LEGACY_POLICY_VERSION);
+                Ok(Self {
+                    version: POLICY_VERSION,
+                    enabled: wire.enabled,
+                    allow_commands: wire.allow_commands,
+                    allow_put_paths: wire.allow_put_paths,
+                    allow_get_paths: wire.allow_get_paths,
+                    allow_accounts: Vec::new(),
+                })
+            }
+            POLICY_VERSION => {
+                let wire: PolicyV2Wire =
+                    serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+                debug_assert_eq!(wire.version, POLICY_VERSION);
+                Ok(Self {
+                    version: POLICY_VERSION,
+                    enabled: wire.enabled,
+                    allow_commands: wire.allow_commands,
+                    allow_put_paths: wire.allow_put_paths,
+                    allow_get_paths: wire.allow_get_paths,
+                    allow_accounts: wire.allow_accounts,
+                })
+            }
+            unsupported => Err(serde::de::Error::custom(format!(
+                "unsupported policy version {unsupported}; supported versions are {LEGACY_POLICY_VERSION} and {POLICY_VERSION}"
+            ))),
+        }
+    }
+}
+
+fn legacy_policy_version() -> u32 {
+    LEGACY_POLICY_VERSION
 }
 
 /// Resolved enforcement state for an invocation.
@@ -51,6 +142,7 @@ pub struct PolicyRules {
     allow_commands: Vec<String>,
     allow_put_paths: Vec<String>,
     allow_get_paths: Vec<String>,
+    allow_accounts: Vec<AccountRule>,
 }
 
 impl PolicyRules {
@@ -82,6 +174,14 @@ impl PolicyRules {
 
     pub fn allows_get(&self, remote_path: &str) -> bool {
         path_is_allowed(&self.allow_get_paths, remote_path)
+    }
+
+    pub fn allows_account(&self, server: &str, user: &str, is_default: bool) -> bool {
+        is_default
+            || self
+                .allow_accounts
+                .iter()
+                .any(|entry| entry.server == server && entry.user == user)
     }
 }
 
@@ -119,6 +219,7 @@ pub fn resolve_policy(policy_path: &Path, force_enable: bool) -> Result<Policy> 
             allow_commands: file.allow_commands,
             allow_put_paths: file.allow_put_paths,
             allow_get_paths: file.allow_get_paths,
+            allow_accounts: file.allow_accounts,
         }))
     } else {
         Ok(Policy::Disabled)
@@ -181,13 +282,6 @@ fn read_optional_policy(path: &Path) -> Result<Option<String>> {
 fn parse_policy_file(path: &Path, contents: &str) -> Result<PolicyFile> {
     let file: PolicyFile = serde_json::from_str(contents)
         .map_err(|err| anyhow::anyhow!("invalid policy file at {}: {err}", path.display()))?;
-    if file.version != POLICY_VERSION {
-        return Err(anyhow::anyhow!(
-            "invalid policy file at {}: unsupported policy version {}; supported version is {POLICY_VERSION}",
-            path.display(),
-            file.version
-        ));
-    }
     Ok(file)
 }
 
@@ -263,6 +357,7 @@ mod tests {
             ],
             allow_put_paths: vec!["/srv/app".to_string()],
             allow_get_paths: vec!["/var/log".to_string()],
+            allow_accounts: Vec::new(),
         }
     }
 
@@ -307,6 +402,7 @@ mod tests {
             allow_commands: vec!["ls && echo done".to_string()],
             allow_put_paths: vec![],
             allow_get_paths: vec![],
+            allow_accounts: Vec::new(),
         };
         assert!(rules.allows_command("ls && echo done"));
         assert!(!rules.allows_command("ls && echo other"));

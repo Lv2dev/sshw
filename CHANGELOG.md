@@ -8,6 +8,17 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 
 ## [Unreleased]
 
+### Added
+- Added `account add/list/show/default/remove` and registered-account selection via `run`/`put`/`get --user`; omitting `--user` preserves the server's default-account behavior.
+
+### Changed
+- Config schema v2 stores a `default_user` and account map per server, with account-specific authentication and privilege metadata. Schema v1 remains readable and is rewritten only after a successful state mutation.
+- Run and transfer JSON success output and audit JSONL now include the selected login user, while `doctor` reports missing login credentials as `server/user` entries.
+
+### Security
+- New v3 credential identities bind home namespace, purpose, server, user, and generation independently; account mutation preserves the new-secret/config-publish/stale-secret-cleanup transaction and rejects cross-account references.
+- Policy schema v2 adds structured `allow_accounts`; enabled legacy v1 policies permit only default accounts, and non-default account selection fails closed without an exact server/user rule.
+
 ## [0.11.0] - 2026-08-04
 
 ### Added

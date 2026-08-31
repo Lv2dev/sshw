@@ -21,8 +21,8 @@ use sshw::config::{
 use sshw::credentials::session_store::SessionOnlyStore;
 use sshw::credentials::{AuthMaterial, CredentialStore};
 use sshw::home::{CredentialPurpose, ResolvedHome};
-use sshw::ssh::SshClient;
 use sshw::ssh::ssh2_client::Ssh2Client;
+use sshw::ssh::{SshClient, SshTarget};
 use std::fs;
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
@@ -185,12 +185,7 @@ impl TestServer {
     }
 
     fn server(&self) -> ServerConfig {
-        ServerConfig {
-            host: "127.0.0.1".to_string(),
-            port: self.port,
-            user: self.user.clone(),
-            auth: AuthConfig::Agent,
-        }
+        ServerConfig::single_account("127.0.0.1", self.port, self.user.clone(), AuthConfig::Agent)
     }
 
     fn client(&self) -> Ssh2Client {
@@ -389,14 +384,14 @@ fn wait_for_ssh_server(server: &ServerConfig, timeout: Duration) -> Result<(), S
 }
 
 fn password_server_config(port: u16) -> ServerConfig {
-    ServerConfig {
-        host: "127.0.0.1".to_string(),
+    ServerConfig::single_account(
+        "127.0.0.1",
         port,
-        user: TEST_USER.to_string(),
-        auth: AuthConfig::Password {
+        TEST_USER,
+        AuthConfig::Password {
             credential: "docker-password".to_string(),
         },
-    }
+    )
 }
 
 fn docker_privileged_config(
@@ -408,22 +403,19 @@ fn docker_privileged_config(
     let login_credential = namespace.legacy_credential_key("docker-password");
     let privilege_credential = namespace.legacy_privilege_credential_key("docker-password");
     let mut server = srv.server();
-    server.auth = AuthConfig::Password {
+    server.account_mut(TEST_USER).unwrap().auth = AuthConfig::Password {
         credential: login_credential.clone(),
     };
+    server.account_mut(TEST_USER).unwrap().privilege = Some(PrivilegeConfig {
+        method,
+        user: "root".to_string(),
+        credential: privilege_credential.clone(),
+    });
     let mut config = SshwConfig {
         default: Some("docker-password".to_string()),
         ..SshwConfig::default()
     };
     config.servers.insert("docker-password".to_string(), server);
-    config.privileges.insert(
-        "docker-password".to_string(),
-        PrivilegeConfig {
-            method,
-            user: "root".to_string(),
-            credential: privilege_credential.clone(),
-        },
-    );
     (config, login_credential, privilege_credential)
 }
 
@@ -478,15 +470,20 @@ fn known_host_name(host: &str, port: u16) -> String {
     }
 }
 
+fn default_target(server: &ServerConfig) -> SshTarget<'_> {
+    SshTarget::new(server, &server.default_user)
+}
+
 #[test]
 #[ignore = "spawns a real sshd; run with --ignored --test-threads=1"]
 fn run_executes_remote_command() {
     let srv = TestServer::start();
     srv.trust();
+    let server = srv.server();
 
     let result = srv
         .client()
-        .run(&srv.server(), &AuthMaterial::Agent, "echo hello")
+        .run(&default_target(&server), &AuthMaterial::Agent, "echo hello")
         .expect("run");
 
     assert_eq!(result.exit_status, 0);
@@ -499,10 +496,11 @@ fn run_without_stdin_sends_eof() {
     let srv = TestServer::start();
     srv.trust();
     let client = srv.client().with_op_timeout(Some(Duration::from_secs(2)));
+    let server = srv.server();
 
     let result = client
         .run(
-            &srv.server(),
+            &default_target(&server),
             &AuthMaterial::Agent,
             "cat; printf eof-observed",
         )
@@ -518,12 +516,13 @@ fn pty_password_input_sends_eof_after_the_secret_line() {
     let srv = TestServer::start();
     srv.trust();
     let client = srv.client().with_op_timeout(Some(Duration::from_secs(2)));
+    let server = srv.server();
     let nonce = "feedface";
     let command = "sh -c 'printf \"Password: \"; IFS= read -r ignored; printf \"\\n__SSHW_BEGIN_feedface__\\n\"; cat; status=$?; printf \"__SSHW_END_feedface_%s__\\n\" \"$status\"'";
 
     let result = client
         .run_with_pty_password(
-            &srv.server(),
+            &default_target(&server),
             &AuthMaterial::Agent,
             command,
             "synthetic-password",
@@ -544,11 +543,12 @@ fn op_timeout_is_absolute_despite_continuous_output() {
     let client = srv
         .client()
         .with_op_timeout(Some(Duration::from_millis(500)));
+    let server = srv.server();
 
     let started = Instant::now();
     let err = client
         .run(
-            &srv.server(),
+            &default_target(&server),
             &AuthMaterial::Agent,
             "i=0; while [ \"$i\" -lt 100 ]; do printf x; i=$((i+1)); sleep 0.05; done",
         )
@@ -570,10 +570,11 @@ fn run_rejects_output_over_limit() {
         .client()
         .with_op_timeout(Some(Duration::from_secs(5)))
         .with_output_limit(1024);
+    let server = srv.server();
 
     let err = client
         .run(
-            &srv.server(),
+            &default_target(&server),
             &AuthMaterial::Agent,
             "head -c 4096 /dev/zero",
         )
@@ -590,10 +591,11 @@ fn run_rejects_output_over_limit() {
 fn run_reports_remote_exit_status() {
     let srv = TestServer::start();
     srv.trust();
+    let server = srv.server();
 
     let result = srv
         .client()
-        .run(&srv.server(), &AuthMaterial::Agent, "exit 7")
+        .run(&default_target(&server), &AuthMaterial::Agent, "exit 7")
         .expect("run");
 
     assert_eq!(result.exit_status, 7);
@@ -604,10 +606,15 @@ fn run_reports_remote_exit_status() {
 fn run_rejects_remote_exit_signal() {
     let srv = TestServer::start();
     srv.trust();
+    let server = srv.server();
 
     let err = srv
         .client()
-        .run(&srv.server(), &AuthMaterial::Agent, "sh -c 'kill -TERM $$'")
+        .run(
+            &default_target(&server),
+            &AuthMaterial::Agent,
+            "sh -c 'kill -TERM $$'",
+        )
         .expect_err("signal-terminated remote commands must fail closed");
 
     let message = format!("{err:#}");
@@ -621,10 +628,11 @@ fn run_rejects_remote_exit_signal() {
 #[ignore = "spawns a real sshd; run with --ignored --test-threads=1"]
 fn run_rejected_when_host_key_not_trusted() {
     let srv = TestServer::start();
+    let server = srv.server();
     // Intentionally skip srv.trust(): the host key is unknown.
     let err = srv
         .client()
-        .run(&srv.server(), &AuthMaterial::Agent, "echo hi")
+        .run(&default_target(&server), &AuthMaterial::Agent, "echo hi")
         .expect_err("run must fail closed on an untrusted host key");
 
     assert!(
@@ -643,11 +651,12 @@ fn run_rejects_changed_host_key_for_trusted_host() {
 
     let changed = TestServer::start_with_known_hosts(known_hosts.clone());
     clone_known_host_entry_to_port(&known_hosts, trusted.port, changed.port);
+    let changed_server = changed.server();
 
     let err = changed
         .client()
         .run(
-            &changed.server(),
+            &default_target(&changed_server),
             &AuthMaterial::Agent,
             "echo should-not-run",
         )
@@ -666,11 +675,12 @@ fn run_authenticates_with_password_against_real_sshd() {
         return;
     };
     srv.trust();
+    let server = srv.server();
 
     let result = srv
         .client()
         .run(
-            &srv.server(),
+            &default_target(&server),
             &AuthMaterial::Password(TEST_PASSWORD.to_string()),
             "printf password-ok",
         )
@@ -871,6 +881,7 @@ fn put_then_get_roundtrip() {
     srv.trust();
     let client = srv.client();
     let server = srv.server();
+    let target = default_target(&server);
 
     let work = tempfile::tempdir().expect("tempdir");
     let src = work.path().join("src.bin");
@@ -879,18 +890,18 @@ fn put_then_get_roundtrip() {
 
     let remote = format!("/tmp/sshw_it_{}.bin", std::process::id());
     let put = client
-        .put(&server, &AuthMaterial::Agent, &src, &remote)
+        .put(&target, &AuthMaterial::Agent, &src, &remote)
         .expect("put");
     assert_eq!(put.bytes, payload.len() as u64);
 
     let dest = work.path().join("dest.bin");
     let got = client
-        .get(&server, &AuthMaterial::Agent, &remote, &dest, false)
+        .get(&target, &AuthMaterial::Agent, &remote, &dest, false)
         .expect("get");
     assert_eq!(got.bytes, payload.len() as u64);
     assert_eq!(fs::read(&dest).expect("read dest"), payload);
 
-    let _ = client.run(&server, &AuthMaterial::Agent, &format!("rm -f {remote}"));
+    let _ = client.run(&target, &AuthMaterial::Agent, &format!("rm -f {remote}"));
 }
 
 #[test]
@@ -913,11 +924,13 @@ exit 1
     let local_dir = tempfile::tempdir().unwrap();
     let destination = local_dir.path().join("download.txt");
     fs::write(&destination, "ORIGINAL").unwrap();
+    let server = srv.server();
+    let target = default_target(&server);
 
     let err = srv
         .client()
         .get(
-            &srv.server(),
+            &target,
             &AuthMaterial::Agent,
             "/ignored",
             &destination,
@@ -940,7 +953,7 @@ exit 1
     let err = srv
         .client()
         .get(
-            &srv.server(),
+            &target,
             &AuthMaterial::Agent,
             "/ignored",
             &destination,
@@ -969,11 +982,13 @@ exit 1
     let local_dir = tempfile::tempdir().unwrap();
     let destination = local_dir.path().join("download.txt");
     fs::write(&destination, "ORIGINAL").unwrap();
+    let server = srv.server();
+    let target = default_target(&server);
 
     let err = srv
         .client()
         .get(
-            &srv.server(),
+            &target,
             &AuthMaterial::Agent,
             "/ignored",
             &destination,
@@ -995,13 +1010,14 @@ fn put_rejects_remote_scp_sink_nonzero_exit_status() {
     srv.trust();
     let client = srv.client();
     let server = srv.server();
+    let target = default_target(&server);
 
     let work = tempfile::tempdir().expect("tempdir");
     let src = work.path().join("src.bin");
     fs::write(&src, b"payload for /dev/full\n").expect("write src");
 
     let err = client
-        .put(&server, &AuthMaterial::Agent, &src, "/dev/full")
+        .put(&target, &AuthMaterial::Agent, &src, "/dev/full")
         .expect_err("remote scp sink failure must fail closed");
 
     let message = format!("{err:#}");
@@ -1019,10 +1035,11 @@ fn op_timeout_aborts_idle_command() {
     let client = srv
         .client()
         .with_op_timeout(Some(Duration::from_millis(500)));
+    let server = srv.server();
 
     let started = Instant::now();
     let err = client
-        .run(&srv.server(), &AuthMaterial::Agent, "sleep 10")
+        .run(&default_target(&server), &AuthMaterial::Agent, "sleep 10")
         .expect_err("idle command must hit the operation timeout");
     assert!(
         started.elapsed() < Duration::from_secs(5),
@@ -1039,13 +1056,14 @@ fn run_handles_large_stderr_without_deadlock() {
     // operation timeout turns the hang into a failure instead of blocking
     // forever. A correct concurrent read finishes well under this budget.
     let client = srv.client().with_op_timeout(Some(Duration::from_secs(15)));
+    let server = srv.server();
 
     // Emit several MB to stderr (far past the SSH channel window) plus a small
     // stdout marker written last. Reading stdout to EOF before touching stderr
     // stalls the remote once the stderr window fills.
     let cmd = "head -c 4194304 /dev/zero | base64 >&2; echo done";
     let result = client
-        .run(&srv.server(), &AuthMaterial::Agent, cmd)
+        .run(&default_target(&server), &AuthMaterial::Agent, cmd)
         .expect("run must not deadlock on large stderr");
 
     assert_eq!(result.exit_status, 0);

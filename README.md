@@ -76,7 +76,7 @@ done
 All state lives under per-project **homes**. A home directory contains:
 
 ```text
-<home>/servers.json    server metadata (host, port, user, auth type, credential key, privilege metadata)
+<home>/servers.json    server endpoints plus registered accounts, auth/credential keys, and per-account privilege metadata
 <home>/known_hosts      trusted SSH host keys (OpenSSH format)
 <home>/policy.json      optional policy (see Policy Enforcement)
 <home>/audit.jsonl      append-only audit log
@@ -91,14 +91,16 @@ The global profile registry maps profile names to homes:
 
 `<config_dir>` is `%AppData%\sshw` on Windows, `~/Library/Application Support/sshw` on macOS, and `~/.config/sshw` on Linux.
 
-New credential keyring entries use a purpose-aware, generation-qualified v2 key so the same server name in different homes never collides and login credentials cannot be reused as privilege credentials:
+New credential keyring entries use a purpose-aware, account-qualified, generation-qualified v3 key so the same server/user pair in different homes never collides, accounts on one server cannot reuse each other's credentials, and login credentials cannot be reused as privilege credentials:
 
 ```text
-sshw:v2:<encoded-namespace>:login:<encoded-server>:<generation>
-sshw:v2:<encoded-namespace>:privilege:<encoded-server>:<generation>
+sshw:v3:<encoded-namespace>:login:<encoded-server>:<encoded-user>:<generation>
+sshw:v3:<encoded-namespace>:privilege:<encoded-server>:<encoded-user>:<generation>
 ```
 
-The namespace and server components are base64url-encoded. Each credential update receives a new generation. Legacy v1 keys (`sshw:<namespace>:<server>` and `sshw:<namespace>:privilege:<server>`) remain readable only when they exactly match the active namespace, purpose, and server; new writes never use v1.
+The namespace, server, and user components are base64url-encoded. Each credential update receives a new generation. Legacy v1 keys (`sshw:<namespace>:<server>` and `sshw:<namespace>:privilege:<server>`) and server-scoped v2 keys remain readable only when they match the active namespace, purpose, and server without colliding with another account; new writes use v3.
+
+`servers.json` schema v2 stores `default_user` plus a username-keyed `accounts` map under each server. Schema v1 remains readable: its single `user`/`auth` pair and optional server privilege entry are interpreted as the default account in memory. Read-only commands do not rewrite the file; the next successful config mutation persists schema v2 while retaining the legacy credential reference.
 
 ### Selecting A Home
 
@@ -160,6 +162,28 @@ sshw add server-beta --host 192.0.2.11 --port 2222 --user deploy --auth agent
 
 Agent auth stores no secret; it uses the active SSH agent.
 
+### Managing Server Accounts
+
+Each server endpoint can hold multiple explicitly registered SSH usernames. Omitting `--user` uses that server's `default_user`; `--user <name>` selects only an existing account and never acts as an ad-hoc username override.
+
+The canonical selector is the explicit `--user` flag. `user@alias` is not parsed because existing server aliases may contain `@`; an exact flag avoids ambiguous target resolution.
+
+```bash
+sshw account add server-alpha ops                         # password prompt
+sshw account add server-alpha auditor --auth agent
+sshw account list server-alpha
+sshw account show server-alpha ops --json
+sshw account default server-alpha ops
+sshw account remove server-alpha auditor --yes
+
+sshw run server-alpha "whoami"                           # default account
+sshw run server-alpha "whoami" --user deploy             # registered deploy account
+sshw put server-alpha ./app /srv/app/app --user deploy
+sshw get server-alpha /var/log/app.log ./app.log --user deploy
+```
+
+Password accounts store a distinct credential per server and username. Updating an account rotates only its login credential and preserves its account-specific privilege configuration. Removing a non-default account publishes the config removal before deleting that account's login and privilege credentials. A default account cannot be removed until another registered account becomes the default. `trust` remains server-only because every account on an endpoint shares the same host/port host-key boundary.
+
 ### Credential Backends
 
 The home's `servers.json` selects the credential backend via `credential_backend` (default `native`):
@@ -173,12 +197,14 @@ An external-helper backend is a planned extension behind the same `CredentialSto
 
 ```bash
 secret-manager-read root/server-alpha | sshw privilege set server-alpha --method sudo --password-stdin
+secret-manager-read root/server-alpha-ops | sshw privilege set server-alpha --account ops --method sudo --password-stdin
 sshw privilege show server-alpha
+sshw privilege show server-alpha --account ops
 sshw privilege clear server-alpha --yes
-sshw run server-alpha "systemctl restart app" --as-root --yes
+sshw run server-alpha "systemctl restart app" --user ops --as-root --yes
 ```
 
-`privilege set` stores only method, target user (default `root`), and credential key metadata in `servers.json`. The sudo/root password is stored in the active credential backend, never in CLI arguments or plaintext config. Without `--password-stdin`, `sshw` prompts with hidden input.
+Privilege metadata is scoped to the selected login account. `privilege set/show/clear --account <login-user>` selects an explicit account; omitting it uses the server default. `privilege set` stores only method, target user (default `root`), and credential key metadata in `servers.json`. The sudo/root password is stored in the active credential backend, never in CLI arguments or plaintext config. Without `--password-stdin`, `sshw` prompts with hidden input.
 
 `run --as-root` is explicit and always requires `--yes`. It first applies the normal safety and policy checks to the original command, then uses `sudo -S` with the privilege password passed through SSH channel stdin. The password is never embedded in the remote command string or audit detail. If the target user has a `NOPASSWD` sudoers rule, the command runs regardless of whether the stored password is correct, since `sudo` never consumes it — keep the stored secret accurate, but do not rely on it as an extra gate in that configuration. A sudo password rejection is reported as the remote command's non-zero status (sshw exit `8`, with the real status in `run --json` as `exit_status`) because `sudo` ran remotely. `method=su` runs `su - <user> -c ...` over a PTY and injects the stored password at the `Password:` prompt (echo disabled, prompt forced to English via `LC_ALL=C`). The command's output and exit code are framed by markers and extracted exactly. It is more environment-sensitive than `sudo`; where the prompt is not recognized it fails closed via a timeout rather than hanging. A `su` prompt/auth failure before the completion marker is an sshw auth/setup failure and maps to exit code `4`.
 
@@ -201,22 +227,27 @@ sshw list [--json]
 sshw show <name> [--json]
 sshw default [<name>]
 sshw trust <name> [--yes] [--json]
-sshw run [<name>] "<command>" [--json] [--yes] [--as-root]
-sshw put [<name>] <local> <remote> [--json] [--yes]
-sshw get [<name>] <remote> <local> [--json] [--yes]
+sshw run [<name>] "<command>" [--user <registered-user>] [--json] [--yes] [--as-root]
+sshw put [<name>] <local> <remote> [--user <registered-user>] [--json] [--yes]
+sshw get [<name>] <remote> <local> [--user <registered-user>] [--json] [--yes]
 sshw remove <name> [--yes] [--json]
 sshw doctor [--json]
+sshw account add <name> <user> [--auth password|agent] [--password-stdin] [--force] [--json]
+sshw account list <name> [--json]
+sshw account show <name> <user> [--json]
+sshw account default <name> <user>
+sshw account remove <name> <user> [--yes] [--json]
 sshw privilege <set|show|clear> ... [--json]
 sshw profile <add|list|show|default|remove> ...
 ```
 
-`add` (and `profile add`) take `--force` to overwrite an existing entry without the interactive confirmation prompt — required when registering or updating an entry non-interactively (e.g. from an agent). Updating an existing server with `add` clears that server's privilege metadata and deletes the stale privilege password from the active credential backend, so run `sshw privilege set ...` again before the next `run --as-root`.
+`add`, `account add`, and `profile add` take `--force` to overwrite an existing entry without the interactive confirmation prompt — required when registering or updating an entry non-interactively (e.g. from an agent). Updating an existing server with `add` replaces the endpoint's entire account set and deletes every stale login/privilege credential after the config publish; use `account add` when only one account's authentication should change.
 
 Global flags (available on every command): `--home <path>`, `--profile <name>`, `--policy`, `--timeout <seconds>`.
 
 `--timeout` sets an absolute timeout (seconds) for the remote operation phase of `run`/`put`/`get` after the connection is established; output or transfer progress does not extend it. Omitting the flag uses the 900-second default, while `0` explicitly disables the deadline. DNS resolution, all resolved-address attempts, TCP setup, and the SSH handshake share one 15-second connection deadline. `run` closes channel stdin even when no input was supplied and drains stdout and stderr concurrently. Exceeding the 16 MiB limit fails the operation with exit 5 instead of returning truncated output; the remote command may already have run, so do not blindly retry non-idempotent work.
 
-When the name is omitted for `run`/`put`/`get`, the configured default server is used.
+When the name is omitted for `run`/`put`/`get`, the configured default server is used. When `--user` is omitted, that server's default account is used.
 
 ### Windows Shell Paths
 
@@ -258,15 +289,18 @@ Policy is **off by default**. Turn it on for an invocation with `--policy`, or p
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "enabled": true,
   "allow_commands": ["uptime", "systemctl status *"],
   "allow_put_paths": ["/srv/app"],
-  "allow_get_paths": ["/var/log"]
+  "allow_get_paths": ["/var/log"],
+  "allow_accounts": [
+    { "server": "server-alpha", "user": "ops" }
+  ]
 }
 ```
 
-When enforcing, `run` commands must match `allow_commands` and `put`/`get` paths must be under `allow_put_paths`/`allow_get_paths`. A command containing shell metacharacters (`;`, `&`, `|`, `` ` ``, `$`, `(`, `)`, `<`, `>`) only matches an **exact** allowlist entry. Transfer paths containing `..` are rejected. Denied operations return exit code 7 (`policy`).
+When enforcing, default accounts remain available, but a non-default `--user` must exactly match a structured `allow_accounts` entry. Existing policy v1 files remain valid and allow only default accounts. `run` commands must match `allow_commands` and `put`/`get` paths must be under `allow_put_paths`/`allow_get_paths`. A command containing shell metacharacters (`;`, `&`, `|`, `` ` ``, `$`, `(`, `)`, `<`, `>`) only matches an **exact** allowlist entry. Transfer paths containing `..` are rejected. Denied operations return exit code 7 (`policy`).
 
 Policy fails closed: with `--policy`, a missing policy file is an error, and a present-but-invalid file is always an error. An inactive policy file (`"enabled": false`) is still rejected when it has an unknown field or unsupported version; rename or remove an intentionally unused invalid file before running remote operations.
 
@@ -274,13 +308,13 @@ See the Security Boundary note: `allow_commands` delegates whole-program executi
 
 ### Audit Log
 
-Mutating/active operations (`add`, `remove`, `trust`, `default`, `profile add`, `profile default`, `profile remove`, `run`, `put`, `get`, `privilege set`, `privilege clear`) are appended to `audit.jsonl`, one JSON object per line. Home-scoped operations use the active home's log; global profile-registry mutations consistently use the built-in default home's log regardless of the profile being added, selected, or removed:
+Mutating/active operations (`add`, `remove`, `trust`, `default`, `account add`, `account default`, `account remove`, `profile add`, `profile default`, `profile remove`, `run`, `put`, `get`, `privilege set`, `privilege clear`) are appended to `audit.jsonl`, one JSON object per line. Home-scoped operations use the active home's log; global profile-registry mutations consistently use the built-in default home's log regardless of the profile being added, selected, or removed:
 
 ```json
-{"time_ms":1700000000000,"action":"run","server":"web","status":"ok","exit_code":0,"detail":"uptime"}
+{"time_ms":1700000000000,"action":"run","server":"web","user":"ops","status":"ok","exit_code":0,"detail":"uptime"}
 ```
 
-`detail` for `run` is only the program name (not its arguments). Server names, paths, and details are redacted on a best-effort basis. Attempted `run`/`put`/`get` operations, including policy setup failures, are recorded with an error status. Read-only commands (`list`, `show`, `doctor`, `profile list`, `profile show`) are not audited. Audit writes are best-effort: a busy record lock is retried for 100 milliseconds and then that record is skipped without failing the operation. The file is owner-only on Unix (best-effort on Windows). The log is append-only but not tamper-evident — it has no integrity chain or signing, and anyone who can write the home can edit or delete entries. Treat `audit.jsonl` as sensitive.
+`user` records the selected login account. `detail` for `run` is only the program name (not its arguments). Server names, users, paths, and details are redacted on a best-effort basis. Attempted `run`/`put`/`get` operations, including policy setup failures, are recorded with an error status. Read-only commands (`list`, `show`, `account list`, `account show`, `doctor`, `profile list`, `profile show`) are not audited. Audit writes are best-effort: a busy record lock is retried for 100 milliseconds and then that record is skipped without failing the operation. The file is owner-only on Unix (best-effort on Windows). The log is append-only but not tamper-evident — it has no integrity chain or signing, and anyone who can write the home can edit or delete entries. Treat `audit.jsonl` as sensitive.
 
 ### Output Redaction
 
@@ -293,11 +327,11 @@ sshw doctor
 sshw doctor --json
 ```
 
-`doctor` reports the resolved home and how it was selected, the registry / config / known_hosts / policy / audit paths, registry validity and diagnostics (`registry_valid`, `registry_message`), whether the config file exists, the operating system, the linked libssh2 and OpenSSL version/status, the credential namespace, whether policy is present/valid/enabled, whether the audit log is writable, the credential backend health, and any configured servers whose credentials are missing (`missing_credentials`). A corrupt registry does not prevent `doctor` from running; it diagnoses the registry from the built-in default home unless an explicit home already resolves. On Windows default builds, `openssl_version` may report `not linked (Windows WinCNG backend)` because libssh2 uses WinCNG instead of OpenSSL.
+`doctor` reports the resolved home and how it was selected, the registry / config / known_hosts / policy / audit paths, registry validity and diagnostics (`registry_valid`, `registry_message`), whether the config file exists, the operating system, the linked libssh2 and OpenSSL version/status, the credential namespace, whether policy is present/valid/enabled, whether the audit log is writable, the credential backend health, and missing login credentials as `server/user` entries (`missing_credentials`). A corrupt registry does not prevent `doctor` from running; it diagnoses the registry from the built-in default home unless an explicit home already resolves. On Windows default builds, `openssl_version` may report `not linked (Windows WinCNG backend)` because libssh2 uses WinCNG instead of OpenSSL.
 
 ### JSON Error Contract
 
-Commands that support `--json` (`add`, `list`, `show`, `trust`, `run`, `put`, `get`, `remove`, `doctor`, `profile list`, `profile show`, `privilege set`, `privilege show`, `privilege clear`) return a structured error envelope on runtime failures:
+Commands that support `--json` (`add`, `list`, `show`, `trust`, `run`, `put`, `get`, `remove`, `doctor`, `account add`, `account list`, `account show`, `account remove`, `profile list`, `profile show`, `privilege set`, `privilege show`, `privilege clear`) return a structured error envelope on runtime failures:
 
 ```json
 {"ok":false,"error":{"kind":"config","message":"unknown server 'missing'","exit_code":3}}
@@ -319,12 +353,12 @@ When wrapped source errors exist, `error` includes an optional `causes` array co
 `put --json` and `get --json` return transfer summaries on success:
 
 ```json
-{"ok":true,"server":"server-alpha","local":"./app","remote":"/tmp/app","bytes":1234}
+{"ok":true,"server":"server-alpha","user":"ops","local":"./app","remote":"/tmp/app","bytes":1234}
 ```
 
-Every single-object `--json` success response (`add`, `show`, `trust`, `run`, `put`, `get`, `remove`, `doctor`, `profile show`, `privilege set`, `privilege show`, `privilege clear`) includes `"ok":true`, mirroring the `"ok":false` error envelope so a consumer can branch on `ok`. `list` and `profile list` return a JSON array on success (no wrapping object); on failure they emit the same `{"ok":false,...}` envelope.
+Every single-object `--json` success response (`add`, `show`, `trust`, `run`, `put`, `get`, `remove`, `doctor`, `account add`, `account show`, `account remove`, `profile show`, `privilege set`, `privilege show`, `privilege clear`) includes `"ok":true`, mirroring the `"ok":false` error envelope so a consumer can branch on `ok`. `list`, `account list`, and `profile list` return a JSON array on success (no wrapping object); on failure they emit the same `{"ok":false,...}` envelope.
 
-`default` and profile state changes (`profile add`, `profile default`, `profile remove`) do not have a `--json` flag; they report human-readable errors on stderr with the same stable exit codes. Human output everywhere uses the same exit-code mapping.
+`default`, `account default`, and profile state changes (`profile add`, `profile default`, `profile remove`) do not have a `--json` flag; they report human-readable errors on stderr with the same stable exit codes. Human output everywhere uses the same exit-code mapping.
 
 Invalid CLI arguments exit with code `9` (`usage`), kept distinct from `safety` (2) so an agent can tell "called sshw wrong" apart from "a safety rail blocked the operation". With `--json`, a usage error is emitted as the same envelope on stdout (`{"ok":false,"error":{"kind":"usage",...}}`); otherwise the parser's message goes to stderr. `--help`/`--version` print to stdout and exit `0`.
 
@@ -446,7 +480,7 @@ done
 모든 상태는 프로젝트별 **home** 아래에 있습니다. home 디렉터리 구성:
 
 ```text
-<home>/servers.json    서버 메타데이터(host, port, user, auth type, credential key, privilege metadata)
+<home>/servers.json    서버 endpoint와 등록 account, auth/credential key, account별 privilege metadata
 <home>/known_hosts      신뢰한 SSH host key(OpenSSH 형식)
 <home>/policy.json      선택적 policy(아래 Policy 참고)
 <home>/audit.jsonl      append-only audit log
@@ -461,14 +495,16 @@ done
 
 `<config_dir>`는 Windows `%AppData%\sshw`, macOS `~/Library/Application Support/sshw`, Linux `~/.config/sshw`입니다.
 
-신규 credential keyring 키는 purpose와 generation을 포함한 v2 형식을 사용합니다. 따라서 서로 다른 home의 같은 서버 이름이 충돌하지 않고 login credential을 privilege credential로 재사용할 수도 없습니다.
+신규 credential keyring 키는 purpose, server, user, generation을 포함한 v3 형식을 사용합니다. 따라서 서로 다른 home의 같은 server/user가 충돌하지 않고, 한 서버의 account끼리 credential을 재사용할 수 없으며, login credential을 privilege credential로 재사용할 수도 없습니다.
 
 ```text
-sshw:v2:<encoded-namespace>:login:<encoded-server>:<generation>
-sshw:v2:<encoded-namespace>:privilege:<encoded-server>:<generation>
+sshw:v3:<encoded-namespace>:login:<encoded-server>:<encoded-user>:<generation>
+sshw:v3:<encoded-namespace>:privilege:<encoded-server>:<encoded-user>:<generation>
 ```
 
-namespace와 server는 base64url로 인코딩하며 credential을 갱신할 때마다 새 generation을 발급합니다. legacy v1 키(`sshw:<namespace>:<server>`, `sshw:<namespace>:privilege:<server>`)는 active namespace, purpose, server가 정확히 일치할 때만 읽기 호환을 유지하며 신규 저장에는 사용하지 않습니다.
+namespace, server, user는 base64url로 인코딩하며 credential을 갱신할 때마다 새 generation을 발급합니다. legacy v1 키(`sshw:<namespace>:<server>`, `sshw:<namespace>:privilege:<server>`)와 server 범위 v2 키는 active namespace, purpose, server가 일치하고 다른 account와 충돌하지 않을 때만 읽기 호환을 유지하며 신규 저장은 v3를 사용합니다.
+
+`servers.json` schema v2는 각 server 아래 `default_user`와 username-keyed `accounts` map을 저장합니다. schema v1도 계속 읽을 수 있으며 기존 단일 `user`/`auth`와 선택적 server privilege를 메모리에서 default account로 해석합니다. read-only 명령은 파일을 바꾸지 않고, 다음 config mutation이 성공하면 legacy credential 참조를 유지한 채 schema v2로 저장합니다.
 
 ### home 선택
 
@@ -530,6 +566,28 @@ sshw add server-beta --host 192.0.2.11 --port 2222 --user deploy --auth agent
 
 agent auth는 비밀을 저장하지 않고 활성 SSH agent를 사용합니다.
 
+### 서버 account 관리
+
+각 server endpoint에는 여러 SSH username을 명시적으로 등록할 수 있습니다. `--user`를 생략하면 server의 `default_user`를 사용하고, `--user <name>`은 등록된 account만 선택하며 임의 username override로 동작하지 않습니다.
+
+canonical selector는 명시적 `--user` 플래그입니다. 기존 server alias에는 `@`가 들어갈 수 있어 target 해석이 모호해지므로 `user@alias`는 파싱하지 않습니다.
+
+```bash
+sshw account add server-alpha ops                         # 비밀번호 prompt
+sshw account add server-alpha auditor --auth agent
+sshw account list server-alpha
+sshw account show server-alpha ops --json
+sshw account default server-alpha ops
+sshw account remove server-alpha auditor --yes
+
+sshw run server-alpha "whoami"                           # default account
+sshw run server-alpha "whoami" --user deploy             # 등록된 deploy account
+sshw put server-alpha ./app /srv/app/app --user deploy
+sshw get server-alpha /var/log/app.log ./app.log --user deploy
+```
+
+password account는 server와 username마다 독립 credential을 저장합니다. account 갱신은 해당 login credential만 rotation하고 account별 privilege 설정은 보존합니다. non-default account 제거는 config에서 먼저 제거한 뒤 해당 login/privilege credential을 삭제합니다. default account는 다른 등록 account를 default로 지정하기 전에는 제거할 수 없습니다. 하나의 endpoint에 속한 모든 account는 같은 host/port host-key 경계를 공유하므로 `trust`는 server-only로 유지됩니다.
+
 ### Credential 백엔드
 
 home의 `servers.json`이 `credential_backend`(기본 `native`)로 백엔드를 선택합니다.
@@ -543,12 +601,14 @@ external-helper 백엔드는 동일한 `CredentialStore` trait 뒤의 후속 확
 
 ```bash
 secret-manager-read root/server-alpha | sshw privilege set server-alpha --method sudo --password-stdin
+secret-manager-read root/server-alpha-ops | sshw privilege set server-alpha --account ops --method sudo --password-stdin
 sshw privilege show server-alpha
+sshw privilege show server-alpha --account ops
 sshw privilege clear server-alpha --yes
-sshw run server-alpha "systemctl restart app" --as-root --yes
+sshw run server-alpha "systemctl restart app" --user ops --as-root --yes
 ```
 
-`privilege set`은 method, 대상 user(기본 `root`), credential key metadata만 `servers.json`에 저장합니다. sudo/root 비밀번호는 활성 credential backend에만 저장되며 CLI 인자나 평문 config에는 들어가지 않습니다. `--password-stdin`을 쓰지 않으면 숨김 입력 프롬프트로 받습니다.
+privilege metadata는 선택된 login account별로 분리됩니다. `privilege set/show/clear --account <login-user>`는 account를 명시하고, 생략하면 server default account를 사용합니다. `privilege set`은 method, 대상 user(기본 `root`), credential key metadata만 `servers.json`에 저장합니다. sudo/root 비밀번호는 활성 credential backend에만 저장되며 CLI 인자나 평문 config에는 들어가지 않습니다. `--password-stdin`을 쓰지 않으면 숨김 입력 프롬프트로 받습니다.
 
 `run --as-root`는 명시적으로만 동작하며 항상 `--yes`가 필요합니다. 원래 명령에 기존 safety/policy 검사를 먼저 적용한 뒤, SSH channel stdin으로만 privilege 비밀번호를 전달하는 `sudo -S` 경로를 사용합니다. 비밀번호는 원격 command string이나 audit detail에 들어가지 않습니다. 대상 user에 `NOPASSWD` sudoers 규칙이 있으면 `sudo`가 비밀번호를 소비하지 않으므로, 저장된 비밀번호의 정확성과 무관하게 명령이 실행됩니다 — 이 경우 저장 비밀번호는 추가 게이트가 아닙니다. sudo 비밀번호 거부는 원격에서 실행된 `sudo` 명령의 non-zero 상태로 보고되므로 sshw exit `8`이며, 실제 상태는 `run --json`의 `exit_status`에 들어갑니다. `method=su`는 `su - <user> -c ...`를 PTY로 실행하고 `Password:` 프롬프트가 나오면 저장된 비밀번호를 주입합니다(echo 비활성화, `LC_ALL=C`로 프롬프트를 영어로 고정). 명령 출력과 exit code는 marker로 정확히 추출되어 출력 라인이 누락되지 않습니다. `sudo`보다 환경에 민감하며, 프롬프트를 인식하지 못하면 무한 대기 대신 타임아웃으로 fail-closed됩니다. completion marker 전에 발생한 `su` 프롬프트/인증 실패는 sshw의 auth/setup 실패로 간주되어 exit code `4`에 매핑됩니다.
 
@@ -571,22 +631,27 @@ sshw list [--json]
 sshw show <name> [--json]
 sshw default [<name>]
 sshw trust <name> [--yes] [--json]
-sshw run [<name>] "<command>" [--json] [--yes] [--as-root]
-sshw put [<name>] <local> <remote> [--json] [--yes]
-sshw get [<name>] <remote> <local> [--json] [--yes]
+sshw run [<name>] "<command>" [--user <registered-user>] [--json] [--yes] [--as-root]
+sshw put [<name>] <local> <remote> [--user <registered-user>] [--json] [--yes]
+sshw get [<name>] <remote> <local> [--user <registered-user>] [--json] [--yes]
 sshw remove <name> [--yes] [--json]
 sshw doctor [--json]
+sshw account add <name> <user> [--auth password|agent] [--password-stdin] [--force] [--json]
+sshw account list <name> [--json]
+sshw account show <name> <user> [--json]
+sshw account default <name> <user>
+sshw account remove <name> <user> [--yes] [--json]
 sshw privilege <set|show|clear> ... [--json]
 sshw profile <add|list|show|default|remove> ...
 ```
 
-`add`(및 `profile add`)는 `--force`로 기존 항목을 대화형 확인 프롬프트 없이 덮어씁니다 — 비대화형(예: 에이전트)에서 항목을 등록/갱신할 때 필요합니다. 기존 서버를 `add`로 갱신하면 해당 서버의 privilege metadata와 활성 credential backend의 오래된 privilege 비밀번호가 삭제되므로, 다음 `run --as-root` 전에 `sshw privilege set ...`을 다시 실행해야 합니다.
+`add`, `account add`, `profile add`는 `--force`로 기존 항목을 대화형 확인 프롬프트 없이 덮어씁니다 — 비대화형(예: 에이전트)에서 항목을 등록/갱신할 때 필요합니다. 기존 server를 `add`로 갱신하면 endpoint의 account 전체를 교체하고 config publish 후 오래된 login/privilege credential을 모두 삭제합니다. 한 account의 auth만 바꾸려면 `account add`를 사용하세요.
 
 전역 플래그(모든 명령에서 사용): `--home <path>`, `--profile <name>`, `--policy`, `--timeout <seconds>`.
 
 `--timeout`은 연결 수립 이후 `run`/`put`/`get`의 원격 작업 단계에 적용되는 절대 타임아웃(초)이며, 출력이나 전송 진행이 있어도 기한이 연장되지 않습니다. 플래그를 생략하면 기본 900초, `0`은 기한을 명시적으로 해제합니다. DNS 해석, 해석된 모든 주소에 대한 연결 시도, TCP 수립, SSH handshake는 하나의 15초 연결 deadline을 공유합니다. `run`은 입력이 없어도 채널 stdin을 닫고 stdout/stderr를 동시에 배출합니다. 두 출력 합계가 16 MiB를 넘으면 잘린 성공 출력을 반환하지 않고 exit 5로 실패합니다. 원격 명령의 부작용은 이미 발생했을 수 있으므로 비멱등 작업을 무작정 재시도하지 마세요.
 
-`run`/`put`/`get`에서 이름을 생략하면 설정된 기본 서버를 사용합니다.
+`run`/`put`/`get`에서 이름을 생략하면 설정된 기본 서버를 사용합니다. `--user`를 생략하면 해당 server의 default account를 사용합니다.
 
 ### Windows 셸 경로
 
@@ -628,15 +693,18 @@ policy는 **기본 off**입니다. 호출별로 `--policy`로 켜거나, home의
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "enabled": true,
   "allow_commands": ["uptime", "systemctl status *"],
   "allow_put_paths": ["/srv/app"],
-  "allow_get_paths": ["/var/log"]
+  "allow_get_paths": ["/var/log"],
+  "allow_accounts": [
+    { "server": "server-alpha", "user": "ops" }
+  ]
 }
 ```
 
-적용 시 `run` 명령은 `allow_commands`에, `put`/`get` 경로는 `allow_put_paths`/`allow_get_paths` 하위에 매칭돼야 합니다. 쉘 메타문자(`;`, `&`, `|`, `` ` ``, `$`, `(`, `)`, `<`, `>`)를 포함한 명령은 **정확히 일치하는** allowlist 항목에만 매칭됩니다. `..`를 포함한 전송 경로는 거부됩니다. 거부된 작업은 exit code 7(`policy`)을 반환합니다.
+적용 시 default account는 계속 허용되지만 non-default `--user`는 구조화된 `allow_accounts`의 exact server/user 항목과 일치해야 합니다. 기존 policy v1은 계속 유효하며 default account만 허용합니다. `run` 명령은 `allow_commands`에, `put`/`get` 경로는 `allow_put_paths`/`allow_get_paths` 하위에 매칭돼야 합니다. 쉘 메타문자(`;`, `&`, `|`, `` ` ``, `$`, `(`, `)`, `<`, `>`)를 포함한 명령은 **정확히 일치하는** allowlist 항목에만 매칭됩니다. `..`를 포함한 전송 경로는 거부됩니다. 거부된 작업은 exit code 7(`policy`)을 반환합니다.
 
 policy는 fail-closed입니다. `--policy`인데 파일이 없으면 에러이고, 파일이 있으나 유효하지 않으면 항상 에러입니다. `"enabled": false`인 비활성 policy도 unknown field나 지원하지 않는 version이 있으면 거부됩니다. 의도적으로 사용하지 않는 잘못된 파일은 원격 작업 전에 이름을 바꾸거나 제거하세요.
 
@@ -644,13 +712,13 @@ policy는 fail-closed입니다. `--policy`인데 파일이 없으면 에러이�
 
 ### Audit Log
 
-변경/실행 작업(`add`, `remove`, `trust`, `default`, `profile add`, `profile default`, `profile remove`, `run`, `put`, `get`, `privilege set`, `privilege clear`)은 `audit.jsonl`에 줄당 JSON 객체로 append됩니다. home 범위 작업은 active home의 로그를 사용하고, 전역 profile registry 변경은 추가·선택·제거 대상과 무관하게 내장 default home의 로그에 일관되게 기록됩니다.
+변경/실행 작업(`add`, `remove`, `trust`, `default`, `account add`, `account default`, `account remove`, `profile add`, `profile default`, `profile remove`, `run`, `put`, `get`, `privilege set`, `privilege clear`)은 `audit.jsonl`에 줄당 JSON 객체로 append됩니다. home 범위 작업은 active home의 로그를 사용하고, 전역 profile registry 변경은 추가·선택·제거 대상과 무관하게 내장 default home의 로그에 일관되게 기록됩니다.
 
 ```json
-{"time_ms":1700000000000,"action":"run","server":"web","status":"ok","exit_code":0,"detail":"uptime"}
+{"time_ms":1700000000000,"action":"run","server":"web","user":"ops","status":"ok","exit_code":0,"detail":"uptime"}
 ```
 
-`run`의 `detail`은 인자가 아닌 프로그램 이름만 기록합니다. 서버명·경로·detail은 best-effort로 redaction됩니다. 시도한 `run`/`put`/`get`의 policy 준비가 실패한 경우도 error 상태로 기록합니다. read-only 명령(`list`, `show`, `doctor`, `profile list`, `profile show`)은 기록하지 않습니다. audit 쓰기는 best-effort입니다. record lock이 바쁘면 100밀리초 동안 재시도한 뒤 해당 레코드를 생략하며 작업 자체는 실패시키지 않습니다. 파일은 Unix에서 owner-only(Windows는 best-effort)입니다. append-only이지만 tamper-evident가 아닙니다 — 무결성 체인이나 서명이 없고, home을 쓸 수 있는 누구나 항목을 수정·삭제할 수 있습니다. `audit.jsonl`은 민감 파일로 취급하세요.
+`user`는 선택된 login account를 기록합니다. `run`의 `detail`은 인자가 아닌 프로그램 이름만 기록합니다. 서버명·user·경로·detail은 best-effort로 redaction됩니다. 시도한 `run`/`put`/`get`의 policy 준비가 실패한 경우도 error 상태로 기록합니다. read-only 명령(`list`, `show`, `account list`, `account show`, `doctor`, `profile list`, `profile show`)은 기록하지 않습니다. audit 쓰기는 best-effort입니다. record lock이 바쁘면 100밀리초 동안 재시도한 뒤 해당 레코드를 생략하며 작업 자체는 실패시키지 않습니다. 파일은 Unix에서 owner-only(Windows는 best-effort)입니다. append-only이지만 tamper-evident가 아닙니다 — 무결성 체인이나 서명이 없고, home을 쓸 수 있는 누구나 항목을 수정·삭제할 수 있습니다. `audit.jsonl`은 민감 파일로 취급하세요.
 
 ### 출력 redaction
 
@@ -663,11 +731,11 @@ sshw doctor
 sshw doctor --json
 ```
 
-`doctor`는 해석된 home과 선택 경위, registry/config/known_hosts/policy/audit 경로, registry 유효성과 진단(`registry_valid`, `registry_message`), config 파일 존재 여부, 운영체제, 연결된 libssh2 및 OpenSSL 버전/상태, credential namespace, policy present/valid/enabled, audit 쓰기 가능 여부, credential backend 상태, 그리고 credential이 없는 등록 서버 목록(`missing_credentials`)을 보고합니다. 손상된 registry도 `doctor` 실행을 막지 않으며, 명시적 home이 이미 해석되지 않았다면 내장 default home에서 registry 오류를 진단합니다. Windows 기본 빌드에서는 libssh2가 OpenSSL 대신 WinCNG를 사용하므로 `openssl_version`이 `not linked (Windows WinCNG backend)`로 표시될 수 있습니다.
+`doctor`는 해석된 home과 선택 경위, registry/config/known_hosts/policy/audit 경로, registry 유효성과 진단(`registry_valid`, `registry_message`), config 파일 존재 여부, 운영체제, 연결된 libssh2 및 OpenSSL 버전/상태, credential namespace, policy present/valid/enabled, audit 쓰기 가능 여부, credential backend 상태, 그리고 누락된 login credential을 `server/user` 항목으로 보고하는 `missing_credentials`를 제공합니다. 손상된 registry도 `doctor` 실행을 막지 않으며, 명시적 home이 이미 해석되지 않았다면 내장 default home에서 registry 오류를 진단합니다. Windows 기본 빌드에서는 libssh2가 OpenSSL 대신 WinCNG를 사용하므로 `openssl_version`이 `not linked (Windows WinCNG backend)`로 표시될 수 있습니다.
 
 ### JSON 오류 계약
 
-`--json`을 지원하는 명령(`add`, `list`, `show`, `trust`, `run`, `put`, `get`, `remove`, `doctor`, `profile list`, `profile show`, `privilege set`, `privilege show`, `privilege clear`)은 런타임 실패 시 구조화된 envelope를 반환합니다.
+`--json`을 지원하는 명령(`add`, `list`, `show`, `trust`, `run`, `put`, `get`, `remove`, `doctor`, `account add`, `account list`, `account show`, `account remove`, `profile list`, `profile show`, `privilege set`, `privilege show`, `privilege clear`)은 런타임 실패 시 구조화된 envelope를 반환합니다.
 
 ```json
 {"ok":false,"error":{"kind":"config","message":"unknown server 'missing'","exit_code":3}}
@@ -689,12 +757,12 @@ sshw doctor --json
 `put --json`과 `get --json`은 성공 시 전송 요약을 반환합니다.
 
 ```json
-{"ok":true,"server":"server-alpha","local":"./app","remote":"/tmp/app","bytes":1234}
+{"ok":true,"server":"server-alpha","user":"ops","local":"./app","remote":"/tmp/app","bytes":1234}
 ```
 
-단일 object를 반환하는 `--json` 성공 응답(`add`, `show`, `trust`, `run`, `put`, `get`, `remove`, `doctor`, `profile show`, `privilege set`, `privilege show`, `privilege clear`)은 모두 `"ok":true`를 포함해 오류 envelope의 `"ok":false`와 대칭을 이루므로, 소비자가 `ok`로 분기할 수 있습니다. `list`와 `profile list`는 성공 시 JSON 배열을 반환하며(래핑 object 없음), 실패 시에는 동일한 `{"ok":false,...}` envelope를 출력합니다.
+단일 object를 반환하는 `--json` 성공 응답(`add`, `show`, `trust`, `run`, `put`, `get`, `remove`, `doctor`, `account add`, `account show`, `account remove`, `profile show`, `privilege set`, `privilege show`, `privilege clear`)은 모두 `"ok":true`를 포함해 오류 envelope의 `"ok":false`와 대칭을 이루므로, 소비자가 `ok`로 분기할 수 있습니다. `list`, `account list`, `profile list`는 성공 시 JSON 배열을 반환하며(래핑 object 없음), 실패 시에는 동일한 `{"ok":false,...}` envelope를 출력합니다.
 
-`default`와 profile 상태 변경(`profile add`, `profile default`, `profile remove`)에는 `--json` 플래그가 없으며, 동일한 안정 exit code로 stderr에 사람용 메시지를 출력합니다. human 출력도 같은 exit code 매핑을 사용합니다.
+`default`, `account default`, profile 상태 변경(`profile add`, `profile default`, `profile remove`)에는 `--json` 플래그가 없으며, 동일한 안정 exit code로 stderr에 사람용 메시지를 출력합니다. human 출력도 같은 exit code 매핑을 사용합니다.
 
 잘못된 CLI 인자는 exit code `9`(`usage`)로 끝나며, `safety`(2)와 분리해 에이전트가 "sshw를 잘못 호출함"과 "safety rail이 차단함"을 구분할 수 있습니다. `--json`이면 usage 오류도 동일한 envelope로 stdout에 출력하고(`{"ok":false,"error":{"kind":"usage",...}}`), 아니면 파서 메시지를 stderr로 보냅니다. `--help`/`--version`은 stdout으로 출력하고 exit `0`입니다.
 

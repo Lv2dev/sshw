@@ -188,6 +188,7 @@ pub struct RunOutput {
     /// the put/get success summaries so JSON consumers can branch on `ok`.
     pub ok: bool,
     pub server: String,
+    pub user: String,
     pub command: String,
     pub exit_status: i32,
     pub stdout: String,
@@ -201,19 +202,24 @@ pub struct ServerOutput {
     pub host: String,
     pub port: u16,
     pub user: String,
+    pub account_count: usize,
     pub is_default: bool,
     pub auth: AuthOutput,
 }
 
 impl ServerOutput {
     pub fn from_config(name: &str, server: &ServerConfig, is_default: bool) -> Self {
+        let (user, account) = server
+            .default_account()
+            .expect("validated server config must contain its default account");
         Self {
             name: name.to_string(),
             host: server.host.clone(),
             port: server.port,
-            user: server.user.clone(),
+            user: user.to_string(),
+            account_count: server.accounts.len(),
             is_default,
-            auth: AuthOutput::from_config(&server.auth),
+            auth: AuthOutput::from_config(&account.auth),
         }
     }
 }

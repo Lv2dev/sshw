@@ -28,8 +28,18 @@ where
     P: Prompter,
 {
     validate_server_name(&args.name).with_error_kind(ErrorKind::Config)?;
-    get_server(config, &args.name)?;
-    if config.privileges.contains_key(&args.name)
+    let server = get_server(config, &args.name)?;
+    let login_user = args
+        .account
+        .clone()
+        .unwrap_or_else(|| server.default_user.clone());
+    if server.account(&login_user).is_none() {
+        return Err(super::account::unknown_account(&args.name, &login_user));
+    }
+    let previous_privilege = get_server(config, &args.name)?
+        .account(&login_user)
+        .and_then(|account| account.privilege.clone());
+    if previous_privilege.is_some()
         && !args.force
         && !prompter
             .confirm(&format!(
@@ -50,11 +60,14 @@ where
     };
     validate_privilege_password(&password)?;
 
-    let previous_privilege = config.privileges.get(&args.name).cloned();
     let privilege = PrivilegeConfig {
         method: map_method(args.method),
         user: args.user,
-        credential: namespace.new_credential_key(CredentialPurpose::Privilege, &args.name),
+        credential: namespace.new_account_credential_key(
+            CredentialPurpose::Privilege,
+            &args.name,
+            &login_user,
+        ),
     };
     let output_method = privilege.method;
     let output_user = privilege.user.clone();
@@ -68,7 +81,12 @@ where
         )
         .with_error_kind(ErrorKind::Auth)?;
     let stored_credential = (privilege.credential.clone(), privilege.user.clone());
-    config.privileges.insert(args.name.clone(), privilege);
+    config
+        .servers
+        .get_mut(&args.name)
+        .and_then(|server| server.accounts.get_mut(&login_user))
+        .expect("validated default account")
+        .privilege = Some(privilege);
     if let Err(err) =
         save_config_if_unchanged(config_path, config, revision).with_error_kind(ErrorKind::Config)
     {
@@ -83,8 +101,10 @@ where
     }
     if let Some(previous) = previous_privilege {
         let current = config
-            .privileges
+            .servers
             .get(&args.name)
+            .and_then(|server| server.account(&login_user))
+            .and_then(|account| account.privilege.as_ref())
             .expect("privilege just set");
         if previous.credential != current.credential || previous.user != current.user {
             credentials
@@ -109,6 +129,7 @@ where
         let mut output = json!({
             "ok": true,
             "server": args.name,
+            "account": login_user,
             "method": output_method,
             "user": output_user,
             "credential": output_credential,
@@ -133,16 +154,21 @@ pub(super) fn show_privilege(
     args: PrivilegeShowArgs,
     config: &SshwConfig,
 ) -> anyhow::Result<CommandOutput> {
-    get_server(config, &args.name)?;
-    let privilege = config
-        .privileges
-        .get(&args.name)
-        .ok_or_else(|| missing_privilege(&args.name))?;
+    let server = get_server(config, &args.name)?;
+    let login_user = args.account.as_deref().unwrap_or(&server.default_user);
+    let account = server
+        .account(login_user)
+        .ok_or_else(|| super::account::unknown_account(&args.name, login_user))?;
+    let privilege = account
+        .privilege
+        .as_ref()
+        .ok_or_else(|| missing_privilege(&args.name, login_user))?;
 
     if args.json {
         let output = json!({
             "ok": true,
             "server": args.name,
+            "account": login_user,
             "method": privilege.method,
             "user": privilege.user,
             "credential": privilege.credential,
@@ -174,11 +200,17 @@ where
     if !config.servers.contains_key(&args.name) {
         return Err(unknown_server(&args.name));
     }
-    let privilege = config
-        .privileges
-        .get(&args.name)
-        .cloned()
-        .ok_or_else(|| missing_privilege(&args.name))?;
+    let login_user = args
+        .account
+        .clone()
+        .unwrap_or_else(|| config.servers[&args.name].default_user.clone());
+    let account = config.servers[&args.name]
+        .account(&login_user)
+        .ok_or_else(|| super::account::unknown_account(&args.name, &login_user))?;
+    let privilege = account
+        .privilege
+        .clone()
+        .ok_or_else(|| missing_privilege(&args.name, &login_user))?;
 
     if !args.yes
         && !prompter
@@ -191,7 +223,12 @@ where
         return Err(app_error(ErrorKind::Config, "privilege clear cancelled"));
     }
 
-    config.privileges.remove(&args.name);
+    config
+        .servers
+        .get_mut(&args.name)
+        .and_then(|server| server.accounts.get_mut(&login_user))
+        .expect("validated default account")
+        .privilege = None;
     save_config_if_unchanged(config_path, config, revision).with_error_kind(ErrorKind::Config)?;
     credentials
         .delete_password_for(
@@ -205,6 +242,7 @@ where
             "ok": true,
             "action": "cleared",
             "server": args.name,
+            "account": login_user,
         });
         return Ok(ok(format!("{}\n", serde_json::to_string(&output)?)));
     }
@@ -212,11 +250,11 @@ where
     Ok(ok(format!("privilege cleared for {}\n", args.name)))
 }
 
-pub(super) fn missing_privilege(server: &str) -> anyhow::Error {
+pub(super) fn missing_privilege(server: &str, login_user: &str) -> anyhow::Error {
     app_error(
         ErrorKind::Config,
         format!(
-            "privilege configuration missing for server '{server}'; run 'sshw privilege set {server} --method sudo' first"
+            "privilege configuration missing for account '{server}/{login_user}'; run 'sshw privilege set {server} --account {login_user} --method sudo' first"
         ),
     )
 }
@@ -322,23 +360,27 @@ mod tests {
         };
         config.servers.insert(
             "web".to_string(),
-            ServerConfig {
-                host: "192.0.2.10".to_string(),
-                port: 22,
-                user: "deploy".to_string(),
-                auth: AuthConfig::Password {
+            ServerConfig::single_account(
+                "192.0.2.10",
+                22,
+                "deploy",
+                AuthConfig::Password {
                     credential: "sshw:default:web".to_string(),
                 },
-            },
+            ),
         );
-        config.privileges.insert(
-            "web".to_string(),
-            PrivilegeConfig {
-                method: PrivilegeMethod::Sudo,
-                user: "root".to_string(),
-                credential: "sshw:default:privilege:web".to_string(),
-            },
-        );
+        config
+            .servers
+            .get_mut("web")
+            .unwrap()
+            .accounts
+            .get_mut("deploy")
+            .unwrap()
+            .privilege = Some(PrivilegeConfig {
+            method: PrivilegeMethod::Sudo,
+            user: "root".to_string(),
+            credential: "sshw:default:privilege:web".to_string(),
+        });
         config
     }
 
@@ -355,6 +397,7 @@ mod tests {
         let err = clear_privilege(
             PrivilegeClearArgs {
                 name: "web".to_string(),
+                account: None,
                 yes: true,
                 json: false,
             },
@@ -376,7 +419,14 @@ mod tests {
     #[test]
     fn set_cleans_new_password_when_config_save_fails() {
         let mut config = sample_config();
-        config.privileges.clear();
+        config
+            .servers
+            .get_mut("web")
+            .unwrap()
+            .accounts
+            .get_mut("deploy")
+            .unwrap()
+            .privilege = None;
         let store = RecordingStore::default();
         let mut prompter = TestPrompter;
         let temp = tempfile::tempdir().unwrap();
@@ -388,6 +438,7 @@ mod tests {
         let err = set_privilege(
             PrivilegeSetArgs {
                 name: "web".to_string(),
+                account: None,
                 method: PrivilegeMethodArg::Sudo,
                 user: "root".to_string(),
                 password_stdin: false,
@@ -411,9 +462,10 @@ mod tests {
         let deleted = store.deleted.borrow();
         assert_eq!(deleted.len(), 1);
         assert_eq!(deleted[0].1, "root");
-        assert!(namespace.credential_key_matches(
+        assert!(namespace.account_credential_key_matches(
             crate::home::CredentialPurpose::Privilege,
             "web",
+            "deploy",
             &deleted[0].0
         ));
         assert_ne!(
@@ -441,6 +493,7 @@ mod tests {
         let err = set_privilege(
             PrivilegeSetArgs {
                 name: "web".to_string(),
+                account: None,
                 method: PrivilegeMethodArg::Su,
                 user: "root".to_string(),
                 password_stdin: false,
@@ -468,9 +521,10 @@ mod tests {
         let deleted = store.deleted.borrow();
         assert_eq!(deleted.len(), 1);
         assert_ne!(deleted[0].0, previous_credential);
-        assert!(namespace.credential_key_matches(
+        assert!(namespace.account_credential_key_matches(
             crate::home::CredentialPurpose::Privilege,
             "web",
+            "deploy",
             &deleted[0].0
         ));
     }
@@ -478,7 +532,14 @@ mod tests {
     #[test]
     fn set_keeps_new_password_when_config_was_published_but_parent_sync_failed() {
         let mut config = sample_config();
-        config.privileges.clear();
+        config
+            .servers
+            .get_mut("web")
+            .unwrap()
+            .accounts
+            .get_mut("deploy")
+            .unwrap()
+            .privilege = None;
         let store = RecordingStore::default();
         let mut prompter = TestPrompter;
         let temp = tempfile::tempdir().unwrap();
@@ -489,6 +550,7 @@ mod tests {
         let err = set_privilege(
             PrivilegeSetArgs {
                 name: "web".to_string(),
+                account: None,
                 method: PrivilegeMethodArg::Sudo,
                 user: "root".to_string(),
                 password_stdin: false,
@@ -509,7 +571,10 @@ mod tests {
             "error was: {err:#}"
         );
         let saved = crate::config::load_config(&config_path).unwrap();
-        let privilege = &saved.privileges["web"];
+        let privilege = saved.servers["web"].accounts["deploy"]
+            .privilege
+            .as_ref()
+            .unwrap();
         assert!(
             store
                 .values

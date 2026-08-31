@@ -10,6 +10,7 @@ pub enum SandboxDecision {
 /// OS-level isolation; stronger per-OS sandbox backends are a future extension
 /// point behind this same trait.
 pub trait Sandbox {
+    fn check_account(&self, server: &str, user: &str, is_default: bool) -> SandboxDecision;
     fn check_command(&self, command: &str) -> SandboxDecision;
     fn check_put(&self, remote_path: &str) -> SandboxDecision;
     fn check_get(&self, remote_path: &str) -> SandboxDecision;
@@ -19,6 +20,10 @@ pub trait Sandbox {
 pub struct NoopSandbox;
 
 impl Sandbox for NoopSandbox {
+    fn check_account(&self, _server: &str, _user: &str, _is_default: bool) -> SandboxDecision {
+        SandboxDecision::Allow
+    }
+
     fn check_command(&self, _command: &str) -> SandboxDecision {
         SandboxDecision::Allow
     }
@@ -44,6 +49,18 @@ impl PolicyOnlySandbox {
 }
 
 impl Sandbox for PolicyOnlySandbox {
+    fn check_account(&self, server: &str, user: &str, is_default: bool) -> SandboxDecision {
+        if self.rules.allows_account(server, user, is_default) {
+            SandboxDecision::Allow
+        } else {
+            SandboxDecision::Deny {
+                reason: format!(
+                    "account '{server}/{user}' is blocked by policy; add it to allow_accounts"
+                ),
+            }
+        }
+    }
+
     fn check_command(&self, command: &str) -> SandboxDecision {
         if self.rules.allows_command(command) {
             SandboxDecision::Allow
