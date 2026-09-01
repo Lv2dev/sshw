@@ -1,7 +1,8 @@
 use crate::audit::{self, AuditRecord, AuditSink, AuditStatus, FileAuditSink, NoopAudit};
 use crate::config::{
-    AuthConfig, ConfigRevision, CredentialBackend, PrivilegeConfig, PrivilegeMethod, ServerConfig,
-    SshwConfig, load_config, load_config_with_revision, validate_config_credential_references,
+    AccountConfig, AuthConfig, ConfigRevision, CredentialBackend, PrivilegeConfig, PrivilegeMethod,
+    ServerConfig, SshwConfig, load_config, load_config_with_revision,
+    validate_config_credential_references,
 };
 use crate::credentials::keyring_store::KeyringCredentialStore;
 use crate::credentials::session_store::SessionOnlyStore;
@@ -15,10 +16,10 @@ use crate::policy::{Policy, describe_policy, resolve_policy};
 use crate::profile::{load_registry, resolve_home_with_registry};
 use crate::safety::{SafetyDecision, classify_command, command_program};
 use crate::sandbox::{NoopSandbox, PolicyOnlySandbox, Sandbox, SandboxDecision};
-use crate::ssh::SshClient;
 use crate::ssh::ssh2_client::{
     Ssh2Client, runtime_library_versions, su_begin_marker, su_end_prefix,
 };
+use crate::ssh::{SshClient, SshTarget};
 use anyhow::Context;
 use clap::Parser;
 use serde_json::json;
@@ -28,6 +29,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use zeroize::Zeroizing;
 
+mod account;
 mod model;
 mod privilege;
 mod profile;
@@ -36,10 +38,12 @@ mod server;
 mod transfer;
 
 pub use model::{
-    AddArgs, AuthArg, Cli, Command, DefaultArgs, DoctorArgs, GetArgs, ListArgs, PrivilegeArgs,
-    PrivilegeClearArgs, PrivilegeCommand, PrivilegeMethodArg, PrivilegeSetArgs, PrivilegeShowArgs,
-    ProfileAddArgs, ProfileArgs, ProfileCommand, ProfileDefaultArgs, ProfileListArgs,
-    ProfileRemoveArgs, ProfileShowArgs, PutArgs, RemoveArgs, RunArgs, ShowArgs, TrustArgs,
+    AccountAddArgs, AccountArgs, AccountCommand, AccountDefaultArgs, AccountListArgs,
+    AccountRemoveArgs, AccountShowArgs, AddArgs, AuthArg, Cli, Command, DefaultArgs, DoctorArgs,
+    GetArgs, ListArgs, PrivilegeArgs, PrivilegeClearArgs, PrivilegeCommand, PrivilegeMethodArg,
+    PrivilegeSetArgs, PrivilegeShowArgs, ProfileAddArgs, ProfileArgs, ProfileCommand,
+    ProfileDefaultArgs, ProfileListArgs, ProfileRemoveArgs, ProfileShowArgs, PutArgs, RemoveArgs,
+    RunArgs, ShowArgs, TrustArgs,
 };
 pub use prompt::Prompter;
 use prompt::TerminalPrompter;
@@ -405,6 +409,30 @@ where
                 &mut config,
             ),
         },
+        Command::Account(args) => match args.command {
+            AccountCommand::Add(args) => account::add_account(
+                args,
+                config_path,
+                &revision,
+                &ctx.home.namespace,
+                credentials,
+                prompter,
+                &mut config,
+            ),
+            AccountCommand::List(args) => account::list_accounts(args, &config),
+            AccountCommand::Show(args) => account::show_account(args, &config),
+            AccountCommand::Default(args) => {
+                account::default_account(args, config_path, &revision, &mut config)
+            }
+            AccountCommand::Remove(args) => account::remove_account(
+                args,
+                config_path,
+                &revision,
+                credentials,
+                prompter,
+                &mut config,
+            ),
+        },
         Command::Profile(_) => unreachable!("profile is dispatched before config loading"),
     };
 
@@ -415,14 +443,14 @@ where
     result.map(|output| remap_remote_nonzero_exit(output, is_run, run_json))
 }
 
-type AuditDescriptor = (&'static str, Option<String>, Option<String>);
+type AuditDescriptor = (&'static str, Option<String>, Option<String>, Option<String>);
 
 fn record_audit_result(
     audit: &dyn AuditSink,
     descriptor: Option<AuditDescriptor>,
     result: &anyhow::Result<CommandOutput>,
 ) {
-    let Some((action, server, detail)) = descriptor else {
+    let Some((action, server, user, detail)) = descriptor else {
         return;
     };
     let (status, exit_code) = match result {
@@ -436,6 +464,7 @@ fn record_audit_result(
     let _ = audit.record(&AuditRecord {
         action: action.to_string(),
         server,
+        user,
         detail,
         status,
         exit_code,
@@ -444,12 +473,17 @@ fn record_audit_result(
 
 fn profile_audit_descriptor(command: &ProfileCommand) -> Option<AuditDescriptor> {
     match command {
-        ProfileCommand::Add(args) => Some(("profile", None, Some(format!("add:{}", args.name)))),
-        ProfileCommand::Default(args) => {
-            Some(("profile", None, Some(format!("default:{}", args.name))))
+        ProfileCommand::Add(args) => {
+            Some(("profile", None, None, Some(format!("add:{}", args.name))))
         }
+        ProfileCommand::Default(args) => Some((
+            "profile",
+            None,
+            None,
+            Some(format!("default:{}", args.name)),
+        )),
         ProfileCommand::Remove(args) => {
-            Some(("profile", None, Some(format!("remove:{}", args.name))))
+            Some(("profile", None, None, Some(format!("remove:{}", args.name))))
         }
         ProfileCommand::List(_) | ProfileCommand::Show(_) => None,
     }
@@ -460,6 +494,14 @@ fn command_mutates_home(command: &Command) -> bool {
         command,
         Command::Add(_) | Command::Trust(_) | Command::Remove(_)
     ) || matches!(command, Command::Default(args) if args.name.is_some())
+        || matches!(
+            command,
+            Command::Account(AccountArgs {
+                command: AccountCommand::Add(_)
+                    | AccountCommand::Default(_)
+                    | AccountCommand::Remove(_),
+            })
+        )
         || matches!(
             command,
             Command::Privilege(PrivilegeArgs {
@@ -511,10 +553,10 @@ fn remap_remote_nonzero_exit(mut output: CommandOutput, is_run: bool, json: bool
 fn audit_descriptor(command: &Command, config: &SshwConfig) -> Option<AuditDescriptor> {
     let default = || config.default.clone();
     match command {
-        Command::Add(a) => Some(("add", Some(a.name.clone()), None)),
-        Command::Remove(a) => Some(("remove", Some(a.name.clone()), None)),
-        Command::Trust(a) => Some(("trust", Some(a.name.clone()), None)),
-        Command::Default(a) => Some(("default", a.name.clone().or_else(default), None)),
+        Command::Add(a) => Some(("add", Some(a.name.clone()), Some(a.user.clone()), None)),
+        Command::Remove(a) => Some(("remove", Some(a.name.clone()), None, None)),
+        Command::Trust(a) => Some(("trust", Some(a.name.clone()), None, None)),
+        Command::Default(a) => Some(("default", a.name.clone().or_else(default), None, None)),
         Command::Run(a) => {
             // target is `[name] <command>`.
             let (server, command) = match split_target(&a.target, 1) {
@@ -527,11 +569,19 @@ fn audit_descriptor(command: &Command, config: &SshwConfig) -> Option<AuditDescr
             // Record only the program name, never the full argument string, so
             // secrets passed inline (e.g. `mysql -phunter2`) are not persisted.
             let program = command.as_deref().and_then(command_program);
+            let user = a.user.clone().or_else(|| {
+                server
+                    .as_deref()
+                    .and_then(|name| config.servers.get(name))
+                    .map(|server| server.default_user.clone())
+            });
             let detail = if a.as_root {
                 let program = program.unwrap_or_else(|| "unknown".to_string());
                 let marker = server
                     .as_deref()
-                    .and_then(|server| config.privileges.get(server))
+                    .and_then(|server| config.servers.get(server))
+                    .and_then(|server| user.as_deref().and_then(|user| server.account(user)))
+                    .and_then(|account| account.privilege.as_ref())
                     .map(|privilege| {
                         format!(
                             "as-root:{}:{}:{}",
@@ -545,7 +595,7 @@ fn audit_descriptor(command: &Command, config: &SshwConfig) -> Option<AuditDescr
             } else {
                 program
             };
-            Some(("run", server, detail))
+            Some(("run", server, user, detail))
         }
         Command::Put(a) => {
             // target is `[name] <local> <remote>`; audit records the remote dest.
@@ -556,7 +606,13 @@ fn audit_descriptor(command: &Command, config: &SshwConfig) -> Option<AuditDescr
                 ),
                 None => (default(), None),
             };
-            Some(("put", server, detail))
+            let user = a.user.clone().or_else(|| {
+                server
+                    .as_deref()
+                    .and_then(|name| config.servers.get(name))
+                    .map(|server| server.default_user.clone())
+            });
+            Some(("put", server, user, detail))
         }
         Command::Get(a) => {
             // target is `[name] <remote> <local>`; audit records the remote source.
@@ -567,20 +623,59 @@ fn audit_descriptor(command: &Command, config: &SshwConfig) -> Option<AuditDescr
                 ),
                 None => (default(), None),
             };
-            Some(("get", server, detail))
+            let user = a.user.clone().or_else(|| {
+                server
+                    .as_deref()
+                    .and_then(|name| config.servers.get(name))
+                    .map(|server| server.default_user.clone())
+            });
+            Some(("get", server, user, detail))
         }
         Command::Privilege(a) => match &a.command {
             PrivilegeCommand::Set(args) => Some((
                 "privilege",
                 Some(args.name.clone()),
+                args.account.clone().or_else(|| {
+                    config
+                        .servers
+                        .get(&args.name)
+                        .map(|server| server.default_user.clone())
+                }),
                 Some("set".to_string()),
             )),
             PrivilegeCommand::Clear(args) => Some((
                 "privilege",
                 Some(args.name.clone()),
+                args.account.clone().or_else(|| {
+                    config
+                        .servers
+                        .get(&args.name)
+                        .map(|server| server.default_user.clone())
+                }),
                 Some("clear".to_string()),
             )),
             PrivilegeCommand::Show(_) => None,
+        },
+        Command::Account(a) => match &a.command {
+            AccountCommand::Add(args) => Some((
+                "account",
+                Some(args.name.clone()),
+                Some(args.user.clone()),
+                Some(format!("add:{}", args.user)),
+            )),
+            AccountCommand::Default(args) => Some((
+                "account",
+                Some(args.name.clone()),
+                Some(args.user.clone()),
+                Some(format!("default:{}", args.user)),
+            )),
+            AccountCommand::Remove(args) => Some((
+                "account",
+                Some(args.name.clone()),
+                Some(args.user.clone()),
+                Some(format!("remove:{}", args.user)),
+            )),
+            AccountCommand::List(_) | AccountCommand::Show(_) => None,
         },
         _ => None,
     }
@@ -606,6 +701,7 @@ where
 {
     let RunArgs {
         target,
+        user,
         json,
         yes,
         as_root,
@@ -629,12 +725,20 @@ where
     }
 
     let server = get_server(config, &server_name)?;
-    let auth = resolve_auth(server, credentials)?;
+    let (login_user, account) = select_account(&server_name, server, user.as_deref())?;
+    if let SandboxDecision::Deny { reason } =
+        sandbox.check_account(&server_name, login_user, login_user == server.default_user)
+    {
+        return Err(app_error(ErrorKind::Policy, reason));
+    }
+    let auth = resolve_auth(account, login_user, credentials)?;
+    let ssh_target = SshTarget::new(server, login_user);
     let privileged = if as_root {
         Some(resolve_privileged_execution(
             &server_name,
+            login_user,
+            account,
             &command,
-            config,
             credentials,
         )?)
     } else {
@@ -648,7 +752,7 @@ where
         .as_ref()
         .and_then(|execution| execution.stdin.as_ref())
     {
-        ssh.run_with_stdin(server, &auth, remote_command, stdin.as_str())
+        ssh.run_with_stdin(&ssh_target, &auth, remote_command, stdin.as_str())
             .with_error_kind(ErrorKind::Ssh)?
     } else if let Some(password) = privileged
         .as_ref()
@@ -659,7 +763,7 @@ where
             .and_then(|execution| execution.pty_marker_nonce.as_deref())
             .unwrap_or_default();
         ssh.run_with_pty_password(
-            server,
+            &ssh_target,
             &auth,
             remote_command,
             password.as_str(),
@@ -667,7 +771,7 @@ where
         )
         .with_error_kind(ErrorKind::Ssh)?
     } else {
-        ssh.run(server, &auth, remote_command)
+        ssh.run(&ssh_target, &auth, remote_command)
             .with_error_kind(ErrorKind::Ssh)?
     };
     let exit_code = result.exit_status;
@@ -688,6 +792,7 @@ where
         let output = RunOutput {
             ok: true,
             server: server_name,
+            user: login_user.to_string(),
             command: redacted_command,
             exit_status: result.exit_status,
             stdout,
@@ -722,17 +827,18 @@ struct PrivilegedExecution {
 
 fn resolve_privileged_execution<C>(
     server_name: &str,
+    login_user: &str,
+    account: &AccountConfig,
     command: &str,
-    config: &SshwConfig,
     credentials: &C,
 ) -> anyhow::Result<PrivilegedExecution>
 where
     C: CredentialStore,
 {
-    let privilege = config
-        .privileges
-        .get(server_name)
-        .ok_or_else(|| privilege::missing_privilege(server_name))?;
+    let privilege = account
+        .privilege
+        .as_ref()
+        .ok_or_else(|| privilege::missing_privilege(server_name, login_user))?;
 
     match privilege.method {
         PrivilegeMethod::Sudo => sudo_execution(command, privilege, credentials),
@@ -992,19 +1098,23 @@ where
     Ok(ok(stdout))
 }
 
-fn resolve_auth<C>(server: &ServerConfig, credentials: &C) -> anyhow::Result<AuthMaterial>
+fn resolve_auth<C>(
+    account: &AccountConfig,
+    login_user: &str,
+    credentials: &C,
+) -> anyhow::Result<AuthMaterial>
 where
     C: CredentialStore,
 {
-    match &server.auth {
+    match &account.auth {
         AuthConfig::Password { credential } => {
             let password = credentials
-                .get_password_for(CredentialPurpose::Login, credential, &server.user)
+                .get_password_for(CredentialPurpose::Login, credential, login_user)
                 .with_error_kind(ErrorKind::Auth)
                 .with_context(|| {
                     format!(
                         "missing credential entry for {} and user {}",
-                        credential, server.user
+                        credential, login_user
                     )
                 })?;
             Ok(AuthMaterial::Password(password))
@@ -1061,6 +1171,19 @@ fn get_server<'a>(config: &'a SshwConfig, name: &str) -> anyhow::Result<&'a Serv
     config.servers.get(name).ok_or_else(|| unknown_server(name))
 }
 
+fn select_account<'a>(
+    server_name: &str,
+    server: &'a ServerConfig,
+    requested_user: Option<&str>,
+) -> anyhow::Result<(&'a str, &'a AccountConfig)> {
+    let user = requested_user.unwrap_or(&server.default_user);
+    server
+        .accounts
+        .get_key_value(user)
+        .map(|(user, account)| (user.as_str(), account))
+        .ok_or_else(|| account::unknown_account(server_name, user))
+}
+
 fn unknown_server(name: &str) -> anyhow::Error {
     app_error(ErrorKind::Config, format!("unknown server '{name}'"))
 }
@@ -1072,12 +1195,17 @@ where
     config
         .servers
         .iter()
-        .filter_map(|(name, server)| match &server.auth {
-            AuthConfig::Password { credential } => credentials
-                .get_password_for(CredentialPurpose::Login, credential, &server.user)
-                .err()
-                .map(|_| name.clone()),
-            AuthConfig::Agent => None,
+        .flat_map(|(name, server)| {
+            server
+                .accounts
+                .iter()
+                .filter_map(move |(user, account)| match &account.auth {
+                    AuthConfig::Password { credential } => credentials
+                        .get_password_for(CredentialPurpose::Login, credential, user)
+                        .err()
+                        .map(|_| format!("{name}/{user}")),
+                    AuthConfig::Agent => None,
+                })
         })
         .collect()
 }
@@ -1303,7 +1431,7 @@ mod runtime_backend_tests {
 
         fn run(
             &self,
-            _server: &ServerConfig,
+            _target: &SshTarget<'_>,
             _auth: &AuthMaterial,
             _command: &str,
         ) -> anyhow::Result<RunResult> {
@@ -1312,7 +1440,7 @@ mod runtime_backend_tests {
 
         fn put(
             &self,
-            _server: &ServerConfig,
+            _target: &SshTarget<'_>,
             _auth: &AuthMaterial,
             _local: &Path,
             _remote: &str,
@@ -1322,7 +1450,7 @@ mod runtime_backend_tests {
 
         fn get(
             &self,
-            _server: &ServerConfig,
+            _target: &SshTarget<'_>,
             _auth: &AuthMaterial,
             _remote: &str,
             _local: &Path,

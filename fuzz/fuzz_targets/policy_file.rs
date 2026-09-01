@@ -115,4 +115,15 @@ fn exercise_resolved_policy(path: &Path, force_enable: bool, file: &PolicyFile) 
     ] {
         let _ = rules.allows_get(remote_path);
     }
+
+    for (server, user) in [("web", "ops"), ("db", "reader"), ("a:b", "user@name")] {
+        if rules.allows_account(server, user, false) {
+            assert!(
+                file.allow_accounts
+                    .iter()
+                    .any(|entry| entry.server == server && entry.user == user),
+                "non-default account allowed without an exact structured rule: {server}/{user}"
+            );
+        }
+    }
 }

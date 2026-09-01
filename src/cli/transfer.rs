@@ -2,7 +2,7 @@
 
 use super::{
     CommandOutput, GetArgs, PutArgs, get_server, ok, resolve_auth, resolve_target_server,
-    split_target,
+    select_account, split_target,
 };
 use crate::config::SshwConfig;
 use crate::credentials::CredentialStore;
@@ -10,7 +10,7 @@ use crate::error::{ResultErrorKindExt, app_error};
 use crate::output::{ErrorKind, classify_error, redact_secrets};
 use crate::safety::{SafetyDecision, classify_remote_write_path};
 use crate::sandbox::{Sandbox, SandboxDecision};
-use crate::ssh::SshClient;
+use crate::ssh::{SshClient, SshTarget};
 use serde_json::json;
 use std::path::PathBuf;
 
@@ -34,7 +34,12 @@ where
     C: CredentialStore,
     S: SshClient,
 {
-    let PutArgs { target, yes, json } = args;
+    let PutArgs {
+        target,
+        user,
+        yes,
+        json,
+    } = args;
     let (server_name, local, remote) = resolve_put_target(target, config)?;
 
     match classify_remote_write_path(&remote.value, yes) {
@@ -47,9 +52,16 @@ where
     }
 
     let server = get_server(config, &server_name)?;
-    let auth = resolve_auth(server, credentials)?;
+    let (login_user, account) = select_account(&server_name, server, user.as_deref())?;
+    if let SandboxDecision::Deny { reason } =
+        sandbox.check_account(&server_name, login_user, login_user == server.default_user)
+    {
+        return Err(app_error(ErrorKind::Policy, reason));
+    }
+    let auth = resolve_auth(account, login_user, credentials)?;
+    let ssh_target = SshTarget::new(server, login_user);
     let result = with_msys_remote_path_hint(
-        ssh.put(server, &auth, &local, &remote.value)
+        ssh.put(&ssh_target, &auth, &local, &remote.value)
             .with_error_kind(ErrorKind::Ssh),
         &remote.value,
         windows_msys_argument_conversion_active() && !remote.explicit_literal,
@@ -58,6 +70,7 @@ where
         let output = json!({
             "ok": true,
             "server": redact_secrets(&server_name),
+            "user": redact_secrets(login_user),
             "local": redact_secrets(&result.source),
             "remote": redact_secrets(&result.destination),
             "bytes": result.bytes,
@@ -82,7 +95,12 @@ where
     C: CredentialStore,
     S: SshClient,
 {
-    let GetArgs { target, yes, json } = args;
+    let GetArgs {
+        target,
+        user,
+        yes,
+        json,
+    } = args;
     let (server_name, remote, local) = resolve_get_target(target, config)?;
 
     let server = get_server(config, &server_name)?;
@@ -100,9 +118,16 @@ where
         ));
     }
 
-    let auth = resolve_auth(server, credentials)?;
+    let (login_user, account) = select_account(&server_name, server, user.as_deref())?;
+    if let SandboxDecision::Deny { reason } =
+        sandbox.check_account(&server_name, login_user, login_user == server.default_user)
+    {
+        return Err(app_error(ErrorKind::Policy, reason));
+    }
+    let auth = resolve_auth(account, login_user, credentials)?;
+    let ssh_target = SshTarget::new(server, login_user);
     let result = with_msys_remote_path_hint(
-        ssh.get(server, &auth, &remote.value, &local, yes)
+        ssh.get(&ssh_target, &auth, &remote.value, &local, yes)
             .with_error_kind(ErrorKind::Ssh),
         &remote.value,
         windows_msys_argument_conversion_active() && !remote.explicit_literal,
@@ -111,6 +136,7 @@ where
         let output = json!({
             "ok": true,
             "server": redact_secrets(&server_name),
+            "user": redact_secrets(login_user),
             "remote": redact_secrets(&result.source),
             "local": redact_secrets(&result.destination),
             "bytes": result.bytes,

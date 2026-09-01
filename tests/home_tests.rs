@@ -182,6 +182,75 @@ fn generated_credential_keys_use_distinct_generations() {
 }
 
 #[test]
+fn v3_account_credential_keys_bind_server_user_purpose_and_namespace() {
+    let namespace = CredentialNamespace::profile("profile:with:delimiters");
+    let key = namespace.credential_key_v3(
+        CredentialPurpose::Login,
+        "web:prod",
+        "ops@example",
+        "0000000000000001",
+    );
+
+    assert!(key.starts_with("sshw:v3:"), "key was {key}");
+    assert!(!key.contains("web:prod"));
+    assert!(!key.contains("ops@example"));
+    assert!(namespace.account_credential_key_matches(
+        CredentialPurpose::Login,
+        "web:prod",
+        "ops@example",
+        &key,
+    ));
+    assert!(!namespace.account_credential_key_matches(
+        CredentialPurpose::Privilege,
+        "web:prod",
+        "ops@example",
+        &key,
+    ));
+    assert!(!namespace.account_credential_key_matches(
+        CredentialPurpose::Login,
+        "web",
+        "ops@example",
+        &key,
+    ));
+    assert!(!namespace.account_credential_key_matches(
+        CredentialPurpose::Login,
+        "web:prod",
+        "deploy",
+        &key,
+    ));
+    assert!(
+        !CredentialNamespace::profile("other").account_credential_key_matches(
+            CredentialPurpose::Login,
+            "web:prod",
+            "ops@example",
+            &key,
+        )
+    );
+}
+
+#[test]
+fn generated_account_credential_keys_use_distinct_generations() {
+    let namespace = CredentialNamespace::profile("default");
+
+    let first = namespace.new_account_credential_key(CredentialPurpose::Login, "web", "ops");
+    let second = namespace.new_account_credential_key(CredentialPurpose::Login, "web", "ops");
+
+    assert_ne!(first, second);
+    assert!(namespace.account_credential_key_matches(
+        CredentialPurpose::Login,
+        "web",
+        "ops",
+        &first,
+    ));
+    assert!(namespace.account_credential_key_matches(
+        CredentialPurpose::Login,
+        "web",
+        "ops",
+        &second,
+    ));
+}
+
+#[test]
 fn server_names_reject_empty_control_and_reserved_forms() {
     assert!(validate_server_name("web").is_ok());
     assert!(validate_server_name("서버-alpha").is_ok());

@@ -2,20 +2,20 @@ use crate::home::{CredentialNamespace, CredentialPurpose, validate_server_name};
 use crate::storage::write_owner_only_atomic;
 use anyhow::Context;
 use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
-const CONFIG_VERSION: u32 = 1;
+const CONFIG_VERSION: u32 = 2;
+const LEGACY_CONFIG_VERSION: u32 = 1;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SshwConfig {
     pub version: u32,
     pub default: Option<String>,
     pub servers: BTreeMap<String, ServerConfig>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub privileges: BTreeMap<String, PrivilegeConfig>,
     /// Which credential backend this home uses. Defaults to the native OS
     /// keyring; older config files without the field load as `native`.
     #[serde(default)]
@@ -28,10 +28,114 @@ impl Default for SshwConfig {
             version: CONFIG_VERSION,
             default: None,
             servers: BTreeMap::new(),
-            privileges: BTreeMap::new(),
             credential_backend: CredentialBackend::Native,
         }
     }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfigV2Wire {
+    version: u32,
+    default: Option<String>,
+    servers: BTreeMap<String, ServerConfig>,
+    #[serde(default)]
+    credential_backend: CredentialBackend,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfigV1Wire {
+    version: u32,
+    default: Option<String>,
+    servers: BTreeMap<String, ServerConfigV1>,
+    #[serde(default)]
+    privileges: BTreeMap<String, PrivilegeConfig>,
+    #[serde(default)]
+    credential_backend: CredentialBackend,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ServerConfigV1 {
+    host: String,
+    port: u16,
+    user: String,
+    auth: AuthConfig,
+}
+
+impl<'de> Deserialize<'de> for SshwConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        let version = value
+            .get("version")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| serde::de::Error::missing_field("version"))?;
+        let version = u32::try_from(version)
+            .map_err(|_| serde::de::Error::custom("config version is out of range"))?;
+
+        match version {
+            CONFIG_VERSION => {
+                let wire: ConfigV2Wire =
+                    serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+                debug_assert_eq!(wire.version, CONFIG_VERSION);
+                Ok(Self {
+                    version: CONFIG_VERSION,
+                    default: wire.default,
+                    servers: wire.servers,
+                    credential_backend: wire.credential_backend,
+                })
+            }
+            LEGACY_CONFIG_VERSION => {
+                let wire: ConfigV1Wire =
+                    serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+                migrate_v1(wire).map_err(serde::de::Error::custom)
+            }
+            unsupported => Err(serde::de::Error::custom(format!(
+                "unsupported config version {unsupported}; supported versions are {LEGACY_CONFIG_VERSION} and {CONFIG_VERSION}"
+            ))),
+        }
+    }
+}
+
+fn migrate_v1(mut wire: ConfigV1Wire) -> Result<SshwConfig, String> {
+    debug_assert_eq!(wire.version, LEGACY_CONFIG_VERSION);
+    let mut servers = BTreeMap::new();
+    for (name, server) in wire.servers {
+        let privilege = wire.privileges.remove(&name);
+        let default_user = server.user;
+        let mut accounts = BTreeMap::new();
+        accounts.insert(
+            default_user.clone(),
+            AccountConfig {
+                auth: server.auth,
+                privilege,
+            },
+        );
+        servers.insert(
+            name,
+            ServerConfig {
+                host: server.host,
+                port: server.port,
+                default_user,
+                accounts,
+            },
+        );
+    }
+    if let Some(orphan) = wire.privileges.keys().next() {
+        return Err(format!(
+            "privilege configuration for server '{orphan}' has no matching server"
+        ));
+    }
+    Ok(SshwConfig {
+        version: CONFIG_VERSION,
+        default: wire.default,
+        servers,
+        credential_backend: wire.credential_backend,
+    })
 }
 
 /// Selects the credential store implementation. `native` uses the OS keyring;
@@ -51,8 +155,55 @@ pub enum CredentialBackend {
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
-    pub user: String,
+    pub default_user: String,
+    pub accounts: BTreeMap<String, AccountConfig>,
+}
+
+impl ServerConfig {
+    pub fn single_account(
+        host: impl Into<String>,
+        port: u16,
+        user: impl Into<String>,
+        auth: AuthConfig,
+    ) -> Self {
+        let user = user.into();
+        let mut accounts = BTreeMap::new();
+        accounts.insert(
+            user.clone(),
+            AccountConfig {
+                auth,
+                privilege: None,
+            },
+        );
+        Self {
+            host: host.into(),
+            port,
+            default_user: user,
+            accounts,
+        }
+    }
+
+    pub fn default_account(&self) -> Option<(&str, &AccountConfig)> {
+        self.accounts
+            .get_key_value(&self.default_user)
+            .map(|(user, account)| (user.as_str(), account))
+    }
+
+    pub fn account(&self, user: &str) -> Option<&AccountConfig> {
+        self.accounts.get(user)
+    }
+
+    pub fn account_mut(&mut self, user: &str) -> Option<&mut AccountConfig> {
+        self.accounts.get_mut(user)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AccountConfig {
     pub auth: AuthConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub privilege: Option<PrivilegeConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -134,13 +285,6 @@ pub fn load_config_with_revision(path: &Path) -> anyhow::Result<(SshwConfig, Con
     };
     let config: SshwConfig = serde_json::from_str(&contents)
         .map_err(|err| anyhow::anyhow!("failed to load config at {}: {err}", path.display()))?;
-    if config.version != CONFIG_VERSION {
-        return Err(anyhow::anyhow!(
-            "failed to load config at {}: unsupported config version {}; supported version is {CONFIG_VERSION}",
-            path.display(),
-            config.version
-        ));
-    }
     let revision = ConfigRevision(Some(contents.into_bytes()));
     Ok((config, revision))
 }
@@ -224,31 +368,36 @@ pub fn validate_config_credential_references(
     for (name, server) in &config.servers {
         validate_server_name(name)
             .map_err(|err| anyhow::anyhow!("invalid server name '{name}': {err}"))?;
-        if let AuthConfig::Password { credential } = &server.auth {
-            validate_credential_owner(
-                namespace,
-                CredentialPurpose::Login,
-                name,
-                credential,
-                &mut owners,
-            )?;
-        }
-    }
-
-    for (name, privilege) in &config.privileges {
-        validate_server_name(name)
-            .map_err(|err| anyhow::anyhow!("invalid server name '{name}': {err}"))?;
-        validate_credential_owner(
-            namespace,
-            CredentialPurpose::Privilege,
-            name,
-            &privilege.credential,
-            &mut owners,
-        )?;
-        if !config.servers.contains_key(name) {
+        if !server.accounts.contains_key(&server.default_user) {
             return Err(anyhow::anyhow!(
-                "privilege configuration for server '{name}' has no matching server"
+                "default user '{}' is not registered for server '{name}'",
+                server.default_user
             ));
+        }
+        for (user, account) in &server.accounts {
+            validate_account_user(user).map_err(|err| {
+                anyhow::anyhow!("invalid user '{user}' for server '{name}': {err}")
+            })?;
+            if let AuthConfig::Password { credential } = &account.auth {
+                validate_credential_owner(
+                    namespace,
+                    CredentialPurpose::Login,
+                    name,
+                    user,
+                    credential,
+                    &mut owners,
+                )?;
+            }
+            if let Some(privilege) = &account.privilege {
+                validate_credential_owner(
+                    namespace,
+                    CredentialPurpose::Privilege,
+                    name,
+                    user,
+                    &privilege.credential,
+                    &mut owners,
+                )?;
+            }
         }
     }
 
@@ -259,12 +408,15 @@ fn validate_credential_owner<'a>(
     namespace: &CredentialNamespace,
     purpose: CredentialPurpose,
     server: &str,
+    user: &str,
     credential: &'a str,
     owners: &mut BTreeMap<&'a str, String>,
 ) -> anyhow::Result<()> {
-    if !namespace.credential_key_matches(purpose, server, credential) {
+    if !namespace.account_credential_key_matches(purpose, server, user, credential)
+        && !namespace.credential_key_matches(purpose, server, credential)
+    {
         return Err(anyhow::anyhow!(
-            "credential reference for server '{server}' does not belong to the active home"
+            "credential reference does not belong to account '{server}/{user}' in the active home"
         ));
     }
 
@@ -272,11 +424,21 @@ fn validate_credential_owner<'a>(
         CredentialPurpose::Login => "login",
         CredentialPurpose::Privilege => "privilege",
     };
-    let owner = format!("{purpose_label}:{server}");
+    let owner = format!("{purpose_label}:{server}/{user}");
     if let Some(previous) = owners.insert(credential, owner.clone()) {
         return Err(anyhow::anyhow!(
             "credential key collision between '{previous}' and '{owner}'"
         ));
+    }
+    Ok(())
+}
+
+pub fn validate_account_user(user: &str) -> anyhow::Result<()> {
+    if user.trim().is_empty() {
+        return Err(anyhow::anyhow!("user cannot be empty"));
+    }
+    if user.chars().any(char::is_control) {
+        return Err(anyhow::anyhow!("user must not contain control characters"));
     }
     Ok(())
 }

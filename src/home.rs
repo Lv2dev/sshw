@@ -22,8 +22,9 @@ impl CredentialPurpose {
 
 /// Keyring namespace for a resolved home/profile.
 ///
-/// New credential entries use an encoded, purpose-aware, generation-qualified
-/// v2 key. Legacy v1 keys remain recognizable for existing configurations.
+/// New account credential entries use an encoded, purpose-aware,
+/// server-and-user-qualified v3 key. Legacy v1 and server-scoped v2 keys
+/// remain recognizable for existing configurations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CredentialNamespace {
     token: String,
@@ -80,6 +81,83 @@ impl CredentialNamespace {
         let token = URL_SAFE_NO_PAD.encode(self.token.as_bytes());
         let server = URL_SAFE_NO_PAD.encode(server.as_bytes());
         format!("sshw:v2:{token}:{}:{server}:{generation}", purpose.label())
+    }
+
+    pub fn new_account_credential_key(
+        &self,
+        purpose: CredentialPurpose,
+        server: &str,
+        user: &str,
+    ) -> String {
+        self.credential_key_v3(purpose, server, user, &credential_generation())
+    }
+
+    pub fn credential_key_v3(
+        &self,
+        purpose: CredentialPurpose,
+        server: &str,
+        user: &str,
+        generation: &str,
+    ) -> String {
+        let token = URL_SAFE_NO_PAD.encode(self.token.as_bytes());
+        let server = URL_SAFE_NO_PAD.encode(server.as_bytes());
+        let user = URL_SAFE_NO_PAD.encode(user.as_bytes());
+        format!(
+            "sshw:v3:{token}:{}:{server}:{user}:{generation}",
+            purpose.label()
+        )
+    }
+
+    pub fn account_credential_key_matches(
+        &self,
+        purpose: CredentialPurpose,
+        server: &str,
+        user: &str,
+        credential: &str,
+    ) -> bool {
+        let mut parts = credential.split(':');
+        let (
+            Some(prefix),
+            Some(version),
+            Some(token),
+            Some(key_purpose),
+            Some(key_server),
+            Some(key_user),
+            Some(generation),
+        ) = (
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+        )
+        else {
+            return false;
+        };
+        if parts.next().is_some()
+            || prefix != "sshw"
+            || version != "v3"
+            || key_purpose != purpose.label()
+            || generation.is_empty()
+            || !generation.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return false;
+        }
+
+        let Ok(token) = URL_SAFE_NO_PAD.decode(token) else {
+            return false;
+        };
+        let Ok(key_server) = URL_SAFE_NO_PAD.decode(key_server) else {
+            return false;
+        };
+        let Ok(key_user) = URL_SAFE_NO_PAD.decode(key_user) else {
+            return false;
+        };
+        token == self.token.as_bytes()
+            && key_server == server.as_bytes()
+            && key_user == user.as_bytes()
     }
 
     pub fn credential_key_matches(

@@ -27,6 +27,7 @@ impl AuditStatus {
 pub struct AuditRecord {
     pub action: String,
     pub server: Option<String>,
+    pub user: Option<String>,
     pub detail: Option<String>,
     pub status: AuditStatus,
     pub exit_code: i32,
@@ -66,6 +67,8 @@ struct AuditLine<'a> {
     action: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     server: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user: Option<String>,
     status: &'a str,
     exit_code: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -82,6 +85,7 @@ impl AuditSink for FileAuditSink {
             time_ms: epoch_millis(),
             action: &record.action,
             server: record.server.as_deref().map(redact_secrets),
+            user: record.user.as_deref().map(redact_secrets),
             status: record.status.as_str(),
             exit_code: record.exit_code,
             detail: record.detail.as_deref().map(redact_secrets),

@@ -48,11 +48,23 @@ fn policy_rejects_unknown_fields_and_future_versions() {
     let future_dir = tempfile::tempdir().unwrap();
     let future = write_policy(
         future_dir.path(),
-        r#"{"version":2,"enabled":true,"allow_commands":["ls"]}"#,
+        r#"{"version":3,"enabled":true,"allow_commands":["ls"]}"#,
     );
     let err = resolve_policy(&future, false).unwrap_err();
-    assert!(err.to_string().contains("unsupported policy version 2"));
-    assert!(err.to_string().contains("supported version is 1"));
+    assert!(err.to_string().contains("unsupported policy version 3"));
+    assert!(err.to_string().contains("supported versions are 1 and 2"));
+
+    let nested_dir = tempfile::tempdir().unwrap();
+    let nested = write_policy(
+        nested_dir.path(),
+        r#"{
+            "version":2,
+            "enabled":true,
+            "allow_accounts":[{"server":"web","user":"ops","unexpected":true}]
+        }"#,
+    );
+    let err = resolve_policy(&nested, false).unwrap_err();
+    assert!(err.to_string().contains("unknown field"));
 }
 
 #[cfg(unix)]
@@ -84,6 +96,36 @@ fn valid_enabled_file_enforces_allowlist() {
         Policy::Enabled(rules) => {
             assert!(rules.allows_command("ls -la"));
             assert!(!rules.allows_command("rm -rf /"));
+            assert!(rules.allows_account("web", "deploy", true));
+            assert!(!rules.allows_account("web", "ops", false));
+        }
+        Policy::Disabled => panic!("expected enabled policy"),
+    }
+}
+
+#[test]
+fn policy_v2_allows_only_exact_registered_non_default_accounts() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = write_policy(
+        temp.path(),
+        r#"{
+            "version": 2,
+            "enabled": true,
+            "allow_commands": ["whoami"],
+            "allow_accounts": [
+                { "server": "web", "user": "ops" },
+                { "server": "db", "user": "reader" }
+            ]
+        }"#,
+    );
+
+    match resolve_policy(&path, false).unwrap() {
+        Policy::Enabled(rules) => {
+            assert!(rules.allows_account("web", "deploy", true));
+            assert!(rules.allows_account("web", "ops", false));
+            assert!(rules.allows_account("db", "reader", false));
+            assert!(!rules.allows_account("web", "reader", false));
+            assert!(!rules.allows_account("db", "ops", false));
         }
         Policy::Disabled => panic!("expected enabled policy"),
     }

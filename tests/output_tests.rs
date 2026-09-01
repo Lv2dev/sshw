@@ -32,6 +32,7 @@ fn run_output_serializes_for_agents() {
     let output = RunOutput {
         ok: true,
         server: "server-alpha".to_string(),
+        user: "deploy".to_string(),
         command: "hostname".to_string(),
         exit_status: 0,
         stdout: "server\n".to_string(),
@@ -49,16 +50,17 @@ fn run_output_serializes_for_agents() {
 
 #[test]
 fn server_output_includes_metadata_without_secrets() {
-    let server = ServerConfig {
-        host: "192.0.2.10".to_string(),
-        port: 2222,
-        user: "deploy".to_string(),
-        auth: AuthConfig::Password {
+    let server = ServerConfig::single_account(
+        "192.0.2.10",
+        2222,
+        "deploy",
+        AuthConfig::Password {
             credential: "sshw:server-alpha".to_string(),
         },
-    };
+    );
 
     let output = ServerOutput::from_config("server-alpha", &server, true);
+    assert_eq!(output.account_count, 1);
     let json = serde_json::to_string(&output).unwrap();
 
     assert!(json.contains("\"name\":\"server-alpha\""));

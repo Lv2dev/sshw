@@ -476,6 +476,9 @@ fn public_docs_cover_hardening_contracts_and_residual_risks() {
         "re-adding a removed profile creates a fresh credential namespace",
         "inactive policy file",
         "waits at most 5 seconds",
+        "sshw account add server-alpha ops",
+        "allow_accounts",
+        "Schema v1 remains readable",
     ] {
         assert!(readme.contains(marker), "README is missing {marker:?}");
     }
@@ -495,7 +498,7 @@ fn public_docs_cover_hardening_contracts_and_residual_risks() {
     let security = read_workflow("SECURITY.md");
     for marker in [
         "## Residual Risk Register",
-        "Next review: 2026-11-03",
+        "Next review: 2026-11-30",
         "resolver worker",
         "bit-for-bit reproducibility",
         "pre-existing releases",
@@ -504,6 +507,8 @@ fn public_docs_cover_hardening_contracts_and_residual_risks() {
         "Profile namespace rebinding",
         "100 milliseconds",
         "standard-library file locks",
+        "Server/account credential isolation",
+        "Account selection authority",
     ] {
         assert!(security.contains(marker), "SECURITY is missing {marker:?}");
     }
@@ -518,6 +523,8 @@ fn public_docs_cover_hardening_contracts_and_residual_risks() {
         "deterministic release archives",
         "full redacted cause chain",
         "crates.io distribution package named `sshw-agent`",
+        "account add/list/show/default/remove",
+        "New v3 credential identities",
     ] {
         assert!(
             changelog.contains(marker),

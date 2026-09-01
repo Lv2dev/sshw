@@ -1,6 +1,6 @@
 use sshw::config::{AuthConfig, ServerConfig};
 use sshw::credentials::AuthMaterial;
-use sshw::ssh::{HostKeyInfo, RunResult, SshClient, TransferResult};
+use sshw::ssh::{HostKeyInfo, RunResult, SshClient, SshTarget, TransferResult};
 use std::path::Path;
 
 struct FakeSshClient;
@@ -16,17 +16,17 @@ impl SshClient for FakeSshClient {
     fn trust_host(
         &self,
         _server_name: &str,
-        _server: &ServerConfig,
+        server: &ServerConfig,
         expected_fingerprint_sha256: &str,
     ) -> anyhow::Result<HostKeyInfo> {
-        let host_key = self.host_key(_server)?;
+        let host_key = self.host_key(server)?;
         assert_eq!(host_key.fingerprint_sha256, expected_fingerprint_sha256);
         Ok(host_key)
     }
 
     fn run(
         &self,
-        _server: &ServerConfig,
+        _target: &SshTarget<'_>,
         _auth: &AuthMaterial,
         command: &str,
     ) -> anyhow::Result<RunResult> {
@@ -40,7 +40,7 @@ impl SshClient for FakeSshClient {
 
     fn run_with_stdin(
         &self,
-        _server: &ServerConfig,
+        _target: &SshTarget<'_>,
         _auth: &AuthMaterial,
         command: &str,
         stdin: &str,
@@ -55,7 +55,7 @@ impl SshClient for FakeSshClient {
 
     fn put(
         &self,
-        _server: &ServerConfig,
+        _target: &SshTarget<'_>,
         _auth: &AuthMaterial,
         local: &Path,
         remote: &str,
@@ -69,7 +69,7 @@ impl SshClient for FakeSshClient {
 
     fn get(
         &self,
-        _server: &ServerConfig,
+        _target: &SshTarget<'_>,
         _auth: &AuthMaterial,
         remote: &str,
         local: &Path,
@@ -86,25 +86,21 @@ impl SshClient for FakeSshClient {
 #[test]
 fn ssh_client_trait_supports_run_and_transfer_results() {
     let client = FakeSshClient;
-    let server = ServerConfig {
-        host: "example.test".to_string(),
-        port: 22,
-        user: "deploy".to_string(),
-        auth: AuthConfig::Agent,
-    };
+    let server = ServerConfig::single_account("example.test", 22, "deploy", AuthConfig::Agent);
+    let target = SshTarget::new(&server, "deploy");
 
     let host_key = client.host_key(&server).unwrap();
     assert_eq!(host_key.algorithm, "ssh-ed25519");
 
     let run = client
-        .run(&server, &AuthMaterial::Agent, "hostname")
+        .run(&target, &AuthMaterial::Agent, "hostname")
         .unwrap();
     assert_eq!(run.exit_status, 0);
     assert_eq!(run.stdout, "hostname");
 
     let run = client
         .run_with_stdin(
-            &server,
+            &target,
             &AuthMaterial::Agent,
             "sudo -S id",
             "ROOT_PASSWORD\n",
@@ -114,7 +110,7 @@ fn ssh_client_trait_supports_run_and_transfer_results() {
 
     let put = client
         .put(
-            &server,
+            &target,
             &AuthMaterial::Agent,
             Path::new("local.bin"),
             "/tmp/local.bin",
@@ -124,7 +120,7 @@ fn ssh_client_trait_supports_run_and_transfer_results() {
 
     let get = client
         .get(
-            &server,
+            &target,
             &AuthMaterial::Agent,
             "/tmp/local.bin",
             Path::new("local.bin"),
