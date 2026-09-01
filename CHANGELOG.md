@@ -8,6 +8,8 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-09-01
+
 ### Added
 - Added `account add/list/show/default/remove` and registered-account selection via `run`/`put`/`get --user`; omitting `--user` preserves the server's default-account behavior.
 
