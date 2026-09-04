@@ -6,7 +6,10 @@ use crate::output::ErrorKind;
 use anyhow::Context;
 use base64::Engine;
 use directories::BaseDirs;
-use ssh2::{CheckResult, HashType, HostKeyType, KnownHostFileKind, KnownHostKeyFormat, Session};
+use ssh2::{
+    CheckResult, ErrorCode as Ssh2ErrorCode, HashType, HostKeyType, KnownHostFileKind,
+    KnownHostKeyFormat, Session,
+};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
@@ -18,6 +21,7 @@ use std::time::{Duration, Instant};
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const DEFAULT_OPERATION_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const DEFAULT_OUTPUT_LIMIT: usize = 16 * 1024 * 1024;
+const WINDOWS_KEX_HANDSHAKE_RETRIES: usize = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RuntimeLibraryVersions {
@@ -573,18 +577,29 @@ fn connect(server: &ServerConfig, timeout: Duration) -> anyhow::Result<Session> 
     let mut resolved_any = false;
     for socket_addr in socket_addrs {
         resolved_any = true;
-        let remaining = deadline.remaining()?;
-        match TcpStream::connect_timeout(&socket_addr, remaining) {
-            Ok(tcp) => {
-                tcp.set_read_timeout(Some(deadline.remaining()?))?;
-                tcp.set_write_timeout(Some(deadline.remaining()?))?;
-                let mut session = Session::new()?;
-                session.set_timeout(timeout_millis(deadline.remaining()?));
-                session.set_tcp_stream(tcp);
-                session.handshake()?;
-                return Ok(session);
+        let mut kex_retries_remaining = WINDOWS_KEX_HANDSHAKE_RETRIES;
+        loop {
+            let remaining = deadline.remaining()?;
+            match TcpStream::connect_timeout(&socket_addr, remaining) {
+                Ok(tcp) => {
+                    tcp.set_read_timeout(Some(deadline.remaining()?))?;
+                    tcp.set_write_timeout(Some(deadline.remaining()?))?;
+                    let mut session = Session::new()?;
+                    session.set_timeout(timeout_millis(deadline.remaining()?));
+                    session.set_tcp_stream(tcp);
+                    match session.handshake() {
+                        Ok(()) => return Ok(session),
+                        Err(err) if should_retry_windows_kex(&err, kex_retries_remaining) => {
+                            kex_retries_remaining -= 1;
+                        }
+                        Err(err) => return Err(err.into()),
+                    }
+                }
+                Err(err) => {
+                    last_error = Some(err);
+                    break;
+                }
             }
-            Err(err) => last_error = Some(err),
         }
     }
 
@@ -603,6 +618,16 @@ fn connect(server: &ServerConfig, timeout: Duration) -> anyhow::Result<Session> 
             timeout.as_secs()
         )
     })
+}
+
+fn should_retry_windows_kex(error: &ssh2::Error, retries_remaining: usize) -> bool {
+    cfg!(windows)
+        && retries_remaining > 0
+        && matches!(
+            error.code(),
+            Ssh2ErrorCode::Session(code)
+                if code == libssh2_sys::LIBSSH2_ERROR_KEY_EXCHANGE_FAILURE
+        )
 }
 
 #[derive(Debug)]
@@ -1313,6 +1338,32 @@ example.test ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB9zU1OEQ2tzYhrXq4/DEjvRNvKv6cU
         let second = deadline.remaining().unwrap();
 
         assert!(second < first);
+    }
+
+    #[test]
+    fn windows_kex_retry_is_exact_and_bounded() {
+        let kex_error = ssh2::Error::from_errno(ssh2::ErrorCode::Session(
+            libssh2_sys::LIBSSH2_ERROR_KEY_EXCHANGE_FAILURE,
+        ));
+        let socket_error = ssh2::Error::from_errno(ssh2::ErrorCode::Session(
+            libssh2_sys::LIBSSH2_ERROR_SOCKET_SEND,
+        ));
+        let sftp_error = ssh2::Error::from_errno(ssh2::ErrorCode::SFTP(
+            libssh2_sys::LIBSSH2_ERROR_KEY_EXCHANGE_FAILURE,
+        ));
+
+        assert_eq!(
+            super::should_retry_windows_kex(&kex_error, 2),
+            cfg!(windows)
+        );
+        assert_eq!(
+            super::should_retry_windows_kex(&kex_error, 1),
+            cfg!(windows)
+        );
+        assert!(!super::should_retry_windows_kex(&kex_error, 0));
+        assert!(!super::should_retry_windows_kex(&socket_error, 2));
+        assert!(!super::should_retry_windows_kex(&sftp_error, 2));
+        assert_eq!(super::WINDOWS_KEX_HANDSHAKE_RETRIES, 2);
     }
 
     #[test]

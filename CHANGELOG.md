@@ -8,6 +8,9 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 
 ## [Unreleased]
 
+### Fixed
+- On Windows, an exact libssh2 key-exchange failure during the initial handshake is retried with a fresh TCP connection and SSH session at most twice. All attempts share the existing 15-second connection deadline, and no retry occurs after host-key verification, authentication, or remote execution begins.
+
 ## [0.12.0] - 2026-09-01
 
 ### Added
