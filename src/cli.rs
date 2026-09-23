@@ -24,13 +24,14 @@ use anyhow::Context;
 use clap::Parser;
 use serde_json::json;
 use std::ffi::OsStr;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use zeroize::Zeroizing;
 
 mod account;
 mod model;
+mod policy_cmd;
 mod privilege;
 mod profile;
 mod prompt;
@@ -45,6 +46,7 @@ pub use model::{
     ProfileDefaultArgs, ProfileListArgs, ProfileRemoveArgs, ProfileShowArgs, PutArgs, RemoveArgs,
     RunArgs, ShowArgs, TrustArgs,
 };
+pub use policy_cmd::PolicyArgs;
 pub use prompt::Prompter;
 use prompt::TerminalPrompter;
 
@@ -94,6 +96,18 @@ pub fn run() -> i32 {
         audit: &audit,
     };
 
+    if !json_errors
+        && io::stderr().is_terminal()
+        && matches!(
+            cli.command,
+            Command::Run(_) | Command::Put(_) | Command::Get(_)
+        )
+    {
+        eprintln!(
+            "sshw: starting remote operation ({})\noutput is returned on completion; use --timeout to set the operation deadline",
+            home.description
+        );
+    }
     let output = execute_for_runtime_selecting_backend(
         cli,
         &ctx,
@@ -155,6 +169,7 @@ fn resolve_runtime_with_base(
         Err(_err)
             if matches!(&cli.command, Command::Doctor(_))
                 && !(cli.home.is_some() && cli.profile.is_some())
+                && !(env_home.is_some() && cli.profile.is_some())
                 && load_registry(&registry_path).is_err() =>
         {
             Ok((builtin_default_home(sshw_base), registry_path))
@@ -321,6 +336,7 @@ where
 
     let config_path = ctx.home.config_path.as_path();
     let command = match command {
+        Command::Policy(args) => return policy_cmd::run_policy(args, ctx),
         Command::Profile(args) => {
             let descriptor = profile_audit_descriptor(&args.command);
             let result = profile::run_profile(args, ctx.registry_path, home_flag.as_deref());
@@ -334,6 +350,7 @@ where
                 ctx.registry_path,
                 ctx.policy_forced,
                 credentials,
+                ssh,
             );
         }
         command => command,
@@ -389,6 +406,7 @@ where
             &mut config,
         ),
         Command::Doctor(_) => unreachable!("doctor is dispatched before config enforcement"),
+        Command::Policy(_) => unreachable!("policy is dispatched before config enforcement"),
         Command::Privilege(args) => match args.command {
             PrivilegeCommand::Set(args) => privilege::set_privilege(
                 args,
@@ -577,20 +595,29 @@ fn audit_descriptor(command: &Command, config: &SshwConfig) -> Option<AuditDescr
             });
             let detail = if a.as_root {
                 let program = program.unwrap_or_else(|| "unknown".to_string());
-                let marker = server
+                let configured = server
                     .as_deref()
                     .and_then(|server| config.servers.get(server))
                     .and_then(|server| user.as_deref().and_then(|user| server.account(user)))
-                    .and_then(|account| account.privilege.as_ref())
-                    .map(|privilege| {
-                        format!(
-                            "as-root:{}:{}:{}",
-                            privilege::method_label(privilege.method),
-                            privilege.user,
-                            program
-                        )
-                    })
-                    .unwrap_or_else(|| format!("as-root:missing:{program}"));
+                    .and_then(|account| account.privilege.as_ref());
+                let marker = if a.no_password {
+                    format!(
+                        "as-root:sudo-nopasswd:{}:{}",
+                        configured.map(|p| p.user.as_str()).unwrap_or("root"),
+                        program
+                    )
+                } else {
+                    configured
+                        .map(|privilege| {
+                            format!(
+                                "as-root:{}:{}:{}",
+                                privilege::method_label(privilege.method),
+                                privilege.user,
+                                program
+                            )
+                        })
+                        .unwrap_or_else(|| format!("as-root:missing:{program}"))
+                };
                 Some(marker)
             } else {
                 program
@@ -705,15 +732,9 @@ where
         json,
         yes,
         as_root,
+        no_password,
     } = args;
     let (server_name, command) = resolve_run_target(target, config)?;
-
-    if as_root && !yes {
-        return Err(app_error(
-            ErrorKind::Safety,
-            "root privilege escalation requires --yes; review the command and rerun with --yes",
-        ));
-    }
 
     match classify_command(&command, yes) {
         SafetyDecision::Allow => {}
@@ -733,7 +754,34 @@ where
     }
     let auth = resolve_auth(account, login_user, credentials)?;
     let ssh_target = SshTarget::new(server, login_user);
-    let privileged = if as_root {
+    let privileged = if no_password {
+        if account
+            .privilege
+            .as_ref()
+            .is_some_and(|p| p.method != PrivilegeMethod::Sudo)
+        {
+            return Err(app_error(
+                ErrorKind::Config,
+                "--no-password requires a sudo privilege path; this account is configured for su",
+            ));
+        }
+        let target_user = account
+            .privilege
+            .as_ref()
+            .map(|p| p.user.as_str())
+            .unwrap_or("root");
+        Some(PrivilegedExecution {
+            command: format!(
+                "sudo -n -u {} -- sh -c {} < /dev/null",
+                shell_quote(target_user),
+                shell_quote(&command)
+            ),
+            stdin: None,
+            pty_password: None,
+            pty_marker_nonce: None,
+            redact_secret: None,
+        })
+    } else if as_root {
         Some(resolve_privileged_execution(
             &server_name,
             login_user,
@@ -753,7 +801,6 @@ where
         .and_then(|execution| execution.stdin.as_ref())
     {
         ssh.run_with_stdin(&ssh_target, &auth, remote_command, stdin.as_str())
-            .with_error_kind(ErrorKind::Ssh)?
     } else if let Some(password) = privileged
         .as_ref()
         .and_then(|execution| execution.pty_password.as_ref())
@@ -769,12 +816,9 @@ where
             password.as_str(),
             marker_nonce,
         )
-        .with_error_kind(ErrorKind::Ssh)?
     } else {
         ssh.run(&ssh_target, &auth, remote_command)
-            .with_error_kind(ErrorKind::Ssh)?
     };
-    let exit_code = result.exit_status;
     let login_secret = match &auth {
         AuthMaterial::Password(password) => Some(password.as_str()),
         AuthMaterial::Agent => None,
@@ -784,6 +828,10 @@ where
         .and_then(|execution| execution.redact_secret.as_ref())
         .map(|secret| secret.as_str());
     let secrets = [login_secret, privilege_secret];
+    let result = result
+        .map_err(|err| redact_partial_run_error(err, &secrets))
+        .with_error_kind(ErrorKind::Ssh)?;
+    let exit_code = result.exit_status;
     let redacted_command = redact_with_known_secrets(&command, &secrets);
     let stdout = redact_with_known_secrets(&result.stdout, &secrets);
     let stderr = redact_with_known_secrets(&filter_startup_stderr_noise(&result.stderr), &secrets);
@@ -791,6 +839,7 @@ where
     if json {
         let output = RunOutput {
             ok: true,
+            command_succeeded: result.exit_status == 0,
             server: server_name,
             user: login_user.to_string(),
             command: redacted_command,
@@ -990,15 +1039,48 @@ fn redact_with_known_secrets(input: &str, secrets: &[Option<&str>]) -> String {
     redacted
 }
 
-fn doctor<C>(
+fn redact_partial_run_error(err: anyhow::Error, secrets: &[Option<&str>]) -> anyhow::Error {
+    match err.downcast::<crate::ssh::PartialRunError>() {
+        Ok(mut partial) => {
+            partial.stdout = redact_partial_text(&partial.stdout, secrets);
+            partial.stderr = redact_partial_text(&partial.stderr, secrets);
+            partial.into()
+        }
+        Err(err) => err,
+    }
+}
+
+fn redact_partial_text(text: &str, secrets: &[Option<&str>]) -> String {
+    let mut redacted = redact_with_known_secrets(text, secrets);
+    // A timeout/output cap may cut a secret between reads. Mask any known
+    // secret prefix at the capture boundary as well as complete secret values.
+    let complete_chars = redacted.trim_end_matches('\u{fffd}');
+    let suffix = secrets
+        .iter()
+        .flatten()
+        .flat_map(|secret| secret.char_indices().skip(1).map(|(end, _)| &secret[..end]))
+        .filter(|prefix| complete_chars.ends_with(prefix))
+        .map(str::len)
+        .max()
+        .unwrap_or(0);
+    if suffix > 0 {
+        redacted.truncate(complete_chars.len() - suffix);
+        redacted.push_str("<redacted>");
+    }
+    redacted
+}
+
+fn doctor<C, S>(
     args: DoctorArgs,
     home: &ResolvedHome,
     registry_path: &Path,
     policy_forced: bool,
     credentials: &C,
+    ssh: &S,
 ) -> anyhow::Result<CommandOutput>
 where
     C: CredentialStore,
+    S: SshClient,
 {
     let config_path = home.config_path.as_path();
     let registry_result = load_registry(registry_path);
@@ -1031,10 +1113,132 @@ where
         .map(|config| missing_credentials(credentials, config))
         .unwrap_or_default();
     let library_versions = runtime_library_versions();
+    let mut issues = Vec::new();
+    let mut issue = |kind: &str, message: String, next_step: String| {
+        issues.push(json!({"kind":kind,"message":redact_secrets(&message),"next_step":next_step}));
+    };
+    if !registry_valid {
+        issue(
+            "registry",
+            registry_message.clone(),
+            "inspect the profile registry or run sshw profile remove <invalid-name>".to_string(),
+        );
+    }
+    if !config_valid {
+        issue(
+            "config",
+            config_message.clone(),
+            "repair servers.json at the reported config path".to_string(),
+        );
+    }
+    let policy_message = resolve_policy(&home.policy_path, policy_forced)
+        .err()
+        .map(|err| redact_secrets(&err.to_string()));
+    if let Some(message) = &policy_message {
+        issue("policy", message.clone(), "inspect the policy file at the reported path; use sshw policy show after correcting it".to_string());
+    }
+    if !health.available {
+        issue(
+            "credentials",
+            health.message.clone(),
+            "restore the credential backend before registering passwords".to_string(),
+        );
+    }
+    if !audit_writable {
+        issue(
+            "audit",
+            "audit log is not writable".to_string(),
+            "check permissions at the reported audit path".to_string(),
+        );
+    }
+    for entry in &missing_credentials {
+        issue(
+            "login_credential",
+            format!("missing login credential for {entry}"),
+            "register the account password again or supply SSHW_PASSWORD for session-only use"
+                .to_string(),
+        );
+    }
+    let mut uses_agent = false;
+    if let Ok(config) = &config_result {
+        if config.servers.is_empty() {
+            issue(
+                "setup",
+                "no servers registered".to_string(),
+                "sshw add web --host <host> --user <user>".to_string(),
+            );
+        }
+        for (name, server) in &config.servers {
+            if !home.known_hosts_path.is_file() {
+                issue(
+                    "host_trust",
+                    format!("no known_hosts file for server '{name}'"),
+                    format!("sshw trust {name}"),
+                );
+            }
+            for (user, account) in &server.accounts {
+                uses_agent |= matches!(account.auth, AuthConfig::Agent);
+                if let Some(privilege) = &account.privilege {
+                    let available = credentials
+                        .get_password_for(
+                            CredentialPurpose::Privilege,
+                            &privilege.credential,
+                            &privilege.user,
+                        )
+                        .map(Zeroizing::new)
+                        .is_ok_and(|password| !password.is_empty());
+                    if !available {
+                        issue(
+                            "privilege_credential",
+                            format!("missing privilege credential for {name}/{user}"),
+                            format!("sshw privilege set {name} --account {user}"),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    let agent_identities = if uses_agent {
+        match ssh.agent_identity_count() {
+            Ok(Some(count)) => {
+                if count == 0 {
+                    issue(
+                        "ssh_agent",
+                        "SSH agent has no identities".to_string(),
+                        "load a key into your SSH agent and retry".to_string(),
+                    );
+                }
+                Some(count)
+            }
+            Ok(None) => {
+                issue(
+                    "ssh_agent",
+                    "SSH agent availability was not checked by this backend".to_string(),
+                    "check that your SSH agent is running and contains a key".to_string(),
+                );
+                None
+            }
+            Err(err) => {
+                issue(
+                    "ssh_agent",
+                    err.to_string(),
+                    "start your SSH agent and load the server's login key".to_string(),
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     if args.json {
         let output = json!({
             "ok": true,
+            "local_checks_passed": issues.is_empty(),
+            "connection_tested": false,
+            "issues": issues,
+            "agent_identities": agent_identities,
+            "policy_message": policy_message,
             "home": home.root,
             "home_source": home.description,
             "registry_path": registry_path,
@@ -1095,6 +1299,21 @@ where
             missing_credentials.join(", ")
         ));
     }
+    stdout.push_str(&format!(
+        "local checks: {} (SSH connectivity and host-key matching are not tested)\n",
+        if issues.is_empty() {
+            "passed"
+        } else {
+            "action required"
+        }
+    ));
+    for issue in issues {
+        stdout.push_str(&format!(
+            "- {}\n  next: {}\n",
+            issue["message"].as_str().unwrap_or_default(),
+            issue["next_step"].as_str().unwrap_or_default()
+        ));
+    }
     Ok(ok(stdout))
 }
 
@@ -1153,6 +1372,16 @@ fn resolve_run_target(
 ) -> anyhow::Result<(String, String)> {
     let (name, rest) = split_target(&target, 1)
         .ok_or_else(|| app_error(ErrorKind::Config, "run expects [name] <command>"))?;
+    if let Some(name) = name
+        && !config.servers.contains_key(name)
+    {
+        return Err(app_error(
+            ErrorKind::Config,
+            format!(
+                "unknown server '{name}'; run 'sshw list' to see registered servers. Quote the whole remote command: sshw run <server> \"<command>\", or sshw run \"<command>\" for the default server"
+            ),
+        ));
+    }
     Ok((resolve_target_server(name, config)?, rest[0].clone()))
 }
 
@@ -1230,9 +1459,17 @@ fn error_output(err: &anyhow::Error, json_errors: bool) -> CommandOutput {
         };
     }
 
+    let mut stderr = format!("{}\n", response.error.message);
+    let stdout = if let Some(partial) = response.partial_output {
+        stderr.push_str(&partial.stderr);
+        stderr.push_str("\nnote: partial output; remote completion was not confirmed. Do not blindly retry a command with side effects.\n");
+        partial.stdout
+    } else {
+        String::new()
+    };
     CommandOutput {
-        stdout: String::new(),
-        stderr: format!("{}\n", response.error.message),
+        stdout,
+        stderr,
         exit_code,
     }
 }
@@ -1243,6 +1480,7 @@ fn error_json_line(response: &ErrorResponse) -> String {
         Err(err) => {
             let fallback = ErrorResponse {
                 ok: false,
+                partial_output: None,
                 error: crate::output::ErrorBody {
                     kind: ErrorKind::Unknown,
                     message: format!("failed to serialize error response: {err}"),
@@ -1342,6 +1580,7 @@ fn parse_error_output(err: clap::Error, json: bool) -> CommandOutput {
     if json {
         let response = ErrorResponse {
             ok: false,
+            partial_output: None,
             error: crate::output::ErrorBody {
                 kind,
                 message: clap_usage_summary(&rendered),
@@ -1383,6 +1622,33 @@ mod runtime_backend_tests {
     use crate::home::ResolvedHome;
     use crate::ssh::{HostKeyInfo, RunResult, TransferResult};
     use std::cell::Cell;
+
+    #[test]
+    fn partial_output_redacts_full_and_truncated_known_secrets() {
+        let error = crate::ssh::PartialRunError {
+            source: anyhow::anyhow!("ssh operation timed out"),
+            stdout: "started\nsecret-long\nsecret-lo".to_string(),
+            stderr: "debug\n한글�".to_string(),
+        };
+        let error = crate::error::classified_error(
+            ErrorKind::Ssh,
+            redact_partial_run_error(error.into(), &[Some("secret-long"), Some("한글비밀")])
+                .context("ssh command did not complete"),
+        );
+        let output = error_output(&error, true);
+        assert_eq!(output.exit_code, 5);
+        let value: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+        assert_eq!(value["partial_output"]["completion_confirmed"], false);
+        assert_eq!(
+            value["partial_output"]["stdout"],
+            "started\n<redacted>\n<redacted>"
+        );
+        assert_eq!(value["partial_output"]["stderr"], "debug\n<redacted>");
+        assert!(!format!("{error:?}").contains("secret-long"));
+        let human = error_output(&error, false);
+        assert!(human.stderr.contains("completion was not confirmed"));
+        assert!(human.stdout.contains("started"));
+    }
 
     struct NamedCredentialStore(&'static str);
 

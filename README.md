@@ -12,6 +12,19 @@ Languages: [English](#english) | [한국어](#한국어)
 
 It is designed for local coding agents that need delegated server access for simple deployment and maintenance tasks. It is a **sandbox-aware SSH wrapper**: it provides per-project profile isolation, an optional command/transfer policy, an audit log, and output redaction.
 
+### Quick Start
+
+```bash
+cargo install sshw-agent --locked
+sshw add web --host 192.0.2.10 --user deploy
+sshw trust web
+sshw run web "hostname" --json
+```
+
+`add` uses port 22 by default and asks for a hidden password. For a key already loaded in your SSH agent, add `--auth agent`. Verify the fingerprint shown by `trust` before approving it. Keep the whole remote command inside quotes. With `--json`, `run.command_succeeded` says whether the remote command succeeded; `ok` alone is not enough.
+
+For an existing home, start with `sshw doctor`: it lists local problems and next steps. A successful diagnostic does not prove a remote connection will succeed.
+
 ### Security Boundary
 
 `sshw` reduces accidental secret exposure in chat, command lines, shell history, JSON config, and normal command output. It also provides:
@@ -89,7 +102,7 @@ The global profile registry maps profile names to homes:
 <config_dir>/sshw/profiles/default/         built-in default profile home
 ```
 
-`<config_dir>` is `%AppData%\sshw` on Windows, `~/Library/Application Support/sshw` on macOS, and `~/.config/sshw` on Linux.
+`<config_dir>` is `%AppData%` on Windows, `~/Library/Application Support` on macOS, and `~/.config` on Linux.
 
 New credential keyring entries use a purpose-aware, account-qualified, generation-qualified v3 key so the same server/user pair in different homes never collides, accounts on one server cannot reuse each other's credentials, and login credentials cannot be reused as privilege credentials:
 
@@ -112,7 +125,7 @@ Home selection priority, highest first:
 4. the registry's default profile.
 5. the built-in default profile home (`<config_dir>/sshw/profiles/default`).
 
-`--home` and `--profile` cannot be combined (exit code 3).
+`--home` and `--profile` cannot be combined (exit code 3). An explicit `--profile` also conflicts with a non-empty `SSHW_HOME`: unset the environment variable to use the profile, or omit the flag to use the environment home. SSHW never silently substitutes one for the other.
 
 ```bash
 sshw --home ./.sshw list
@@ -206,7 +219,9 @@ sshw run server-alpha "systemctl restart app" --user ops --as-root --yes
 
 Privilege metadata is scoped to the selected login account. `privilege set/show/clear --account <login-user>` selects an explicit account; omitting it uses the server default. `privilege set` stores only method, target user (default `root`), and credential key metadata in `servers.json`. The sudo/root password is stored in the active credential backend, never in CLI arguments or plaintext config. Without `--password-stdin`, `sshw` prompts with hidden input.
 
-`run --as-root` is explicit and always requires `--yes`. It first applies the normal safety and policy checks to the original command, then uses `sudo -S` with the privilege password passed through SSH channel stdin. The password is never embedded in the remote command string or audit detail. If the target user has a `NOPASSWD` sudoers rule, the command runs regardless of whether the stored password is correct, since `sudo` never consumes it — keep the stored secret accurate, but do not rely on it as an extra gate in that configuration. A sudo password rejection is reported as the remote command's non-zero status (sshw exit `8`, with the real status in `run --json` as `exit_status`) because `sudo` ran remotely. `method=su` runs `su - <user> -c ...` over a PTY and injects the stored password at the `Password:` prompt (echo disabled, prompt forced to English via `LC_ALL=C`). The command's output and exit code are framed by markers and extracted exactly. It is more environment-sensitive than `sudo`; where the prompt is not recognized it fails closed via a timeout rather than hanging. A `su` prompt/auth failure before the completion marker is an sshw auth/setup failure and maps to exit code `4`.
+`run --as-root` (alias `--elevate`) explicitly requests elevation; a second `--yes` is not needed unless the original command triggers a safety check. It first applies the normal safety and policy checks to the original command, then uses `sudo -S` with the privilege password passed through SSH channel stdin. The password is never embedded in the remote command string or audit detail. If the target user has a `NOPASSWD` sudoers rule, the command runs regardless of whether the stored password is correct, since `sudo` never consumes it — keep the stored secret accurate, but do not rely on it as an extra gate in that configuration. A sudo password rejection is reported as the remote command's non-zero status (sshw exit `8`, with the real status in `run --json` as `exit_status`) because `sudo` ran remotely. `method=su` runs `su - <user> -c ...` over a PTY and injects the stored password at the `Password:` prompt (echo disabled, prompt forced to English via `LC_ALL=C`). The command's output and exit code are framed by markers and extracted exactly. It is more environment-sensitive than `sudo`; where the prompt is not recognized it fails closed via a timeout rather than hanging. A `su` prompt/auth failure before the completion marker is an sshw auth/setup failure and maps to exit code `4`.
+
+For a server that already permits passwordless sudo, use `sshw run web "id -u" --as-root --no-password`. This runs `sudo -n` without reading a stored privilege password or prompting. It uses the configured sudo target user, or `root` when no privilege configuration exists; a configured `su` path is rejected. The server still enforces sudoers. `privilege set --account` also accepts `--login-user`, and its target `--user` accepts `--target-user`.
 
 ### Host Trust Flow
 
@@ -222,30 +237,31 @@ sshw trust server-alpha --yes
 ### Commands
 
 ```bash
-sshw add <name> --host <host> --port <port> --user <user> [--auth password|agent] [--password-stdin] [--force] [--json]
+sshw add <name> --host <host> [--port <port>] --user <user> [--auth password|agent] [--password-stdin] [--force] [--replace] [--json]
 sshw list [--json]
 sshw show <name> [--json]
-sshw default [<name>]
+sshw default [<name>] [--json]
 sshw trust <name> [--yes] [--json]
-sshw run [<name>] "<command>" [--user <registered-user>] [--json] [--yes] [--as-root]
-sshw put [<name>] <local> <remote> [--user <registered-user>] [--json] [--yes]
+sshw run [<name>] "<command>" [--user <registered-user>] [--json] [--yes] [--as-root [--no-password]]
+sshw put [<name>] <local> <remote> [--user <registered-user>] [--mode 600|755] [--json] [--yes]
 sshw get [<name>] <remote> <local> [--user <registered-user>] [--json] [--yes]
 sshw remove <name> [--yes] [--json]
 sshw doctor [--json]
 sshw account add <name> <user> [--auth password|agent] [--password-stdin] [--force] [--json]
 sshw account list <name> [--json]
 sshw account show <name> <user> [--json]
-sshw account default <name> <user>
+sshw account default <name> <user> [--json]
 sshw account remove <name> <user> [--yes] [--json]
 sshw privilege <set|show|clear> ... [--json]
-sshw profile <add|list|show|default|remove> ...
+sshw profile <add|list|show|default|remove> ... [--json]
+sshw policy <init|show|enable|disable|allow|remove|check> ... [--json]
 ```
 
-`add`, `account add`, and `profile add` take `--force` to overwrite an existing entry without the interactive confirmation prompt — required when registering or updating an entry non-interactively (e.g. from an agent). Updating an existing server with `add` replaces the endpoint's entire account set and deletes every stale login/privilege credential after the config publish; use `account add` when only one account's authentication should change.
+`add`, `account add`, and `profile add` take `--force` to confirm an update non-interactively. Updating a server at the same host/port preserves its other accounts and the updated account's privilege settings; only the selected login credential is rotated. Changing host or port requires `--replace`, which explicitly resets the account set and privilege settings and cleans up stale credentials. Use a new server name to keep the old endpoint available. `--force` alone never authorizes endpoint replacement.
 
 Global flags (available on every command): `--home <path>`, `--profile <name>`, `--policy`, `--timeout <seconds>`.
 
-`--timeout` sets an absolute timeout (seconds) for the remote operation phase of `run`/`put`/`get` after the connection is established; output or transfer progress does not extend it. Omitting the flag uses the 900-second default, while `0` explicitly disables the deadline. DNS resolution, all resolved-address attempts, TCP setup, and the SSH handshake share one 15-second connection deadline. `run` closes channel stdin even when no input was supplied and drains stdout and stderr concurrently. Exceeding the 16 MiB limit fails the operation with exit 5 instead of returning truncated output; the remote command may already have run, so do not blindly retry non-idempotent work.
+`--timeout` sets an absolute timeout (seconds) for the remote operation phase of `run`/`put`/`get` after the connection is established; output or transfer progress does not extend it. Omitting the flag uses the 900-second default, while `0` explicitly disables the deadline. DNS resolution, all resolved-address attempts, TCP setup, and the SSH handshake share one 15-second connection deadline. `run` closes channel stdin even when no input was supplied and drains stdout and stderr concurrently. Exceeding the 16 MiB limit fails the operation with exit 5 instead of returning truncated success output; the remote command may already have run, so do not blindly retry non-idempotent work.
 
 When the name is omitted for `run`/`put`/`get`, the configured default server is used. When `--user` is omitted, that server's default account is used.
 
@@ -279,11 +295,30 @@ sshw put server-alpha "$archive" 'remote:/tmp/sshw-src.tgz'
 
 `git archive` includes only files tracked in the selected commit, so it excludes `.git`, `target`, untracked files, and uncommitted changes. This also avoids depending on whether the shell resolves `tar` to Windows bsdtar, Git's GNU tar, or a WSL executable.
 
+`run` returns captured output after completion. Human TTY invocations show the selected home and a start notice. Ordinary run/sudo read failures and timeouts can include redacted `partial_output` with `completion_confirmed:false`; they remain errors and must not trigger blind retries. A capture ending inside a known password is conservatively masked. `su` prompt/marker failures do not offer this partial-output contract. Local stdin is not forwarded to the remote command.
+
+For executable uploads, request permissions explicitly: `sshw put web ./app /srv/app/app --mode 755`. The creation default stays 600, and special permission bits are rejected. Explicit mode also updates an existing file's permissions and sets its timestamps to the transfer time; ordinary uploads retain the server's existing-mode behavior. This does not elevate file transfers. Uploading to an existing remote file can replace it; downloading over a local file still requires `--yes`.
+
 ### Safety Rails
 
 Dangerous commands such as `rm -rf`, `sudo`, `chmod -R`, `chown -R`, `pm2 delete`, and obvious writes to `/etc` require `--yes`. `sshw get` will not overwrite an existing local file without `--yes`. `sshw put` creates remote files with owner-only permissions where the server honors SCP modes. These are safety rails, not a security sandbox.
 
 ### Policy Enforcement
+
+Manage the existing policy format without editing JSON:
+
+```bash
+sshw policy init
+sshw policy allow command "systemctl status app"
+sshw policy allow put /srv/app
+sshw policy allow account web ops
+sshw policy enable
+sshw policy check web "systemctl status app" --user ops --json
+sshw policy show --json
+```
+
+`init` creates a disabled empty policy and refuses to replace an existing file. `allow` adds a rule without enabling enforcement; `remove` removes an exact entry, while other rules may still match. `enable`/`disable` change enforcement. `check` evaluates run safety, policy and the selected account locally; its `allowed` result does not test credentials, SSH, or sudoers. Policy mutations use the home's lock, revision check, atomic save and audit log. Full command rules are never copied into audit detail. Existing policy v1 files remain readable and are saved as v2 after a successful policy mutation.
+
 
 Policy is **off by default**. Turn it on for an invocation with `--policy`, or persistently with `"enabled": true` in the home's `policy.json`:
 
@@ -327,7 +362,7 @@ sshw doctor
 sshw doctor --json
 ```
 
-`doctor` reports the resolved home and how it was selected, the registry / config / known_hosts / policy / audit paths, registry validity and diagnostics (`registry_valid`, `registry_message`), whether the config file exists, the operating system, the linked libssh2 and OpenSSL version/status, the credential namespace, whether policy is present/valid/enabled, whether the audit log is writable, the credential backend health, and missing login credentials as `server/user` entries (`missing_credentials`). A corrupt registry does not prevent `doctor` from running; it diagnoses the registry from the built-in default home unless an explicit home already resolves. On Windows default builds, `openssl_version` may report `not linked (Windows WinCNG backend)` because libssh2 uses WinCNG instead of OpenSSL.
+`doctor` reports the active home/source, storage paths, config/registry/policy validity, linked libraries, audit writability, credential-backend health, missing login and privilege credentials, and local SSH agent availability. `issues` includes a suggested next step for each local problem. `local_checks_passed` summarizes those checks while `connection_tested:false` makes clear that reachability, matching host keys, authentication and sudoers were not tested. `ok:true` means the diagnostic ran, even when local issues exist. A corrupt registry is diagnosed from a recoverable home; conflicting home/profile selectors are still rejected.
 
 ### JSON Error Contract
 
@@ -358,7 +393,7 @@ When wrapped source errors exist, `error` includes an optional `causes` array co
 
 Every single-object `--json` success response (`add`, `show`, `trust`, `run`, `put`, `get`, `remove`, `doctor`, `account add`, `account show`, `account remove`, `profile show`, `privilege set`, `privilege show`, `privilege clear`) includes `"ok":true`, mirroring the `"ok":false` error envelope so a consumer can branch on `ok`. `list`, `account list`, and `profile list` return a JSON array on success (no wrapping object); on failure they emit the same `{"ok":false,...}` envelope.
 
-`default`, `account default`, and profile state changes (`profile add`, `profile default`, `profile remove`) do not have a `--json` flag; they report human-readable errors on stderr with the same stable exit codes. Human output everywhere uses the same exit-code mapping.
+`default`, `account default`, profile state changes, and all policy subcommands support `--json`. Existing list commands retain their array-on-success format. A completed `run` retains `ok:true` for compatibility; use `command_succeeded` (or `exit_status == 0`) to judge remote success. A policy check uses `allowed`, and doctor uses `local_checks_passed`; each says explicitly that remote connectivity was not tested.
 
 Invalid CLI arguments exit with code `9` (`usage`), kept distinct from `safety` (2) so an agent can tell "called sshw wrong" apart from "a safety rail blocked the operation". With `--json`, a usage error is emitted as the same envelope on stdout (`{"ok":false,"error":{"kind":"usage",...}}`); otherwise the parser's message goes to stderr. `--help`/`--version` print to stdout and exit `0`.
 
@@ -415,6 +450,19 @@ MIT
 `sshw`는 SSH 비밀번호, 개인키, 패스프레이즈, 토큰을 프롬프트, 셸 히스토리, 평문 설정 파일에 남기지 않고 등록된 SSH 서버를 조작하기 위한 크로스플랫폼 Rust CLI입니다.
 
 로컬 코딩 에이전트가 간단한 배포·유지보수 작업을 위임받아 수행할 때 쓰도록 설계했습니다. 강한 OS 샌드박스가 아니라 **sandbox-aware SSH wrapper**로서, 프로젝트별 profile 격리, 선택적 command/transfer policy, audit log, 출력 redaction을 제공합니다.
+
+### 빠른 시작
+
+```bash
+cargo install sshw-agent --locked
+sshw add web --host 192.0.2.10 --user deploy
+sshw trust web
+sshw run web "hostname" --json
+```
+
+`add`의 기본 포트는 22이며 비밀번호는 숨김 입력으로 받습니다. SSH agent에 등록한 키를 쓰려면 `--auth agent`를 추가하세요. `trust`가 보여주는 지문을 확인한 뒤 승인하고, 원격 명령 전체는 따옴표로 묶으세요. `run --json`의 원격 성공 여부는 `command_succeeded`로 판단합니다. `ok`만으로 원격 명령의 성공을 판단하지 마세요.
+
+기존 설정을 점검하려면 `sshw doctor`를 사용하세요. 로컬 문제와 다음 조치를 표시하며, 진단 자체의 성공은 원격 연결 성공을 보장하지 않습니다.
 
 ### 보안 경계
 
@@ -493,7 +541,7 @@ done
 <config_dir>/sshw/profiles/default/         내장 default profile home
 ```
 
-`<config_dir>`는 Windows `%AppData%\sshw`, macOS `~/Library/Application Support/sshw`, Linux `~/.config/sshw`입니다.
+`<config_dir>`는 Windows `%AppData%`, macOS `~/Library/Application Support`, Linux `~/.config`입니다.
 
 신규 credential keyring 키는 purpose, server, user, generation을 포함한 v3 형식을 사용합니다. 따라서 서로 다른 home의 같은 server/user가 충돌하지 않고, 한 서버의 account끼리 credential을 재사용할 수 없으며, login credential을 privilege credential로 재사용할 수도 없습니다.
 
@@ -516,7 +564,7 @@ namespace, server, user는 base64url로 인코딩하며 credential을 갱신할 
 4. registry의 default profile.
 5. 내장 default profile home(`<config_dir>/sshw/profiles/default`).
 
-`--home`과 `--profile`은 함께 쓸 수 없습니다(exit code 3).
+`--home`과 `--profile`은 함께 쓸 수 없습니다(exit code 3). 명시적 `--profile`과 비어 있지 않은 `SSHW_HOME`도 충돌 오류를 반환합니다. profile을 선택하려면 환경변수를 해제하고, 환경변수 home을 쓰려면 `--profile`을 생략하세요. 한쪽이 다른 쪽을 조용히 가리지 않습니다.
 
 ```bash
 sshw --home ./.sshw list
@@ -610,9 +658,11 @@ sshw run server-alpha "systemctl restart app" --user ops --as-root --yes
 
 privilege metadata는 선택된 login account별로 분리됩니다. `privilege set/show/clear --account <login-user>`는 account를 명시하고, 생략하면 server default account를 사용합니다. `privilege set`은 method, 대상 user(기본 `root`), credential key metadata만 `servers.json`에 저장합니다. sudo/root 비밀번호는 활성 credential backend에만 저장되며 CLI 인자나 평문 config에는 들어가지 않습니다. `--password-stdin`을 쓰지 않으면 숨김 입력 프롬프트로 받습니다.
 
-`run --as-root`는 명시적으로만 동작하며 항상 `--yes`가 필요합니다. 원래 명령에 기존 safety/policy 검사를 먼저 적용한 뒤, SSH channel stdin으로만 privilege 비밀번호를 전달하는 `sudo -S` 경로를 사용합니다. 비밀번호는 원격 command string이나 audit detail에 들어가지 않습니다. 대상 user에 `NOPASSWD` sudoers 규칙이 있으면 `sudo`가 비밀번호를 소비하지 않으므로, 저장된 비밀번호의 정확성과 무관하게 명령이 실행됩니다 — 이 경우 저장 비밀번호는 추가 게이트가 아닙니다. sudo 비밀번호 거부는 원격에서 실행된 `sudo` 명령의 non-zero 상태로 보고되므로 sshw exit `8`이며, 실제 상태는 `run --json`의 `exit_status`에 들어갑니다. `method=su`는 `su - <user> -c ...`를 PTY로 실행하고 `Password:` 프롬프트가 나오면 저장된 비밀번호를 주입합니다(echo 비활성화, `LC_ALL=C`로 프롬프트를 영어로 고정). 명령 출력과 exit code는 marker로 정확히 추출되어 출력 라인이 누락되지 않습니다. `sudo`보다 환경에 민감하며, 프롬프트를 인식하지 못하면 무한 대기 대신 타임아웃으로 fail-closed됩니다. completion marker 전에 발생한 `su` 프롬프트/인증 실패는 sshw의 auth/setup 실패로 간주되어 exit code `4`에 매핑됩니다.
+`run --as-root`(별칭 `--elevate`) 자체가 명시적 권한 상승 요청입니다. 원래 명령이 위험 작업 확인 대상인 경우에만 별도 `--yes`가 필요합니다. 원래 명령에 기존 safety/policy 검사를 먼저 적용한 뒤, SSH channel stdin으로만 privilege 비밀번호를 전달하는 `sudo -S` 경로를 사용합니다. 비밀번호는 원격 command string이나 audit detail에 들어가지 않습니다. 대상 user에 `NOPASSWD` sudoers 규칙이 있으면 `sudo`가 비밀번호를 소비하지 않으므로, 저장된 비밀번호의 정확성과 무관하게 명령이 실행됩니다 — 이 경우 저장 비밀번호는 추가 게이트가 아닙니다. sudo 비밀번호 거부는 원격에서 실행된 `sudo` 명령의 non-zero 상태로 보고되므로 sshw exit `8`이며, 실제 상태는 `run --json`의 `exit_status`에 들어갑니다. `method=su`는 `su - <user> -c ...`를 PTY로 실행하고 `Password:` 프롬프트가 나오면 저장된 비밀번호를 주입합니다(echo 비활성화, `LC_ALL=C`로 프롬프트를 영어로 고정). 명령 출력과 exit code는 marker로 정확히 추출되어 출력 라인이 누락되지 않습니다. `sudo`보다 환경에 민감하며, 프롬프트를 인식하지 못하면 무한 대기 대신 타임아웃으로 fail-closed됩니다. completion marker 전에 발생한 `su` 프롬프트/인증 실패는 sshw의 auth/setup 실패로 간주되어 exit code `4`에 매핑됩니다.
 
 ### Host Trust Flow
+
+서버가 이미 무비밀번호 sudo를 허용한다면 `sshw run web "id -u" --as-root --no-password`를 사용하세요. 저장된 privilege 비밀번호를 읽거나 입력받지 않고 `sudo -n`을 실행합니다. 등록된 sudo 대상 계정을 사용하며 설정이 없으면 root입니다. su 설정이 있으면 거부하고 실제 권한은 원격 sudoers가 결정합니다. `privilege set --account`는 `--login-user`, 대상 `--user`는 `--target-user` 별칭도 지원합니다.
 
 Host key 검증은 fail-closed이며, 알 수 없거나 변경된 key는 조용히 허용하지 않습니다. 신뢰한 key는 활성 home의 `known_hosts`에 저장됩니다.
 
@@ -626,26 +676,27 @@ sshw trust server-alpha --yes
 ### 명령
 
 ```bash
-sshw add <name> --host <host> --port <port> --user <user> [--auth password|agent] [--password-stdin] [--force] [--json]
+sshw add <name> --host <host> [--port <port>] --user <user> [--auth password|agent] [--password-stdin] [--force] [--replace] [--json]
 sshw list [--json]
 sshw show <name> [--json]
-sshw default [<name>]
+sshw default [<name>] [--json]
 sshw trust <name> [--yes] [--json]
-sshw run [<name>] "<command>" [--user <registered-user>] [--json] [--yes] [--as-root]
-sshw put [<name>] <local> <remote> [--user <registered-user>] [--json] [--yes]
+sshw run [<name>] "<command>" [--user <registered-user>] [--json] [--yes] [--as-root [--no-password]]
+sshw put [<name>] <local> <remote> [--user <registered-user>] [--mode 600|755] [--json] [--yes]
 sshw get [<name>] <remote> <local> [--user <registered-user>] [--json] [--yes]
 sshw remove <name> [--yes] [--json]
 sshw doctor [--json]
 sshw account add <name> <user> [--auth password|agent] [--password-stdin] [--force] [--json]
 sshw account list <name> [--json]
 sshw account show <name> <user> [--json]
-sshw account default <name> <user>
+sshw account default <name> <user> [--json]
 sshw account remove <name> <user> [--yes] [--json]
 sshw privilege <set|show|clear> ... [--json]
-sshw profile <add|list|show|default|remove> ...
+sshw profile <add|list|show|default|remove> ... [--json]
+sshw policy <init|show|enable|disable|allow|remove|check> ... [--json]
 ```
 
-`add`, `account add`, `profile add`는 `--force`로 기존 항목을 대화형 확인 프롬프트 없이 덮어씁니다 — 비대화형(예: 에이전트)에서 항목을 등록/갱신할 때 필요합니다. 기존 server를 `add`로 갱신하면 endpoint의 account 전체를 교체하고 config publish 후 오래된 login/privilege credential을 모두 삭제합니다. 한 account의 auth만 바꾸려면 `account add`를 사용하세요.
+`add`, `account add`, `profile add`는 `--force`로 갱신을 비대화형 승인합니다. 같은 host/port의 서버를 갱신하면 다른 계정과 해당 계정의 privilege 설정을 보존하고 선택한 login credential만 갱신합니다. host/port 변경은 `--replace`가 필요하며 전체 계정·privilege 설정을 초기화하고 오래된 credential을 정리합니다. 이전 endpoint를 유지하려면 새 서버 이름을 쓰세요. `--force`만으로 endpoint 교체를 승인하지 않습니다.
 
 전역 플래그(모든 명령에서 사용): `--home <path>`, `--profile <name>`, `--policy`, `--timeout <seconds>`.
 
@@ -683,11 +734,30 @@ sshw put server-alpha "$archive" 'remote:/tmp/sshw-src.tgz'
 
 `git archive`는 선택한 커밋에서 Git이 추적하는 파일만 포함하므로 `.git`, `target`, 미추적 파일, 커밋하지 않은 변경 사항은 제외됩니다. 셸이 `tar`를 Windows bsdtar, Git의 GNU tar, WSL 실행 파일 중 무엇으로 해석하는지에도 의존하지 않습니다.
 
+`run`은 완료 후 모은 출력을 반환합니다. 사람이 사용하는 TTY에는 선택한 home과 작업 시작 안내를 표시합니다. 일반 run/sudo의 읽기 실패·타임아웃에서는 redaction한 `partial_output`과 `completion_confirmed:false`를 제공할 수 있습니다. 여전히 실패이며 무조건 재시도하면 안 됩니다. 알려진 비밀번호가 캡처 경계에서 잘린 경우도 보수적으로 가립니다. su prompt/marker 실패에는 이 부분 출력 계약을 적용하지 않습니다. 로컬 stdin은 원격 명령에 전달하지 않습니다.
+
+실행 파일은 `sshw put web ./app /srv/app/app --mode 755`처럼 권한을 명시하세요. 새 파일의 기본 권한은 600이고 특수 권한 비트는 거부합니다. mode를 명시하면 기존 파일의 권한도 바꾸고 시각 정보는 전송 시각으로 설정합니다. 일반 업로드는 서버의 기존 권한 유지 동작을 따릅니다. 파일 전송 자체의 권한 상승은 제공하지 않습니다. 원격의 기존 파일은 업로드로 교체될 수 있고, 로컬의 기존 파일을 다운로드로 덮어쓰려면 `--yes`가 필요합니다.
+
 ### Safety Rails
 
 `rm -rf`, `sudo`, `chmod -R`, `chown -R`, `pm2 delete`, `/etc`에 대한 명백한 쓰기 같은 위험 명령은 `--yes`가 필요합니다. `sshw get`은 `--yes` 없이 기존 로컬 파일을 덮어쓰지 않습니다. `sshw put`은 서버가 SCP mode를 존중하면 owner-only 권한으로 원격 파일을 만듭니다. 이것은 safety rail이지 보안 샌드박스가 아닙니다.
 
 ### Policy 적용
+
+JSON을 직접 편집하지 않고 기존 정책 형식을 관리할 수 있습니다.
+
+```bash
+sshw policy init
+sshw policy allow command "systemctl status app"
+sshw policy allow put /srv/app
+sshw policy allow account web ops
+sshw policy enable
+sshw policy check web "systemctl status app" --user ops --json
+sshw policy show --json
+```
+
+`init`은 비활성 빈 정책을 만들며 기존 파일은 덮어쓰지 않습니다. `allow`는 항목만 추가하고, `remove`는 정확히 일치하는 항목만 제거합니다. 다른 규칙이 남아 있으면 계속 허용될 수 있습니다. `enable`/`disable`은 정책 활성 상태를 바꿉니다. `check`의 `allowed`는 safety·policy·계정에 대한 로컬 판정이며 credential·SSH·sudoers를 검증하지 않습니다. 정책 변경은 home 잠금, revision 검사, 원자적 저장과 audit을 사용하고 명령 전체를 audit detail에 복사하지 않습니다. 기존 v1 정책은 계속 읽을 수 있고 정책 변경에 성공하면 v2로 저장됩니다.
+
 
 policy는 **기본 off**입니다. 호출별로 `--policy`로 켜거나, home의 `policy.json`에 `"enabled": true`로 영속 적용합니다.
 
@@ -726,6 +796,8 @@ policy는 fail-closed입니다. `--policy`인데 파일이 없으면 에러이�
 
 ### Doctor
 
+`local_checks_passed`는 로컬 검사 결과이고 `issues`에는 문제와 다음 조치가 담깁니다. SSH agent와 누락된 privilege credential도 확인합니다. `connection_tested:false`이며 원격 접속·host key 일치·sudoers를 검사하지는 않습니다. `ok:true`는 진단 실행 성공을 뜻합니다.
+
 ```bash
 sshw doctor
 sshw doctor --json
@@ -762,7 +834,7 @@ sshw doctor --json
 
 단일 object를 반환하는 `--json` 성공 응답(`add`, `show`, `trust`, `run`, `put`, `get`, `remove`, `doctor`, `account add`, `account show`, `account remove`, `profile show`, `privilege set`, `privilege show`, `privilege clear`)은 모두 `"ok":true`를 포함해 오류 envelope의 `"ok":false`와 대칭을 이루므로, 소비자가 `ok`로 분기할 수 있습니다. `list`, `account list`, `profile list`는 성공 시 JSON 배열을 반환하며(래핑 object 없음), 실패 시에는 동일한 `{"ok":false,...}` envelope를 출력합니다.
 
-`default`, `account default`, profile 상태 변경(`profile add`, `profile default`, `profile remove`)에는 `--json` 플래그가 없으며, 동일한 안정 exit code로 stderr에 사람용 메시지를 출력합니다. human 출력도 같은 exit code 매핑을 사용합니다.
+`default`, `account default`, profile 상태 변경과 모든 policy 하위 명령도 `--json`을 지원합니다. 기존 list 명령의 성공 배열 형식은 유지합니다. 완료된 `run`의 `ok:true`는 호환성을 위해 유지하므로 원격 성공은 `command_succeeded` 또는 `exit_status == 0`으로 판단하세요. 정책 검사는 `allowed`, doctor는 `local_checks_passed`를 사용하며 실제 원격 연결을 검사한 것은 아닙니다.
 
 잘못된 CLI 인자는 exit code `9`(`usage`)로 끝나며, `safety`(2)와 분리해 에이전트가 "sshw를 잘못 호출함"과 "safety rail이 차단함"을 구분할 수 있습니다. `--json`이면 usage 오류도 동일한 envelope로 stdout에 출력하고(`{"ok":false,"error":{"kind":"usage",...}}`), 아니면 파서 메시지를 stderr로 보냅니다. `--help`/`--version`은 stdout으로 출력하고 exit `0`입니다.
 

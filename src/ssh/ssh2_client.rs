@@ -1,4 +1,4 @@
-use super::{HostKeyInfo, RunResult, SshClient, SshTarget, TransferResult};
+use super::{HostKeyInfo, PartialRunError, RunResult, SshClient, SshTarget, TransferResult};
 use crate::config::ServerConfig;
 use crate::credentials::AuthMaterial;
 use crate::error::{ResultErrorKindExt, app_error, classified_error, classified_io_error};
@@ -60,6 +60,111 @@ impl Default for Ssh2Client {
 }
 
 impl Ssh2Client {
+    fn put_inner(
+        &self,
+        target: &SshTarget<'_>,
+        auth: &AuthMaterial,
+        local: &Path,
+        remote: &str,
+        mode: Option<u32>,
+    ) -> anyhow::Result<TransferResult> {
+        if mode.is_some_and(|mode| mode > 0o777) {
+            return Err(app_error(
+                ErrorKind::Config,
+                "upload mode must be between 000 and 777",
+            ));
+        }
+        // Open first, then inspect metadata on that exact handle. A path or
+        // symlink replacement during network setup cannot change what is sent.
+        let (mut local_file, metadata) = open_regular_local_file(local)?;
+
+        // OpenSSH scp preserves the existing mode unless the sender requests
+        // preserve mode (-p). libssh2 enables -p when timestamps are supplied.
+        // Explicit --mode therefore stamps transfer time as well; ordinary put
+        // retains the original protocol behavior and owner-only creation mode.
+        let times = if mode.is_some() {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .context("cannot determine upload timestamp")?
+                .as_secs()
+                .max(1);
+            Some((now, now))
+        } else {
+            None
+        };
+
+        let known_hosts = self.resolved_known_hosts_path()?;
+        let session = connect_verified_authenticated(
+            target.server,
+            target.user,
+            auth,
+            self.connect_timeout,
+            self.op_timeout,
+            &known_hosts,
+        )?;
+        let deadline = OperationDeadline::new(self.op_timeout);
+        deadline.apply(&session)?;
+        let mut remote_file = session
+            .scp_send(
+                Path::new(remote),
+                mode.unwrap_or(0o600) as i32,
+                metadata.len(),
+                times,
+            )
+            .context("ssh transfer error")
+            .with_error_kind(ErrorKind::Ssh)?;
+        // scp promised `metadata.len()` bytes up front. Cap the reader at that
+        // length so a file that grows mid-transfer never writes past the
+        // declared size, and fail closed below if fewer bytes were sent (the
+        // file shrank), so a truncated upload is never reported as a success.
+        let copied = copy_file_with_deadline(
+            &mut local_file,
+            &mut remote_file,
+            metadata.len(),
+            &session,
+            &deadline,
+        )?;
+        if copied != metadata.len() {
+            return Err(anyhow::anyhow!(
+                "ssh transfer aborted: local file changed during transfer (expected {} bytes, sent {})",
+                metadata.len(),
+                copied
+            ));
+        }
+        deadline.apply(&session)?;
+        remote_file
+            .write_all(&[0])
+            .context("ssh transfer error")
+            .with_error_kind(ErrorKind::Ssh)?;
+        deadline.apply(&session)?;
+        remote_file
+            .send_eof()
+            .context("ssh transfer error")
+            .with_error_kind(ErrorKind::Ssh)?;
+        deadline.apply(&session)?;
+        remote_file
+            .wait_eof()
+            .context("ssh transfer error")
+            .with_error_kind(ErrorKind::Ssh)?;
+        deadline.apply(&session)?;
+        remote_file
+            .close()
+            .context("ssh transfer error")
+            .with_error_kind(ErrorKind::Ssh)?;
+        deadline.apply(&session)?;
+        remote_file
+            .wait_close()
+            .context("ssh transfer error")
+            .with_error_kind(ErrorKind::Ssh)?;
+        ensure_scp_transfer_succeeded(&remote_file)?;
+
+        Ok(TransferResult {
+            bytes: copied,
+            source: local.display().to_string(),
+            destination: remote.to_string(),
+        })
+    }
+
     pub fn connect_timeout(&self) -> Duration {
         self.connect_timeout
     }
@@ -106,6 +211,17 @@ impl Ssh2Client {
 }
 
 impl SshClient for Ssh2Client {
+    fn agent_identity_count(&self) -> anyhow::Result<Option<usize>> {
+        let session = Session::new()?;
+        let mut agent = session.agent()?;
+        agent
+            .connect()
+            .context("cannot connect to the local SSH agent")?;
+        agent
+            .list_identities()
+            .context("cannot list SSH agent identities")?;
+        Ok(Some(agent.identities()?.len()))
+    }
     fn host_key(&self, server: &ServerConfig) -> anyhow::Result<HostKeyInfo> {
         let session = connect(server, self.connect_timeout).with_error_kind(ErrorKind::Ssh)?;
         host_key_info(&session).with_error_kind(ErrorKind::Ssh)
@@ -201,75 +317,18 @@ impl SshClient for Ssh2Client {
         local: &Path,
         remote: &str,
     ) -> anyhow::Result<TransferResult> {
-        // Open first, then inspect metadata on that exact handle. A path or
-        // symlink replacement during network setup cannot change what is sent.
-        let (mut local_file, metadata) = open_regular_local_file(local)?;
+        self.put_inner(target, auth, local, remote, None)
+    }
 
-        let known_hosts = self.resolved_known_hosts_path()?;
-        let session = connect_verified_authenticated(
-            target.server,
-            target.user,
-            auth,
-            self.connect_timeout,
-            self.op_timeout,
-            &known_hosts,
-        )?;
-        let deadline = OperationDeadline::new(self.op_timeout);
-        deadline.apply(&session)?;
-        let mut remote_file = session
-            .scp_send(Path::new(remote), 0o600, metadata.len(), None)
-            .context("ssh transfer error")
-            .with_error_kind(ErrorKind::Ssh)?;
-        // scp promised `metadata.len()` bytes up front. Cap the reader at that
-        // length so a file that grows mid-transfer never writes past the
-        // declared size, and fail closed below if fewer bytes were sent (the
-        // file shrank), so a truncated upload is never reported as a success.
-        let copied = copy_file_with_deadline(
-            &mut local_file,
-            &mut remote_file,
-            metadata.len(),
-            &session,
-            &deadline,
-        )?;
-        if copied != metadata.len() {
-            return Err(anyhow::anyhow!(
-                "ssh transfer aborted: local file changed during transfer (expected {} bytes, sent {})",
-                metadata.len(),
-                copied
-            ));
-        }
-        deadline.apply(&session)?;
-        remote_file
-            .write_all(&[0])
-            .context("ssh transfer error")
-            .with_error_kind(ErrorKind::Ssh)?;
-        deadline.apply(&session)?;
-        remote_file
-            .send_eof()
-            .context("ssh transfer error")
-            .with_error_kind(ErrorKind::Ssh)?;
-        deadline.apply(&session)?;
-        remote_file
-            .wait_eof()
-            .context("ssh transfer error")
-            .with_error_kind(ErrorKind::Ssh)?;
-        deadline.apply(&session)?;
-        remote_file
-            .close()
-            .context("ssh transfer error")
-            .with_error_kind(ErrorKind::Ssh)?;
-        deadline.apply(&session)?;
-        remote_file
-            .wait_close()
-            .context("ssh transfer error")
-            .with_error_kind(ErrorKind::Ssh)?;
-        ensure_scp_transfer_succeeded(&remote_file)?;
-
-        Ok(TransferResult {
-            bytes: copied,
-            source: local.display().to_string(),
-            destination: remote.to_string(),
-        })
+    fn put_with_mode(
+        &self,
+        target: &SshTarget<'_>,
+        auth: &AuthMaterial,
+        local: &Path,
+        remote: &str,
+        mode: u32,
+    ) -> anyhow::Result<TransferResult> {
+        self.put_inner(target, auth, local, remote, Some(mode))
     }
 
     fn get(
@@ -383,10 +442,17 @@ impl Ssh2Client {
 
         let (stdout, stderr) =
             read_channel_outputs(&session, &mut channel, &deadline, self.output_limit)?;
-        deadline.apply(&session)?;
-        channel.wait_close().context("ssh session error")?;
-        ensure_remote_command_not_signaled(&channel)?;
-        let exit_status = channel.exit_status().context("ssh session error")?;
+        let completion = (|| {
+            deadline.apply(&session)?;
+            channel.wait_close().context("ssh session error")?;
+            ensure_remote_command_not_signaled(&channel)?;
+            channel.exit_status().context("ssh session error")
+        })();
+        let exit_status = completion.map_err(|source| PartialRunError {
+            source,
+            stdout: stdout.clone(),
+            stderr: stderr.clone(),
+        })?;
 
         Ok(RunResult {
             exit_status,
@@ -1075,50 +1141,60 @@ fn drain_both_streams(
     let mut err_done = false;
     let mut buf = [0u8; 32 * 1024];
 
-    while !(out_done && err_done) {
-        deadline.remaining()?;
-        let mut progressed = false;
+    let result = (|| -> anyhow::Result<()> {
+        while !(out_done && err_done) {
+            deadline.remaining()?;
+            let mut progressed = false;
 
-        if !out_done {
-            match channel.read(&mut buf) {
-                Ok(0) => out_done = true,
-                Ok(n) => {
-                    append_output_bounded(&mut out, &buf[..n], err.len(), output_limit)?;
-                    progressed = true;
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(e) => {
-                    return Err(classified_error(
-                        ErrorKind::Ssh,
-                        anyhow::Error::new(e).context("ssh session error"),
-                    ));
+            if !out_done {
+                match channel.read(&mut buf) {
+                    Ok(0) => out_done = true,
+                    Ok(n) => {
+                        append_output_bounded(&mut out, &buf[..n], err.len(), output_limit)?;
+                        progressed = true;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(e) => {
+                        return Err(classified_error(
+                            ErrorKind::Ssh,
+                            anyhow::Error::new(e).context("ssh session error"),
+                        ));
+                    }
                 }
             }
-        }
 
-        if !err_done {
-            match channel.stderr().read(&mut buf) {
-                Ok(0) => err_done = true,
-                Ok(n) => {
-                    append_output_bounded(&mut err, &buf[..n], out.len(), output_limit)?;
-                    progressed = true;
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(e) => {
-                    return Err(classified_error(
-                        ErrorKind::Ssh,
-                        anyhow::Error::new(e).context("ssh session error"),
-                    ));
+            if !err_done {
+                match channel.stderr().read(&mut buf) {
+                    Ok(0) => err_done = true,
+                    Ok(n) => {
+                        append_output_bounded(&mut err, &buf[..n], out.len(), output_limit)?;
+                        progressed = true;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(e) => {
+                        return Err(classified_error(
+                            ErrorKind::Ssh,
+                            anyhow::Error::new(e).context("ssh session error"),
+                        ));
+                    }
                 }
             }
-        }
 
-        if !(progressed || out_done && err_done) {
-            std::thread::sleep(Duration::from_millis(5));
+            if !(progressed || out_done && err_done) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
         }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => Ok((out, err)),
+        Err(source) => Err(PartialRunError {
+            source,
+            stdout: decode_remote_output_lossy(out),
+            stderr: decode_remote_output_lossy(err),
+        }
+        .into()),
     }
-
-    Ok((out, err))
 }
 
 fn append_output_bounded(

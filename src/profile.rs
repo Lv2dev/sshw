@@ -216,6 +216,12 @@ pub fn resolve_home_with_registry(
         ));
     }
 
+    if env_home.is_some() && profile_flag.is_some() {
+        return Err(anyhow::anyhow!(
+            "cannot use --profile while SSHW_HOME is set; unset SSHW_HOME to select the profile, or omit --profile to use SSHW_HOME"
+        ));
+    }
+
     if let Some(env) = env_home {
         let path = Path::new(env);
         return Ok(ResolvedHome::ad_hoc(

@@ -613,6 +613,7 @@ fn add_json_update_reports_updated_action_and_session_warning() {
             "deploy",
             "--password-stdin",
             "--force",
+            "--replace",
             "--json",
         ])
         .unwrap(),
@@ -1406,6 +1407,7 @@ fn add_update_removes_stale_privilege_metadata_and_password() {
             "--auth",
             "agent",
             "--force",
+            "--replace",
         ])
         .unwrap(),
         &path,
@@ -2194,7 +2196,7 @@ fn run_as_root_without_privilege_config_fails_closed() {
 }
 
 #[test]
-fn run_as_root_requires_yes_before_ssh() {
+fn dangerous_root_command_still_requires_yes_before_ssh() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("servers.json");
     save_config(&path, &sample_config(&path)).unwrap();
@@ -2210,7 +2212,14 @@ fn run_as_root_requires_yes_before_ssh() {
     let mut prompter = FakePrompter::default();
 
     let err = execute(
-        Cli::try_parse_from(["sshw", "run", "server-alpha", "id -u", "--as-root"]).unwrap(),
+        Cli::try_parse_from([
+            "sshw",
+            "run",
+            "server-alpha",
+            "rm -rf /tmp/sshw-test-fixture",
+            "--as-root",
+        ])
+        .unwrap(),
         &path,
         &store,
         &ssh,
@@ -2256,8 +2265,7 @@ fn run_as_root_uses_sudo_stdin_and_redacts_privilege_secret() {
     let mut prompter = FakePrompter::default();
 
     let output = execute(
-        Cli::try_parse_from(["sshw", "run", "server-alpha", "id -u", "--as-root", "--yes"])
-            .unwrap(),
+        Cli::try_parse_from(["sshw", "run", "server-alpha", "id -u", "--as-root"]).unwrap(),
         &path,
         &store,
         &ssh,
@@ -2283,6 +2291,85 @@ fn run_as_root_uses_sudo_stdin_and_redacts_privilege_secret() {
         ssh.run_stdin.borrow().as_slice(),
         [Some("ROOT_PASSWORD\n".to_string())]
     );
+}
+
+#[test]
+fn passwordless_sudo_needs_no_privilege_secret_and_reports_remote_failure() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    let mut config = sample_config(&path);
+    config
+        .servers
+        .get_mut("server-alpha")
+        .unwrap()
+        .accounts
+        .get_mut("deploy")
+        .unwrap()
+        .auth = AuthConfig::Agent;
+    save_config(&path, &config).unwrap();
+    let store = FakeCredentialStore::default();
+    let ssh = FakeSshClient::with_exit_status(1);
+    let output = execute(
+        Cli::try_parse_from([
+            "sshw",
+            "run",
+            "server-alpha",
+            "printf 'hello world'",
+            "--as-root",
+            "--no-password",
+            "--json",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut FakePrompter::default(),
+    )
+    .unwrap();
+    assert_eq!(output.exit_code, 8);
+    let value: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+    assert_eq!(value["ok"], true);
+    assert_eq!(value["command_succeeded"], false);
+    assert_eq!(value["exit_status"], 1);
+    assert_eq!(ssh.run_commands.borrow().len(), 1);
+    assert!(ssh.run_commands.borrow()[0].starts_with("sudo -n -u 'root' -- sh -c "));
+    assert_eq!(ssh.run_stdin.borrow().as_slice(), &[None]);
+}
+
+#[test]
+fn profile_mutations_have_json_without_changing_namespace_contract() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("servers.json");
+    let profile_home = temp.path().join("profile-home");
+    let profile_home = profile_home.to_str().unwrap();
+    let store = FakeCredentialStore::default();
+    let ssh = FakeSshClient::default();
+    let mut prompter = FakePrompter::default();
+    for args in [
+        vec![
+            "sshw",
+            "profile",
+            "add",
+            "test",
+            "--home",
+            profile_home,
+            "--json",
+        ],
+        vec!["sshw", "profile", "default", "test", "--json"],
+        vec!["sshw", "profile", "remove", "test", "--json"],
+    ] {
+        let output = execute(
+            Cli::try_parse_from(args).unwrap(),
+            &config_path,
+            &store,
+            &ssh,
+            &mut prompter,
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["name"], "test");
+    }
 }
 
 #[test]

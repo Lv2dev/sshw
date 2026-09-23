@@ -34,10 +34,10 @@ where
     if previous.is_some()
         && !args.force
         && !prompter
-            .confirm(&format!(
-                "update account '{}/{}'? [y/N] ",
-                args.name, args.user
-            ))
+            .confirm_with_option(
+                &format!("update account '{}/{}'? [y/N] ", args.name, args.user),
+                "--force",
+            )
             .with_error_kind(ErrorKind::Config)?
     {
         return Err(app_error(ErrorKind::Config, "account update cancelled"));
@@ -221,6 +221,12 @@ pub(super) fn default_account(
     }
     server.default_user = args.user.clone();
     save_config_if_unchanged(config_path, config, revision).with_error_kind(ErrorKind::Config)?;
+    if args.json {
+        return Ok(ok(format!(
+            "{}\n",
+            json!({"ok":true,"action":"default","server":args.name,"user":args.user})
+        )));
+    }
     Ok(ok(format!(
         "default account for {} set to {}\n",
         args.name, args.user
