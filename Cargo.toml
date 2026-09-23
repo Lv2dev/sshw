@@ -12,13 +12,13 @@ categories = ["command-line-utilities", "authentication"]
 publish = ["crates-io"]
 autobins = false
 include = [
-    "src/**",
-    "build.rs",
-    "Cargo.lock",
-    "README.md",
-    "LICENSE",
-    "CHANGELOG.md",
-    "SECURITY.md",
+    "/src/**",
+    "/build.rs",
+    "/Cargo.lock",
+    "/README.md",
+    "/LICENSE",
+    "/CHANGELOG.md",
+    "/SECURITY.md",
 ]
 
 [lib]
