@@ -16,7 +16,6 @@ use crate::home::{CredentialNamespace, CredentialPurpose, validate_server_name};
 use crate::output::{ErrorKind, ServerOutput};
 use crate::ssh::SshClient;
 use serde_json::json;
-use std::collections::BTreeMap;
 use std::path::Path;
 
 pub(super) fn add_server<C, P>(
@@ -36,10 +35,30 @@ where
     validate_account_user(&args.user).with_error_kind(ErrorKind::Config)?;
 
     let previous_server = config.servers.get(&args.name).cloned();
+    if let Some(previous) = &previous_server
+        && (previous.host != args.host || previous.port != args.port)
+        && !args.replace
+    {
+        return Err(app_error(
+            ErrorKind::Config,
+            "changing a server's host or port requires --replace (removes its accounts and privilege settings); use a new server name to keep the existing configuration",
+        ));
+    }
+    let prompt = if args.replace {
+        format!(
+            "replace server '{}' and remove its existing accounts and privilege settings? [y/N] ",
+            args.name
+        )
+    } else {
+        format!(
+            "update account '{}/{}' (other accounts and privilege settings are preserved)? [y/N] ",
+            args.name, args.user
+        )
+    };
     if previous_server.is_some()
         && !args.force
         && !prompter
-            .confirm(&format!("update existing server '{}'? [y/N] ", args.name))
+            .confirm_with_option(&prompt, "--force")
             .with_error_kind(ErrorKind::Config)?
     {
         return Err(app_error(ErrorKind::Config, "add cancelled"));
@@ -80,24 +99,28 @@ where
         }
     };
 
-    let mut accounts = BTreeMap::new();
-    accounts.insert(
-        args.user.clone(),
-        AccountConfig {
-            auth,
-            privilege: None,
-        },
-    );
+    let mut accounts = previous_server
+        .as_ref()
+        .filter(|_| !args.replace)
+        .map(|server| server.accounts.clone())
+        .unwrap_or_default();
+    let privilege = accounts
+        .get(&args.user)
+        .and_then(|account| account.privilege.clone());
+    accounts.insert(args.user.clone(), AccountConfig { auth, privilege });
     let new_server = ServerConfig {
         host: args.host,
         port: args.port,
         default_user: args.user,
         accounts,
     };
+    let retained_credentials = stored_credentials(&new_server);
     let stale_credentials = previous_server
         .as_ref()
         .map(stored_credentials)
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|entry| !retained_credentials.contains(entry));
     config.servers.insert(args.name.clone(), new_server);
 
     if config.default.is_none() {
@@ -151,6 +174,12 @@ where
     }
 
     let mut message = format!("{action} {}\n", args.name);
+    if previous_server.is_none() || args.replace {
+        message.push_str(&format!(
+            "next: sshw trust {}\nthen: sshw run {} \"hostname\"\n",
+            args.name, args.name
+        ));
+    }
     if let Some(warning) = warning {
         message.push_str(&format!("warning: {warning}\n"));
     }
@@ -161,6 +190,13 @@ pub(super) fn list_servers(args: ListArgs, config: &SshwConfig) -> anyhow::Resul
     let servers = server_outputs(config);
     if args.json {
         return Ok(ok(format!("{}\n", serde_json::to_string(&servers)?)));
+    }
+
+    if servers.is_empty() {
+        return Ok(ok(
+            "no servers registered; start with: sshw add web --host <host> --user <user>\n"
+                .to_string(),
+        ));
     }
 
     let mut stdout = String::new();
@@ -219,6 +255,9 @@ pub(super) fn default_server(
             .default
             .as_ref()
             .ok_or_else(no_default_server_error)?;
+        if args.json {
+            return Ok(ok(format!("{}\n", json!({"ok":true,"server":name}))));
+        }
         return Ok(ok(format!("{name}\n")));
     };
 
@@ -228,6 +267,12 @@ pub(super) fn default_server(
 
     config.default = Some(name.clone());
     save_config_if_unchanged(config_path, config, revision).with_error_kind(ErrorKind::Config)?;
+    if args.json {
+        return Ok(ok(format!(
+            "{}\n",
+            json!({"ok":true,"action":"default","server":name})
+        )));
+    }
     Ok(ok(format!("default set to {name}\n")))
 }
 
@@ -505,6 +550,7 @@ mod tests {
                 user: "deploy".to_string(),
                 auth: AuthArg::Password,
                 force: false,
+                replace: false,
                 password_stdin: false,
                 json: false,
             },
@@ -558,6 +604,7 @@ mod tests {
                 user: "deploy".to_string(),
                 auth: AuthArg::Password,
                 force: true,
+                replace: true,
                 password_stdin: false,
                 json: false,
             },
@@ -608,6 +655,7 @@ mod tests {
                 user: "deploy".to_string(),
                 auth: AuthArg::Password,
                 force: false,
+                replace: false,
                 password_stdin: false,
                 json: false,
             },

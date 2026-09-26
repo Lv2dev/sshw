@@ -27,9 +27,9 @@ const AFTER_LONG_HELP: &str = r#"SECURITY MODEL:
     Output and audit redaction are best-effort.
 
 HOME SELECTION:
-  Home resolution order is `--home`, `SSHW_HOME`, then `--profile <name>`.
-  The `--profile` selection is after SSHW_HOME and before the registry default
-  profile, followed by the app default.
+  Use `--home`, `SSHW_HOME`, or `--profile <name>` to select a home.
+  An explicit --profile conflicts with SSHW_HOME; unset SSHW_HOME first.
+  Otherwise the registry default profile or app default is used.
 
 EXIT CODES (stable; sshw's own operational failures):
   0  success
@@ -49,13 +49,13 @@ EXIT CODES (stable; sshw's own operational failures):
 
 JSON OUTPUT:
   `--json` is accepted by: add, list, show, trust, run, put, get, remove,
-  doctor, account add/list/show/remove, profile list/show, and privilege
-  set/show/clear. default/account default/profile state changes have no --json.
+  doctor, default, all account/profile/policy subcommands, and privilege
+  set/show/clear. A completed run uses command_succeeded for remote success.
   Success (single object) carries `"ok":true`, e.g.:
     run:      {"ok":true,"server":"web","user":"ops","command":"uptime","exit_status":0,...}
     put/get:  {"ok":true,"server":"web","user":"ops","local":"./app","remote":"/srv/app","bytes":1234}
     change:   {"ok":true,"action":"added","server":"web"}
-  list / profile list return a JSON array on success (no wrapping object).
+  list / account list / profile list return a JSON array on success (no wrapping object).
   Failure (any --json command, including usage errors) uses one envelope:
     {"ok":false,"error":{"kind":"config","message":"unknown server 'x'","exit_code":3}}
   `kind` is one of safety/config/auth/ssh/io/policy/usage/unknown (see EXIT CODES).
@@ -83,7 +83,9 @@ EXAMPLES:
   sshw run web "uptime" --json                             # run a command, JSON out
   sshw account add web ops --auth agent                    # register another login user
   sshw run web "whoami" --user ops                         # select a registered account
-  sshw run web "systemctl restart app" --user ops --as-root --yes
+  sshw run web "systemctl restart app" --user ops --as-root
+  sshw run web "id -u" --as-root --no-password
+  sshw policy check web "uptime" --json
   sshw put web ./app /srv/app/app --user ops               # upload [server] <local> <remote>
   sshw get web /var/log/app.log ./app.log                  # download [server] <remote> <local>
 "#;
@@ -101,8 +103,8 @@ pub struct Cli {
     /// with `--profile`.
     #[arg(long, global = true, value_name = "PATH")]
     pub home: Option<PathBuf>,
-    /// Select a registered profile by name after SSHW_HOME and before the
-    /// registry default (see `sshw profile`). Cannot be combined with `--home`.
+    /// Select a registered profile. Conflicts with --home and a non-empty
+    /// SSHW_HOME; unset SSHW_HOME to select a profile explicitly.
     #[arg(long, global = true, value_name = "NAME")]
     pub profile: Option<String>,
     /// Force policy.json enforcement for this invocation. Enforcement is also
@@ -143,6 +145,8 @@ pub enum Command {
     Remove(RemoveArgs),
     /// Report the resolved home, paths, native library, and credential health.
     Doctor(DoctorArgs),
+    /// Manage command/path/account allowlists and explain local execution checks.
+    Policy(super::policy_cmd::PolicyArgs),
     /// Manage privilege escalation credentials for a configured server.
     Privilege(PrivilegeArgs),
     /// Manage registered login accounts for a configured server.
@@ -158,12 +162,13 @@ impl Command {
             Self::Show(args) => args.json,
             Self::Run(args) => args.json,
             Self::Doctor(args) => args.json,
+            Self::Policy(args) => args.json,
             Self::Profile(args) => match &args.command {
                 ProfileCommand::List(a) => a.json,
                 ProfileCommand::Show(a) => a.json,
-                ProfileCommand::Add(_) | ProfileCommand::Default(_) | ProfileCommand::Remove(_) => {
-                    false
-                }
+                ProfileCommand::Add(a) => a.json,
+                ProfileCommand::Default(a) => a.json,
+                ProfileCommand::Remove(a) => a.json,
             },
             Self::Privilege(args) => match &args.command {
                 PrivilegeCommand::Show(a) => a.json,
@@ -175,14 +180,14 @@ impl Command {
                 AccountCommand::List(a) => a.json,
                 AccountCommand::Show(a) => a.json,
                 AccountCommand::Remove(a) => a.json,
-                AccountCommand::Default(_) => false,
+                AccountCommand::Default(a) => a.json,
             },
             Self::Put(args) => args.json,
             Self::Get(args) => args.json,
             Self::Add(args) => args.json,
             Self::Trust(args) => args.json,
             Self::Remove(args) => args.json,
-            Self::Default(_) => false,
+            Self::Default(args) => args.json,
         }
     }
 }
@@ -253,6 +258,9 @@ pub struct AccountDefaultArgs {
     pub name: String,
     /// Registered remote SSH username to make the default.
     pub user: String,
+    /// Emit JSON.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -290,14 +298,14 @@ pub struct PrivilegeSetArgs {
     /// Server name to configure.
     pub name: String,
     /// Login account whose privilege configuration is updated.
-    #[arg(long, value_name = "LOGIN_USER")]
+    #[arg(long, visible_alias = "login-user", value_name = "LOGIN_USER")]
     pub account: Option<String>,
     /// Privilege method used by `run --as-root`; see possible values below.
     /// Default: sudo.
     #[arg(long, value_enum, default_value_t = PrivilegeMethodArg::Sudo)]
     pub method: PrivilegeMethodArg,
     /// Target privileged user.
-    #[arg(long, default_value = "root")]
+    #[arg(long, visible_alias = "target-user", default_value = "root")]
     pub user: String,
     /// Read the privilege password from stdin instead of a hidden prompt.
     #[arg(long)]
@@ -374,6 +382,9 @@ pub struct ProfileAddArgs {
     /// Overwrite an existing profile entry without confirmation.
     #[arg(long)]
     pub force: bool,
+    /// Emit JSON.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -396,12 +407,18 @@ pub struct ProfileShowArgs {
 pub struct ProfileDefaultArgs {
     /// Profile name to make the default.
     pub name: String,
+    /// Emit JSON.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
 pub struct ProfileRemoveArgs {
     /// Profile name to remove from the registry.
     pub name: String,
+    /// Emit JSON.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -411,8 +428,8 @@ pub struct AddArgs {
     /// Hostname or IP address to connect to.
     #[arg(long)]
     pub host: String,
-    /// TCP port of the SSH server.
-    #[arg(long)]
+    /// TCP port of the SSH server (default: 22).
+    #[arg(long, default_value_t = 22)]
     pub port: u16,
     /// Remote username to log in as.
     #[arg(long)]
@@ -424,6 +441,11 @@ pub struct AddArgs {
     /// non-interactive/agent use).
     #[arg(long)]
     pub force: bool,
+    /// Replace the whole server, removing its other accounts and privilege
+    /// settings. Required when changing host or port. Without this flag,
+    /// updating the same endpoint preserves other accounts and privileges.
+    #[arg(long)]
+    pub replace: bool,
     /// Read the password from stdin once instead of a hidden prompt. Password
     /// auth only; there is no `--password <value>` flag.
     #[arg(long)]
@@ -461,6 +483,9 @@ pub struct ShowArgs {
 pub struct DefaultArgs {
     /// Server name to set as default; omit to print the current default.
     pub name: Option<String>,
+    /// Emit JSON.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -492,13 +517,19 @@ pub struct RunArgs {
     #[arg(long)]
     pub yes: bool,
     /// Run through the selected account's configured privilege path (`sshw
-    /// privilege set`). Requires `--yes`; never automatic. Uses the stored method (`sudo`
+    /// privilege set`). This flag explicitly requests elevation; dangerous commands
+    /// still require `--yes`. Uses the stored method (`sudo`
     /// or `su`); with NOPASSWD sudoers the command runs even if the stored
     /// password is wrong, since sudo does not consume it. A sudo password
     /// rejection reports the remote command's non-zero status (exit 8), while
     /// a su prompt/auth failure maps to auth (exit 4).
-    #[arg(long)]
+    #[arg(long, visible_alias = "elevate")]
     pub as_root: bool,
+    /// With --as-root, use non-interactive sudo -n without a stored privilege
+    /// password. Uses the configured sudo target, or root if not configured.
+    /// The server must already permit this through sudoers (e.g. NOPASSWD).
+    #[arg(long, requires = "as_root")]
+    pub no_password: bool,
 }
 
 #[derive(Debug, Args)]
@@ -511,12 +542,26 @@ pub struct PutArgs {
     /// Use this registered login account instead of the server default.
     #[arg(long, value_name = "USER")]
     pub user: Option<String>,
+    /// Remote file permissions in octal, e.g. 755 for an executable. Default: 600.
+    #[arg(long, value_parser = parse_file_mode)]
+    pub mode: Option<u32>,
     /// Confirm writes to system paths non-interactively.
     #[arg(long)]
     pub yes: bool,
     /// Emit JSON.
     #[arg(long)]
     pub json: bool,
+}
+
+fn parse_file_mode(value: &str) -> Result<u32, String> {
+    if !(3..=4).contains(&value.len()) || !value.bytes().all(|c| (b'0'..=b'7').contains(&c)) {
+        return Err("use octal permissions such as 600 or 755 (no special bits)".to_string());
+    }
+    let mode = u32::from_str_radix(value, 8).map_err(|_| "invalid file mode".to_string())?;
+    if mode > 0o777 {
+        return Err("special permission bits are not supported".to_string());
+    }
+    Ok(mode)
 }
 
 #[derive(Debug, Args)]
@@ -577,10 +622,10 @@ mod tests {
             "sshw trust",
             "JSON OUTPUT:",
             "`--json` is accepted by: add, list, show, trust, run, put, get, remove,",
-            "doctor, account add/list/show/remove, profile list/show, and privilege",
-            "set/show/clear. default/account default/profile state changes have no --json.",
+            "doctor, default, all account/profile/policy subcommands, and privilege",
+            "set/show/clear. A completed run uses command_succeeded for remote success.",
             "sshw account add web ops --auth agent",
-            "after SSHW_HOME and before the registry default",
+            "An explicit --profile conflicts with SSHW_HOME",
             "sudo password rejection is reported as the remote command's non-zero status",
             "su prompt/auth failure maps to auth",
             "change:   {\"ok\":true,\"action\":\"added\",\"server\":\"web\"}",

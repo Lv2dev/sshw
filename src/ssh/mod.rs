@@ -4,6 +4,32 @@ use crate::config::ServerConfig;
 use crate::credentials::AuthMaterial;
 use std::path::Path;
 
+/// Output captured before a failed command could be confirmed complete.
+/// Display/Debug deliberately omit output; the CLI redacts it before returning it.
+pub struct PartialRunError {
+    pub source: anyhow::Error,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+impl std::fmt::Debug for PartialRunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PartialRunError")
+            .field("source", &self.source)
+            .finish_non_exhaustive()
+    }
+}
+impl std::fmt::Display for PartialRunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.source.fmt(f)
+    }
+}
+impl std::error::Error for PartialRunError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RunResult {
     pub exit_status: i32,
@@ -38,6 +64,10 @@ impl<'a> SshTarget<'a> {
 }
 
 pub trait SshClient {
+    /// Inspect the local agent only. None means this backend cannot probe it.
+    fn agent_identity_count(&self) -> anyhow::Result<Option<usize>> {
+        Ok(None)
+    }
     fn host_key(&self, server: &ServerConfig) -> anyhow::Result<HostKeyInfo>;
     fn trust_host(
         &self,
@@ -102,6 +132,22 @@ pub trait SshClient {
         local: &Path,
         remote: &str,
     ) -> anyhow::Result<TransferResult>;
+    fn put_with_mode(
+        &self,
+        target: &SshTarget<'_>,
+        auth: &AuthMaterial,
+        local: &Path,
+        remote: &str,
+        mode: u32,
+    ) -> anyhow::Result<TransferResult> {
+        if mode == 0o600 {
+            self.put(target, auth, local, remote)
+        } else {
+            Err(anyhow::anyhow!(
+                "this SSH backend does not support custom upload modes"
+            ))
+        }
+    }
     fn get(
         &self,
         target: &SshTarget<'_>,

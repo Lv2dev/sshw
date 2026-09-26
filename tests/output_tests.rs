@@ -31,6 +31,7 @@ fn error_response_omits_an_empty_cause_chain() {
 fn run_output_serializes_for_agents() {
     let output = RunOutput {
         ok: true,
+        command_succeeded: true,
         server: "server-alpha".to_string(),
         user: "deploy".to_string(),
         command: "hostname".to_string(),

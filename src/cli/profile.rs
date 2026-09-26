@@ -98,6 +98,12 @@ fn profile_add(
     }
 
     save_registry_if_unchanged(registry_path, registry, revision)?;
+    if args.json {
+        return Ok(ok(format!(
+            "{}\n",
+            json!({"ok":true,"action":"added","name":args.name,"home":home})
+        )));
+    }
     Ok(ok(format!(
         "added profile {} -> {}\n",
         args.name,
@@ -190,7 +196,7 @@ fn profile_show(
     }
 
     Ok(ok(format!(
-        "{}\n  id: {}\n  home: {}\n  default: {}\n",
+        "{}\n  id: {}\n  home: {}\n  default: {}\n  use --profile to retain this credential namespace; --home uses a separate namespace\n",
         args.name,
         entry.id,
         entry.home.display(),
@@ -210,6 +216,12 @@ fn profile_default(
 
     registry.default = Some(args.name.clone());
     save_registry_if_unchanged(registry_path, registry, revision)?;
+    if args.json {
+        return Ok(ok(format!(
+            "{}\n",
+            json!({"ok":true,"action":"default","name":args.name})
+        )));
+    }
     Ok(ok(format!("default profile set to {}\n", args.name)))
 }
 
@@ -227,6 +239,12 @@ fn profile_remove(
     }
 
     save_registry_if_unchanged(registry_path, registry, revision)?;
+    if args.json {
+        return Ok(ok(format!(
+            "{}\n",
+            json!({"ok":true,"action":"removed","name":args.name,"warning":"home and keyring entries left intact; re-adding requires credentials to be registered again"})
+        )));
+    }
     Ok(ok(format!(
         "removed profile {} (home and keyring entries left intact; re-adding creates a fresh credential namespace)\n",
         args.name

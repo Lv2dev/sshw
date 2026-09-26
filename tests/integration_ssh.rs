@@ -906,6 +906,45 @@ fn put_then_get_roundtrip() {
 
 #[test]
 #[ignore = "spawns a real sshd; run with --ignored --test-threads=1"]
+fn explicit_upload_mode_changes_existing_file_and_keeps_default_behavior() {
+    let srv = TestServer::start();
+    srv.trust();
+    let client = srv.client();
+    let server = srv.server();
+    let target = default_target(&server);
+    let work = tempfile::tempdir().unwrap();
+    let source = work.path().join("source");
+    let remote = work.path().join("remote");
+    fs::write(&source, b"updated content\n").unwrap();
+    fs::write(&remote, b"old content\n").unwrap();
+    fs::set_permissions(&remote, fs::Permissions::from_mode(0o600)).unwrap();
+    let destination = remote.to_str().unwrap();
+    client
+        .put_with_mode(&target, &AuthMaterial::Agent, &source, destination, 0o755)
+        .unwrap();
+    assert_eq!(
+        fs::metadata(&remote).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+    assert_eq!(fs::read(&remote).unwrap(), b"updated content\n");
+    client
+        .put(&target, &AuthMaterial::Agent, &source, destination)
+        .unwrap();
+    assert_eq!(
+        fs::metadata(&remote).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+    client
+        .put_with_mode(&target, &AuthMaterial::Agent, &source, destination, 0o600)
+        .unwrap();
+    assert_eq!(
+        fs::metadata(&remote).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}
+
+#[test]
+#[ignore = "spawns a real sshd; run with --ignored --test-threads=1"]
 fn get_rejects_nonzero_scp_source_after_full_announced_payload() {
     let srv = TestServer::start_with_force_command_script(
         r#"#!/bin/sh

@@ -47,6 +47,15 @@ pub const REMOTE_NONZERO_EXIT_CODE: i32 = 8;
 pub struct ErrorResponse {
     pub ok: bool,
     pub error: ErrorBody,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub partial_output: Option<PartialOutput>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PartialOutput {
+    pub stdout: String,
+    pub stderr: String,
+    pub completion_confirmed: bool,
 }
 
 impl ErrorResponse {
@@ -66,6 +75,14 @@ impl ErrorResponse {
         }
         Self {
             ok: false,
+            partial_output: err
+                .chain()
+                .find_map(|cause| cause.downcast_ref::<crate::ssh::PartialRunError>())
+                .map(|partial| PartialOutput {
+                    stdout: redact_secrets(&partial.stdout),
+                    stderr: redact_secrets(&partial.stderr),
+                    completion_confirmed: false,
+                }),
             error: ErrorBody {
                 kind,
                 message,
@@ -184,9 +201,9 @@ pub fn classify_error(err: &anyhow::Error) -> ErrorKind {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RunOutput {
-    /// Always `true`; mirrors the `ok` discriminator on the error envelope and
-    /// the put/get success summaries so JSON consumers can branch on `ok`.
+    /// The remote command completed. Use `command_succeeded` for its outcome.
     pub ok: bool,
+    pub command_succeeded: bool,
     pub server: String,
     pub user: String,
     pub command: String,

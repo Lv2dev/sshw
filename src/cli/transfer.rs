@@ -37,6 +37,7 @@ where
     let PutArgs {
         target,
         user,
+        mode,
         yes,
         json,
     } = args;
@@ -61,8 +62,11 @@ where
     let auth = resolve_auth(account, login_user, credentials)?;
     let ssh_target = SshTarget::new(server, login_user);
     let result = with_msys_remote_path_hint(
-        ssh.put(&ssh_target, &auth, &local, &remote.value)
-            .with_error_kind(ErrorKind::Ssh),
+        match mode {
+            Some(mode) => ssh.put_with_mode(&ssh_target, &auth, &local, &remote.value, mode),
+            None => ssh.put(&ssh_target, &auth, &local, &remote.value),
+        }
+        .with_error_kind(ErrorKind::Ssh),
         &remote.value,
         windows_msys_argument_conversion_active() && !remote.explicit_literal,
     )?;
@@ -178,6 +182,10 @@ fn resolve_get_target(
         decode_remote_path(&rest[0])?,
         PathBuf::from(&rest[1]),
     ))
+}
+
+pub(super) fn policy_remote_path(path: &str) -> anyhow::Result<String> {
+    decode_remote_path(path).map(|remote| remote.value)
 }
 
 fn decode_remote_path(path: &str) -> anyhow::Result<RemotePath> {

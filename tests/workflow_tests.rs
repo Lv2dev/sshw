@@ -482,11 +482,13 @@ fn public_docs_cover_hardening_contracts_and_residual_risks() {
     ] {
         assert!(readme.contains(marker), "README is missing {marker:?}");
     }
-    assert_eq!(
-        readme.matches("cargo install sshw-agent --locked").count(),
-        2,
-        "README must document the crates.io install command in English and Korean"
-    );
+    let (english, korean) = readme.split_once("## 한국어").expect("bilingual README");
+    for section in [english, korean] {
+        assert!(
+            section.contains("cargo install sshw-agent --locked"),
+            "each language must document the crates.io install command"
+        );
+    }
     assert_eq!(
         readme.matches("Visual C++ Build Tools/Windows SDK").count(),
         2,

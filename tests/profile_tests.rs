@@ -187,7 +187,7 @@ fn home_flag_beats_everything() {
 }
 
 #[test]
-fn env_beats_profile_and_default() {
+fn env_beats_default_but_cannot_shadow_explicit_profile() {
     let base = PathBuf::from("/base/sshw");
     let mut registry = registry_with("prod", "p_prod", "/homes/prod");
     registry.default = Some("prod".to_string());
@@ -195,13 +195,22 @@ fn env_beats_profile_and_default() {
     let resolved = resolve_home_with_registry(
         None,
         Some(std::ffi::OsStr::new("/env")),
-        Some("prod"),
+        None,
         &registry,
         &base,
     )
     .unwrap();
 
     assert_eq!(resolved.root, PathBuf::from("/env"));
+    let err = resolve_home_with_registry(
+        None,
+        Some(std::ffi::OsStr::new("/env")),
+        Some("prod"),
+        &registry,
+        &base,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("SSHW_HOME"));
 }
 
 #[test]

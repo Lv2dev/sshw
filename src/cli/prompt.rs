@@ -4,6 +4,9 @@ use std::io::{BufRead, Write};
 
 pub trait Prompter {
     fn confirm(&mut self, prompt: &str) -> anyhow::Result<bool>;
+    fn confirm_with_option(&mut self, prompt: &str, _option: &str) -> anyhow::Result<bool> {
+        self.confirm(prompt)
+    }
     fn password(&mut self, prompt: &str) -> anyhow::Result<String>;
     fn password_stdin(&mut self) -> anyhow::Result<String>;
 }
@@ -12,9 +15,13 @@ pub(crate) struct TerminalPrompter;
 
 impl Prompter for TerminalPrompter {
     fn confirm(&mut self, prompt: &str) -> anyhow::Result<bool> {
+        self.confirm_with_option(prompt, "--yes")
+    }
+
+    fn confirm_with_option(&mut self, prompt: &str, option: &str) -> anyhow::Result<bool> {
         if !io::stdin().is_terminal() {
             return Err(anyhow::anyhow!(
-                "confirmation requires an interactive terminal; rerun with --yes to confirm"
+                "confirmation requires an interactive terminal; rerun with {option} to confirm"
             ));
         }
 

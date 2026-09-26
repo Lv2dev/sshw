@@ -285,6 +285,31 @@ fn parse_policy_file(path: &Path, contents: &str) -> Result<PolicyFile> {
     Ok(file)
 }
 
+pub(crate) fn load_policy_with_revision(
+    path: &Path,
+) -> Result<(Option<PolicyFile>, Option<String>)> {
+    let contents = read_optional_policy(path)?;
+    let file = contents
+        .as_deref()
+        .map(|text| parse_policy_file(path, text))
+        .transpose()?;
+    Ok((file, contents))
+}
+
+pub(crate) fn save_policy_if_unchanged(
+    path: &Path,
+    file: &PolicyFile,
+    revision: &Option<String>,
+) -> Result<()> {
+    if &read_optional_policy(path)? != revision {
+        return Err(anyhow::anyhow!(
+            "policy file changed concurrently; inspect it and retry"
+        ));
+    }
+    let contents = serde_json::to_string_pretty(file)?;
+    crate::storage::write_owner_only_atomic(path, &contents)
+}
+
 fn command_matches_simple(entry: &str, command: &str) -> bool {
     if let Some(prefix) = entry.strip_suffix('*') {
         // An empty/whitespace-only prefix ("*") would match everything,
@@ -347,6 +372,20 @@ fn has_parent_traversal(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn policy_cas_does_not_overwrite_an_external_change() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("policy.json");
+        let (_, revision) = load_policy_with_revision(&path).unwrap();
+        std::fs::write(&path, r#"{"enabled":true}"#).unwrap();
+        let err = save_policy_if_unchanged(&path, &PolicyFile::default(), &revision).unwrap_err();
+        assert!(err.to_string().contains("changed concurrently"));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            r#"{"enabled":true}"#
+        );
+    }
 
     fn rules() -> PolicyRules {
         PolicyRules {

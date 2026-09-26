@@ -8,6 +8,24 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-09-27
+
+### 의존성과 알려진 보안 제한
+- 배포 철회된 `libssh2-sys 0.3.2` 대신 공식 `0.3.3`을 사용합니다. `ssh2`는 기존 공식 패키지를 유지합니다.
+- 이번 버전은 사용성 개선 릴리스이며 native SSH 보안 문제가 모두 해결된 버전이 아닙니다. `0.3.3`에는 일부 공개 보안 수정이 빠져 있습니다. 상세 영향과 제한은 [SECURITY.md](SECURITY.md#native-ssh-의존성의-알려진-보안-제한-0130)를 확인하세요.
+
+### 사용성 개선
+- 명시적 `--profile`과 `SSHW_HOME` 충돌을 오류로 알려 다른 환경이 조용히 선택되지 않도록 했습니다.
+- 같은 endpoint의 `add` 갱신은 다른 계정과 privilege를 보존합니다. host/port를 바꾸거나 전체 재등록하려면 `--replace`가 필요합니다.
+- 갱신 확인 오류가 실제 옵션인 `--force`를 안내하고, 기본 포트 22·빈 목록 안내·등록 후 다음 명령을 제공합니다.
+- `policy init/show/enable/disable/allow/remove/check`로 정책을 관리하고 SSH 연결 없이 차단 이유를 확인할 수 있습니다.
+- `--as-root`의 중복 `--yes` 요구를 제거했습니다. 위험 명령에는 여전히 `--yes`가 필요합니다. `--as-root --no-password`는 저장된 비밀번호 없이 sudo -n을 명시적으로 사용합니다.
+- `put --mode 755` 등 일반 파일 권한을 지정할 수 있습니다. 기본값은 600입니다.
+- `doctor`는 로컬 준비 상태·SSH agent·누락된 privilege credential과 다음 조치를 표시합니다. 실제 원격 연결 여부와 진단 성공을 구분합니다.
+- default/account default/profile 변경에도 JSON을 지원하고, run JSON에 `command_succeeded`를 추가했습니다. 기존 `ok`·배열·exit code 계약은 유지합니다.
+- 일반 run/sudo 실패에 redaction한 부분 출력과 완료 미확인 상태를 제공하고, TTY에 작업 시작 상태를 표시합니다.
+- 배포 패키지 포함 경로를 루트에 고정해 하위 동명 문서가 섞이지 않도록 했습니다.
+
 ### Fixed
 - On Windows, an exact libssh2 key-exchange failure during the initial handshake is retried with a fresh TCP connection and SSH session at most twice. All attempts share the existing 15-second connection deadline, and no retry occurs after host-key verification, authentication, or remote execution begins.
 

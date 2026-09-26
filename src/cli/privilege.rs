@@ -42,10 +42,10 @@ where
     if previous_privilege.is_some()
         && !args.force
         && !prompter
-            .confirm(&format!(
-                "update privilege configuration for '{}'? [y/N] ",
-                args.name
-            ))
+            .confirm_with_option(
+                &format!("update privilege configuration for '{}'? [y/N] ", args.name),
+                "--force",
+            )
             .with_error_kind(ErrorKind::Config)?
     {
         return Err(app_error(ErrorKind::Config, "privilege update cancelled"));
