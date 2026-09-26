@@ -60,7 +60,7 @@ These are explicitly **not** strong guarantees:
 
 ## Residual Risk Register
 
-Last reviewed: 2026-08-31. Next review: 2026-11-30. These risks are accepted for the current threat model and must be reviewed when the connection, storage, account, policy, redaction, or release pipeline changes.
+Last reviewed: 2026-09-27. Next review: 2026-11-30. These risks are accepted for the current threat model and must be reviewed when the connection, storage, account, policy, redaction, or release pipeline changes.
 
 | Residual risk | Current control and decision |
 | --- | --- |
@@ -81,3 +81,13 @@ sshw's own failures map to stable exit codes for agent consumption: `2` safety, 
 ## CLI configuration changes
 
 Updating a server at the same host/port preserves other registered accounts and privilege metadata. Changing host/port requires explicit `--replace`, which resets the account set and cleans up stale secrets only after config publication. Policy CLI mutations preserve strict parsing, use the home lock and a revision check, and never put full command rules into audit detail. Upload permissions default to 600; explicit `put --mode` accepts only ordinary 000–777 permission bits.
+
+## Native SSH 의존성의 알려진 보안 제한 (0.13.0)
+
+0.13.0은 사용성 개선 릴리스입니다. Cargo 설치와 공식 실행 파일은 기존 공식 `ssh2`와 `libssh2-sys 0.3.3`을 사용하며, native SSH 보안 문제가 모두 해결됐다고 보장하지 않습니다. 새 자체 의존성 패키지는 도입하지 않습니다.
+
+`libssh2-sys 0.3.3`의 실제 배포 archive(SHA-256 `0f5eb74291e8691cab524a01274a1b1e7742b1a94f29d8b101d8aadc8372c1cd`)는 libssh2 1.11.1에 일부 보안 수정을 backport한 소스입니다. CVE-2026-55200, CVE-2026-55199, CVE-2025-15661 및 SFTP 후속 수정은 포함하지만, 확인한 ETM/GCM 후속 수정인 [CVE-2026-66035](https://www.cve.org/CVERecord?id=CVE-2026-66035)와 [CVE-2026-66033](https://www.cve.org/CVERecord?id=CVE-2026-66033)은 포함하지 않습니다. 적용되는 암호화 backend와 협상 알고리즘에 따라 노출 경로가 달라집니다.
+
+악성 SSH peer가 native 처리 경로의 메모리 손상이나 서비스 거부를 유발할 수 있습니다. host-key 검증, 명령 정책, Rust의 메모리 안전성이나 연결 timeout은 native 처리 단계의 취약점을 해결하지 않습니다. 신뢰할 수 없는 SSH endpoint에 연결하는 용도에는 이 릴리스를 권장하지 않으며, 이미 알고 있는 서버만 사용하더라도 완전한 방어를 보장하지 않습니다.
+
+이 릴리스는 위 미해결 위험을 유지한 채 기능 개선을 제공합니다. dependency audit 통과는 native C 취약점 해소의 증거가 아닙니다. 후속 공식 패키지의 실제 소스와 수정 포함 여부를 검증한 뒤 의존성을 갱신해야 합니다.

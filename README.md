@@ -27,6 +27,8 @@ For an existing home, start with `sshw doctor`: it lists local problems and next
 
 ### Security Boundary
 
+Version 0.13.0 improves usability but retains known native SSH security issues in the official dependency. Read the [native dependency limitations](SECURITY.md#native-ssh-의존성의-알려진-보안-제한-0130) before use.
+
 `sshw` reduces accidental secret exposure in chat, command lines, shell history, JSON config, and normal command output. It also provides:
 
 - **Profile/home isolation** — config, `known_hosts`, policy, audit, and credential namespace are scoped per home.
@@ -465,6 +467,8 @@ sshw run web "hostname" --json
 기존 설정을 점검하려면 `sshw doctor`를 사용하세요. 로컬 문제와 다음 조치를 표시하며, 진단 자체의 성공은 원격 연결 성공을 보장하지 않습니다.
 
 ### 보안 경계
+
+0.13.0은 사용성 개선 버전이며 공식 의존성의 알려진 native SSH 보안 문제가 남아 있습니다. 사용 전에 [의존성의 보안 제한](SECURITY.md#native-ssh-의존성의-알려진-보안-제한-0130)을 확인하세요.
 
 `sshw`는 채팅, 명령줄, 셸 히스토리, JSON 설정, 일반 출력에서 비밀이 실수로 노출되는 일을 줄이며, 추가로 다음을 제공합니다.
 

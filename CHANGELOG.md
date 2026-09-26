@@ -8,6 +8,12 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-09-27
+
+### 의존성과 알려진 보안 제한
+- 배포 철회된 `libssh2-sys 0.3.2` 대신 공식 `0.3.3`을 사용합니다. `ssh2`는 기존 공식 패키지를 유지합니다.
+- 이번 버전은 사용성 개선 릴리스이며 native SSH 보안 문제가 모두 해결된 버전이 아닙니다. `0.3.3`에는 일부 공개 보안 수정이 빠져 있습니다. 상세 영향과 제한은 [SECURITY.md](SECURITY.md#native-ssh-의존성의-알려진-보안-제한-0130)를 확인하세요.
+
 ### 사용성 개선
 - 명시적 `--profile`과 `SSHW_HOME` 충돌을 오류로 알려 다른 환경이 조용히 선택되지 않도록 했습니다.
 - 같은 endpoint의 `add` 갱신은 다른 계정과 privilege를 보존합니다. host/port를 바꾸거나 전체 재등록하려면 `--replace`가 필요합니다.
