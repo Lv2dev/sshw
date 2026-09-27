@@ -1,3 +1,4 @@
+pub(crate) mod atomic_upload;
 pub mod ssh2_client;
 
 use crate::config::ServerConfig;
@@ -37,6 +38,14 @@ pub struct RunResult {
     pub stderr: String,
     pub duration_ms: u128,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputStream {
+    Stdout,
+    Stderr,
+}
+/// Raw SSH output; callers must redact before displaying or recording it.
+pub type OutputCallback<'a> = dyn FnMut(OutputStream, &[u8]) -> anyhow::Result<()> + 'a;
 
 #[derive(Debug, Clone)]
 pub struct TransferResult {
@@ -81,6 +90,19 @@ pub trait SshClient {
         auth: &AuthMaterial,
         command: &str,
     ) -> anyhow::Result<RunResult>;
+    fn run_streaming(
+        &self,
+        target: &SshTarget<'_>,
+        auth: &AuthMaterial,
+        command: &str,
+        stdin: Option<&str>,
+        output: &mut OutputCallback<'_>,
+    ) -> anyhow::Result<RunResult> {
+        let _ = (target, auth, command, stdin, output);
+        Err(anyhow::anyhow!(
+            "streaming is unsupported by this SSH backend"
+        ))
+    }
     /// Run `command`, writing `stdin` to the channel before draining output.
     ///
     /// `stdin` is written in full before output draining begins, so it must fit
@@ -147,6 +169,19 @@ pub trait SshClient {
                 "this SSH backend does not support custom upload modes"
             ))
         }
+    }
+    fn put_atomic(
+        &self,
+        target: &SshTarget<'_>,
+        auth: &AuthMaterial,
+        local: &Path,
+        remote: &str,
+        mode: Option<u32>,
+    ) -> anyhow::Result<TransferResult> {
+        let _ = (target, auth, local, remote, mode);
+        Err(anyhow::anyhow!(
+            "atomic upload is unsupported by this SSH backend"
+        ))
     }
     fn get(
         &self,

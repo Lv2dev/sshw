@@ -513,6 +513,10 @@ pub struct RunArgs {
     /// Emit JSON.
     #[arg(long)]
     pub json: bool,
+    /// Stream redacted complete lines while running (ordinary SSH or sudo).
+    /// Incomplete lines wait until completion. Incompatible with JSON and su PTY.
+    #[arg(long, conflicts_with = "json")]
+    pub stream: bool,
     /// Confirm safety-sensitive commands non-interactively.
     #[arg(long)]
     pub yes: bool,
@@ -545,6 +549,11 @@ pub struct PutArgs {
     /// Remote file permissions in octal, e.g. 755 for an executable. Default: 600.
     #[arg(long, value_parser = parse_file_mode)]
     pub mode: Option<u32>,
+    /// Stage beside the destination and atomically replace it using the SFTP
+    /// posix-rename extension. Requires parent-directory policy/write permission.
+    /// New file mode defaults to 600; existing inode ownership/ACLs are not kept.
+    #[arg(long)]
+    pub atomic: bool,
     /// Confirm writes to system paths non-interactively.
     #[arg(long)]
     pub yes: bool,

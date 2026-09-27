@@ -65,6 +65,176 @@ fn add(home: &Path) {
 }
 
 #[test]
+fn transfer_preflight_checks_the_same_paths_without_connecting() {
+    let home = home();
+    add(home.path());
+    successful(home.path(), &["policy", "init"], "");
+    successful(home.path(), &["policy", "allow", "put", "/srv/app"], "");
+    successful(home.path(), &["policy", "allow", "get", "/var/log/app"], "");
+    successful(home.path(), &["policy", "enable"], "");
+    let local = home.path().join("input.txt");
+    std::fs::write(&local, "fixture").unwrap();
+    let result = successful(
+        home.path(),
+        &[
+            "policy",
+            "check-put",
+            "web",
+            local.to_str().unwrap(),
+            "remote:/srv/app/file",
+            "--json",
+        ],
+        "",
+    );
+    let value: Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(value["allowed"], true);
+    assert_eq!(value["connection_tested"], false);
+    assert_eq!(value["credentials_checked"], false);
+    for command in [vec!["policy", "check-put"], vec!["put"]] {
+        let mut args = command;
+        args.extend(["web", local.to_str().unwrap(), "/blocked/file", "--json"]);
+        let result = run(home.path(), &args, "");
+        assert_eq!(result.status.code(), Some(7));
+    }
+    let result = run(
+        home.path(),
+        &[
+            "policy",
+            "check-get",
+            "web",
+            "/var/log/app/file",
+            local.to_str().unwrap(),
+            "--json",
+        ],
+        "",
+    );
+    assert_eq!(result.status.code(), Some(6));
+    successful(
+        home.path(),
+        &[
+            "policy",
+            "check-get",
+            "web",
+            "/var/log/app/file",
+            local.to_str().unwrap(),
+            "--yes",
+            "--json",
+        ],
+        "",
+    );
+}
+
+#[test]
+fn streaming_json_is_rejected_before_running_a_command() {
+    let home = home();
+    let result = run(
+        home.path(),
+        &["run", "web", "uptime", "--stream", "--json"],
+        "",
+    );
+    assert_eq!(result.status.code(), Some(9));
+    let value: Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert!(
+        value["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("cannot be used")
+    );
+}
+
+#[test]
+fn atomic_upload_still_obeys_path_policy_before_connecting() {
+    let home = home();
+    add(home.path());
+    successful(home.path(), &["policy", "init"], "");
+    successful(home.path(), &["policy", "enable"], "");
+    let result = run(
+        home.path(),
+        &[
+            "put",
+            "web",
+            "missing.txt",
+            "/tmp/file",
+            "--atomic",
+            "--json",
+        ],
+        "",
+    );
+    assert_eq!(result.status.code(), Some(7));
+}
+
+#[test]
+fn atomic_preflight_requires_parent_directory_and_preserves_existing_policy() {
+    let home = home();
+    add(home.path());
+    successful(home.path(), &["policy", "init"], "");
+    successful(
+        home.path(),
+        &["policy", "allow", "put", "/srv/app/file"],
+        "",
+    );
+    successful(home.path(), &["policy", "enable"], "");
+    successful(
+        home.path(),
+        &[
+            "policy",
+            "check-put",
+            "web",
+            "file",
+            "/srv/app/file",
+            "--json",
+        ],
+        "",
+    );
+    for args in [vec!["policy", "check-put"], vec!["put"]] {
+        let mut args = args;
+        args.extend(["web", "file", "/srv/app/file", "--atomic", "--json"]);
+        let output = run(home.path(), &args, "");
+        assert_eq!(output.status.code(), Some(7));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("parent-directory"));
+    }
+    successful(home.path(), &["policy", "allow", "put", "/srv/app"], "");
+    successful(
+        home.path(),
+        &[
+            "policy",
+            "check-put",
+            "web",
+            "file",
+            "/srv/app/file",
+            "--atomic",
+            "--json",
+        ],
+        "",
+    );
+}
+
+#[test]
+fn streaming_su_is_rejected_without_loading_privilege_credentials() {
+    let home = home();
+    add(home.path());
+    successful(
+        home.path(),
+        &[
+            "privilege",
+            "set",
+            "web",
+            "--method",
+            "su",
+            "--password-stdin",
+        ],
+        "fixture-only\n",
+    );
+    let output = run(
+        home.path(),
+        &["run", "web", "uptime", "--as-root", "--stream"],
+        "",
+    );
+    assert_eq!(output.status.code(), Some(9));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("su PTY"));
+}
+
+#[test]
 fn explicit_profile_cannot_be_silently_shadowed_by_environment() {
     let home = home();
     add(home.path());

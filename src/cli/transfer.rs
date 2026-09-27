@@ -18,8 +18,8 @@ const MSYS_REMOTE_PATH_HINT: &str = "Git Bash/MSYS may have converted the remote
 const REMOTE_PATH_LITERAL_PREFIX: &str = "remote:";
 
 #[derive(Debug)]
-struct RemotePath {
-    value: String,
+pub(super) struct RemotePath {
+    pub(super) value: String,
     explicit_literal: bool,
 }
 
@@ -38,19 +38,13 @@ where
         target,
         user,
         mode,
+        atomic,
         yes,
         json,
     } = args;
     let (server_name, local, remote) = resolve_put_target(target, config)?;
 
-    match classify_remote_write_path(&remote.value, yes) {
-        SafetyDecision::Allow => {}
-        SafetyDecision::Block { reason } => return Err(app_error(ErrorKind::Safety, reason)),
-    }
-
-    if let SandboxDecision::Deny { reason } = sandbox.check_put(&remote.value) {
-        return Err(app_error(ErrorKind::Policy, reason));
-    }
+    check_put_path(&remote.value, yes, atomic, sandbox)?;
 
     let server = get_server(config, &server_name)?;
     let (login_user, account) = select_account(&server_name, server, user.as_deref())?;
@@ -62,9 +56,13 @@ where
     let auth = resolve_auth(account, login_user, credentials)?;
     let ssh_target = SshTarget::new(server, login_user);
     let result = with_msys_remote_path_hint(
-        match mode {
-            Some(mode) => ssh.put_with_mode(&ssh_target, &auth, &local, &remote.value, mode),
-            None => ssh.put(&ssh_target, &auth, &local, &remote.value),
+        if atomic {
+            ssh.put_atomic(&ssh_target, &auth, &local, &remote.value, mode)
+        } else {
+            match mode {
+                Some(mode) => ssh.put_with_mode(&ssh_target, &auth, &local, &remote.value, mode),
+                None => ssh.put(&ssh_target, &auth, &local, &remote.value),
+            }
         }
         .with_error_kind(ErrorKind::Ssh),
         &remote.value,
@@ -108,19 +106,8 @@ where
     let (server_name, remote, local) = resolve_get_target(target, config)?;
 
     let server = get_server(config, &server_name)?;
-    if let SandboxDecision::Deny { reason } = sandbox.check_get(&remote.value) {
-        return Err(app_error(ErrorKind::Policy, reason));
-    }
-
-    if local.try_exists().with_error_kind(ErrorKind::Io)? && !yes {
-        return Err(app_error(
-            ErrorKind::Io,
-            format!(
-                "local file already exists: {}; pass --yes to overwrite",
-                local.display()
-            ),
-        ));
-    }
+    check_get_path(&remote.value, sandbox)?;
+    check_local_overwrite(&local, yes)?;
 
     let (login_user, account) = select_account(&server_name, server, user.as_deref())?;
     if let SandboxDecision::Deny { reason } =
@@ -154,7 +141,54 @@ where
     )))
 }
 
-fn resolve_put_target(
+pub(super) fn check_put_path(
+    remote: &str,
+    yes: bool,
+    atomic: bool,
+    sandbox: &dyn Sandbox,
+) -> anyhow::Result<()> {
+    if let SafetyDecision::Block { reason } = classify_remote_write_path(remote, yes) {
+        return Err(app_error(ErrorKind::Safety, reason));
+    }
+    if let SandboxDecision::Deny { reason } = sandbox.check_put(remote) {
+        return Err(app_error(ErrorKind::Policy, reason));
+    }
+    if atomic {
+        let parent = crate::ssh::atomic_upload::parent_path(remote)?;
+        if let SandboxDecision::Deny { reason } = sandbox.check_put(parent) {
+            return Err(app_error(
+                ErrorKind::Policy,
+                format!(
+                    "atomic upload needs parent-directory permission for its temporary file: {reason}"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn check_get_path(remote: &str, sandbox: &dyn Sandbox) -> anyhow::Result<()> {
+    if let SandboxDecision::Deny { reason } = sandbox.check_get(remote) {
+        return Err(app_error(ErrorKind::Policy, reason));
+    }
+    Ok(())
+}
+
+pub(super) fn check_local_overwrite(local: &std::path::Path, yes: bool) -> anyhow::Result<()> {
+    if local.try_exists().with_error_kind(ErrorKind::Io)? && !yes {
+        return Err(app_error(
+            ErrorKind::Io,
+            format!(
+                "local file already exists: {}; pass --yes to overwrite",
+                local.display()
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
+pub(super) fn resolve_put_target(
     target: Vec<String>,
     config: &SshwConfig,
 ) -> anyhow::Result<(String, PathBuf, RemotePath)> {
@@ -169,7 +203,7 @@ fn resolve_put_target(
     ))
 }
 
-fn resolve_get_target(
+pub(super) fn resolve_get_target(
     target: Vec<String>,
     config: &SshwConfig,
 ) -> anyhow::Result<(String, RemotePath, PathBuf)> {

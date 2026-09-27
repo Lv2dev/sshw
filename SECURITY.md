@@ -82,9 +82,21 @@ sshw's own failures map to stable exit codes for agent consumption: `2` safety, 
 
 Updating a server at the same host/port preserves other registered accounts and privilege metadata. Changing host/port requires explicit `--replace`, which resets the account set and cleans up stale secrets only after config publication. Policy CLI mutations preserve strict parsing, use the home lock and a revision check, and never put full command rules into audit detail. Upload permissions default to 600; explicit `put --mode` accepts only ordinary 000–777 permission bits.
 
+## 추가 전송·출력 옵션의 경계
+
+`put --atomic`은 목적지와 같은 디렉터리에서 독점 생성한 임시 파일만 작성·정리합니다. 원격 크기/닫기 확인 뒤 POSIX rename 확장을 호출하고 일반 rename으로 후퇴하지 않습니다. 현재 공식 binding에 선언되지 않은 native POSIX rename 함수는 별도의 좁은 FFI 경계에서 session mutex를 보유한 채 호출합니다. 의존성 패키지나 native C 소스는 변경하지 않습니다. 정책이 활성화되면 목적지뿐 아니라 임시 파일을 둘 부모 디렉터리의 업로드 허용도 필요합니다.
+
+이 옵션은 기존 inode·소유권·ACL을 유지하지 않으며 mode 기본값은600입니다. 목적지 symlink는 교체하고 따라가지 않습니다. 전송 실패 시 기존 파일 보호와 원자적 가시성을 제공하지만 crash durability를 보장하지 않습니다. 연결이 끊기면 임시 파일 정리가 실패하거나 rename 결과가 미확정일 수 있으므로 오류에 표시한 상태·경로를 확인해야 합니다. 같은 OS 사용자/악성 서버가 임시 파일을 조작하는 것까지 격리하지 않습니다.
+
+`run --stream`은 완성된 줄을 마스킹한 뒤 출력하며, 네트워크 chunk와 UTF8 경계를 그대로 출력하지 않습니다. PEM private-key 상태는 줄 사이에서 유지하고 알려진 여러 줄 비밀은 버퍼링합니다. 개행 없는 마지막 줄은 종료 시 처리하며 실패로 잘린 알려진 비밀 prefix도 마스킹합니다. JSON/su PTY는 streaming 옵션과 함께 사용할 수 없습니다. 기존 출력 상한·원격 완료 검증은 유지되며, 이미 나온 출력은 작업 성공이나 rollback의 증거가 아닙니다.
+
+`policy check-put/check-get`은 로컬 사전 검사입니다. SSH 인증, 원격 OS 권한과 POSIX rename 지원을 검증하지 않으며 `--yes`나 policy allow가 원격 권한을 부여하지 않습니다.
+
 ## Native SSH 의존성의 알려진 보안 제한 (0.13.0)
 
 0.13.0은 사용성 개선 릴리스입니다. Cargo 설치와 공식 실행 파일은 기존 공식 `ssh2`와 `libssh2-sys 0.3.3`을 사용하며, native SSH 보안 문제가 모두 해결됐다고 보장하지 않습니다. 새 자체 의존성 패키지는 도입하지 않습니다.
+
+0.14.0도 같은 공식 의존성을 유지하며 아래 native 보안 제한이 동일하게 적용됩니다.
 
 `libssh2-sys 0.3.3`의 실제 배포 archive(SHA-256 `0f5eb74291e8691cab524a01274a1b1e7742b1a94f29d8b101d8aadc8372c1cd`)는 libssh2 1.11.1에 일부 보안 수정을 backport한 소스입니다. CVE-2026-55200, CVE-2026-55199, CVE-2025-15661 및 SFTP 후속 수정은 포함하지만, 확인한 ETM/GCM 후속 수정인 [CVE-2026-66035](https://www.cve.org/CVERecord?id=CVE-2026-66035)와 [CVE-2026-66033](https://www.cve.org/CVERecord?id=CVE-2026-66033)은 포함하지 않습니다. 적용되는 암호화 backend와 협상 알고리즘에 따라 노출 경로가 달라집니다.
 

@@ -286,7 +286,7 @@ impl SshClient for Ssh2Client {
         auth: &AuthMaterial,
         command: &str,
     ) -> anyhow::Result<RunResult> {
-        self.run_inner(target, auth, command, None)
+        self.run_inner(target, auth, command, None, None)
     }
 
     fn run_with_stdin(
@@ -296,7 +296,18 @@ impl SshClient for Ssh2Client {
         command: &str,
         stdin: &str,
     ) -> anyhow::Result<RunResult> {
-        self.run_inner(target, auth, command, Some(stdin))
+        self.run_inner(target, auth, command, Some(stdin), None)
+    }
+
+    fn run_streaming(
+        &self,
+        target: &SshTarget<'_>,
+        auth: &AuthMaterial,
+        command: &str,
+        stdin: Option<&str>,
+        output: &mut super::OutputCallback<'_>,
+    ) -> anyhow::Result<RunResult> {
+        self.run_inner(target, auth, command, stdin, Some(output))
     }
 
     fn run_with_pty_password(
@@ -329,6 +340,46 @@ impl SshClient for Ssh2Client {
         mode: u32,
     ) -> anyhow::Result<TransferResult> {
         self.put_inner(target, auth, local, remote, Some(mode))
+    }
+
+    fn put_atomic(
+        &self,
+        target: &SshTarget<'_>,
+        auth: &AuthMaterial,
+        local: &Path,
+        remote: &str,
+        mode: Option<u32>,
+    ) -> anyhow::Result<TransferResult> {
+        if mode.is_some_and(|mode| mode > 0o777) {
+            return Err(app_error(
+                ErrorKind::Config,
+                "upload mode must be between 000 and 777",
+            ));
+        }
+        super::atomic_upload::parent_path(remote)?;
+        let (mut file, metadata) = open_regular_local_file(local)?;
+        let session = connect_verified_authenticated(
+            target.server,
+            target.user,
+            auth,
+            self.connect_timeout,
+            self.op_timeout,
+            &self.resolved_known_hosts_path()?,
+        )?;
+        let deadline = OperationDeadline::new(self.op_timeout);
+        let bytes = super::atomic_upload::upload(
+            &session,
+            &mut file,
+            metadata.len(),
+            remote,
+            mode.unwrap_or(0o600),
+            &deadline,
+        )?;
+        Ok(TransferResult {
+            bytes,
+            source: local.display().to_string(),
+            destination: remote.to_string(),
+        })
     }
 
     fn get(
@@ -415,6 +466,7 @@ impl Ssh2Client {
         auth: &AuthMaterial,
         command: &str,
         stdin: Option<&str>,
+        output: Option<&mut super::OutputCallback<'_>>,
     ) -> anyhow::Result<RunResult> {
         let started = Instant::now();
         let known_hosts = self.resolved_known_hosts_path()?;
@@ -441,7 +493,7 @@ impl Ssh2Client {
         channel.send_eof().context("ssh session error")?;
 
         let (stdout, stderr) =
-            read_channel_outputs(&session, &mut channel, &deadline, self.output_limit)?;
+            read_channel_outputs(&session, &mut channel, &deadline, self.output_limit, output)?;
         let completion = (|| {
             deadline.apply(&session)?;
             channel.wait_close().context("ssh session error")?;
@@ -755,7 +807,7 @@ where
     }
 }
 
-fn timeout_millis(timeout: Duration) -> u32 {
+pub(super) fn timeout_millis(timeout: Duration) -> u32 {
     timeout.as_millis().clamp(1, u32::MAX as u128) as u32
 }
 
@@ -766,7 +818,7 @@ fn op_timeout_millis(op_timeout: Option<Duration>) -> u32 {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct OperationDeadline {
+pub(super) struct OperationDeadline {
     started: Instant,
     timeout: Option<Duration>,
 }
@@ -779,7 +831,7 @@ impl OperationDeadline {
         }
     }
 
-    fn remaining(&self) -> anyhow::Result<Option<Duration>> {
+    pub(super) fn remaining(&self) -> anyhow::Result<Option<Duration>> {
         let Some(timeout) = self.timeout else {
             return Ok(None);
         };
@@ -796,7 +848,7 @@ impl OperationDeadline {
         Ok(Some(timeout - elapsed))
     }
 
-    fn apply(&self, session: &Session) -> anyhow::Result<()> {
+    pub(super) fn apply(&self, session: &Session) -> anyhow::Result<()> {
         session.set_timeout(op_timeout_millis(self.remaining()?));
         Ok(())
     }
@@ -1120,9 +1172,16 @@ fn read_channel_outputs(
     channel: &mut ssh2::Channel,
     deadline: &OperationDeadline,
     output_limit: usize,
+    output: Option<&mut super::OutputCallback<'_>>,
 ) -> anyhow::Result<(String, String)> {
+    let streaming = output.is_some();
     session.set_blocking(false);
-    let drained = drain_both_streams(channel, deadline, output_limit);
+    let drained = drain_both_streams(channel, deadline, output_limit, output);
+    if streaming && drained.is_err() {
+        // A failed output sink must not leave channel destruction waiting for
+        // the original (possibly 15-minute) operation timeout.
+        session.set_timeout(100);
+    }
     session.set_blocking(true);
     let (out, err) = drained?;
     let stdout = decode_remote_output_lossy(out);
@@ -1134,6 +1193,7 @@ fn drain_both_streams(
     channel: &mut ssh2::Channel,
     deadline: &OperationDeadline,
     output_limit: usize,
+    mut output: Option<&mut super::OutputCallback<'_>>,
 ) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
     let mut out = Vec::new();
     let mut err = Vec::new();
@@ -1151,6 +1211,9 @@ fn drain_both_streams(
                     Ok(0) => out_done = true,
                     Ok(n) => {
                         append_output_bounded(&mut out, &buf[..n], err.len(), output_limit)?;
+                        if let Some(sink) = output.as_mut() {
+                            sink(super::OutputStream::Stdout, &buf[..n])?;
+                        }
                         progressed = true;
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -1168,6 +1231,9 @@ fn drain_both_streams(
                     Ok(0) => err_done = true,
                     Ok(n) => {
                         append_output_bounded(&mut err, &buf[..n], out.len(), output_limit)?;
+                        if let Some(sink) = output.as_mut() {
+                            sink(super::OutputStream::Stderr, &buf[..n])?;
+                        }
                         progressed = true;
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}

@@ -317,7 +317,7 @@ fn redact_private_key_blocks(input: &str) -> String {
     out
 }
 
-fn is_pem_marker(trimmed: &str, prefix: &str) -> bool {
+pub(crate) fn is_pem_marker(trimmed: &str, prefix: &str) -> bool {
     trimmed.starts_with(prefix) && trimmed.contains("PRIVATE KEY")
 }
 

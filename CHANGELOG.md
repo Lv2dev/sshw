@@ -8,6 +8,13 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-09-27
+
+### 전송·실행 개선
+- `put --atomic`으로 임시 파일 업로드 후 원자적으로 목적지를 교체할 수 있습니다. POSIX rename 확장이 없는 SFTP 서버에서는 일반 덮어쓰기로 후퇴하지 않습니다.
+- `run --stream`으로 비밀을 마스킹한 완성된 줄을 실행 중에 확인할 수 있습니다. 일반 실행과 sudo를 지원하며 JSON·su PTY와의 조합은 실행 전에 거부합니다.
+- `policy check-put/check-get`으로 전송 경로·계정·확인 옵션과 다운로드 덮어쓰기 조건을 연결 전에 검사할 수 있습니다.
+
 ## [0.13.0] - 2026-09-27
 
 ### 의존성과 알려진 보안 제한
