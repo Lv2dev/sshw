@@ -84,6 +84,8 @@ Updating a server at the same host/port preserves other registered accounts and 
 
 ## 추가 전송·출력 옵션의 경계
 
+원자적 업로드는 임시 파일 생성 미시도·미확정·확정을 구분합니다. OPEN 응답을 받지 못했거나 요청이 거부된 경로는 소유권이 확인되지 않았으므로 unlink하지 않습니다. 원인 정보는 cleanup 전에 확보하고 각 error cause를 따로 마스킹한 뒤 단계·경로 안내에 결합합니다. native/SFTP 코드는 binding이 제공할 때 보존하며, 메시지만 남기는 write 오류에서 코드를 추측하지 않습니다. 부분 쓰기마다 남은 절대 deadline을 다시 적용합니다.
+
 `put --atomic`은 목적지와 같은 디렉터리에서 독점 생성한 임시 파일만 작성·정리합니다. 원격 크기/닫기 확인 뒤 POSIX rename 확장을 호출하고 일반 rename으로 후퇴하지 않습니다. 현재 공식 binding에 선언되지 않은 native POSIX rename 함수는 별도의 좁은 FFI 경계에서 session mutex를 보유한 채 호출합니다. 의존성 패키지나 native C 소스는 변경하지 않습니다. 정책이 활성화되면 목적지뿐 아니라 임시 파일을 둘 부모 디렉터리의 업로드 허용도 필요합니다.
 
 이 옵션은 기존 inode·소유권·ACL을 유지하지 않으며 mode 기본값은600입니다. 목적지 symlink는 교체하고 따라가지 않습니다. 전송 실패 시 기존 파일 보호와 원자적 가시성을 제공하지만 crash durability를 보장하지 않습니다. 연결이 끊기면 임시 파일 정리가 실패하거나 rename 결과가 미확정일 수 있으므로 오류에 표시한 상태·경로를 확인해야 합니다. 같은 OS 사용자/악성 서버가 임시 파일을 조작하는 것까지 격리하지 않습니다.

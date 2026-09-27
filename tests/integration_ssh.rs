@@ -79,7 +79,9 @@ impl TestServer {
         let dir = tempfile::tempdir().expect("tempdir");
         let known_hosts = dir.path().join("known_hosts");
         let script = dir.path().join("force-command.sh");
-        fs::write(&script, contents).expect("write force command");
+        // External fixtures can be checked out with CRLF on Windows before
+        // this Linux harness is run through WSL; Unix shebangs require LF.
+        fs::write(&script, contents.replace("\r\n", "\n")).expect("write force command");
         fs::set_permissions(&script, fs::Permissions::from_mode(0o700))
             .expect("chmod force command");
         Self::start_in(dir, known_hosts, Some(script))
@@ -1178,6 +1180,216 @@ fn atomic_upload_reports_permission_denied_and_preserves_the_destination() {
     assert!(error.to_string().contains("PERMISSION_DENIED"), "{error:#}");
     assert!(error.to_string().contains("SFTP status 3"), "{error:#}");
     assert!(!error.to_string().contains("OP_UNSUPPORTED"));
+    assert_eq!(fs::read(&remote).unwrap(), b"original");
+}
+
+#[test]
+#[ignore = "spawns a real sshd; run with --ignored --test-threads=1"]
+fn atomic_upload_creation_failure_reports_cause_paths_and_unconfirmed_ownership() {
+    let uid = Command::new("id").arg("-u").output().unwrap();
+    assert_ne!(String::from_utf8(uid.stdout).unwrap().trim(), "0");
+    let srv = TestServer::start();
+    srv.trust();
+    let server = srv.server();
+    let work = tempfile::tempdir().unwrap();
+    let source = work.path().join("source");
+    fs::write(&source, b"fixture").unwrap();
+    let parent = work.path().join("readonly");
+    fs::create_dir(&parent).unwrap();
+    let remote = parent.join("destination");
+    fs::write(&remote, b"original").unwrap();
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o500)).unwrap();
+    let result = srv.client().put_atomic(
+        &default_target(&server),
+        &AuthMaterial::Agent,
+        &source,
+        remote.to_str().unwrap(),
+        None,
+    );
+    let home = tempfile::tempdir().unwrap();
+    let mut config = SshwConfig {
+        credential_backend: sshw::config::CredentialBackend::SessionOnly,
+        ..SshwConfig::default()
+    };
+    config.servers.insert("test".into(), server);
+    save_config(&home.path().join("servers.json"), &config).unwrap();
+    fs::copy(&srv.known_hosts, home.path().join("known_hosts")).unwrap();
+    let outputs: Vec<_> = [false, true]
+        .into_iter()
+        .map(|json| {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_sshw"));
+            command
+                .env("SSHW_HOME", home.path())
+                .env_remove("SSHW_PASSWORD")
+                .env_remove("SSHW_PRIVILEGE_PASSWORD")
+                .args([
+                    "put",
+                    "test",
+                    source.to_str().unwrap(),
+                    remote.to_str().unwrap(),
+                    "--atomic",
+                ]);
+            if json {
+                command.arg("--json");
+            }
+            (json, command.output())
+        })
+        .collect();
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+    for (json, output) in outputs {
+        let output = output.unwrap();
+        assert_eq!(output.status.code(), Some(5));
+        let message = if json {
+            let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            value["error"]["message"].as_str().unwrap().to_string()
+        } else {
+            String::from_utf8(output.stderr).unwrap()
+        };
+        assert!(message.contains("create temporary file"), "{message}");
+        assert!(
+            message.to_lowercase().contains("permission denied"),
+            "{message}"
+        );
+        assert!(message.contains(remote.to_str().unwrap()));
+    }
+    let error = result.unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("create temporary file"), "{message}");
+    assert!(
+        message.to_lowercase().contains("permission denied"),
+        "{message}"
+    );
+    assert!(message.contains(remote.to_str().unwrap()));
+    assert!(message.contains(".sshw-upload-"));
+    assert!(message.contains("creation was not confirmed"));
+    assert!(message.contains("not removed"));
+    assert_eq!(fs::read(&remote).unwrap(), b"original");
+}
+
+#[test]
+#[ignore = "spawns a real sshd; run with --ignored --test-threads=1"]
+fn atomic_upload_subsystem_failure_does_not_claim_creation() {
+    let srv = TestServer::start_with_force_command_script("#!/bin/sh\nexit 1\n");
+    srv.trust();
+    let server = srv.server();
+    let work = tempfile::tempdir().unwrap();
+    let source = work.path().join("source");
+    let remote = work.path().join("destination");
+    fs::write(&source, b"fixture").unwrap();
+    fs::write(&remote, b"original").unwrap();
+    let error = srv
+        .client()
+        .with_op_timeout(Some(Duration::from_secs(2)))
+        .put_atomic(
+            &default_target(&server),
+            &AuthMaterial::Agent,
+            &source,
+            remote.to_str().unwrap(),
+            None,
+        )
+        .unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("initialize SFTP"), "{message}");
+    assert!(message.contains("creation was not attempted"), "{message}");
+    assert!(!message.contains("temporary file removed"));
+    assert_eq!(fs::read(&remote).unwrap(), b"original");
+    assert_eq!(fs::read_dir(work.path()).unwrap().count(), 2);
+}
+
+#[test]
+#[ignore = "spawns a real sshd; run with --ignored --test-threads=1"]
+fn atomic_upload_stage_failures_report_the_original_cause_before_cleanup() {
+    for (request, stage) in [
+        ("write", "write temporary file"),
+        ("fstat", "verify temporary size"),
+        ("fsetstat", "set temporary mode"),
+        ("close", "close temporary file"),
+    ] {
+        let srv = TestServer::start_with_force_command_script(&format!(
+            "#!/bin/sh\nexec /usr/lib/openssh/sftp-server -P {request}\n"
+        ));
+        srv.trust();
+        let server = srv.server();
+        let work = tempfile::tempdir().unwrap();
+        let source = work.path().join("source");
+        let remote = work.path().join("destination");
+        fs::write(&source, b"fixture").unwrap();
+        fs::write(&remote, b"original").unwrap();
+        let error = srv
+            .client()
+            .put_atomic(
+                &default_target(&server),
+                &AuthMaterial::Agent,
+                &source,
+                remote.to_str().unwrap(),
+                None,
+            )
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains(stage), "{request}: {message}");
+        assert!(
+            message.to_lowercase().contains("permission denied"),
+            "{request}: {message}"
+        );
+        assert!(message.contains(remote.to_str().unwrap()));
+        assert!(
+            message.contains("temporary file removed"),
+            "{request}: {message}"
+        );
+        assert_eq!(fs::read(&remote).unwrap(), b"original");
+        assert!(!fs::read_dir(work.path()).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".sshw-upload-")
+        }));
+    }
+}
+
+#[test]
+#[ignore = "spawns a real sshd; run with --ignored --test-threads=1"]
+fn atomic_upload_lost_creation_reply_never_deletes_an_unconfirmed_file() {
+    let srv = TestServer::start_with_force_command_script(include_str!(
+        "fixtures/sftp_drop_open_reply.py"
+    ));
+    srv.trust();
+    let server = srv.server();
+    let work = tempfile::tempdir().unwrap();
+    let source = work.path().join("source");
+    let remote = work.path().join("destination");
+    fs::write(&source, b"fixture").unwrap();
+    fs::write(&remote, b"original").unwrap();
+    let error = srv
+        .client()
+        .with_op_timeout(Some(Duration::from_secs(2)))
+        .put_atomic(
+            &default_target(&server),
+            &AuthMaterial::Agent,
+            &source,
+            remote.to_str().unwrap(),
+            None,
+        )
+        .unwrap_err();
+    let pending: Vec<_> = fs::read_dir(work.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(".sshw-upload-")
+        })
+        .collect();
+    assert_eq!(
+        pending.len(),
+        1,
+        "server creation must have happened before its response was dropped"
+    );
+    let message = error.to_string();
+    assert!(message.contains("creation was not confirmed"), "{message}");
+    assert!(message.contains("not removed"), "{message}");
+    assert!(message.contains(pending[0].to_str().unwrap()));
     assert_eq!(fs::read(&remote).unwrap(), b"original");
 }
 
