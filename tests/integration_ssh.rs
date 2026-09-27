@@ -1057,7 +1057,7 @@ fn atomic_upload_replaces_only_after_completion_and_preserves_destination_on_fai
 
 #[test]
 #[ignore = "spawns a real sshd; run with --ignored --test-threads=1"]
-fn atomic_upload_never_falls_back_when_posix_rename_is_denied() {
+fn atomic_upload_never_falls_back_when_server_disables_posix_rename() {
     let srv = TestServer::start_with_force_command_script(
         "#!/bin/sh\nexec /usr/lib/openssh/sftp-server -P posix-rename\n",
     );
@@ -1079,6 +1079,7 @@ fn atomic_upload_never_falls_back_when_posix_rename_is_denied() {
         )
         .unwrap_err();
     assert!(format!("{error:#}").contains("no non-atomic fallback"));
+    assert!(error.to_string().contains("OP_UNSUPPORTED"), "{error:#}");
     assert_eq!(fs::read(&remote).unwrap(), b"original");
     assert!(!fs::read_dir(work.path()).unwrap().any(|entry| {
         entry
@@ -1087,6 +1088,97 @@ fn atomic_upload_never_falls_back_when_posix_rename_is_denied() {
             .to_string_lossy()
             .starts_with(".sshw-upload-")
     }));
+}
+
+#[test]
+#[ignore = "spawns a real sshd; run with --ignored --test-threads=1"]
+fn atomic_upload_reports_destination_conflict_without_claiming_missing_extension() {
+    let srv = TestServer::start();
+    srv.trust();
+    let server = srv.server();
+    let work = tempfile::tempdir().unwrap();
+    let source = work.path().join("source");
+    let remote = work.path().join("directory");
+    fs::write(&source, b"replacement").unwrap();
+    fs::create_dir(&remote).unwrap();
+    fs::write(remote.join("original"), b"preserved").unwrap();
+    let error = srv
+        .client()
+        .put_atomic(
+            &default_target(&server),
+            &AuthMaterial::Agent,
+            &source,
+            remote.to_str().unwrap(),
+            None,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("SFTP status"), "{error:#}");
+    assert!(error.to_string().contains("destination type"), "{error:#}");
+    assert!(!error.to_string().contains("OP_UNSUPPORTED"));
+    assert_eq!(fs::read(remote.join("original")).unwrap(), b"preserved");
+    assert!(!fs::read_dir(work.path()).unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".sshw-upload-")
+    }));
+}
+
+#[test]
+#[ignore = "spawns a real sshd; run with --ignored --test-threads=1"]
+fn atomic_upload_reports_permission_denied_and_preserves_the_destination() {
+    let uid = Command::new("id").arg("-u").output().unwrap();
+    assert_ne!(
+        String::from_utf8(uid.stdout).unwrap().trim(),
+        "0",
+        "permission test requires a non-root user"
+    );
+    let srv = TestServer::start();
+    srv.trust();
+    let server = srv.server();
+    let work = tempfile::tempdir().unwrap();
+    let source = work.path().join("source");
+    let remote = work.path().join("remote");
+    fs::File::create(&source)
+        .unwrap()
+        .set_len(32 * 1024 * 1024)
+        .unwrap();
+    fs::write(&remote, b"original").unwrap();
+    let watched = work.path().to_path_buf();
+    let observer = std::thread::spawn(move || {
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(10) {
+            if fs::read_dir(&watched).unwrap().any(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".sshw-upload-")
+            }) {
+                fs::set_permissions(&watched, fs::Permissions::from_mode(0o500)).unwrap();
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        false
+    });
+    let result = srv.client().put_atomic(
+        &default_target(&server),
+        &AuthMaterial::Agent,
+        &source,
+        remote.to_str().unwrap(),
+        None,
+    );
+    let restricted = observer.join().unwrap();
+    // Restore our throwaway directory even if the assertions below fail.
+    fs::set_permissions(work.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(restricted);
+    let error = result.unwrap_err();
+    assert!(error.to_string().contains("PERMISSION_DENIED"), "{error:#}");
+    assert!(error.to_string().contains("SFTP status 3"), "{error:#}");
+    assert!(!error.to_string().contains("OP_UNSUPPORTED"));
+    assert_eq!(fs::read(&remote).unwrap(), b"original");
 }
 
 #[test]

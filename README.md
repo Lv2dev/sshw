@@ -280,7 +280,7 @@ sshw run web "./long-build" --stream
 
 `run --stream` emits complete, redacted stdout/stderr lines while the command runs. Incomplete lines wait for completion; PEM private-key blocks and secrets split across network reads remain masked. Known multiline secrets require conservative buffering. The existing 16 MiB combined output limit and exit codes remain in force. JSON and `su` PTY are not supported with streaming; ordinary run and sudo are supported. Output already emitted is not repeated on failure, and the remote command may have had side effects.
 
-`policy check-put/check-get` use the same positional arguments, `--user` and `--yes` as transfers; `check-put --atomic` also checks staging-directory policy. They check local policy/safety/account rules and download overwrite confirmation, without connecting or reading credentials. They do not validate remote filesystem permissions, server extension support, or that a local upload file can be opened. `--yes` confirms a guardrail; it grants no remote OS permission.
+`policy check-put/check-get` use the same positional arguments, `--user` and `--yes` as transfers; `check-put --atomic` also checks staging-directory policy. Shared checks use the execution order and report the first failing prerequisite. After access checks pass, `check-put` verifies that the local source is a readable regular file without reading its contents. JSON distinguishes `access_allowed`, `local_file_checked` and `local_file_ready`; `allowed` covers all evaluated local checks. These are point-in-time results, and the transfer still opens and validates its own file handle. SSH authentication, remote filesystem permissions and server extension support are not tested. `--yes` confirms a guardrail; it grants no remote OS permission.
 
 ### Windows Shell Paths
 
@@ -770,7 +770,7 @@ sshw run web "./long-build" --stream
 
 `run --stream`은 완성된 줄을 비밀 마스킹 후 실행 중에 출력합니다. 데이터가 여러 번에 나뉘어 도착해도 UTF8·비밀·PEM 블록을 유지해서 처리하고, 개행 없는 줄은 종료까지 기다립니다. 알려진 비밀 자체가 여러 줄이면 보수적으로 버퍼링합니다. 일반 실행과 sudo를 지원하며 JSON·su PTY 조합은 거부합니다. 기존16MiB 상한과 exit code는 유지하고 이미 출력한 내용은 실패 시 반복하지 않습니다.
 
-`policy check-put/check-get`은 실제 전송과 같은 인자 순서·`--user`·`--yes`를 사용합니다. 업로드의 `--atomic`은 임시 파일 디렉터리 정책도 검사합니다. 로컬 정책·계정·위험 경로와 다운로드 덮어쓰기 조건만 검사하며 SSH·credential·원격 OS 권한·서버 확장·로컬 업로드 파일 읽기 가능 여부는 확인하지 않습니다. `--yes`는 확인 옵션일 뿐 원격 권한을 부여하지 않습니다.
+`policy check-put/check-get`은 실제 전송과 같은 인자 순서·`--user`·`--yes`를 사용합니다. 공통 검사는 실제 전송과 같은 순서로 첫 실패를 알려주며, `check-put --atomic`은 임시 파일 디렉터리 정책도 검사합니다. 접근 검사를 통과하면 업로드 파일을 읽기 전용으로 열어 읽을 수 있는 일반 파일인지 확인하고 내용은 읽지 않습니다. JSON의 `access_allowed`는 접근 검사, `local_file_checked`·`local_file_ready`는 파일 검사 여부·결과를 구분하며 `allowed`는 평가한 로컬 검사 전체의 결과입니다. 실제 전송은 파일을 다시 열고 해당 handle로 검증·전송하므로 사전 검사가 이후 상태까지 보장하지 않습니다. SSH·credential·원격 OS 권한·서버 확장은 확인하지 않습니다. `--yes`는 확인 옵션일 뿐 원격 권한을 부여하지 않습니다.
 
 ### Safety Rails
 

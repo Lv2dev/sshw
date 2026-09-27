@@ -90,13 +90,13 @@ Updating a server at the same host/port preserves other registered accounts and 
 
 `run --stream`은 완성된 줄을 마스킹한 뒤 출력하며, 네트워크 chunk와 UTF8 경계를 그대로 출력하지 않습니다. PEM private-key 상태는 줄 사이에서 유지하고 알려진 여러 줄 비밀은 버퍼링합니다. 개행 없는 마지막 줄은 종료 시 처리하며 실패로 잘린 알려진 비밀 prefix도 마스킹합니다. JSON/su PTY는 streaming 옵션과 함께 사용할 수 없습니다. 기존 출력 상한·원격 완료 검증은 유지되며, 이미 나온 출력은 작업 성공이나 rollback의 증거가 아닙니다.
 
-`policy check-put/check-get`은 로컬 사전 검사입니다. SSH 인증, 원격 OS 권한과 POSIX rename 지원을 검증하지 않으며 `--yes`나 policy allow가 원격 권한을 부여하지 않습니다.
+`policy check-put/check-get`은 로컬 사전 검사입니다. 실제 전송과 공통 검사의 순서·첫 실패를 공유하고, `check-put`은 접근 검사 뒤 로컬 일반 파일의 읽기 가능 여부를 확인하되 내용을 읽지 않습니다. 시점 검사이므로 전송 시 파일을 다시 열고 그 handle의 metadata를 검증하는 기존 경계를 대체하지 않습니다. SSH 인증, 원격 OS 권한과 POSIX rename 지원을 검증하지 않으며 `--yes`나 policy allow가 원격 권한을 부여하지 않습니다. 원자적 교체 실패의 SFTP status는 해당 protocol 오류에서만, cleanup 이전에 읽으며 transport 오류에 stale status를 적용하지 않습니다.
 
 ## Native SSH 의존성의 알려진 보안 제한 (0.13.0)
 
 0.13.0은 사용성 개선 릴리스입니다. Cargo 설치와 공식 실행 파일은 기존 공식 `ssh2`와 `libssh2-sys 0.3.3`을 사용하며, native SSH 보안 문제가 모두 해결됐다고 보장하지 않습니다. 새 자체 의존성 패키지는 도입하지 않습니다.
 
-0.14.0도 같은 공식 의존성을 유지하며 아래 native 보안 제한이 동일하게 적용됩니다.
+0.14.x도 같은 공식 의존성을 유지하며 아래 native 보안 제한이 동일하게 적용됩니다.
 
 `libssh2-sys 0.3.3`의 실제 배포 archive(SHA-256 `0f5eb74291e8691cab524a01274a1b1e7742b1a94f29d8b101d8aadc8372c1cd`)는 libssh2 1.11.1에 일부 보안 수정을 backport한 소스입니다. CVE-2026-55200, CVE-2026-55199, CVE-2025-15661 및 SFTP 후속 수정은 포함하지만, 확인한 ETM/GCM 후속 수정인 [CVE-2026-66035](https://www.cve.org/CVERecord?id=CVE-2026-66035)와 [CVE-2026-66033](https://www.cve.org/CVERecord?id=CVE-2026-66033)은 포함하지 않습니다. 적용되는 암호화 backend와 협상 알고리즘에 따라 노출 경로가 달라집니다.
 
