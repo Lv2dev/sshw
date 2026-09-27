@@ -573,10 +573,18 @@ impl Ssh2Client {
     }
 }
 
-fn open_regular_local_file(local: &Path) -> anyhow::Result<(fs::File, fs::Metadata)> {
-    let file = fs::File::open(local)
-        .with_context(|| format!("local file not found: {}", local.display()))
-        .with_error_kind(ErrorKind::Io)?;
+pub(crate) fn open_regular_local_file(local: &Path) -> anyhow::Result<(fs::File, fs::Metadata)> {
+    // Reject directories/devices/FIFOs before opening (a FIFO open may block).
+    // This is only an early check: the opened handle is still checked below and
+    // remains the handle whose bytes are sent by the transfer implementation.
+    let before_open = fs::metadata(local).map_err(|error| local_file_error(local, error))?;
+    if !before_open.is_file() {
+        return Err(app_error(
+            ErrorKind::Io,
+            format!("local path is not a regular file: {}", local.display()),
+        ));
+    }
+    let file = fs::File::open(local).map_err(|error| local_file_error(local, error))?;
     let metadata = file.metadata().with_error_kind(ErrorKind::Io)?;
     if !metadata.is_file() {
         return Err(app_error(
@@ -585,6 +593,42 @@ fn open_regular_local_file(local: &Path) -> anyhow::Result<(fs::File, fs::Metada
         ));
     }
     Ok((file, metadata))
+}
+
+fn local_file_error(local: &Path, error: io::Error) -> anyhow::Error {
+    let description = match error.kind() {
+        io::ErrorKind::NotFound => "local file not found",
+        io::ErrorKind::PermissionDenied => "permission denied accessing local file",
+        _ => "cannot access local file",
+    };
+    classified_error(
+        ErrorKind::Io,
+        anyhow::Error::new(error).context(format!("{description}: {}", local.display())),
+    )
+}
+
+#[cfg(test)]
+mod local_file_error_tests {
+    use super::*;
+    #[test]
+    fn file_error_messages_preserve_the_os_cause_without_claiming_not_found() {
+        for (kind, expected) in [
+            (io::ErrorKind::PermissionDenied, "permission denied"),
+            (io::ErrorKind::NotFound, "not found"),
+            (io::ErrorKind::Other, "cannot access"),
+        ] {
+            let error = local_file_error(
+                Path::new("fixture"),
+                io::Error::new(kind, "synthetic OS cause"),
+            );
+            assert!(error.to_string().contains(expected));
+            assert!(format!("{error:#}").contains("synthetic OS cause"));
+            assert_eq!(crate::output::classify_error(&error), ErrorKind::Io);
+            if kind != io::ErrorKind::NotFound {
+                assert!(!error.to_string().contains("not found"));
+            }
+        }
+    }
 }
 
 fn ensure_scp_transfer_succeeded(channel: &ssh2::Channel) -> anyhow::Result<()> {

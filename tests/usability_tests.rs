@@ -65,6 +65,81 @@ fn add(home: &Path) {
 }
 
 #[test]
+fn upload_diagnostics_reject_missing_files_and_directories_locally() {
+    let home = home();
+    add(home.path());
+    let missing = home.path().join("missing.txt");
+    for (local, message) in [
+        (missing.as_path(), "local file not found"),
+        (home.path(), "not a regular file"),
+    ] {
+        for prefix in [vec!["put"], vec!["policy", "check-put"]] {
+            let mut args = prefix;
+            args.extend(["web", local.to_str().unwrap(), "/tmp/file", "--json"]);
+            let output = run(home.path(), &args, "");
+            assert_eq!(
+                output.status.code(),
+                Some(6),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains(message));
+            if args[0] == "policy" {
+                let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(value["access_allowed"], true);
+                assert_eq!(value["allowed"], false);
+                assert_eq!(value["local_file_checked"], true);
+                assert_eq!(value["local_file_ready"], false);
+            }
+        }
+    }
+}
+
+#[test]
+fn transfer_preflight_and_execution_choose_the_same_first_failure() {
+    let home = home();
+    add(home.path());
+    successful(home.path(), &["policy", "init"], "");
+    successful(home.path(), &["policy", "allow", "get", "/allowed"], "");
+    successful(home.path(), &["policy", "enable"], "");
+    let existing = home.path().join("existing");
+    std::fs::write(&existing, "original").unwrap();
+    for (operation, check, operands, expected) in [
+        ("put", "check-put", ["missing-local", "/blocked/file"], 7),
+        (
+            "get",
+            "check-get",
+            ["/blocked/file", existing.to_str().unwrap()],
+            7,
+        ),
+        (
+            "get",
+            "check-get",
+            ["/allowed/file", existing.to_str().unwrap()],
+            6,
+        ),
+    ] {
+        for mut prefix in [vec![operation], vec!["policy", check]] {
+            prefix.extend([
+                "web",
+                operands[0],
+                operands[1],
+                "--user",
+                "missing-user",
+                "--json",
+            ]);
+            let output = run(home.path(), &prefix, "");
+            assert_eq!(
+                output.status.code(),
+                Some(expected),
+                "{prefix:?}: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
+    }
+}
+
+#[test]
 fn transfer_preflight_checks_the_same_paths_without_connecting() {
     let home = home();
     add(home.path());
@@ -88,6 +163,8 @@ fn transfer_preflight_checks_the_same_paths_without_connecting() {
     );
     let value: Value = serde_json::from_slice(&result.stdout).unwrap();
     assert_eq!(value["allowed"], true);
+    assert_eq!(value["local_file_checked"], true);
+    assert_eq!(value["local_file_ready"], true);
     assert_eq!(value["connection_tested"], false);
     assert_eq!(value["credentials_checked"], false);
     for command in [vec!["policy", "check-put"], vec!["put"]] {
@@ -167,6 +244,8 @@ fn atomic_upload_still_obeys_path_policy_before_connecting() {
 fn atomic_preflight_requires_parent_directory_and_preserves_existing_policy() {
     let home = home();
     add(home.path());
+    let local = home.path().join("file");
+    std::fs::write(&local, "fixture").unwrap();
     successful(home.path(), &["policy", "init"], "");
     successful(
         home.path(),
@@ -180,7 +259,7 @@ fn atomic_preflight_requires_parent_directory_and_preserves_existing_policy() {
             "policy",
             "check-put",
             "web",
-            "file",
+            local.to_str().unwrap(),
             "/srv/app/file",
             "--json",
         ],
@@ -188,7 +267,13 @@ fn atomic_preflight_requires_parent_directory_and_preserves_existing_policy() {
     );
     for args in [vec!["policy", "check-put"], vec!["put"]] {
         let mut args = args;
-        args.extend(["web", "file", "/srv/app/file", "--atomic", "--json"]);
+        args.extend([
+            "web",
+            local.to_str().unwrap(),
+            "/srv/app/file",
+            "--atomic",
+            "--json",
+        ]);
         let output = run(home.path(), &args, "");
         assert_eq!(output.status.code(), Some(7));
         assert!(String::from_utf8_lossy(&output.stdout).contains("parent-directory"));
@@ -200,7 +285,7 @@ fn atomic_preflight_requires_parent_directory_and_preserves_existing_policy() {
             "policy",
             "check-put",
             "web",
-            "file",
+            local.to_str().unwrap(),
             "/srv/app/file",
             "--atomic",
             "--json",

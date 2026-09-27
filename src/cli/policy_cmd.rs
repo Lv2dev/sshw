@@ -35,7 +35,7 @@ pub enum PolicyCommand {
     Remove(PolicyRuleArgs),
     /// Explain run safety, account and policy checks without SSH or credentials.
     Check(PolicyCheckArgs),
-    /// Check upload path/account/safety rules locally, without SSH or credentials.
+    /// Check upload rules and local file readability, without SSH or credentials.
     CheckPut(PolicyTransferCheckArgs),
     /// Check download path/account rules and local overwrite confirmation.
     CheckGet(PolicyTransferCheckArgs),
@@ -327,52 +327,78 @@ fn check_transfer(
         ));
     }
     let config = load_active_config(ctx.home)?;
+    let sandbox = build_sandbox(&ctx.home.policy_path, ctx.policy_forced)?;
     let (name, local, remote) = if upload {
         transfer::resolve_put_target(args.target, &config)?
     } else {
         let (name, remote, local) = transfer::resolve_get_target(args.target, &config)?;
         (name, local, remote)
     };
-    let server = get_server(&config, &name)?;
-    let (user, _) = select_account(&name, server, args.user.as_deref())?;
-    let sandbox = build_sandbox(&ctx.home.policy_path, ctx.policy_forced)?;
-    let mut checks = if upload {
-        vec![transfer::check_put_path(
+    let access = if upload {
+        transfer::check_put_access(
+            &name,
+            args.user.as_deref(),
             &remote.value,
             args.yes,
             args.atomic,
             sandbox.as_ref(),
-        )]
+            &config,
+        )
     } else {
-        vec![
-            transfer::check_get_path(&remote.value, sandbox.as_ref()),
-            transfer::check_local_overwrite(&local, args.yes),
-        ]
+        transfer::check_get_access(
+            &name,
+            args.user.as_deref(),
+            &remote.value,
+            &local,
+            args.yes,
+            sandbox.as_ref(),
+            &config,
+        )
     };
-    checks.push(
-        match sandbox.check_account(&name, user, user == server.default_user) {
-            SandboxDecision::Allow => Ok(()),
-            SandboxDecision::Deny { reason } => Err(app_error(ErrorKind::Policy, reason)),
-        },
-    );
+    let access_allowed = access.is_ok();
+    let user = access
+        .as_ref()
+        .ok()
+        .map(|(_, user, _)| *user)
+        .or(args.user.as_deref())
+        .or_else(|| {
+            config
+                .servers
+                .get(&name)
+                .map(|server| server.default_user.as_str())
+        });
+    let local_file_checked = upload && access_allowed;
+    let validation = access.and_then(|_| {
+        if upload {
+            // Readability at this instant, without reading contents. Actual
+            // transfer still opens and checks its own retained file handle.
+            crate::ssh::ssh2_client::open_regular_local_file(&local)?;
+        }
+        Ok(())
+    });
+    let local_file_ready = local_file_checked.then(|| validation.is_ok());
     let mut reasons = Vec::new();
     let mut exit_code = 0;
-    for error in checks.into_iter().filter_map(Result::err) {
-        if exit_code == 0 {
-            exit_code = crate::output::classify_error(&error).exit_code();
+    if let Err(error) = validation {
+        let kind = crate::output::classify_error(&error);
+        if kind == ErrorKind::Config {
+            return Err(error);
         }
-        reasons.push(redact_secrets(&error.to_string()));
+        exit_code = kind.exit_code();
+        reasons.push(redact_secrets(&format!("{error:#}")));
     }
     let operation = if upload { "put" } else { "get" };
     let mut value = json!({"ok":true,"allowed":reasons.is_empty(),"operation":operation,
         "server":name,"user":user,"local":local,"remote":remote.value,"reasons":reasons,
+        "access_allowed":access_allowed,"local_file_checked":local_file_checked,"local_file_ready":local_file_ready,
         "connection_tested":false,"credentials_checked":false,"remote_permissions_checked":false});
     redact_json(&mut value);
     let stdout = if json_output {
         format!("{value}\n")
     } else {
         redact_secrets(&format!(
-            "operation: {operation}\nserver/account: {name}/{user}\nlocal: {}\nremote: {}\nlocal checks: {}\n{}\nSSH, credentials and remote filesystem permissions were not tested. --yes confirms a local guardrail; it does not grant remote write permission.\n",
+            "operation: {operation}\nserver/account: {name}/{}\nlocal: {}\nremote: {}\nlocal checks: {}\n{}\nSSH, credentials and remote filesystem permissions were not tested. Local readiness is a point-in-time check. --yes confirms a local guardrail; it does not grant remote write permission.\n",
+            user.unwrap_or("unresolved"),
             local.display(),
             remote.value,
             if reasons.is_empty() {

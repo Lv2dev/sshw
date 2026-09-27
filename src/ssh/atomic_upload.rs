@@ -118,7 +118,8 @@ pub(super) fn upload<R: Read>(
         posix_rename(session, &temporary, remote, deadline)?;
         Ok(sent)
     })();
-    if result.is_err() {
+    if let Err(error) = &result {
+        let failure = error.to_string();
         // Only our exclusively-created sibling is removed. Never remove or
         // truncate the destination, including after an unconfirmed rename.
         session.set_timeout(100);
@@ -131,7 +132,7 @@ pub(super) fn upload<R: Read>(
         };
         return result.with_context(|| {
             format!(
-                "atomic upload failed: {phase}; temporary file {} at {temporary}",
+                "atomic upload failed: {failure}; {phase}; temporary file {} at {temporary}",
                 if cleaned { "removed" } else { "may remain" }
             )
         });
@@ -156,9 +157,9 @@ fn posix_rename(
     unsafe {
         let sftp = raw::libssh2_sftp_init(session_ptr);
         if sftp.is_null() {
-            return Err(app_error(
-                ErrorKind::Ssh,
-                "cannot initialize atomic rename subsystem",
+            return Err(rename_error(
+                raw::libssh2_session_last_errno(session_ptr),
+                None,
             ));
         }
         let result = (|| {
@@ -175,12 +176,11 @@ fn posix_rename(
                 destination.as_bytes().len(),
             );
             if code != 0 {
-                return Err(app_error(
-                    ErrorKind::Ssh,
-                    format!(
-                        "atomic SFTP rename failed (code {code}); server must support posix-rename@openssh.com; no non-atomic fallback was used"
-                    ),
-                ));
+                // SFTP status is meaningful for protocol failures only. Read
+                // it before shutdown/cleanup can overwrite the last error.
+                let status = (code == raw::LIBSSH2_ERROR_SFTP_PROTOCOL)
+                    .then(|| raw::libssh2_sftp_last_error(sftp) as u64);
+                return Err(rename_error(code, status));
             }
             Ok(())
         })();
@@ -190,9 +190,125 @@ fn posix_rename(
     }
 }
 
+fn rename_error(code: c_int, status: Option<u64>) -> anyhow::Error {
+    let (label, hint) = if code == raw::LIBSSH2_FX_OP_UNSUPPORTED {
+        // libssh2 1.11.x returns the positive SFTP constant directly when the
+        // extension was not advertised; last_errno is not set on that path.
+        (
+            "OP_UNSUPPORTED",
+            "server does not support posix-rename@openssh.com; use a server with atomic rename support",
+        )
+    } else if code == raw::LIBSSH2_ERROR_SFTP_PROTOCOL {
+        match status.and_then(|value| c_int::try_from(value).ok()) {
+            Some(raw::LIBSSH2_FX_OP_UNSUPPORTED) => (
+                "OP_UNSUPPORTED",
+                "server rejected the atomic rename extension; check server extension support",
+            ),
+            Some(raw::LIBSSH2_FX_PERMISSION_DENIED) => (
+                "PERMISSION_DENIED",
+                "server denied replacement; check parent-directory permissions and SFTP request restrictions",
+            ),
+            Some(raw::LIBSSH2_FX_NO_SUCH_FILE | raw::LIBSSH2_FX_NO_SUCH_PATH) => (
+                "MISSING_PATH",
+                "check that the staging file and destination directory still exist",
+            ),
+            Some(
+                raw::LIBSSH2_FX_FILE_ALREADY_EXISTS
+                | raw::LIBSSH2_FX_DIR_NOT_EMPTY
+                | raw::LIBSSH2_FX_NOT_A_DIRECTORY,
+            ) => (
+                "DESTINATION_CONFLICT",
+                "check the destination path and its file/directory type",
+            ),
+            Some(raw::LIBSSH2_FX_WRITE_PROTECT) => {
+                ("WRITE_PROTECT", "the remote filesystem is read-only")
+            }
+            Some(raw::LIBSSH2_FX_NO_SPACE_ON_FILESYSTEM | raw::LIBSSH2_FX_QUOTA_EXCEEDED) => {
+                ("STORAGE_LIMIT", "check remote free space and quota")
+            }
+            Some(raw::LIBSSH2_FX_NO_CONNECTION | raw::LIBSSH2_FX_CONNECTION_LOST) => (
+                "CONNECTION_LOST",
+                "connection was lost; inspect the destination before retrying",
+            ),
+            Some(raw::LIBSSH2_FX_FAILURE) => (
+                "FAILURE",
+                "server rejected replacement without a specific cause; check destination type, directory permissions, filesystem constraints and server logs",
+            ),
+            _ => (
+                "SFTP_ERROR",
+                "check the SFTP server response and server logs",
+            ),
+        }
+    } else {
+        match code {
+            raw::LIBSSH2_ERROR_SOCKET_TIMEOUT | raw::LIBSSH2_ERROR_TIMEOUT => (
+                "TIMEOUT",
+                "rename response timed out; inspect the destination before retrying",
+            ),
+            raw::LIBSSH2_ERROR_SOCKET_SEND
+            | raw::LIBSSH2_ERROR_SOCKET_RECV
+            | raw::LIBSSH2_ERROR_SOCKET_DISCONNECT => (
+                "CONNECTION_ERROR",
+                "SSH transport failed; inspect connection state and the destination before retrying",
+            ),
+            _ => ("SSH_ERROR", "check the SSH connection and server logs"),
+        }
+    };
+    let detail = if code == raw::LIBSSH2_ERROR_SFTP_PROTOCOL {
+        status
+            .map(|status| format!(", SFTP status {status}"))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    app_error(
+        ErrorKind::Ssh,
+        format!(
+            "atomic SFTP rename failed: {label} (native code {code}{detail}); {hint}; no non-atomic fallback was used"
+        ),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn rename_errors_distinguish_native_transport_and_sftp_status() {
+        for (code, status, expected) in [
+            (raw::LIBSSH2_FX_OP_UNSUPPORTED, None, "OP_UNSUPPORTED"),
+            (raw::LIBSSH2_ERROR_SFTP_PROTOCOL, Some(8), "OP_UNSUPPORTED"),
+            (
+                raw::LIBSSH2_ERROR_SFTP_PROTOCOL,
+                Some(3),
+                "PERMISSION_DENIED",
+            ),
+            (raw::LIBSSH2_ERROR_SFTP_PROTOCOL, Some(4), "FAILURE"),
+            (raw::LIBSSH2_ERROR_SFTP_PROTOCOL, Some(10), "MISSING_PATH"),
+            (
+                raw::LIBSSH2_ERROR_SFTP_PROTOCOL,
+                Some(18),
+                "DESTINATION_CONFLICT",
+            ),
+            (raw::LIBSSH2_ERROR_SFTP_PROTOCOL, Some(12), "WRITE_PROTECT"),
+            (raw::LIBSSH2_ERROR_SFTP_PROTOCOL, Some(15), "STORAGE_LIMIT"),
+            (raw::LIBSSH2_ERROR_SFTP_PROTOCOL, Some(7), "CONNECTION_LOST"),
+            (
+                raw::LIBSSH2_ERROR_SFTP_PROTOCOL,
+                Some(u64::MAX),
+                "SFTP_ERROR",
+            ),
+            (raw::LIBSSH2_ERROR_SOCKET_TIMEOUT, Some(3), "TIMEOUT"),
+            (raw::LIBSSH2_ERROR_SOCKET_RECV, Some(8), "CONNECTION_ERROR"),
+        ] {
+            let error = rename_error(code, status);
+            assert!(error.to_string().contains(expected), "{error}");
+            assert!(error.to_string().contains("no non-atomic fallback"));
+            assert_eq!(crate::output::classify_error(&error), ErrorKind::Ssh);
+            if code != raw::LIBSSH2_ERROR_SFTP_PROTOCOL {
+                assert!(!error.to_string().contains("SFTP status"));
+            }
+        }
+    }
     #[test]
     fn staging_uses_remote_path_semantics_on_every_client_os() {
         assert_eq!(parent_path("/srv/app/file").unwrap(), "/srv/app");

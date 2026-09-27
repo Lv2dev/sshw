@@ -4,7 +4,7 @@ use super::{
     CommandOutput, GetArgs, PutArgs, get_server, ok, resolve_auth, resolve_target_server,
     select_account, split_target,
 };
-use crate::config::SshwConfig;
+use crate::config::{AccountConfig, ServerConfig, SshwConfig};
 use crate::credentials::CredentialStore;
 use crate::error::{ResultErrorKindExt, app_error};
 use crate::output::{ErrorKind, classify_error, redact_secrets};
@@ -44,15 +44,15 @@ where
     } = args;
     let (server_name, local, remote) = resolve_put_target(target, config)?;
 
-    check_put_path(&remote.value, yes, atomic, sandbox)?;
-
-    let server = get_server(config, &server_name)?;
-    let (login_user, account) = select_account(&server_name, server, user.as_deref())?;
-    if let SandboxDecision::Deny { reason } =
-        sandbox.check_account(&server_name, login_user, login_user == server.default_user)
-    {
-        return Err(app_error(ErrorKind::Policy, reason));
-    }
+    let (server, login_user, account) = check_put_access(
+        &server_name,
+        user.as_deref(),
+        &remote.value,
+        yes,
+        atomic,
+        sandbox,
+        config,
+    )?;
     let auth = resolve_auth(account, login_user, credentials)?;
     let ssh_target = SshTarget::new(server, login_user);
     let result = with_msys_remote_path_hint(
@@ -105,16 +105,15 @@ where
     } = args;
     let (server_name, remote, local) = resolve_get_target(target, config)?;
 
-    let server = get_server(config, &server_name)?;
-    check_get_path(&remote.value, sandbox)?;
-    check_local_overwrite(&local, yes)?;
-
-    let (login_user, account) = select_account(&server_name, server, user.as_deref())?;
-    if let SandboxDecision::Deny { reason } =
-        sandbox.check_account(&server_name, login_user, login_user == server.default_user)
-    {
-        return Err(app_error(ErrorKind::Policy, reason));
-    }
+    let (server, login_user, account) = check_get_access(
+        &server_name,
+        user.as_deref(),
+        &remote.value,
+        &local,
+        yes,
+        sandbox,
+        config,
+    )?;
     let auth = resolve_auth(account, login_user, credentials)?;
     let ssh_target = SshTarget::new(server, login_user);
     let result = with_msys_remote_path_hint(
@@ -141,7 +140,52 @@ where
     )))
 }
 
-pub(super) fn check_put_path(
+// Execution and preflight use these ordered prerequisites. Keep the operation's
+// existing first-error precedence, including combinations of invalid inputs.
+pub(super) fn check_put_access<'a>(
+    name: &str,
+    user: Option<&str>,
+    remote: &str,
+    yes: bool,
+    atomic: bool,
+    sandbox: &dyn Sandbox,
+    config: &'a SshwConfig,
+) -> anyhow::Result<(&'a ServerConfig, &'a str, &'a AccountConfig)> {
+    check_put_path(remote, yes, atomic, sandbox)?;
+    checked_account(name, user, get_server(config, name)?, sandbox)
+}
+
+pub(super) fn check_get_access<'a>(
+    name: &str,
+    user: Option<&str>,
+    remote: &str,
+    local: &std::path::Path,
+    yes: bool,
+    sandbox: &dyn Sandbox,
+    config: &'a SshwConfig,
+) -> anyhow::Result<(&'a ServerConfig, &'a str, &'a AccountConfig)> {
+    let server = get_server(config, name)?;
+    check_get_path(remote, sandbox)?;
+    check_local_overwrite(local, yes)?;
+    checked_account(name, user, server, sandbox)
+}
+
+fn checked_account<'a>(
+    name: &str,
+    user: Option<&str>,
+    server: &'a ServerConfig,
+    sandbox: &dyn Sandbox,
+) -> anyhow::Result<(&'a ServerConfig, &'a str, &'a AccountConfig)> {
+    let (user, account) = select_account(name, server, user)?;
+    if let SandboxDecision::Deny { reason } =
+        sandbox.check_account(name, user, user == server.default_user)
+    {
+        return Err(app_error(ErrorKind::Policy, reason));
+    }
+    Ok((server, user, account))
+}
+
+fn check_put_path(
     remote: &str,
     yes: bool,
     atomic: bool,
@@ -167,14 +211,14 @@ pub(super) fn check_put_path(
     Ok(())
 }
 
-pub(super) fn check_get_path(remote: &str, sandbox: &dyn Sandbox) -> anyhow::Result<()> {
+fn check_get_path(remote: &str, sandbox: &dyn Sandbox) -> anyhow::Result<()> {
     if let SandboxDecision::Deny { reason } = sandbox.check_get(remote) {
         return Err(app_error(ErrorKind::Policy, reason));
     }
     Ok(())
 }
 
-pub(super) fn check_local_overwrite(local: &std::path::Path, yes: bool) -> anyhow::Result<()> {
+fn check_local_overwrite(local: &std::path::Path, yes: bool) -> anyhow::Result<()> {
     if local.try_exists().with_error_kind(ErrorKind::Io)? && !yes {
         return Err(app_error(
             ErrorKind::Io,
