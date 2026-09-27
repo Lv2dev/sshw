@@ -36,6 +36,7 @@ mod privilege;
 mod profile;
 mod prompt;
 mod server;
+mod stream;
 mod transfer;
 
 pub use model::{
@@ -103,8 +104,13 @@ pub fn run() -> i32 {
             Command::Run(_) | Command::Put(_) | Command::Get(_)
         )
     {
+        let feedback = if matches!(&cli.command, Command::Run(args) if args.stream) {
+            "redacted complete lines are streamed; use --timeout to set the operation deadline"
+        } else {
+            "output is returned on completion; use --timeout to set the operation deadline"
+        };
         eprintln!(
-            "sshw: starting remote operation ({})\noutput is returned on completion; use --timeout to set the operation deadline",
+            "sshw: starting remote operation ({})\n{feedback}",
             home.description
         );
     }
@@ -733,6 +739,7 @@ where
         yes,
         as_root,
         no_password,
+        stream,
     } = args;
     let (server_name, command) = resolve_run_target(target, config)?;
 
@@ -751,6 +758,18 @@ where
         sandbox.check_account(&server_name, login_user, login_user == server.default_user)
     {
         return Err(app_error(ErrorKind::Policy, reason));
+    }
+    if stream
+        && as_root
+        && account
+            .privilege
+            .as_ref()
+            .is_some_and(|privilege| privilege.method == PrivilegeMethod::Su)
+    {
+        return Err(app_error(
+            ErrorKind::Usage,
+            "--stream is not supported with su PTY; use the ordinary buffered run or a sudo privilege path",
+        ));
     }
     let auth = resolve_auth(account, login_user, credentials)?;
     let ssh_target = SshTarget::new(server, login_user);
@@ -796,7 +815,58 @@ where
         .as_ref()
         .map(|execution| execution.command.as_str())
         .unwrap_or(command.as_str());
-    let result = if let Some(stdin) = privileged
+    if stream
+        && privileged
+            .as_ref()
+            .is_some_and(|execution| execution.pty_password.is_some())
+    {
+        return Err(app_error(
+            ErrorKind::Usage,
+            "--stream is not supported with su PTY; use the ordinary buffered run or a sudo privilege path",
+        ));
+    }
+    let login_secret = match &auth {
+        AuthMaterial::Password(password) => Some(password.as_str()),
+        AuthMaterial::Agent => None,
+    };
+    let privilege_secret = privileged
+        .as_ref()
+        .and_then(|execution| execution.redact_secret.as_ref())
+        .map(|secret| secret.as_str());
+    let secrets = [login_secret, privilege_secret];
+    let result = if stream {
+        let stdout = io::stdout();
+        let stderr = io::stderr();
+        let mut writer = stream::Writer::new(stdout.lock(), stderr.lock(), &secrets);
+        let stdin = privileged
+            .as_ref()
+            .and_then(|execution| execution.stdin.as_ref())
+            .map(|value| value.as_str());
+        let result = ssh.run_streaming(
+            &ssh_target,
+            &auth,
+            remote_command,
+            stdin,
+            &mut |kind, bytes| writer.push(kind, bytes),
+        );
+        let final_output = writer.finish(result.is_err());
+        match result {
+            Ok(mut result) => {
+                final_output?;
+                // Output has already been emitted; neither success nor failure
+                // may replay the captured output a second time.
+                result.stdout.clear();
+                result.stderr.clear();
+                Ok(result)
+            }
+            Err(error) => Err(match error.downcast::<crate::ssh::PartialRunError>() {
+                Ok(partial) => partial
+                    .source
+                    .context("streamed command failed; completion was not confirmed"),
+                Err(error) => error,
+            }),
+        }
+    } else if let Some(stdin) = privileged
         .as_ref()
         .and_then(|execution| execution.stdin.as_ref())
     {
@@ -819,15 +889,6 @@ where
     } else {
         ssh.run(&ssh_target, &auth, remote_command)
     };
-    let login_secret = match &auth {
-        AuthMaterial::Password(password) => Some(password.as_str()),
-        AuthMaterial::Agent => None,
-    };
-    let privilege_secret = privileged
-        .as_ref()
-        .and_then(|execution| execution.redact_secret.as_ref())
-        .map(|secret| secret.as_str());
-    let secrets = [login_secret, privilege_secret];
     let result = result
         .map_err(|err| redact_partial_run_error(err, &secrets))
         .with_error_kind(ErrorKind::Ssh)?;

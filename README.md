@@ -267,6 +267,21 @@ Global flags (available on every command): `--home <path>`, `--profile <name>`, 
 
 When the name is omitted for `run`/`put`/`get`, the configured default server is used. When `--user` is omitted, that server's default account is used.
 
+### Safer transfers and live output
+
+```bash
+sshw policy check-put web ./app /srv/app/app --atomic --json
+sshw put web ./app /srv/app/app --atomic --mode 755
+sshw policy check-get web /var/log/app.log ./app.log --json
+sshw run web "./long-build" --stream
+```
+
+`put --atomic` writes a temporary file in the destination directory, verifies its size and closes it before replacing the destination using `posix-rename@openssh.com`. An SFTP server supporting that extension and write permission on the parent directory are required. When policy is enabled, allow the parent directory as well as the destination. Unsupported atomic rename fails without a non-atomic fallback. Before replacement, failures preserve the existing destination and attempt to remove the temporary file. A lost connection can leave a temporary file or an unconfirmed replacement; inspect the reported paths before retrying. Replacement creates a new inode with mode 600 unless `--mode` is specified: old ownership/ACLs are not preserved, and a destination symlink is replaced rather than followed. This provides atomic visibility, not crash-durability or privilege escalation. Ordinary `put` retains its existing SCP behavior.
+
+`run --stream` emits complete, redacted stdout/stderr lines while the command runs. Incomplete lines wait for completion; PEM private-key blocks and secrets split across network reads remain masked. Known multiline secrets require conservative buffering. The existing 16 MiB combined output limit and exit codes remain in force. JSON and `su` PTY are not supported with streaming; ordinary run and sudo are supported. Output already emitted is not repeated on failure, and the remote command may have had side effects.
+
+`policy check-put/check-get` use the same positional arguments, `--user` and `--yes` as transfers; `check-put --atomic` also checks staging-directory policy. They check local policy/safety/account rules and download overwrite confirmation, without connecting or reading credentials. They do not validate remote filesystem permissions, server extension support, or that a local upload file can be opened. `--yes` confirms a guardrail; it grants no remote OS permission.
+
 ### Windows Shell Paths
 
 Git Bash/MSYS automatically converts path-like arguments passed to native Windows executables. That conversion can rewrite a remote POSIX path such as `/tmp/artifact.tgz` into a local Windows path before `sshw` sees it. Prefix an absolute remote path with `remote:` to pass it literally; sshw removes the prefix before applying safety, policy, audit, JSON, and SSH handling:
@@ -741,6 +756,21 @@ sshw put server-alpha "$archive" 'remote:/tmp/sshw-src.tgz'
 `run`은 완료 후 모은 출력을 반환합니다. 사람이 사용하는 TTY에는 선택한 home과 작업 시작 안내를 표시합니다. 일반 run/sudo의 읽기 실패·타임아웃에서는 redaction한 `partial_output`과 `completion_confirmed:false`를 제공할 수 있습니다. 여전히 실패이며 무조건 재시도하면 안 됩니다. 알려진 비밀번호가 캡처 경계에서 잘린 경우도 보수적으로 가립니다. su prompt/marker 실패에는 이 부분 출력 계약을 적용하지 않습니다. 로컬 stdin은 원격 명령에 전달하지 않습니다.
 
 실행 파일은 `sshw put web ./app /srv/app/app --mode 755`처럼 권한을 명시하세요. 새 파일의 기본 권한은 600이고 특수 권한 비트는 거부합니다. mode를 명시하면 기존 파일의 권한도 바꾸고 시각 정보는 전송 시각으로 설정합니다. 일반 업로드는 서버의 기존 권한 유지 동작을 따릅니다. 파일 전송 자체의 권한 상승은 제공하지 않습니다. 원격의 기존 파일은 업로드로 교체될 수 있고, 로컬의 기존 파일을 다운로드로 덮어쓰려면 `--yes`가 필요합니다.
+
+### 업로드 보호·실시간 출력·전송 사전 검사
+
+```bash
+sshw policy check-put web ./app /srv/app/app --atomic --json
+sshw put web ./app /srv/app/app --atomic --mode 755
+sshw policy check-get web /var/log/app.log ./app.log --json
+sshw run web "./long-build" --stream
+```
+
+`put --atomic`은 목적지 디렉터리의 임시 파일에 올리고 크기·닫기를 확인한 뒤 원자적으로 교체합니다. `posix-rename@openssh.com` 확장을 지원하는 SFTP 서버와 부모 디렉터리 쓰기 권한이 필요하며, 정책도 부모 디렉터리 업로드를 허용해야 합니다. 미지원 서버에서는 일반 덮어쓰기로 후퇴하지 않습니다. 교체 전 실패는 기존 파일을 보존하고 임시 파일을 정리하지만, 연결 단절 시 정리가 실패하거나 교체 결과가 미확정일 수 있습니다. 오류에 나온 경로를 확인한 뒤 재시도하세요. 기존 inode·소유권·ACL은 보존하지 않으며 mode는 기본600 또는 명시한 값입니다. 목적지 symlink는 따라가지 않고 교체합니다. 전원 장애 내구성이나 관리자 권한 상승은 제공하지 않으며 일반 `put`은 기존 SCP 동작을 유지합니다.
+
+`run --stream`은 완성된 줄을 비밀 마스킹 후 실행 중에 출력합니다. 데이터가 여러 번에 나뉘어 도착해도 UTF8·비밀·PEM 블록을 유지해서 처리하고, 개행 없는 줄은 종료까지 기다립니다. 알려진 비밀 자체가 여러 줄이면 보수적으로 버퍼링합니다. 일반 실행과 sudo를 지원하며 JSON·su PTY 조합은 거부합니다. 기존16MiB 상한과 exit code는 유지하고 이미 출력한 내용은 실패 시 반복하지 않습니다.
+
+`policy check-put/check-get`은 실제 전송과 같은 인자 순서·`--user`·`--yes`를 사용합니다. 업로드의 `--atomic`은 임시 파일 디렉터리 정책도 검사합니다. 로컬 정책·계정·위험 경로와 다운로드 덮어쓰기 조건만 검사하며 SSH·credential·원격 OS 권한·서버 확장·로컬 업로드 파일 읽기 가능 여부는 확인하지 않습니다. `--yes`는 확인 옵션일 뿐 원격 권한을 부여하지 않습니다.
 
 ### Safety Rails
 

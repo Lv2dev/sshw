@@ -35,6 +35,26 @@ pub enum PolicyCommand {
     Remove(PolicyRuleArgs),
     /// Explain run safety, account and policy checks without SSH or credentials.
     Check(PolicyCheckArgs),
+    /// Check upload path/account/safety rules locally, without SSH or credentials.
+    CheckPut(PolicyTransferCheckArgs),
+    /// Check download path/account rules and local overwrite confirmation.
+    CheckGet(PolicyTransferCheckArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct PolicyTransferCheckArgs {
+    /// Same target order as put/get: [server] <source> <destination>.
+    #[arg(value_name = "TARGET", num_args = 2..=3)]
+    pub target: Vec<String>,
+    /// Registered login account (default: server default).
+    #[arg(long)]
+    pub user: Option<String>,
+    /// Evaluate the safety/overwrite confirmation used by put/get --yes.
+    #[arg(long)]
+    pub yes: bool,
+    /// For check-put, also check permission for the sibling staging file.
+    #[arg(long)]
+    pub atomic: bool,
 }
 
 #[derive(Debug, Args)]
@@ -79,6 +99,12 @@ pub(super) fn run_policy(args: PolicyArgs, ctx: &ExecContext<'_>) -> anyhow::Res
     if let PolicyCommand::Check(check) = args.command {
         return check_run(check, args.json, ctx);
     }
+    if let PolicyCommand::CheckPut(check) = args.command {
+        return check_transfer(check, true, args.json, ctx);
+    }
+    if let PolicyCommand::CheckGet(check) = args.command {
+        return check_transfer(check, false, args.json, ctx);
+    }
     let action = match &args.command {
         PolicyCommand::Init => "init",
         PolicyCommand::Show => "show",
@@ -86,7 +112,9 @@ pub(super) fn run_policy(args: PolicyArgs, ctx: &ExecContext<'_>) -> anyhow::Res
         PolicyCommand::Disable => "disable",
         PolicyCommand::Allow(_) => "allow",
         PolicyCommand::Remove(_) => "remove",
-        PolicyCommand::Check(_) => unreachable!(),
+        PolicyCommand::Check(_) | PolicyCommand::CheckPut(_) | PolicyCommand::CheckGet(_) => {
+            unreachable!()
+        }
     };
     let mutating = action != "show";
     let _lock = if mutating {
@@ -277,6 +305,83 @@ fn check_run(
             },
             redact_secrets(&reasons.join("\n"))
         )
+    };
+    Ok(CommandOutput {
+        stdout,
+        stderr: String::new(),
+        exit_code,
+    })
+}
+
+fn check_transfer(
+    args: PolicyTransferCheckArgs,
+    upload: bool,
+    json_output: bool,
+    ctx: &ExecContext<'_>,
+) -> anyhow::Result<CommandOutput> {
+    use super::transfer;
+    if !upload && args.atomic {
+        return Err(app_error(
+            ErrorKind::Usage,
+            "--atomic is only supported by check-put",
+        ));
+    }
+    let config = load_active_config(ctx.home)?;
+    let (name, local, remote) = if upload {
+        transfer::resolve_put_target(args.target, &config)?
+    } else {
+        let (name, remote, local) = transfer::resolve_get_target(args.target, &config)?;
+        (name, local, remote)
+    };
+    let server = get_server(&config, &name)?;
+    let (user, _) = select_account(&name, server, args.user.as_deref())?;
+    let sandbox = build_sandbox(&ctx.home.policy_path, ctx.policy_forced)?;
+    let mut checks = if upload {
+        vec![transfer::check_put_path(
+            &remote.value,
+            args.yes,
+            args.atomic,
+            sandbox.as_ref(),
+        )]
+    } else {
+        vec![
+            transfer::check_get_path(&remote.value, sandbox.as_ref()),
+            transfer::check_local_overwrite(&local, args.yes),
+        ]
+    };
+    checks.push(
+        match sandbox.check_account(&name, user, user == server.default_user) {
+            SandboxDecision::Allow => Ok(()),
+            SandboxDecision::Deny { reason } => Err(app_error(ErrorKind::Policy, reason)),
+        },
+    );
+    let mut reasons = Vec::new();
+    let mut exit_code = 0;
+    for error in checks.into_iter().filter_map(Result::err) {
+        if exit_code == 0 {
+            exit_code = crate::output::classify_error(&error).exit_code();
+        }
+        reasons.push(redact_secrets(&error.to_string()));
+    }
+    let operation = if upload { "put" } else { "get" };
+    let mut value = json!({"ok":true,"allowed":reasons.is_empty(),"operation":operation,
+        "server":name,"user":user,"local":local,"remote":remote.value,"reasons":reasons,
+        "connection_tested":false,"credentials_checked":false,"remote_permissions_checked":false});
+    redact_json(&mut value);
+    let stdout = if json_output {
+        format!("{value}\n")
+    } else {
+        redact_secrets(&format!(
+            "operation: {operation}\nserver/account: {name}/{user}\nlocal: {}\nremote: {}\nlocal checks: {}\n{}\nSSH, credentials and remote filesystem permissions were not tested. --yes confirms a local guardrail; it does not grant remote write permission.\n",
+            local.display(),
+            remote.value,
+            if reasons.is_empty() {
+                "allowed"
+            } else {
+                "blocked"
+            },
+            reasons.join("\n")
+        ))
     };
     Ok(CommandOutput {
         stdout,

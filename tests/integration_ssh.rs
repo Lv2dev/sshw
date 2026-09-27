@@ -747,6 +747,42 @@ fn run_as_root_uses_sudo_against_real_sshd_without_forwarding_password_stdin() {
 
 #[test]
 #[ignore = "spawns a Docker-backed sshd; run with --ignored --test-threads=1"]
+fn streaming_sudo_redacts_loaded_password_and_closes_command_stdin() {
+    let Some(srv) = DockerPasswordServer::start() else {
+        return;
+    };
+    srv.trust();
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join("servers.json");
+    let (mut config, _, _) = docker_privileged_config(&path, &srv, PrivilegeMethod::Sudo);
+    config.credential_backend = sshw::config::CredentialBackend::SessionOnly;
+    save_config(&path, &config).unwrap();
+    fs::copy(&srv.known_hosts, home.path().join("known_hosts")).unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_sshw"))
+        .env("SSHW_HOME", home.path())
+        .env("SSHW_PASSWORD", TEST_PASSWORD)
+        .env("SSHW_PRIVILEGE_PASSWORD", TEST_PASSWORD)
+        .args([
+            "run",
+            "docker-password",
+            &format!("id -u; printf '%s\\n' '{TEST_PASSWORD}'; cat"),
+            "--as-root",
+            "--stream",
+            "--yes",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(String::from_utf8(result.stdout).unwrap(), "0\n<redacted>\n");
+    assert!(!String::from_utf8_lossy(&result.stderr).contains(TEST_PASSWORD));
+}
+
+#[test]
+#[ignore = "spawns a Docker-backed sshd; run with --ignored --test-threads=1"]
 fn run_as_root_uses_su_against_real_sshd_with_pty_password() {
     let Some(srv) = DockerPasswordServer::start() else {
         return;
@@ -941,6 +977,254 @@ fn explicit_upload_mode_changes_existing_file_and_keeps_default_behavior() {
         fs::metadata(&remote).unwrap().permissions().mode() & 0o777,
         0o600
     );
+}
+
+#[test]
+#[ignore = "spawns a real sshd; run with --ignored --test-threads=1"]
+fn atomic_upload_replaces_only_after_completion_and_preserves_destination_on_failure() {
+    let srv = TestServer::start();
+    srv.trust();
+    let client = srv.client();
+    let server = srv.server();
+    let target = default_target(&server);
+    let work = tempfile::tempdir().unwrap();
+    let source = work.path().join("source");
+    let remote = work.path().join("remote with ' quotes");
+    fs::write(&source, b"replacement").unwrap();
+    fs::write(&remote, b"original").unwrap();
+    client
+        .put_atomic(
+            &target,
+            &AuthMaterial::Agent,
+            &source,
+            remote.to_str().unwrap(),
+            Some(0o755),
+        )
+        .unwrap();
+    assert_eq!(fs::read(&remote).unwrap(), b"replacement");
+    assert_eq!(
+        fs::metadata(&remote).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+    // Shrink the source after SFTP has created its staging file. A large sparse
+    // source makes the transfer remain in flight while the observer runs.
+    fs::File::create(&source)
+        .unwrap()
+        .set_len(128 * 1024 * 1024)
+        .unwrap();
+    let watched = work.path().to_path_buf();
+    let truncated = source.clone();
+    let observer = std::thread::spawn(move || {
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(10) {
+            if fs::read_dir(&watched).unwrap().any(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".sshw-upload-")
+            }) {
+                fs::OpenOptions::new()
+                    .write(true)
+                    .open(&truncated)
+                    .unwrap()
+                    .set_len(0)
+                    .unwrap();
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        false
+    });
+    let result = client.put_atomic(
+        &target,
+        &AuthMaterial::Agent,
+        &source,
+        remote.to_str().unwrap(),
+        None,
+    );
+    assert!(observer.join().unwrap(), "staging file was never observed");
+    assert!(result.is_err(), "shrinking source unexpectedly succeeded");
+    assert_eq!(fs::read(&remote).unwrap(), b"replacement");
+    assert!(!fs::read_dir(work.path()).unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".sshw-upload-")
+    }));
+}
+
+#[test]
+#[ignore = "spawns a real sshd; run with --ignored --test-threads=1"]
+fn atomic_upload_never_falls_back_when_posix_rename_is_denied() {
+    let srv = TestServer::start_with_force_command_script(
+        "#!/bin/sh\nexec /usr/lib/openssh/sftp-server -P posix-rename\n",
+    );
+    srv.trust();
+    let client = srv.client();
+    let server = srv.server();
+    let work = tempfile::tempdir().unwrap();
+    let source = work.path().join("source");
+    let remote = work.path().join("remote");
+    fs::write(&source, b"replacement").unwrap();
+    fs::write(&remote, b"original").unwrap();
+    let error = client
+        .put_atomic(
+            &default_target(&server),
+            &AuthMaterial::Agent,
+            &source,
+            remote.to_str().unwrap(),
+            None,
+        )
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("no non-atomic fallback"));
+    assert_eq!(fs::read(&remote).unwrap(), b"original");
+    assert!(!fs::read_dir(work.path()).unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".sshw-upload-")
+    }));
+}
+
+#[test]
+#[ignore = "spawns a real sshd; run with --ignored --test-threads=1"]
+fn streaming_delivers_output_before_remote_completion() {
+    let srv = TestServer::start();
+    srv.trust();
+    let client = srv.client();
+    let server = srv.server();
+    let started = Instant::now();
+    let mut first = None;
+    let mut last = None;
+    let mut received_stdout = Vec::new();
+    let mut output = Vec::new();
+    let result = client
+        .run_streaming(
+            &default_target(&server),
+            &AuthMaterial::Agent,
+            "printf 'first\\n'; sleep 2; printf 'last\\n'; printf 'warning\\n' >&2",
+            None,
+            &mut |stream, bytes| {
+                if stream == sshw::ssh::OutputStream::Stdout {
+                    received_stdout.extend_from_slice(bytes);
+                    if first.is_none() && received_stdout.starts_with(b"first\n") {
+                        first = Some(started.elapsed());
+                    }
+                    if received_stdout.ends_with(b"last\n") {
+                        last = Some(started.elapsed());
+                    }
+                }
+                output.push((stream, bytes.to_vec()));
+                Ok(())
+            },
+        )
+        .unwrap();
+    // Exclude SSH connection/authentication latency from the streaming check.
+    // Buffered output would deliver both lines together and fail this gap.
+    assert!(
+        last.unwrap() - first.unwrap() >= Duration::from_millis(1500),
+        "first={first:?}, last={last:?}"
+    );
+    assert!(started.elapsed() >= Duration::from_secs(2));
+    assert_eq!(result.stdout, "first\nlast\n");
+    assert_eq!(result.stderr, "warning\n");
+    assert_eq!(result.exit_status, 0);
+    assert!(
+        output
+            .iter()
+            .any(|(stream, _)| *stream == sshw::ssh::OutputStream::Stderr)
+    );
+}
+
+#[test]
+#[ignore = "spawns a real sshd; run with --ignored --test-threads=1"]
+fn streaming_sink_failure_has_bounded_cleanup_and_preserves_error_kind() {
+    let srv = TestServer::start();
+    srv.trust();
+    let server = srv.server();
+    let mut failed_at = None;
+    let error = srv
+        .client()
+        .run_streaming(
+            &default_target(&server),
+            &AuthMaterial::Agent,
+            "printf 'first\\n'; sleep 4",
+            None,
+            &mut |_, _| {
+                failed_at = Some(Instant::now());
+                Err(sshw::error::app_error(
+                    sshw::output::ErrorKind::Io,
+                    "synthetic output sink failure",
+                ))
+            },
+        )
+        .unwrap_err();
+    assert!(failed_at.unwrap().elapsed() < Duration::from_secs(1));
+    assert_eq!(
+        sshw::output::classify_error(&error),
+        sshw::output::ErrorKind::Io
+    );
+}
+
+#[test]
+#[ignore = "spawns a real sshd; run with --ignored --test-threads=1"]
+fn streaming_cli_redacts_split_secrets_and_does_not_replay_output() {
+    use std::io::{BufRead, Read};
+    let srv = TestServer::start();
+    srv.trust();
+    let home = tempfile::tempdir().unwrap();
+    let mut config = SshwConfig {
+        default: Some("test".into()),
+        credential_backend: sshw::config::CredentialBackend::SessionOnly,
+        ..SshwConfig::default()
+    };
+    config.servers.insert("test".into(), srv.server());
+    save_config(&home.path().join("servers.json"), &config).unwrap();
+    fs::copy(&srv.known_hosts, home.path().join("known_hosts")).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sshw"))
+        .env("SSHW_HOME", home.path())
+        .env_remove("SSHW_PASSWORD")
+        .env_remove("SSHW_PRIVILEGE_PASSWORD")
+        .args(["run", "test", "printf 'first\\n'; sleep 2; printf 'pass'; sleep 0.1; printf 'word=stream-secret\\nlast\\n'; printf 'err-line\\n' >&2; exit 7", "--stream", "--yes"])
+        .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let mut reader = std::io::BufReader::new(child.stdout.take().unwrap());
+    let mut output = String::new();
+    reader.read_line(&mut output).unwrap();
+    let first = Instant::now();
+    assert_eq!(output, "first\n");
+    assert!(child.try_wait().unwrap().is_none());
+    reader.read_to_string(&mut output).unwrap();
+    let result = child.wait_with_output().unwrap();
+    assert!(first.elapsed() >= Duration::from_millis(1500));
+    assert_eq!(result.status.code(), Some(8));
+    assert_eq!(output, "first\npassword=<redacted>\nlast\n");
+    let stderr = String::from_utf8(result.stderr).unwrap();
+    assert_eq!(stderr.matches("err-line").count(), 1);
+    assert!(!stderr.contains("stream-secret"));
+    let result = Command::new(env!("CARGO_BIN_EXE_sshw"))
+        .env("SSHW_HOME", home.path())
+        .env_remove("SSHW_PASSWORD")
+        .env_remove("SSHW_PRIVILEGE_PASSWORD")
+        .args([
+            "--timeout",
+            "1",
+            "run",
+            "test",
+            "printf 'started\\npassword=hidden'; sleep 3",
+            "--stream",
+            "--yes",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(result.status.code(), Some(5));
+    assert_eq!(
+        String::from_utf8(result.stdout).unwrap(),
+        "started\npassword=<redacted>"
+    );
+    assert!(!String::from_utf8_lossy(&result.stderr).contains("hidden"));
 }
 
 #[test]
