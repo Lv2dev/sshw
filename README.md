@@ -269,6 +269,8 @@ When the name is omitted for `run`/`put`/`get`, the configured default server is
 
 ### Safer transfers and live output
 
+Atomic upload errors identify the failed step, its cause, the destination and temporary path, and the cleanup/replacement state. If the server's file-creation response is lost, the temporary file may exist but its creation is unconfirmed; sshw does not automatically delete that path. Inspect the path and ownership before retrying. Confirmed temporary files are cleaned up on failure when the connection and permissions allow it.
+
 ```bash
 sshw policy check-put web ./app /srv/app/app --atomic --json
 sshw put web ./app /srv/app/app --atomic --mode 755
@@ -758,6 +760,8 @@ sshw put server-alpha "$archive" 'remote:/tmp/sshw-src.tgz'
 실행 파일은 `sshw put web ./app /srv/app/app --mode 755`처럼 권한을 명시하세요. 새 파일의 기본 권한은 600이고 특수 권한 비트는 거부합니다. mode를 명시하면 기존 파일의 권한도 바꾸고 시각 정보는 전송 시각으로 설정합니다. 일반 업로드는 서버의 기존 권한 유지 동작을 따릅니다. 파일 전송 자체의 권한 상승은 제공하지 않습니다. 원격의 기존 파일은 업로드로 교체될 수 있고, 로컬의 기존 파일을 다운로드로 덮어쓰려면 `--yes`가 필요합니다.
 
 ### 업로드 보호·실시간 출력·전송 사전 검사
+
+원자적 업로드 오류는 실패 단계·실제 원인·목적지와 임시 경로·정리 및 교체 상태를 함께 표시합니다. 생성 응답이 유실되면 원격 파일이 생겼더라도 생성 성공을 확인할 수 없으므로 해당 경로를 자동 삭제하지 않습니다. 경로와 소유권을 확인한 뒤 재시도하세요. 생성 성공이 확인된 임시 파일만 연결과 권한이 허용하는 범위에서 실패 시 정리합니다.
 
 ```bash
 sshw policy check-put web ./app /srv/app/app --atomic --json

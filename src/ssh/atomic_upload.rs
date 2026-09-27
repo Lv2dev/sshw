@@ -1,7 +1,7 @@
 //! Same-directory SFTP staging with an explicit POSIX atomic rename.
 use super::ssh2_client::{OperationDeadline, timeout_millis};
 use crate::error::{ResultErrorKindExt, app_error};
-use crate::output::ErrorKind;
+use crate::output::{ErrorKind, redact_secrets};
 use anyhow::Context;
 use libssh2_sys as raw;
 use ssh2::{FileStat, OpenFlags, OpenType, Session};
@@ -37,6 +37,13 @@ pub(crate) fn parent_path(remote: &str) -> anyhow::Result<&str> {
     Ok(if parent.is_empty() { "/" } else { parent })
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Creation {
+    NotAttempted,
+    Unconfirmed,
+    Confirmed,
+}
+
 pub(super) fn upload<R: Read>(
     session: &Session,
     source: &mut R,
@@ -46,37 +53,59 @@ pub(super) fn upload<R: Read>(
     deadline: &OperationDeadline,
 ) -> anyhow::Result<u64> {
     let parent = parent_path(remote)?;
-    // tempfile supplies an OS-random name. Remote CREATE|EXCLUSIVE ensures a
-    // collision can never overwrite somebody else's staging file or symlink.
-    let nonce = tempfile::Builder::new()
-        .prefix(".sshw-upload-")
-        .rand_bytes(24)
-        .tempfile()
-        .with_error_kind(ErrorKind::Io)?;
-    let name = nonce
-        .path()
-        .file_name()
-        .and_then(|name| name.to_str())
-        .context("cannot name upload temporary file")?;
-    let temporary = format!("{}/{name}", parent.trim_end_matches('/'));
-    deadline.apply(session)?;
-    let sftp = session
-        .sftp()
-        .context("atomic upload requires an SFTP subsystem")?;
-    deadline.apply(session)?;
-    let mut file = sftp
-        .open_mode(
-            std::path::Path::new(&temporary),
+    let mut stage = "prepare local temporary name";
+    let mut temporary = None;
+    let mut creation = Creation::NotAttempted;
+    let mut sftp = None;
+    let mut file = None;
+    let mut rename_started = false;
+    let result = (|| {
+        // A random sibling name plus CREATE|EXCLUSIVE prevents collisions from
+        // overwriting another file. Only a successful OPEN establishes ownership.
+        let local_temp_dir = std::env::temp_dir();
+        let nonce = tempfile::Builder::new()
+            .prefix(".sshw-upload-")
+            .rand_bytes(24)
+            .tempfile_in(&local_temp_dir)
+            .with_context(|| {
+                format!(
+                    "cannot prepare upload in local temporary directory {}",
+                    local_temp_dir.display()
+                )
+            })
+            .with_error_kind(ErrorKind::Io)?;
+        let name = nonce
+            .path()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("cannot name upload temporary file")?;
+        temporary = Some(format!("{}/{name}", parent.trim_end_matches('/')));
+        let temporary_path = temporary.as_deref().expect("temporary name was selected");
+
+        stage = "initialize SFTP";
+        deadline.apply(session)?;
+        sftp = Some(
+            session
+                .sftp()
+                .context("atomic upload requires an SFTP subsystem")?,
+        );
+
+        stage = "create temporary file";
+        deadline.apply(session)?;
+        creation = Creation::Unconfirmed;
+        file = Some(sftp.as_ref().expect("SFTP was initialized").open_mode(
+            std::path::Path::new(temporary_path),
             OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::EXCLUSIVE,
             0o600,
             OpenType::File,
-        )
-        .context("cannot create exclusive upload temporary file")?;
-    let mut rename_started = false;
-    let result = (|| {
+        )?);
+        creation = Creation::Confirmed;
+        let remote_file = file.as_mut().expect("OPEN returned a handle");
+
         let mut sent = 0;
         let mut buffer = [0u8; 32 * 1024];
         while sent < size {
+            stage = "read local source";
             deadline.apply(session)?;
             let limit = (size - sent).min(buffer.len() as u64) as usize;
             let count = source
@@ -85,59 +114,142 @@ pub(super) fn upload<R: Read>(
             if count == 0 {
                 return Err(app_error(
                     ErrorKind::Ssh,
-                    "atomic upload aborted: local file shrank during transfer",
+                    "local file shrank during transfer",
                 ));
             }
-            deadline.apply(session)?;
-            file.write_all(&buffer[..count])
-                .context("atomic upload write failed")?;
+            stage = "write temporary file";
+            let mut written = 0;
+            while written < count {
+                // Reapply the absolute deadline on every partial write. ssh2's
+                // Write adapter preserves the native message, but not its code.
+                deadline.apply(session)?;
+                let part = remote_file
+                    .write(&buffer[written..count])
+                    .with_error_kind(ErrorKind::Ssh)?;
+                if part == 0 {
+                    return Err(app_error(
+                        ErrorKind::Ssh,
+                        "remote file accepted no further bytes",
+                    ));
+                }
+                written += part;
+            }
             sent += count as u64;
         }
+        stage = "verify temporary size";
         deadline.apply(session)?;
-        let stat = file.stat().context("cannot verify staged upload size")?;
-        if stat.size != Some(size) {
+        if remote_file.stat()?.size != Some(size) {
             return Err(app_error(
                 ErrorKind::Ssh,
                 "staged upload size does not match the source",
             ));
         }
+        stage = "set temporary mode";
         deadline.apply(session)?;
-        file.setstat(FileStat {
+        remote_file.setstat(FileStat {
             size: None,
             uid: None,
             gid: None,
             perm: Some(mode),
             atime: None,
             mtime: None,
-        })
-        .context("cannot set staged upload mode")?;
+        })?;
+        stage = "close temporary file";
         deadline.apply(session)?;
-        file.close().context("cannot confirm staged upload close")?;
+        remote_file.close()?;
+        stage = "replace destination";
         deadline.apply(session)?;
         rename_started = true;
-        posix_rename(session, &temporary, remote, deadline)?;
+        posix_rename(session, temporary_path, remote, deadline)?;
         Ok(sent)
     })();
-    if let Err(error) = &result {
-        let failure = error.to_string();
-        // Only our exclusively-created sibling is removed. Never remove or
-        // truncate the destination, including after an unconfirmed rename.
-        session.set_timeout(100);
-        drop(file);
-        let cleaned = sftp.unlink(std::path::Path::new(&temporary)).is_ok();
-        let phase = if rename_started {
-            "replacement was not confirmed; inspect the destination before retrying"
-        } else {
-            "replacement was not attempted; the existing destination was preserved"
-        };
-        return result.with_context(|| {
-            format!(
-                "atomic upload failed: {failure}; {phase}; temporary file {} at {temporary}",
-                if cleaned { "removed" } else { "may remain" }
-            )
-        });
+    match result {
+        Ok(sent) => Ok(sent),
+        Err(error) => {
+            // Capture the original cause before close/unlink can change native
+            // last-error state. A lost OPEN response never authorizes unlink.
+            let cause = describe_error(&error);
+            session.set_timeout(100);
+            drop(file.take());
+            let cleanup = if creation == Creation::Confirmed {
+                let sftp = sftp.as_ref().expect("confirmed OPEN requires SFTP");
+                let path = temporary
+                    .as_deref()
+                    .expect("confirmed OPEN requires a path");
+                Some(
+                    sftp.unlink(std::path::Path::new(path))
+                        .map_err(|error| error.to_string()),
+                )
+            } else {
+                None
+            };
+            let message = failure_message(
+                stage,
+                remote,
+                temporary.as_deref(),
+                creation,
+                rename_started,
+                cleanup.as_ref(),
+                &cause,
+            );
+            Err(error.context(message))
+        }
     }
-    Ok(size)
+}
+
+fn describe_error(error: &anyhow::Error) -> String {
+    // Redact each cause independently. Flattening a chain first can join the
+    // END marker of one PEM block to the BEGIN marker of a duplicate cause.
+    let mut parts = Vec::new();
+    for cause in error.chain() {
+        let part = redact_secrets(&cause.to_string());
+        if parts.last() != Some(&part) {
+            parts.push(part);
+        }
+    }
+    parts.join(": ")
+}
+
+fn failure_message(
+    stage: &str,
+    destination: &str,
+    temporary: Option<&str>,
+    creation: Creation,
+    rename_started: bool,
+    cleanup: Option<&Result<(), String>>,
+    cause: &str,
+) -> String {
+    // Redact each cause before adding a prefix, which could otherwise hide a
+    // line-start PEM marker from the outer error renderer.
+    let cause = redact_secrets(cause);
+    let destination = redact_secrets(destination);
+    let path = redact_secrets(temporary.unwrap_or("not selected"));
+    let cleanup = match (creation, cleanup) {
+        (Creation::NotAttempted, _) => format!(
+            "temporary creation was not attempted; no cleanup attempted; temporary path: {path}"
+        ),
+        (Creation::Unconfirmed, _) => format!(
+            "temporary creation was not confirmed; temporary file not removed: {path}; inspect this path and ownership before retrying"
+        ),
+        (Creation::Confirmed, Some(Ok(()))) => format!("temporary file removed: {path}"),
+        (Creation::Confirmed, Some(Err(error))) => {
+            format!(
+                "temporary file may remain: {path}; cleanup failed: {}",
+                redact_secrets(error)
+            )
+        }
+        (Creation::Confirmed, None) => {
+            format!("temporary file may remain: {path}; cleanup was not confirmed")
+        }
+    };
+    let replacement = if rename_started {
+        "replacement was not confirmed; inspect the destination before retrying"
+    } else {
+        "replacement was not attempted; the existing destination was preserved"
+    };
+    format!(
+        "atomic upload failed during {stage}: {cause}\ndestination: {destination}\n{replacement}\n{cleanup}"
+    )
 }
 
 fn posix_rename(
@@ -272,6 +384,32 @@ fn rename_error(code: c_int, status: Option<u64>) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn diagnostics_preserve_primary_kind_and_redact_prefixed_causes() {
+        let error = app_error(
+            ErrorKind::Io,
+            "-----BEGIN PRIVATE KEY-----\nfixture-secret\n-----END PRIVATE KEY-----",
+        );
+        let cleanup = Err("password=cleanup-secret".to_string());
+        let message = failure_message(
+            "read local source",
+            "/destination",
+            Some("/temporary"),
+            Creation::Confirmed,
+            false,
+            Some(&cleanup),
+            &describe_error(&error),
+        );
+        let error = error.context(message);
+        let response = crate::output::ErrorResponse::from_error(&error);
+        assert_eq!(response.error.kind, ErrorKind::Io);
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(!json.contains("fixture-secret"));
+        assert!(!json.contains("cleanup-secret"));
+        assert!(response.error.message.contains("read local source"));
+        assert!(response.error.message.contains("cleanup failed"));
+        assert!(response.error.message.contains("/temporary"));
+    }
     #[test]
     fn rename_errors_distinguish_native_transport_and_sftp_status() {
         for (code, status, expected) in [
