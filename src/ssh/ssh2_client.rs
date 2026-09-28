@@ -481,37 +481,47 @@ impl Ssh2Client {
         let deadline = OperationDeadline::new(self.op_timeout);
         deadline.apply(&session)?;
         let mut channel = session.channel_session().context("ssh session error")?;
-        deadline.apply(&session)?;
-        channel.exec(command).context("ssh session error")?;
-        if let Some(stdin) = stdin {
+        let result = (|| {
             deadline.apply(&session)?;
-            channel
-                .write_all(stdin.as_bytes())
-                .context("ssh session error")?;
-        }
-        deadline.apply(&session)?;
-        channel.send_eof().context("ssh session error")?;
+            channel.exec(command).context("ssh session error")?;
+            if let Some(stdin) = stdin {
+                deadline.apply(&session)?;
+                channel
+                    .write_all(stdin.as_bytes())
+                    .context("ssh session error")?;
+            }
+            deadline.apply(&session)?;
+            channel.send_eof().context("ssh session error")?;
 
-        let (stdout, stderr) =
-            read_channel_outputs(&session, &mut channel, &deadline, self.output_limit, output)?;
-        let completion = (|| {
-            deadline.apply(&session)?;
-            channel.wait_close().context("ssh session error")?;
-            ensure_remote_command_not_signaled(&channel)?;
-            channel.exit_status().context("ssh session error")
+            let (stdout, stderr) =
+                read_channel_outputs(&session, &mut channel, &deadline, self.output_limit, output)?;
+            let completion = (|| {
+                deadline.apply(&session)?;
+                channel.wait_close().context("ssh session error")?;
+                ensure_remote_command_not_signaled(&channel)?;
+                channel.exit_status().context("ssh session error")
+            })();
+            let exit_status = completion.map_err(|source| PartialRunError {
+                source,
+                stdout: stdout.clone(),
+                stderr: stderr.clone(),
+            })?;
+
+            Ok(RunResult {
+                exit_status,
+                stdout,
+                stderr,
+                duration_ms: started.elapsed().as_millis(),
+            })
         })();
-        let exit_status = completion.map_err(|source| PartialRunError {
-            source,
-            stdout: stdout.clone(),
-            stderr: stderr.clone(),
-        })?;
-
-        Ok(RunResult {
-            exit_status,
-            stdout,
-            stderr,
-            duration_ms: started.elapsed().as_millis(),
-        })
+        if result.is_err() {
+            // Bound blocking channel/session destruction after any run error,
+            // including completion errors, regardless of the output mode.
+            // Keep the original error and never reuse the operation timeout
+            // (which can be 15 minutes or explicitly unlimited) for cleanup.
+            session.set_timeout(100);
+        }
+        result
     }
 
     fn run_pty_inner(
@@ -1218,14 +1228,8 @@ fn read_channel_outputs(
     output_limit: usize,
     output: Option<&mut super::OutputCallback<'_>>,
 ) -> anyhow::Result<(String, String)> {
-    let streaming = output.is_some();
     session.set_blocking(false);
     let drained = drain_both_streams(channel, deadline, output_limit, output);
-    if streaming && drained.is_err() {
-        // A failed output sink must not leave channel destruction waiting for
-        // the original (possibly 15-minute) operation timeout.
-        session.set_timeout(100);
-    }
     session.set_blocking(true);
     let (out, err) = drained?;
     let stdout = decode_remote_output_lossy(out);

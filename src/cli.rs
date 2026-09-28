@@ -860,9 +860,7 @@ where
                 Ok(result)
             }
             Err(error) => Err(match error.downcast::<crate::ssh::PartialRunError>() {
-                Ok(partial) => partial
-                    .source
-                    .context("streamed command failed; completion was not confirmed"),
+                Ok(partial) => streamed_run_error(partial.source, &secrets),
                 Err(error) => error,
             }),
         }
@@ -1098,6 +1096,22 @@ fn redact_with_known_secrets(input: &str, secrets: &[Option<&str>]) -> String {
         redacted = redacted.replace(secret, "<redacted>");
     }
     redacted
+}
+
+fn streamed_run_error(source: anyhow::Error, secrets: &[Option<&str>]) -> anyhow::Error {
+    // Redact causes individually before joining: a prefix or adjacent PEM
+    // blocks can otherwise hide a key marker from the line-oriented redactor.
+    let mut causes = Vec::new();
+    for cause in source.chain() {
+        let cause = redact_with_known_secrets(&cause.to_string(), secrets);
+        if causes.last() != Some(&cause) {
+            causes.push(cause);
+        }
+    }
+    source.context(format!(
+        "streamed command failed; completion was not confirmed: {}",
+        causes.join(": ")
+    ))
 }
 
 fn redact_partial_run_error(err: anyhow::Error, secrets: &[Option<&str>]) -> anyhow::Error {
@@ -1683,6 +1697,57 @@ mod runtime_backend_tests {
     use crate::home::ResolvedHome;
     use crate::ssh::{HostKeyInfo, RunResult, TransferResult};
     use std::cell::Cell;
+
+    #[test]
+    fn streamed_failure_shows_causes_without_replaying_output() {
+        for cause in [
+            "ssh operation timed out after 1000 milliseconds",
+            "connection reset by peer",
+            "ssh session output exceeded 1024-byte limit",
+        ] {
+            let error = streamed_run_error(
+                crate::error::app_error(ErrorKind::Ssh, cause).context("ssh session error"),
+                &[],
+            );
+            let output = error_output(&error, false);
+            assert_eq!(output.exit_code, 5);
+            assert!(output.stdout.is_empty());
+            assert!(output.stderr.contains("completion was not confirmed"));
+            assert!(output.stderr.contains(cause), "{}", output.stderr);
+            assert_eq!(output.stderr.matches(cause).count(), 1);
+        }
+    }
+
+    #[test]
+    fn streamed_failure_redacts_each_cause_and_preserves_io_kind() {
+        let detail = "sink closed for login-secret and privilege-secret\npassword=synthetic\n-----BEGIN OPENSSH PRIVATE KEY-----\nprivate-key-body\n-----END OPENSSH PRIVATE KEY-----";
+        let source = crate::error::classified_io_error(
+            ErrorKind::Io,
+            io::ErrorKind::BrokenPipe,
+            anyhow::anyhow!(detail),
+        );
+        let error = streamed_run_error(
+            anyhow::Error::new(source).context(detail),
+            &[Some("login-secret"), Some("privilege-secret")],
+        );
+        let output = error_output(&error, false);
+        assert_eq!(output.exit_code, 6);
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.contains("sink closed"), "{}", output.stderr);
+        for secret in [
+            "login-secret",
+            "privilege-secret",
+            "synthetic",
+            "private-key-body",
+        ] {
+            assert!(!output.stderr.contains(secret), "{}", output.stderr);
+        }
+        assert_eq!(output.stderr.matches("sink closed").count(), 1);
+        assert_eq!(
+            error.downcast_ref::<io::Error>().unwrap().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+    }
 
     #[test]
     fn partial_output_redacts_full_and_truncated_known_secrets() {

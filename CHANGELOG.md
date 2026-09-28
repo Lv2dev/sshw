@@ -8,6 +8,10 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 
 ## [Unreleased]
 
+### 실행 오류 처리 수정
+- 일반 실행·sudo의 타임아웃, 출력 제한 및 완료 확인 오류 이후 SSH 정리 대기를 짧게 제한합니다. 기본 출력·JSON·스트리밍에 동일하게 적용하며 원래 오류 종류와 부분 출력을 유지합니다.
+- `run --stream` 실패 시 완료 미확정 안내와 함께 실제 원인을 표시합니다. 각 원인의 비밀을 먼저 마스킹하고 이미 출력한 내용은 반복하지 않습니다.
+
 ## [0.14.2] - 2026-09-27
 
 ### 원자적 업로드 오류 안내

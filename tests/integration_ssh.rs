@@ -1676,6 +1676,168 @@ fn op_timeout_aborts_idle_command() {
 
 #[test]
 #[ignore = "spawns a real sshd; run with --ignored --test-threads=1"]
+fn run_timeout_cli_has_bounded_cleanup_and_actionable_errors() {
+    let srv = TestServer::start();
+    srv.trust();
+    let home = tempfile::tempdir().unwrap();
+    let mut config = SshwConfig {
+        default: Some("test".into()),
+        credential_backend: sshw::config::CredentialBackend::SessionOnly,
+        ..SshwConfig::default()
+    };
+    config.servers.insert("test".into(), srv.server());
+    save_config(&home.path().join("servers.json"), &config).unwrap();
+    fs::copy(&srv.known_hosts, home.path().join("known_hosts")).unwrap();
+
+    for mode in ["buffered", "json", "stream"] {
+        let ready = home.path().join("ready");
+        // Start measuring only when the remote command is running, so slow
+        // SSH connection/authentication on CI does not consume the time budget.
+        let script = format!(
+            "printf 'started\\n'; printf 'warning\\n' >&2; touch '{}'; sleep 4",
+            ready.display()
+        );
+        let mut command = Command::new(env!("CARGO_BIN_EXE_sshw"));
+        command
+            .env("SSHW_HOME", home.path())
+            .env_remove("SSHW_PASSWORD")
+            .env_remove("SSHW_PRIVILEGE_PASSWORD")
+            .args(["--timeout", "1", "run", "test", &script])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if mode != "buffered" {
+            command.arg(format!("--{mode}"));
+        }
+        let mut child = command.spawn().unwrap();
+        let started = Instant::now();
+        while !ready.exists() {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "command exited before marker: {mode}"
+            );
+            if started.elapsed() > Duration::from_secs(10) {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("remote command did not start: {mode}");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let running = Instant::now();
+        while child.try_wait().unwrap().is_none() {
+            if running.elapsed() > Duration::from_secs(5) {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("timeout failed to terminate CLI: {mode}");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let elapsed = running.elapsed();
+        let result = child.wait_with_output().unwrap();
+        fs::remove_file(&ready).unwrap();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "{mode} cleanup took {elapsed:?}"
+        );
+        assert_eq!(result.status.code(), Some(5));
+        if mode == "json" {
+            let value: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+            assert_eq!(value["error"]["kind"], "ssh");
+            assert!(
+                value["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("timed out")
+            );
+            assert_eq!(value["partial_output"]["stdout"], "started\n");
+            assert_eq!(value["partial_output"]["stderr"], "warning\n");
+            assert_eq!(value["partial_output"]["completion_confirmed"], false);
+            assert!(result.stderr.is_empty());
+        } else {
+            assert_eq!(String::from_utf8(result.stdout).unwrap(), "started\n");
+            let stderr = String::from_utf8(result.stderr).unwrap();
+            assert!(
+                stderr.contains("timed out after 1000 milliseconds"),
+                "{stderr}"
+            );
+            assert!(stderr.contains("completion was not confirmed"), "{stderr}");
+            assert_eq!(stderr.matches("warning").count(), 1);
+        }
+    }
+}
+
+#[test]
+#[ignore = "spawns a real sshd; run with --ignored --test-threads=1"]
+fn run_output_limit_bounds_cleanup_even_without_an_operation_timeout() {
+    let srv = TestServer::start();
+    srv.trust();
+    let server = srv.server();
+    for timeout in [None, Some(Duration::from_secs(5))] {
+        let client = srv.client().with_op_timeout(timeout).with_output_limit(16);
+        let started = Instant::now();
+        // Exercise the stdin path shared with sudo, after the password-sized
+        // input has been consumed. The server remains alive after the cap.
+        let error = client
+            .run_with_stdin(
+                &default_target(&server),
+                &AuthMaterial::Agent,
+                "cat >/dev/null; head -c 1024 /dev/zero; sleep 4",
+                "synthetic-input\n",
+            )
+            .unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "cleanup took {:?}",
+            started.elapsed()
+        );
+        assert!(
+            error.to_string().contains("output exceeded 16-byte limit"),
+            "{error:#}"
+        );
+        assert_eq!(
+            sshw::output::classify_error(&error),
+            sshw::output::ErrorKind::Ssh
+        );
+    }
+}
+
+#[test]
+#[ignore = "spawns a real sshd; run with --ignored --test-threads=1"]
+fn run_completion_timeout_bounds_cleanup_and_preserves_partial_output() {
+    let srv = TestServer::start();
+    srv.trust();
+    let server = srv.server();
+    let started = Instant::now();
+    let error = srv
+        .client()
+        .with_op_timeout(Some(Duration::from_secs(1)))
+        .run(
+            &default_target(&server),
+            &AuthMaterial::Agent,
+            "printf 'complete output\\n'; exec 1>&- 2>&-; sleep 4",
+        )
+        .unwrap_err();
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "cleanup took {:?}",
+        started.elapsed()
+    );
+    let partial = error.downcast_ref::<sshw::ssh::PartialRunError>().unwrap();
+    assert_eq!(partial.stdout, "complete output\n");
+    assert!(partial.stderr.is_empty());
+    // EOF was already drained: this must exercise the native wait_close
+    // timeout, not the operation deadline in the output-reading loop.
+    assert!(
+        partial.source.downcast_ref::<ssh2::Error>().is_some(),
+        "expected a native completion error: {error:#}"
+    );
+    assert_eq!(
+        sshw::output::classify_error(&error),
+        sshw::output::ErrorKind::Ssh
+    );
+}
+
+#[test]
+#[ignore = "spawns a real sshd; run with --ignored --test-threads=1"]
 fn run_handles_large_stderr_without_deadlock() {
     let srv = TestServer::start();
     srv.trust();
