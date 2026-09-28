@@ -811,7 +811,8 @@ fn privilege_clear_json_success_reports_state_change() {
         PrivilegeConfig {
             method: PrivilegeMethod::Sudo,
             user: "root".to_string(),
-            credential: privilege_credential(&path, "server-alpha"),
+            credential: Some(privilege_credential(&path, "server-alpha")),
+            no_password: false,
         },
     );
     save_config(&path, &config).unwrap();
@@ -1016,7 +1017,8 @@ fn remove_deletes_privilege_metadata_and_password() {
         PrivilegeConfig {
             method: PrivilegeMethod::Sudo,
             user: "root".to_string(),
-            credential: privilege_credential(&path, "server-alpha"),
+            credential: Some(privilege_credential(&path, "server-alpha")),
+            no_password: false,
         },
     );
     config
@@ -1033,7 +1035,8 @@ fn remove_deletes_privilege_metadata_and_password() {
                 privilege: Some(PrivilegeConfig {
                     method: PrivilegeMethod::Sudo,
                     user: "admin".to_string(),
-                    credential: ops_privilege.clone(),
+                    credential: Some(ops_privilege.clone()),
+                    no_password: false,
                 }),
             },
         );
@@ -1347,7 +1350,8 @@ fn add_update_removes_stale_privilege_metadata_and_password() {
         PrivilegeConfig {
             method: PrivilegeMethod::Sudo,
             user: "root".to_string(),
-            credential: privilege_credential(&path, "server-alpha"),
+            credential: Some(privilege_credential(&path, "server-alpha")),
+            no_password: false,
         },
     );
     config
@@ -1364,7 +1368,8 @@ fn add_update_removes_stale_privilege_metadata_and_password() {
                 privilege: Some(PrivilegeConfig {
                     method: PrivilegeMethod::Sudo,
                     user: "admin".to_string(),
-                    credential: ops_privilege.clone(),
+                    credential: Some(ops_privilege.clone()),
+                    no_password: false,
                 }),
             },
         );
@@ -1604,17 +1609,20 @@ fn privilege_set_stores_root_password_outside_config() {
         CredentialPurpose::Privilege,
         "server-alpha",
         "deploy",
-        &privilege.credential
+        privilege.credential.as_deref().unwrap()
     ));
     assert_ne!(
         privilege.credential,
-        namespace.legacy_privilege_credential_key("server-alpha")
+        Some(namespace.legacy_privilege_credential_key("server-alpha"))
     );
 
     let stored = store
         .values
         .borrow()
-        .get(&(privilege.credential.clone(), "root".to_string()))
+        .get(&(
+            privilege.credential.as_ref().unwrap().clone(),
+            "root".to_string(),
+        ))
         .cloned()
         .unwrap();
     assert_eq!(stored, "ROOT_PASSWORD");
@@ -1673,7 +1681,8 @@ fn privilege_show_redacts_secret_material() {
         PrivilegeConfig {
             method: PrivilegeMethod::Sudo,
             user: "root".to_string(),
-            credential: privilege_credential(&path, "server-alpha"),
+            credential: Some(privilege_credential(&path, "server-alpha")),
+            no_password: false,
         },
     );
     save_config(&path, &config).unwrap();
@@ -1717,7 +1726,8 @@ fn privilege_show_json_success_includes_ok_true() {
         PrivilegeConfig {
             method: PrivilegeMethod::Sudo,
             user: "root".to_string(),
-            credential: privilege_credential(&path, "server-alpha"),
+            credential: Some(privilege_credential(&path, "server-alpha")),
+            no_password: false,
         },
     );
     save_config(&path, &config).unwrap();
@@ -1752,7 +1762,8 @@ fn privilege_clear_removes_metadata_and_stored_password() {
         PrivilegeConfig {
             method: PrivilegeMethod::Sudo,
             user: "root".to_string(),
-            credential: privilege_credential(&path, "server-alpha"),
+            credential: Some(privilege_credential(&path, "server-alpha")),
+            no_password: false,
         },
     );
     save_config(&path, &config).unwrap();
@@ -1792,7 +1803,8 @@ fn privilege_clear_removes_metadata_when_password_delete_fails() {
         PrivilegeConfig {
             method: PrivilegeMethod::Sudo,
             user: "root".to_string(),
-            credential: privilege_credential(&path, "server-alpha"),
+            credential: Some(privilege_credential(&path, "server-alpha")),
+            no_password: false,
         },
     );
     save_config(&path, &config).unwrap();
@@ -1827,7 +1839,8 @@ fn privilege_set_update_deletes_previous_user_credential() {
         PrivilegeConfig {
             method: PrivilegeMethod::Sudo,
             user: "root".to_string(),
-            credential: privilege_credential(&path, "server-alpha"),
+            credential: Some(privilege_credential(&path, "server-alpha")),
+            no_password: false,
         },
     );
     save_config(&path, &config).unwrap();
@@ -1879,12 +1892,10 @@ fn privilege_set_update_deletes_previous_user_credential() {
             "root".to_string()
         )]
     );
-    assert!(
-        store
-            .values
-            .borrow()
-            .contains_key(&(privilege.credential.clone(), "admin".to_string()))
-    );
+    assert!(store.values.borrow().contains_key(&(
+        privilege.credential.as_ref().unwrap().clone(),
+        "admin".to_string()
+    )));
 }
 
 #[test]
@@ -1903,7 +1914,8 @@ fn privilege_set_update_surfaces_previous_credential_delete_failure() {
         PrivilegeConfig {
             method: PrivilegeMethod::Sudo,
             user: "root".to_string(),
-            credential: privilege_credential(&path, "server-alpha"),
+            credential: Some(privilege_credential(&path, "server-alpha")),
+            no_password: false,
         },
     );
     save_config(&path, &config).unwrap();
@@ -1953,12 +1965,10 @@ fn privilege_set_update_surfaces_previous_credential_delete_failure() {
     let config = load_config(&path).unwrap();
     let privilege = default_privilege(&config, "server-alpha").unwrap();
     assert_eq!(privilege.user, "admin");
-    assert!(
-        store
-            .values
-            .borrow()
-            .contains_key(&(privilege.credential.clone(), "admin".to_string()))
-    );
+    assert!(store.values.borrow().contains_key(&(
+        privilege.credential.as_ref().unwrap().clone(),
+        "admin".to_string()
+    )));
     // The previous user's credential remains an orphan because delete failed.
     assert!(store.values.borrow().contains_key(&(
         privilege_credential(&path, "server-alpha"),
@@ -2242,7 +2252,8 @@ fn run_as_root_uses_sudo_stdin_and_redacts_privilege_secret() {
         PrivilegeConfig {
             method: PrivilegeMethod::Sudo,
             user: "root".to_string(),
-            credential: privilege_credential(&path, "server-alpha"),
+            credential: Some(privilege_credential(&path, "server-alpha")),
+            no_password: false,
         },
     );
     save_config(&path, &config).unwrap();
@@ -2336,6 +2347,435 @@ fn passwordless_sudo_needs_no_privilege_secret_and_reports_remote_failure() {
     assert_eq!(ssh.run_stdin.borrow().as_slice(), &[None]);
 }
 
+fn agent_accounts_config(path: &Path) -> SshwConfig {
+    let mut config = sample_config(path);
+    let server = config.servers.get_mut("server-alpha").unwrap();
+    server.account_mut("deploy").unwrap().auth = AuthConfig::Agent;
+    server.accounts.insert(
+        "ops".into(),
+        AccountConfig {
+            auth: AuthConfig::Agent,
+            privilege: None,
+        },
+    );
+    config
+}
+
+struct NoPasswordPrompter {
+    prompts: Vec<String>,
+}
+
+impl Prompter for NoPasswordPrompter {
+    fn confirm(&mut self, prompt: &str) -> anyhow::Result<bool> {
+        self.prompts.push(prompt.to_string());
+        Ok(true)
+    }
+    fn password(&mut self, _: &str) -> anyhow::Result<String> {
+        panic!("unexpected password prompt")
+    }
+    fn password_stdin(&mut self) -> anyhow::Result<String> {
+        panic!("unexpected password stdin")
+    }
+}
+
+#[test]
+fn saved_passwordless_sudo_uses_selected_target_without_secret_access() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &agent_accounts_config(&path)).unwrap();
+    let store = FakeCredentialStore::default();
+    let ssh = FakeSshClient::default();
+    let mut prompter = NoPasswordPrompter {
+        prompts: Vec::new(),
+    };
+    let result = execute(
+        Cli::try_parse_from([
+            "sshw",
+            "privilege",
+            "set",
+            "server-alpha",
+            "--account",
+            "ops",
+            "--user",
+            "service",
+            "--no-password",
+            "--json",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    )
+    .unwrap();
+    let output: serde_json::Value = serde_json::from_str(&result.stdout).unwrap();
+    assert_eq!(output["account"], "ops");
+    assert_eq!(output["user"], "service");
+    assert_eq!(output["no_password"], true);
+    assert!(output["credential"].is_null());
+    let saved = load_config(&path).unwrap();
+    assert!(
+        saved.servers["server-alpha"].accounts["deploy"]
+            .privilege
+            .is_none()
+    );
+    let privilege = saved.servers["server-alpha"].accounts["ops"]
+        .privilege
+        .as_ref()
+        .unwrap();
+    assert!(privilege.no_password);
+    assert_eq!(privilege.credential, None);
+    let saved_json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert!(
+        saved_json["servers"]["server-alpha"]["accounts"]["ops"]["privilege"]
+            .get("credential")
+            .is_none()
+    );
+
+    for extra in [None, Some("--no-password")] {
+        let mut args = vec![
+            "sshw",
+            "run",
+            "server-alpha",
+            "whoami",
+            "--user",
+            "ops",
+            "--as-root",
+        ];
+        args.extend(extra);
+        execute(
+            Cli::try_parse_from(args).unwrap(),
+            &path,
+            &store,
+            &ssh,
+            &mut prompter,
+        )
+        .unwrap();
+    }
+    assert!(
+        ssh.run_commands
+            .borrow()
+            .iter()
+            .all(|command| command.starts_with("sudo -n -u 'service' -- sh -c "))
+    );
+    assert_eq!(*ssh.run_stdin.borrow(), vec![None, None]);
+    assert_eq!(*ssh.selected_users.borrow(), vec!["ops", "ops"]);
+    execute(
+        Cli::try_parse_from(["sshw", "run", "server-alpha", "whoami", "--user", "ops"]).unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    )
+    .unwrap();
+    assert_eq!(
+        ssh.run_commands.borrow().last().unwrap(),
+        "whoami",
+        "a saved setting must not elevate ordinary runs"
+    );
+
+    let denied = execute(
+        Cli::try_parse_from([
+            "sshw",
+            "run",
+            "server-alpha",
+            "whoami",
+            "--user",
+            "ops",
+            "--as-root",
+            "--json",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &FakeSshClient::with_exit_status(1),
+        &mut prompter,
+    )
+    .unwrap();
+    assert_eq!(denied.exit_code, 8);
+    let value: serde_json::Value = serde_json::from_str(&denied.stdout).unwrap();
+    assert_eq!(value["exit_status"], 1);
+    assert_eq!(value["command_succeeded"], false);
+
+    let doctor = execute(
+        Cli::try_parse_from(["sshw", "doctor", "--json"]).unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    )
+    .unwrap();
+    assert!(!doctor.stdout.contains("privilege_credential"));
+    let account = execute(
+        Cli::try_parse_from(["sshw", "account", "show", "server-alpha", "ops", "--json"]).unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    )
+    .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&account.stdout).unwrap();
+    assert_eq!(value["privilege"]["no_password"], true);
+    let calls = ssh.run_commands.borrow().len();
+    let dangerous = execute_for_runtime(
+        Cli::try_parse_from([
+            "sshw",
+            "run",
+            "server-alpha",
+            "rm -rf /",
+            "--user",
+            "ops",
+            "--as-root",
+            "--json",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    );
+    assert_eq!(dangerous.exit_code, 2);
+    write_policy(
+        temp.path(),
+        r#"{"version":1,"enabled":true,"allow_commands":["uptime"]}"#,
+    );
+    let blocked = execute_for_runtime(
+        Cli::try_parse_from([
+            "sshw",
+            "run",
+            "server-alpha",
+            "whoami",
+            "--user",
+            "ops",
+            "--as-root",
+            "--json",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    );
+    assert_eq!(blocked.exit_code, 7);
+    assert_eq!(ssh.run_commands.borrow().len(), calls);
+    assert!(store.values.borrow().is_empty());
+    assert!(store.requested.borrow().is_empty());
+    assert!(store.deleted.borrow().is_empty());
+}
+
+#[test]
+fn passwordless_privilege_transitions_and_prompts_identify_both_accounts() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &agent_accounts_config(&path)).unwrap();
+    let store = FakeCredentialStore::default();
+    let ssh = FakeSshClient::default();
+    let mut no_password_prompter = NoPasswordPrompter {
+        prompts: Vec::new(),
+    };
+    execute(
+        Cli::try_parse_from([
+            "sshw",
+            "privilege",
+            "set",
+            "server-alpha",
+            "--account",
+            "ops",
+            "--user",
+            "root",
+            "--password-stdin",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut FakePrompter::default(),
+    )
+    .unwrap();
+    let old = load_config(&path).unwrap().servers["server-alpha"].accounts["ops"]
+        .privilege
+        .as_ref()
+        .unwrap()
+        .credential
+        .clone()
+        .unwrap();
+    let set = execute(
+        Cli::try_parse_from([
+            "sshw",
+            "privilege",
+            "set",
+            "server-alpha",
+            "--account",
+            "ops",
+            "--user",
+            "service",
+            "--no-password",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut no_password_prompter,
+    )
+    .unwrap();
+    assert!(set.stdout.contains("server-alpha/ops"));
+    assert!(set.stdout.contains("login account: ops"));
+    assert!(set.stdout.contains("target user: service"));
+    assert_eq!(*store.deleted.borrow(), vec![(old, "root".into())]);
+    assert!(store.values.borrow().is_empty());
+    let prompt = &no_password_prompter.prompts[0];
+    assert!(prompt.contains("server-alpha/ops"));
+    assert!(prompt.contains("sudo target: root -> sudo target: service"));
+    assert!(prompt.contains("password -> no password"));
+    let show = execute(
+        Cli::try_parse_from([
+            "sshw",
+            "privilege",
+            "show",
+            "server-alpha",
+            "--account",
+            "ops",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut no_password_prompter,
+    )
+    .unwrap();
+    assert!(show.stdout.contains("login account: ops"));
+    assert!(show.stdout.contains("target user: service"));
+    assert!(show.stdout.contains("credential: none"));
+    execute(
+        Cli::try_parse_from([
+            "sshw",
+            "privilege",
+            "set",
+            "server-alpha",
+            "--account",
+            "ops",
+            "--user",
+            "service2",
+            "--no-password",
+            "--force",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut no_password_prompter,
+    )
+    .unwrap();
+    assert_eq!(
+        store.deleted.borrow().len(),
+        1,
+        "no nonexistent credential cleanup"
+    );
+    let clear = execute(
+        Cli::try_parse_from([
+            "sshw",
+            "privilege",
+            "clear",
+            "server-alpha",
+            "--account",
+            "ops",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut no_password_prompter,
+    )
+    .unwrap();
+    assert!(
+        clear
+            .stdout
+            .contains("server-alpha/ops (sudo target: service2)")
+    );
+    let prompt = no_password_prompter.prompts.last().unwrap();
+    assert!(prompt.contains("server-alpha/ops"));
+    assert!(prompt.contains("sudo target: service2"));
+    assert_eq!(store.deleted.borrow().len(), 1);
+
+    execute(
+        Cli::try_parse_from(["sshw", "privilege", "set", "server-alpha", "--no-password"]).unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut no_password_prompter,
+    )
+    .unwrap();
+    execute(
+        Cli::try_parse_from([
+            "sshw",
+            "privilege",
+            "set",
+            "server-alpha",
+            "--password-stdin",
+            "--force",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut FakePrompter::default(),
+    )
+    .unwrap();
+    let saved = load_config(&path).unwrap();
+    let privilege = saved.servers["server-alpha"].accounts["deploy"]
+        .privilege
+        .as_ref()
+        .unwrap();
+    assert!(!privilege.no_password);
+    assert!(
+        store
+            .values
+            .borrow()
+            .contains_key(&(privilege.credential.clone().unwrap(), "root".into()))
+    );
+}
+
+#[test]
+fn passwordless_account_and_server_removal_skip_nonexistent_credentials() {
+    for remove in [
+        vec!["account", "remove", "server-alpha", "ops", "--yes"],
+        vec!["remove", "server-alpha", "--yes"],
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("servers.json");
+        let mut config = agent_accounts_config(&path);
+        config
+            .servers
+            .get_mut("server-alpha")
+            .unwrap()
+            .accounts
+            .get_mut("ops")
+            .unwrap()
+            .privilege = Some(PrivilegeConfig {
+            method: PrivilegeMethod::Sudo,
+            user: "service".into(),
+            credential: None,
+            no_password: true,
+        });
+        save_config(&path, &config).unwrap();
+        let store = FakeCredentialStore {
+            delete_error: Some("credential deletion must not be attempted".into()),
+            ..Default::default()
+        };
+        let mut args = vec!["sshw"];
+        args.extend(remove);
+        execute(
+            Cli::try_parse_from(args).unwrap(),
+            &path,
+            &store,
+            &FakeSshClient::default(),
+            &mut NoPasswordPrompter { prompts: vec![] },
+        )
+        .unwrap();
+    }
+}
+
 #[test]
 fn profile_mutations_have_json_without_changing_namespace_contract() {
     let temp = tempfile::tempdir().unwrap();
@@ -2383,7 +2823,8 @@ fn session_passwords_are_selected_by_typed_login_and_privilege_purpose() {
         PrivilegeConfig {
             method: PrivilegeMethod::Sudo,
             user: "root".to_string(),
-            credential: privilege_credential(&path, "server-alpha"),
+            credential: Some(privilege_credential(&path, "server-alpha")),
+            no_password: false,
         },
     );
     save_config(&path, &config).unwrap();
@@ -2420,7 +2861,8 @@ fn run_as_root_rejects_stored_multiline_privilege_password_before_ssh() {
         PrivilegeConfig {
             method: PrivilegeMethod::Sudo,
             user: "root".to_string(),
-            credential: privilege_credential(&path, "server-alpha"),
+            credential: Some(privilege_credential(&path, "server-alpha")),
+            no_password: false,
         },
     );
     save_config(&path, &config).unwrap();
@@ -2467,7 +2909,8 @@ fn run_as_root_su_injects_password_over_pty_without_leaking_it() {
         PrivilegeConfig {
             method: PrivilegeMethod::Su,
             user: "root".to_string(),
-            credential: privilege_credential(&path, "server-alpha"),
+            credential: Some(privilege_credential(&path, "server-alpha")),
+            no_password: false,
         },
     );
     save_config(&path, &config).unwrap();
@@ -3791,7 +4234,8 @@ fn run_redacts_overlapping_login_and_privilege_secrets_longest_first() {
         PrivilegeConfig {
             method: PrivilegeMethod::Sudo,
             user: "root".to_string(),
-            credential: privilege_credential(&path, "server-alpha"),
+            credential: Some(privilege_credential(&path, "server-alpha")),
+            no_password: false,
         },
     );
     save_config(&path, &config).unwrap();
@@ -4084,7 +4528,8 @@ fn run_as_root_audit_records_privilege_marker_without_secret() {
         PrivilegeConfig {
             method: PrivilegeMethod::Sudo,
             user: "root".to_string(),
-            credential: privilege_credential(&path, "server-alpha"),
+            credential: Some(privilege_credential(&path, "server-alpha")),
+            no_password: false,
         },
     );
     save_config(&path, &config).unwrap();
@@ -5234,7 +5679,7 @@ fn privilege_configuration_is_scoped_to_the_selected_login_account() {
                 CredentialPurpose::Privilege,
                 "server-alpha",
                 "ops",
-                &privilege.credential,
+                privilege.credential.as_deref().unwrap(),
             )
     );
     assert!(
@@ -5689,7 +6134,8 @@ fn account_auth_update_preserves_privilege_and_deletes_only_stale_login_secret()
                 privilege: Some(PrivilegeConfig {
                     method: PrivilegeMethod::Sudo,
                     user: "root".to_string(),
-                    credential: privilege.clone(),
+                    credential: Some(privilege.clone()),
+                    no_password: false,
                 }),
             },
         );
@@ -5722,7 +6168,10 @@ fn account_auth_update_preserves_privilege_and_deletes_only_stale_login_secret()
     let config = load_config(&path).unwrap();
     let account = &config.servers["server-alpha"].accounts["ops"];
     assert!(matches!(account.auth, AuthConfig::Agent));
-    assert_eq!(account.privilege.as_ref().unwrap().credential, privilege);
+    assert_eq!(
+        account.privilege.as_ref().unwrap().credential.as_ref(),
+        Some(&privilege)
+    );
     assert_eq!(
         store.deleted.borrow().as_slice(),
         [(login, "ops".to_string())]

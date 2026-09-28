@@ -285,7 +285,7 @@ pub struct PrivilegeArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum PrivilegeCommand {
-    /// Store privilege escalation metadata and password for a server.
+    /// Store privilege settings; use --no-password for non-interactive sudo.
     Set(PrivilegeSetArgs),
     /// Show privilege metadata without revealing the password.
     Show(PrivilegeShowArgs),
@@ -310,6 +310,10 @@ pub struct PrivilegeSetArgs {
     /// Read the privilege password from stdin instead of a hidden prompt.
     #[arg(long)]
     pub password_stdin: bool,
+    /// Store a sudo target without a password. run --as-root will use sudo -n.
+    /// Cannot be used with --method su or --password-stdin.
+    #[arg(long, conflicts_with = "password_stdin")]
+    pub no_password: bool,
     /// Overwrite an existing privilege configuration without prompting.
     #[arg(long)]
     pub force: bool,

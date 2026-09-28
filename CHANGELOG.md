@@ -8,6 +8,12 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 
 ## [Unreleased]
 
+### 권한 설정 개선
+- `privilege set --no-password --user <target>`로 로그인 계정별 sudo 대상을 비밀번호 없이 등록할 수 있습니다. 이후 `run --as-root`는 해당 설정으로 `sudo -n`을 사용하며 일반 실행은 자동 승격하지 않습니다.
+- 비밀번호 방식과의 전환, doctor, 계정·서버 삭제가 무비밀번호 상태를 지원합니다. `su` 또는 credential과 무비밀번호 상태를 섞은 설정은 거부하며, 기존 비밀번호는 설정 저장 성공 뒤에만 정리합니다.
+- 권한 설정·조회·삭제 결과와 확인 질문에 로그인 계정과 승격 대상을 구분해 표시합니다. JSON은 기존 필드를 유지하면서 `no_password`를 추가하고 무비밀번호 설정의 `credential`은 null로 반환합니다.
+- 기존 설정 파일은 그대로 읽고 비밀번호 방식으로 유지합니다. Rust API의 `PrivilegeConfig.credential`은 `Option<String>`으로 바뀌며 `no_password: bool`이 추가됩니다.
+
 ### 실행 오류 처리 수정
 - 일반 실행·sudo의 타임아웃, 출력 제한 및 완료 확인 오류 이후 SSH 정리 대기를 짧게 제한합니다. 기본 출력·JSON·스트리밍에 동일하게 적용하며 원래 오류 종류와 부분 출력을 유지합니다.
 - `run --stream` 실패 시 완료 미확정 안내와 함께 실제 원인을 표시합니다. 각 원인의 비밀을 먼저 마스킹하고 이미 출력한 내용은 반복하지 않습니다.

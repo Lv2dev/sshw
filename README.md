@@ -219,11 +219,20 @@ sshw privilege clear server-alpha --yes
 sshw run server-alpha "systemctl restart app" --user ops --as-root --yes
 ```
 
-Privilege metadata is scoped to the selected login account. `privilege set/show/clear --account <login-user>` selects an explicit account; omitting it uses the server default. `privilege set` stores only method, target user (default `root`), and credential key metadata in `servers.json`. The sudo/root password is stored in the active credential backend, never in CLI arguments or plaintext config. Without `--password-stdin`, `sshw` prompts with hidden input.
+Privilege metadata is scoped to the selected login account. `privilege set/show/clear --account <login-user>` selects an explicit account; omitting it uses the server default. `privilege set` stores only method, target user (default `root`), and credential key metadata in `servers.json`. The sudo/root password is stored in the active credential backend, never in CLI arguments or plaintext config. For password-based settings, omitting `--password-stdin` uses a hidden prompt. Passwordless settings store `no_password:true` without a credential reference. Existing settings remain password-based. Human set/show/clear output and confirmation prompts identify the login account and target user separately; JSON includes `no_password` and uses `credential:null` for passwordless settings.
 
-`run --as-root` (alias `--elevate`) explicitly requests elevation; a second `--yes` is not needed unless the original command triggers a safety check. It first applies the normal safety and policy checks to the original command, then uses `sudo -S` with the privilege password passed through SSH channel stdin. The password is never embedded in the remote command string or audit detail. If the target user has a `NOPASSWD` sudoers rule, the command runs regardless of whether the stored password is correct, since `sudo` never consumes it — keep the stored secret accurate, but do not rely on it as an extra gate in that configuration. A sudo password rejection is reported as the remote command's non-zero status (sshw exit `8`, with the real status in `run --json` as `exit_status`) because `sudo` ran remotely. `method=su` runs `su - <user> -c ...` over a PTY and injects the stored password at the `Password:` prompt (echo disabled, prompt forced to English via `LC_ALL=C`). The command's output and exit code are framed by markers and extracted exactly. It is more environment-sensitive than `sudo`; where the prompt is not recognized it fails closed via a timeout rather than hanging. A `su` prompt/auth failure before the completion marker is an sshw auth/setup failure and maps to exit code `4`.
+`run --as-root` (alias `--elevate`) explicitly requests elevation; a second `--yes` is not needed unless the original command triggers a safety check. With password-based sudo settings, it first applies the normal safety and policy checks to the original command, then uses `sudo -S` with the privilege password passed through SSH channel stdin. The password is never embedded in the remote command string or audit detail. If the target user has a `NOPASSWD` sudoers rule, the command runs regardless of whether the stored password is correct, since `sudo` never consumes it — keep the stored secret accurate, but do not rely on it as an extra gate in that configuration. A sudo password rejection is reported as the remote command's non-zero status (sshw exit `8`, with the real status in `run --json` as `exit_status`) because `sudo` ran remotely. `method=su` runs `su - <user> -c ...` over a PTY and injects the stored password at the `Password:` prompt (echo disabled, prompt forced to English via `LC_ALL=C`). The command's output and exit code are framed by markers and extracted exactly. It is more environment-sensitive than `sudo`; where the prompt is not recognized it fails closed via a timeout rather than hanging. A `su` prompt/auth failure before the completion marker is an sshw auth/setup failure and maps to exit code `4`.
 
 For a server that already permits passwordless sudo, use `sshw run web "id -u" --as-root --no-password`. This runs `sudo -n` without reading a stored privilege password or prompting. It uses the configured sudo target user, or `root` when no privilege configuration exists; a configured `su` path is rejected. The server still enforces sudoers. `privilege set --account` also accepts `--login-user`, and its target `--user` accepts `--target-user`.
+
+To save a passwordless sudo target for a specific login account:
+
+```bash
+sshw privilege set web --account ops --user service --no-password
+sshw run web "id -un" --user ops --as-root
+```
+
+The saved setting makes `--as-root` use `sudo -n` without prompting, storing or loading a privilege password. Ordinary runs still use the login account. `privilege set --no-password` rejects `--method su` and `--password-stdin`; omit `--no-password` on a later set to restore password-based authentication. Updating an existing setting requires confirmation or `--force`. Switching modes removes the old stored password only after the configuration is saved successfully. Doctor and removal commands skip nonexistent password entries. The server must independently allow the requested sudo target; denial returns the normal remote failure status without a password fallback.
 
 ### Host Trust Flow
 
@@ -677,13 +686,22 @@ sshw privilege clear server-alpha --yes
 sshw run server-alpha "systemctl restart app" --user ops --as-root --yes
 ```
 
-privilege metadata는 선택된 login account별로 분리됩니다. `privilege set/show/clear --account <login-user>`는 account를 명시하고, 생략하면 server default account를 사용합니다. `privilege set`은 method, 대상 user(기본 `root`), credential key metadata만 `servers.json`에 저장합니다. sudo/root 비밀번호는 활성 credential backend에만 저장되며 CLI 인자나 평문 config에는 들어가지 않습니다. `--password-stdin`을 쓰지 않으면 숨김 입력 프롬프트로 받습니다.
+privilege metadata는 선택된 login account별로 분리됩니다. `privilege set/show/clear --account <login-user>`는 account를 명시하고, 생략하면 server default account를 사용합니다. `privilege set`은 method, 대상 user(기본 `root`), credential key metadata만 `servers.json`에 저장합니다. sudo/root 비밀번호는 활성 credential backend에만 저장되며 CLI 인자나 평문 config에는 들어가지 않습니다. 비밀번호 방식에서 `--password-stdin`을 쓰지 않으면 숨김 입력 프롬프트로 받습니다. 무비밀번호 설정은 credential 참조 없이 `no_password:true`를 저장하고 기존 설정은 비밀번호 방식으로 읽습니다. 일반 set/show/clear 출력과 확인 질문은 로그인 계정과 승격 대상을 구분합니다. JSON에는 `no_password`가 추가되며 무비밀번호 설정의 `credential`은 null입니다.
 
-`run --as-root`(별칭 `--elevate`) 자체가 명시적 권한 상승 요청입니다. 원래 명령이 위험 작업 확인 대상인 경우에만 별도 `--yes`가 필요합니다. 원래 명령에 기존 safety/policy 검사를 먼저 적용한 뒤, SSH channel stdin으로만 privilege 비밀번호를 전달하는 `sudo -S` 경로를 사용합니다. 비밀번호는 원격 command string이나 audit detail에 들어가지 않습니다. 대상 user에 `NOPASSWD` sudoers 규칙이 있으면 `sudo`가 비밀번호를 소비하지 않으므로, 저장된 비밀번호의 정확성과 무관하게 명령이 실행됩니다 — 이 경우 저장 비밀번호는 추가 게이트가 아닙니다. sudo 비밀번호 거부는 원격에서 실행된 `sudo` 명령의 non-zero 상태로 보고되므로 sshw exit `8`이며, 실제 상태는 `run --json`의 `exit_status`에 들어갑니다. `method=su`는 `su - <user> -c ...`를 PTY로 실행하고 `Password:` 프롬프트가 나오면 저장된 비밀번호를 주입합니다(echo 비활성화, `LC_ALL=C`로 프롬프트를 영어로 고정). 명령 출력과 exit code는 marker로 정확히 추출되어 출력 라인이 누락되지 않습니다. `sudo`보다 환경에 민감하며, 프롬프트를 인식하지 못하면 무한 대기 대신 타임아웃으로 fail-closed됩니다. completion marker 전에 발생한 `su` 프롬프트/인증 실패는 sshw의 auth/setup 실패로 간주되어 exit code `4`에 매핑됩니다.
-
-### Host Trust Flow
+`run --as-root`(별칭 `--elevate`) 자체가 명시적 권한 상승 요청입니다. 원래 명령이 위험 작업 확인 대상인 경우에만 별도 `--yes`가 필요합니다. 비밀번호 sudo 설정에서는 원래 명령에 기존 safety/policy 검사를 먼저 적용한 뒤, SSH channel stdin으로만 privilege 비밀번호를 전달하는 `sudo -S` 경로를 사용합니다. 비밀번호는 원격 command string이나 audit detail에 들어가지 않습니다. 대상 user에 `NOPASSWD` sudoers 규칙이 있으면 `sudo`가 비밀번호를 소비하지 않으므로, 저장된 비밀번호의 정확성과 무관하게 명령이 실행됩니다 — 이 경우 저장 비밀번호는 추가 게이트가 아닙니다. sudo 비밀번호 거부는 원격에서 실행된 `sudo` 명령의 non-zero 상태로 보고되므로 sshw exit `8`이며, 실제 상태는 `run --json`의 `exit_status`에 들어갑니다. `method=su`는 `su - <user> -c ...`를 PTY로 실행하고 `Password:` 프롬프트가 나오면 저장된 비밀번호를 주입합니다(echo 비활성화, `LC_ALL=C`로 프롬프트를 영어로 고정). 명령 출력과 exit code는 marker로 정확히 추출되어 출력 라인이 누락되지 않습니다. `sudo`보다 환경에 민감하며, 프롬프트를 인식하지 못하면 무한 대기 대신 타임아웃으로 fail-closed됩니다. completion marker 전에 발생한 `su` 프롬프트/인증 실패는 sshw의 auth/setup 실패로 간주되어 exit code `4`에 매핑됩니다.
 
 서버가 이미 무비밀번호 sudo를 허용한다면 `sshw run web "id -u" --as-root --no-password`를 사용하세요. 저장된 privilege 비밀번호를 읽거나 입력받지 않고 `sudo -n`을 실행합니다. 등록된 sudo 대상 계정을 사용하며 설정이 없으면 root입니다. su 설정이 있으면 거부하고 실제 권한은 원격 sudoers가 결정합니다. `privilege set --account`는 `--login-user`, 대상 `--user`는 `--target-user` 별칭도 지원합니다.
+
+로그인 계정별 무비밀번호 sudo 대상을 저장하려면 다음과 같이 실행합니다.
+
+```bash
+sshw privilege set web --account ops --user service --no-password
+sshw run web "id -un" --user ops --as-root
+```
+
+이후 `--as-root`는 저장된 설정에 따라 `sudo -n`을 사용하며 privilege 비밀번호를 입력·저장·조회하지 않습니다. 일반 실행은 계속 로그인 계정을 사용합니다. `privilege set --no-password`는 `--method su`, `--password-stdin`과 함께 쓸 수 없습니다. 다시 비밀번호 방식으로 바꾸려면 set에서 `--no-password`를 생략하세요. 기존 설정 변경에는 확인 또는 `--force`가 필요하며, 이전 비밀번호는 설정 저장이 성공한 뒤에만 정리합니다. doctor와 삭제 명령은 존재하지 않는 비밀번호 항목을 조회·삭제하지 않습니다. 실제 sudo 권한은 서버에서 허용해야 하며, 거부되면 비밀번호 방식으로 재시도하지 않고 기존 원격 실패 상태를 반환합니다.
+
+### Host Trust Flow
 
 Host key 검증은 fail-closed이며, 알 수 없거나 변경된 key는 조용히 허용하지 않습니다. 신뢰한 key는 활성 home의 `known_hosts`에 저장됩니다.
 

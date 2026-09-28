@@ -411,7 +411,8 @@ fn docker_privileged_config(
     server.account_mut(TEST_USER).unwrap().privilege = Some(PrivilegeConfig {
         method,
         user: "root".to_string(),
-        credential: privilege_credential.clone(),
+        credential: Some(privilege_credential.clone()),
+        no_password: false,
     });
     let mut config = SshwConfig {
         default: Some("docker-password".to_string()),
@@ -781,6 +782,112 @@ fn streaming_sudo_redacts_loaded_password_and_closes_command_stdin() {
     );
     assert_eq!(String::from_utf8(result.stdout).unwrap(), "0\n<redacted>\n");
     assert!(!String::from_utf8_lossy(&result.stderr).contains(TEST_PASSWORD));
+}
+
+#[test]
+#[ignore = "spawns a Docker-backed sshd; run with --ignored --test-threads=1"]
+fn saved_passwordless_sudo_runs_as_non_root_target_without_a_privilege_secret() {
+    let Some(srv) = DockerPasswordServer::start() else {
+        return;
+    };
+    srv.trust();
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join("servers.json");
+    let (mut config, login_credential, _) =
+        docker_privileged_config(&path, &srv, PrivilegeMethod::Sudo);
+    config
+        .servers
+        .get_mut("docker-password")
+        .unwrap()
+        .account_mut(TEST_USER)
+        .unwrap()
+        .privilege = None;
+    save_config(&path, &config).unwrap();
+    let store = SessionOnlyStore::new();
+    store
+        .set_password_for(
+            CredentialPurpose::Login,
+            &login_credential,
+            TEST_USER,
+            TEST_PASSWORD,
+        )
+        .unwrap();
+    let mut prompter = NoopPrompter;
+    execute(
+        Cli::try_parse_from([
+            "sshw",
+            "privilege",
+            "set",
+            "docker-password",
+            "--user",
+            "daemon",
+            "--no-password",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &srv.client(),
+        &mut prompter,
+    )
+    .unwrap();
+    let output = execute(
+        Cli::try_parse_from([
+            "sshw",
+            "run",
+            "docker-password",
+            "id -un; cat",
+            "--as-root",
+            "--yes",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &srv.client(),
+        &mut prompter,
+    )
+    .unwrap();
+    assert_eq!(output.exit_code, 0);
+    assert_eq!(output.stdout, "daemon\n");
+    assert!(output.stderr.is_empty());
+
+    // Root still requires a password in this fixture. No interactive fallback.
+    execute(
+        Cli::try_parse_from([
+            "sshw",
+            "privilege",
+            "set",
+            "docker-password",
+            "--user",
+            "root",
+            "--no-password",
+            "--force",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &srv.client(),
+        &mut prompter,
+    )
+    .unwrap();
+    let denied = execute(
+        Cli::try_parse_from([
+            "sshw",
+            "run",
+            "docker-password",
+            "id -un",
+            "--as-root",
+            "--json",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &srv.client(),
+        &mut prompter,
+    )
+    .unwrap();
+    assert_eq!(denied.exit_code, 8);
+    let value: serde_json::Value = serde_json::from_str(&denied.stdout).unwrap();
+    assert_eq!(value["command_succeeded"], false);
 }
 
 #[test]

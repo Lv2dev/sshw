@@ -385,6 +385,48 @@ fn same_endpoint_update_preserves_other_accounts_and_privilege() {
 }
 
 #[test]
+fn passwordless_privilege_cli_needs_no_stdin_and_rejects_conflicting_options() {
+    let home = home();
+    add(home.path());
+    let path = home.path().join("servers.json");
+    let initial = std::fs::read(&path).unwrap();
+    for flags in [vec!["--method", "su"], vec!["--password-stdin"]] {
+        let mut args = vec!["privilege", "set", "web", "--no-password", "--json"];
+        args.extend(flags);
+        let output = run(home.path(), &args, "");
+        assert_eq!(output.status.code(), Some(9));
+        assert_eq!(std::fs::read(&path).unwrap(), initial);
+    }
+    let output = successful(
+        home.path(),
+        &[
+            "privilege",
+            "set",
+            "web",
+            "--user",
+            "service",
+            "--no-password",
+            "--json",
+        ],
+        "",
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["no_password"], true);
+    assert!(
+        value.get("warning").is_none(),
+        "passwordless settings need no password environment variable"
+    );
+    assert!(value["credential"].is_null());
+    let stored: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert!(
+        stored["servers"]["web"]["accounts"]["deploy"]["privilege"]
+            .get("credential")
+            .is_none()
+    );
+    successful(home.path(), &["privilege", "clear", "web", "--yes"], "");
+}
+
+#[test]
 fn endpoint_change_requires_explicit_replacement_before_mutation() {
     let home = home();
     add(home.path());

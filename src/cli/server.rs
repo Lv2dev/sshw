@@ -384,10 +384,12 @@ fn stored_credentials(server: &ServerConfig) -> Vec<(CredentialPurpose, String, 
         if let AuthConfig::Password { credential } = &account.auth {
             stored.push((CredentialPurpose::Login, credential.clone(), user.clone()));
         }
-        if let Some(privilege) = &account.privilege {
+        if let Some(privilege) = &account.privilege
+            && let Some(credential) = &privilege.credential
+        {
             stored.push((
                 CredentialPurpose::Privilege,
-                privilege.credential.clone(),
+                credential.clone(),
                 privilege.user.clone(),
             ));
         }
@@ -495,7 +497,8 @@ mod tests {
             .privilege = Some(PrivilegeConfig {
             method: PrivilegeMethod::Sudo,
             user: "root".to_string(),
-            credential: "sshw:default:privilege:web".to_string(),
+            credential: Some("sshw:default:privilege:web".to_string()),
+            no_password: false,
         });
         config
     }

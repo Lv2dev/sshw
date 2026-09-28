@@ -286,9 +286,10 @@ where
         cleanup_error = Some(err);
     }
     if let Some(privilege) = &account.privilege
+        && let Some(credential) = &privilege.credential
         && let Err(err) = credentials.delete_password_for(
             CredentialPurpose::Privilege,
-            &privilege.credential,
+            credential,
             &privilege.user,
         )
     {
@@ -323,6 +324,7 @@ fn account_json(user: &str, account: &AccountConfig, is_default: bool) -> Value 
             "method": privilege.method,
             "user": privilege.user,
             "credential": privilege.credential,
+            "no_password": privilege.no_password,
         })
     });
     json!({
@@ -341,6 +343,13 @@ fn auth_label(auth: &AuthConfig) -> &'static str {
 }
 
 fn privilege_label(account: &AccountConfig) -> &'static str {
+    if account
+        .privilege
+        .as_ref()
+        .is_some_and(|privilege| privilege.no_password)
+    {
+        return "sudo (no password)";
+    }
     match account.privilege.as_ref().map(|privilege| privilege.method) {
         Some(PrivilegeMethod::Sudo) => "sudo",
         Some(PrivilegeMethod::Su) => "su",

@@ -246,13 +246,57 @@ impl<'de> Deserialize<'de> for AuthConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct PrivilegeConfig {
     pub method: PrivilegeMethod,
-    #[serde(default = "default_privilege_user")]
     pub user: String,
-    pub credential: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential: Option<String>,
+    #[serde(skip_serializing_if = "is_false")]
+    pub no_password: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PrivilegeConfigWire {
+    method: PrivilegeMethod,
+    #[serde(default = "default_privilege_user")]
+    user: String,
+    credential: Option<String>,
+    #[serde(default)]
+    no_password: bool,
+}
+
+impl<'de> Deserialize<'de> for PrivilegeConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = PrivilegeConfigWire::deserialize(deserializer)?;
+        let config = Self {
+            method: wire.method,
+            user: wire.user,
+            credential: wire.credential,
+            no_password: wire.no_password,
+        };
+        config.validate().map_err(serde::de::Error::custom)?;
+        Ok(config)
+    }
+}
+
+impl PrivilegeConfig {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        match (self.no_password, self.method, &self.credential) {
+            (true, PrivilegeMethod::Sudo, None) | (false, _, Some(_)) => Ok(()),
+            (true, PrivilegeMethod::Su, _) => Err("no_password requires method sudo"),
+            (true, _, Some(_)) => Err("no_password cannot include a credential"),
+            (false, _, None) => Err("missing field `credential` for password privilege"),
+        }
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -389,14 +433,17 @@ pub fn validate_config_credential_references(
                 )?;
             }
             if let Some(privilege) = &account.privilege {
-                validate_credential_owner(
-                    namespace,
-                    CredentialPurpose::Privilege,
-                    name,
-                    user,
-                    &privilege.credential,
-                    &mut owners,
-                )?;
+                privilege.validate().map_err(anyhow::Error::msg)?;
+                if let Some(credential) = &privilege.credential {
+                    validate_credential_owner(
+                        namespace,
+                        CredentialPurpose::Privilege,
+                        name,
+                        user,
+                        credential,
+                        &mut owners,
+                    )?;
+                }
             }
         }
     }

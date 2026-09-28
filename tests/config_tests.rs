@@ -42,7 +42,8 @@ fn config_serializes_password_and_agent_auth_without_secrets() {
         .privilege = Some(PrivilegeConfig {
         method: PrivilegeMethod::Sudo,
         user: "root".to_string(),
-        credential: "sshw:default:privilege:server-alpha".to_string(),
+        credential: Some("sshw:default:privilege:server-alpha".to_string()),
+        no_password: false,
     });
 
     let json = serde_json::to_string_pretty(&config).unwrap();
@@ -345,14 +346,59 @@ fn credential_references_accept_expected_legacy_and_v2_keys() {
         .privilege = Some(PrivilegeConfig {
         method: PrivilegeMethod::Sudo,
         user: "root".to_string(),
-        credential: namespace.credential_key_v2(
+        credential: Some(namespace.credential_key_v2(
             CredentialPurpose::Privilege,
             "modern",
             "0000000000000002",
-        ),
+        )),
+        no_password: false,
     });
 
     validate_config_credential_references(&config, &namespace).unwrap();
+}
+
+#[test]
+fn privilege_modes_preserve_legacy_shape_and_roundtrip_passwordless_settings() {
+    let legacy = serde_json::json!({"method":"sudo","user":"root","credential":"existing-key"});
+    let parsed: PrivilegeConfig = serde_json::from_value(legacy.clone()).unwrap();
+    assert!(!parsed.no_password);
+    assert_eq!(parsed.credential.as_deref(), Some("existing-key"));
+    assert_eq!(serde_json::to_value(parsed).unwrap(), legacy);
+
+    let passwordless = serde_json::json!({"method":"sudo","user":"service","no_password":true});
+    let parsed: PrivilegeConfig = serde_json::from_value(passwordless.clone()).unwrap();
+    assert!(parsed.no_password);
+    assert_eq!(parsed.credential, None);
+    assert_eq!(serde_json::to_value(&parsed).unwrap(), passwordless);
+    let mut config = SshwConfig::default();
+    let mut server = ServerConfig::single_account("localhost", 22, "ops", AuthConfig::Agent);
+    server.account_mut("ops").unwrap().privilege = Some(parsed);
+    config.servers.insert("web".into(), server);
+    validate_config_credential_references(&config, &CredentialNamespace::profile("default"))
+        .unwrap();
+    let serialized = serde_json::to_string(&config).unwrap();
+    assert_eq!(
+        serde_json::from_str::<SshwConfig>(&serialized).unwrap(),
+        config
+    );
+}
+
+#[test]
+fn privilege_modes_reject_ambiguous_or_unsupported_authentication() {
+    for value in [
+        serde_json::json!({"method":"sudo"}),
+        serde_json::json!({"method":"su","no_password":true}),
+        serde_json::json!({"method":"sudo","credential":"key","no_password":true}),
+        serde_json::json!({"method":"sudo","credential":"","no_password":true}),
+        serde_json::json!({"method":"sudo","no_password":false}),
+        serde_json::json!({"method":"sudo","no_password":"true"}),
+        serde_json::json!({"method":"sudo","no_password":true,"future_auth":true}),
+    ] {
+        assert!(
+            serde_json::from_value::<PrivilegeConfig>(value.clone()).is_err(),
+            "{value}"
+        );
+    }
 }
 
 #[test]
@@ -528,12 +574,13 @@ fn v2_config_round_trip_preserves_multiple_accounts() {
             privilege: Some(PrivilegeConfig {
                 method: PrivilegeMethod::Sudo,
                 user: "root".to_string(),
-                credential: namespace.credential_key_v3(
+                credential: Some(namespace.credential_key_v3(
                     CredentialPurpose::Privilege,
                     "web",
                     "ops",
                     "0000000000000002",
-                ),
+                )),
+                no_password: false,
             }),
         },
     );

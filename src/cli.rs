@@ -773,7 +773,13 @@ where
     }
     let auth = resolve_auth(account, login_user, credentials)?;
     let ssh_target = SshTarget::new(server, login_user);
-    let privileged = if no_password {
+    let privileged = if no_password
+        || (as_root
+            && account
+                .privilege
+                .as_ref()
+                .is_some_and(|privilege| privilege.no_password))
+    {
         if account
             .privilege
             .as_ref()
@@ -964,18 +970,20 @@ fn fetch_validated_privilege_password<C>(
 where
     C: CredentialStore,
 {
+    let credential = privilege.credential.as_deref().ok_or_else(|| {
+        app_error(
+            ErrorKind::Config,
+            "password privilege requires a credential",
+        )
+    })?;
     let password = Zeroizing::new(
         credentials
-            .get_password_for(
-                CredentialPurpose::Privilege,
-                &privilege.credential,
-                &privilege.user,
-            )
+            .get_password_for(CredentialPurpose::Privilege, credential, &privilege.user)
             .with_error_kind(ErrorKind::Auth)
             .with_context(|| {
                 format!(
                     "missing credential entry for {} and privilege user {}",
-                    privilege.credential, privilege.user
+                    credential, privilege.user
                 )
             })?,
     );
@@ -1253,13 +1261,11 @@ where
             }
             for (user, account) in &server.accounts {
                 uses_agent |= matches!(account.auth, AuthConfig::Agent);
-                if let Some(privilege) = &account.privilege {
+                if let Some(privilege) = &account.privilege
+                    && let Some(credential) = &privilege.credential
+                {
                     let available = credentials
-                        .get_password_for(
-                            CredentialPurpose::Privilege,
-                            &privilege.credential,
-                            &privilege.user,
-                        )
+                        .get_password_for(CredentialPurpose::Privilege, credential, &privilege.user)
                         .map(Zeroizing::new)
                         .is_ok_and(|password| !password.is_empty());
                     if !available {
