@@ -390,6 +390,7 @@ impl SshClient for Ssh2Client {
         local: &Path,
         overwrite: bool,
     ) -> anyhow::Result<TransferResult> {
+        crate::storage::check_download_destination(local, overwrite)?;
         let known_hosts = self.resolved_known_hosts_path()?;
         let session = connect_verified_authenticated(
             target.server,

@@ -1051,6 +1051,81 @@ fn put_then_get_roundtrip() {
 
 #[test]
 #[ignore = "spawns a real sshd; run with --ignored --test-threads=1"]
+fn get_validates_local_paths_and_preserves_symlink_targets() {
+    use std::os::unix::fs::symlink;
+    let srv = TestServer::start();
+    let client = srv.client();
+    let server = srv.server();
+    let work = tempfile::tempdir().unwrap();
+    let source = work.path().join("source");
+    fs::write(&source, b"DATA").unwrap();
+    let directory = work.path().join("directory");
+    fs::create_dir(&directory).unwrap();
+    let parent_file = work.path().join("parent-file");
+    fs::write(&parent_file, b"ORIGINAL").unwrap();
+    // No host trust yet: direct library calls must reject local path errors
+    // before connecting and before any remote download could start.
+    for destination in [&directory, &parent_file.join("child")] {
+        for overwrite in [false, true] {
+            let error = client
+                .get(
+                    &default_target(&server),
+                    &AuthMaterial::Agent,
+                    source.to_str().unwrap(),
+                    destination,
+                    overwrite,
+                )
+                .unwrap_err();
+            assert_eq!(
+                sshw::output::classify_error(&error),
+                sshw::output::ErrorKind::Io
+            );
+            assert!(
+                error.to_string().contains(destination.to_str().unwrap()),
+                "{error:#}"
+            );
+        }
+    }
+    srv.trust();
+    let nested = work.path().join("missing/parents/download");
+    client
+        .get(
+            &default_target(&server),
+            &AuthMaterial::Agent,
+            source.to_str().unwrap(),
+            &nested,
+            false,
+        )
+        .unwrap();
+    assert_eq!(fs::read(&nested).unwrap(), b"DATA");
+    let missing = work.path().join("missing-target");
+    for (index, target) in [&parent_file, &directory, &missing].iter().enumerate() {
+        let destination = work.path().join(format!("link-{index}"));
+        symlink(target, &destination).unwrap();
+        client
+            .get(
+                &default_target(&server),
+                &AuthMaterial::Agent,
+                source.to_str().unwrap(),
+                &destination,
+                true,
+            )
+            .unwrap();
+        assert!(
+            !fs::symlink_metadata(&destination)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read(destination).unwrap(), b"DATA");
+    }
+    assert_eq!(fs::read(parent_file).unwrap(), b"ORIGINAL");
+    assert!(directory.is_dir());
+    assert!(!missing.exists());
+}
+
+#[test]
+#[ignore = "spawns a real sshd; run with --ignored --test-threads=1"]
 fn explicit_upload_mode_changes_existing_file_and_keeps_default_behavior() {
     let srv = TestServer::start();
     srv.trust();

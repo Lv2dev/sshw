@@ -385,7 +385,17 @@ fn check_transfer(
             return Err(error);
         }
         exit_code = kind.exit_code();
-        reasons.push(redact_secrets(&format!("{error:#}")));
+        let diagnostic = crate::output::ErrorResponse::from_error(&error);
+        let mut reason = diagnostic.error.message;
+        // Each cause is already redacted and consecutive wrapper duplicates
+        // are removed. A path diagnostic may also include its OS cause inline.
+        for cause in diagnostic.error.causes {
+            if !reason.ends_with(&format!(": {cause}")) {
+                reason.push_str(": ");
+                reason.push_str(&cause);
+            }
+        }
+        reasons.push(reason);
     }
     let operation = if upload { "put" } else { "get" };
     let mut value = json!({"ok":true,"allowed":reasons.is_empty(),"operation":operation,

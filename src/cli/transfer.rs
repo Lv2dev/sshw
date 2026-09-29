@@ -166,7 +166,7 @@ pub(super) fn check_get_access<'a>(
 ) -> anyhow::Result<(&'a ServerConfig, &'a str, &'a AccountConfig)> {
     let server = get_server(config, name)?;
     check_get_path(remote, sandbox)?;
-    check_local_overwrite(local, yes)?;
+    crate::storage::check_download_destination(local, yes)?;
     checked_account(name, user, server, sandbox)
 }
 
@@ -215,20 +215,6 @@ fn check_get_path(remote: &str, sandbox: &dyn Sandbox) -> anyhow::Result<()> {
     if let SandboxDecision::Deny { reason } = sandbox.check_get(remote) {
         return Err(app_error(ErrorKind::Policy, reason));
     }
-    Ok(())
-}
-
-fn check_local_overwrite(local: &std::path::Path, yes: bool) -> anyhow::Result<()> {
-    if local.try_exists().with_error_kind(ErrorKind::Io)? && !yes {
-        return Err(app_error(
-            ErrorKind::Io,
-            format!(
-                "local file already exists: {}; pass --yes to overwrite",
-                local.display()
-            ),
-        ));
-    }
-
     Ok(())
 }
 

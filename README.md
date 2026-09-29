@@ -293,6 +293,8 @@ sshw run web "./long-build" --stream
 
 `policy check-put/check-get` use the same positional arguments, `--user` and `--yes` as transfers; `check-put --atomic` also checks staging-directory policy. Shared checks use the execution order and report the first failing prerequisite. After access checks pass, `check-put` verifies that the local source is a readable regular file without reading its contents. JSON distinguishes `access_allowed`, `local_file_checked` and `local_file_ready`; `allowed` covers all evaluated local checks. These are point-in-time results, and the transfer still opens and validates its own file handle. SSH authentication, remote filesystem permissions and server extension support are not tested. `--yes` confirms a guardrail; it grants no remote OS permission.
 
+For `get`, specify a local file path. Both execution and `policy check-get` reject an existing directory destination and identify invalid local parent paths before connecting. `--yes` approves replacing a file; it does not make a directory a valid file destination. Missing parent directories are created only during the actual download. Preflight does not create files or verify local write permission. With `--yes`, a destination symlink is replaced rather than writing through it to its target. The destination is checked again before staging and final publication; failures before publication preserve the existing destination and clean up the staged file.
+
 ### Windows Shell Paths
 
 Git Bash/MSYS automatically converts path-like arguments passed to native Windows executables. That conversion can rewrite a remote POSIX path such as `/tmp/artifact.tgz` into a local Windows path before `sshw` sees it. Prefix an absolute remote path with `remote:` to pass it literally; sshw removes the prefix before applying safety, policy, audit, JSON, and SSH handling:
@@ -793,6 +795,8 @@ sshw run web "./long-build" --stream
 `run --stream`은 완성된 줄을 비밀 마스킹 후 실행 중에 출력합니다. 데이터가 여러 번에 나뉘어 도착해도 UTF8·비밀·PEM 블록을 유지해서 처리하고, 개행 없는 줄은 종료까지 기다립니다. 알려진 비밀 자체가 여러 줄이면 보수적으로 버퍼링합니다. 일반 실행과 sudo를 지원하며 JSON·su PTY 조합은 거부합니다. 실패하면 완료 미확정 안내와 함께 비밀을 마스킹한 실제 원인을 표시합니다. 기존16MiB 상한과 exit code는 유지하고 이미 출력한 내용은 실패 시 반복하지 않습니다. 일반 실행과 sudo는 기본 출력·JSON·스트리밍 모두 채널 오류 후 SSH 정리 대기를 짧게 제한합니다. 이것이 원격 프로세스의 종료를 확인했다는 뜻은 아닙니다.
 
 `policy check-put/check-get`은 실제 전송과 같은 인자 순서·`--user`·`--yes`를 사용합니다. 공통 검사는 실제 전송과 같은 순서로 첫 실패를 알려주며, `check-put --atomic`은 임시 파일 디렉터리 정책도 검사합니다. 접근 검사를 통과하면 업로드 파일을 읽기 전용으로 열어 읽을 수 있는 일반 파일인지 확인하고 내용은 읽지 않습니다. JSON의 `access_allowed`는 접근 검사, `local_file_checked`·`local_file_ready`는 파일 검사 여부·결과를 구분하며 `allowed`는 평가한 로컬 검사 전체의 결과입니다. 실제 전송은 파일을 다시 열고 해당 handle로 검증·전송하므로 사전 검사가 이후 상태까지 보장하지 않습니다. SSH·credential·원격 OS 권한·서버 확장은 확인하지 않습니다. `--yes`는 확인 옵션일 뿐 원격 권한을 부여하지 않습니다.
+
+`get`의 로컬 목적지에는 파일 경로를 지정하세요. 실제 실행과 `policy check-get` 모두 기존 디렉터리 목적지와 잘못된 로컬 부모 경로를 연결 전에 거부하고 해당 경로를 표시합니다. `--yes`는 파일 교체 확인이며 디렉터리를 파일 목적지로 바꾸지 않습니다. 없는 부모 디렉터리는 실제 다운로드 때만 생성합니다. 사전 검사는 파일을 만들거나 로컬 쓰기 권한을 검증하지 않습니다. `--yes`로 목적지 심볼릭 링크를 교체할 때는 링크가 가리키는 원본을 덮어쓰지 않습니다. 임시 파일 쓰기와 최종 반영 전에 목적지를 다시 검사하며, 반영 전 실패하면 기존 목적지를 보존하고 임시 파일을 정리합니다.
 
 ### Safety Rails
 

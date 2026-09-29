@@ -140,6 +140,139 @@ fn transfer_preflight_and_execution_choose_the_same_first_failure() {
 }
 
 #[test]
+fn download_directory_is_rejected_with_a_file_path_hint_before_ssh() {
+    let home = home();
+    add(home.path());
+    let directory = home.path().join("destination");
+    std::fs::create_dir(&directory).unwrap();
+    for yes in [false, true] {
+        for check in [false, true] {
+            for json in [false, true] {
+                let mut args = if check {
+                    vec!["policy", "check-get"]
+                } else {
+                    vec!["get"]
+                };
+                args.extend(["web", "/tmp/source", directory.to_str().unwrap()]);
+                if yes {
+                    args.push("--yes");
+                }
+                if json {
+                    args.push("--json");
+                }
+                let output = run(home.path(), &args, "");
+                assert_eq!(output.status.code(), Some(6), "{args:?}: {output:?}");
+                let message = if json {
+                    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+                    if check {
+                        assert_eq!(value["allowed"], false);
+                        assert_eq!(value["connection_tested"], false);
+                        value["reasons"][0].as_str().unwrap().to_string()
+                    } else {
+                        assert_eq!(value["error"]["kind"], "io");
+                        value["error"]["message"].as_str().unwrap().to_string()
+                    }
+                } else {
+                    String::from_utf8(if check { output.stdout } else { output.stderr }).unwrap()
+                };
+                assert!(message.contains("is a directory"), "{message}");
+                assert!(message.contains("specify a file path"), "{message}");
+                assert!(message.contains(directory.to_str().unwrap()), "{message}");
+                assert!(!message.contains("pass --yes to overwrite"), "{message}");
+            }
+        }
+    }
+    assert!(directory.is_dir());
+    assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
+}
+
+#[test]
+fn download_invalid_parent_reports_local_path_and_one_copy_of_each_cause() {
+    let home = home();
+    add(home.path());
+    let parent = home.path().join("parent-file");
+    std::fs::write(&parent, "original").unwrap();
+    let destination = parent.join("file.txt");
+    let mut messages = Vec::new();
+    for check in [true, false] {
+        let mut args = if check {
+            vec!["policy", "check-get"]
+        } else {
+            vec!["get"]
+        };
+        args.extend([
+            "web",
+            "/tmp/source",
+            destination.to_str().unwrap(),
+            "--yes",
+            "--json",
+        ]);
+        let output = run(home.path(), &args, "");
+        assert_eq!(output.status.code(), Some(6), "{args:?}: {output:?}");
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let message = if check {
+            &value["reasons"][0]
+        } else {
+            &value["error"]["message"]
+        };
+        let message = message.as_str().unwrap();
+        assert!(message.contains("local download"), "{message}");
+        assert!(message.contains(destination.to_str().unwrap()), "{message}");
+        assert_eq!(
+            message.matches("(os error").count(),
+            usize::from(message.contains("(os error")),
+            "{message}"
+        );
+        messages.push(message.to_string());
+    }
+    assert_eq!(messages[0], messages[1]);
+    let human = run(
+        home.path(),
+        &[
+            "get",
+            "web",
+            "/tmp/source",
+            destination.to_str().unwrap(),
+            "--yes",
+        ],
+        "",
+    );
+    assert_eq!(human.status.code(), Some(6));
+    assert!(
+        String::from_utf8(human.stderr)
+            .unwrap()
+            .contains(&messages[0])
+    );
+    assert_eq!(std::fs::read_to_string(parent).unwrap(), "original");
+}
+
+#[test]
+fn download_preflight_accepts_missing_relative_parents_without_creating_them() {
+    let home = home();
+    add(home.path());
+    let output = Command::new(env!("CARGO_BIN_EXE_sshw"))
+        .current_dir(home.path())
+        .env("SSHW_HOME", home.path())
+        .env_remove("SSHW_PASSWORD")
+        .env_remove("SSHW_PRIVILEGE_PASSWORD")
+        .args([
+            "policy",
+            "check-get",
+            "web",
+            "/tmp/source",
+            "missing/nested/file",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["allowed"], true);
+    assert_eq!(value["local_file_ready"], Value::Null);
+    assert!(!home.path().join("missing").exists());
+}
+
+#[test]
 fn transfer_preflight_checks_the_same_paths_without_connecting() {
     let home = home();
     add(home.path());
