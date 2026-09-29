@@ -349,6 +349,8 @@ sshw policy show --json
 
 `init` creates a disabled empty policy and refuses to replace an existing file. `allow` adds a rule without enabling enforcement; `remove` removes an exact entry, while other rules may still match. `enable`/`disable` change enforcement. `check` evaluates run safety, policy and the selected account locally; its `allowed` result does not test credentials, SSH, or sudoers. Policy mutations use the home's lock, revision check, atomic save and audit log. Full command rules are never copied into audit detail. Existing policy v1 files remain readable and are saved as v2 after a successful policy mutation.
 
+`policy check [server] "<command>"` uses the same target syntax and default server as `run`; for example, `sshw policy check "uptime" --json`. Shared local checks follow execution order, so the first reason and exit code match `run` for the checks performed. Preflight still lists additional independent blockers. Config and policy loading errors retain their normal error envelope, as does an account-selection failure when it is the first failure. Privilege metadata is checked without loading passwords; authentication or connection failures are outside this check.
+
 
 Policy is **off by default**. Turn it on for an invocation with `--policy`, or persistently with `"enabled": true` in the home's `policy.json`:
 
@@ -817,6 +819,8 @@ sshw policy show --json
 ```
 
 `init`은 비활성 빈 정책을 만들며 기존 파일은 덮어쓰지 않습니다. `allow`는 항목만 추가하고, `remove`는 정확히 일치하는 항목만 제거합니다. 다른 규칙이 남아 있으면 계속 허용될 수 있습니다. `enable`/`disable`은 정책 활성 상태를 바꿉니다. `check`의 `allowed`는 safety·policy·계정에 대한 로컬 판정이며 credential·SSH·sudoers를 검증하지 않습니다. 정책 변경은 home 잠금, revision 검사, 원자적 저장과 audit을 사용하고 명령 전체를 audit detail에 복사하지 않습니다. 기존 v1 정책은 계속 읽을 수 있고 정책 변경에 성공하면 v2로 저장됩니다.
+
+`policy check [server] "<command>"`는 `run`과 같은 인자 순서와 기본 서버를 사용합니다. 예를 들어 `sshw policy check "uptime" --json`으로 기본 서버를 검사할 수 있습니다. 공통 로컬 검사 순서를 실행과 공유하므로 검사한 항목의 첫 실패 이유와 종료 코드가 일치하며, 사전 검사는 추가 차단 이유도 계속 표시합니다. 설정·정책 로딩 오류와 첫 실패인 계정 선택 오류는 기존 오류 형식을 유지합니다. 승격 메타데이터는 비밀번호를 읽지 않고 검사하며 인증·연결 실패 여부는 검사 대상이 아닙니다.
 
 
 policy는 **기본 off**입니다. 호출별로 `--policy`로 켜거나, home의 `policy.json`에 `"enabled": true`로 영속 적용합니다.

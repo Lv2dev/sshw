@@ -5,8 +5,6 @@ use super::{
 use crate::error::{ResultErrorKindExt, app_error};
 use crate::output::{ErrorKind, redact_secrets};
 use crate::policy::{AccountRule, PolicyFile, load_policy_with_revision, save_policy_if_unchanged};
-use crate::safety::{SafetyDecision, classify_command};
-use crate::sandbox::SandboxDecision;
 use clap::{Args, Subcommand};
 use serde_json::json;
 
@@ -77,10 +75,10 @@ pub enum PolicyRule {
 
 #[derive(Debug, Args)]
 pub struct PolicyCheckArgs {
-    /// Registered server name.
-    pub name: String,
-    /// Entire remote command, quoted as one argument.
-    pub command: String,
+    /// Same target order as run: [server] <command>. With one value, use the
+    /// default server. Quote the entire remote command as one argument.
+    #[arg(value_name = "TARGET", num_args = 1..=2)]
+    pub target: Vec<String>,
     /// Registered login account (default: server default).
     #[arg(long)]
     pub user: Option<String>,
@@ -243,51 +241,55 @@ fn check_run(
     ctx: &ExecContext<'_>,
 ) -> anyhow::Result<CommandOutput> {
     let config = load_active_config(ctx.home)?;
-    let server = get_server(&config, &args.name)?;
-    let (user, account) = select_account(&args.name, server, args.user.as_deref())?;
+    // Match run's loading and target-resolution order before evaluating checks.
     let sandbox = build_sandbox(&ctx.home.policy_path, ctx.policy_forced)?;
-    let mut reasons = Vec::new();
-    let mut exit_code = 0;
-    if let SafetyDecision::Block { reason } = classify_command(&args.command, args.yes) {
-        reasons.push(reason);
-        exit_code = ErrorKind::Safety.exit_code();
-    }
-    for decision in [
-        sandbox.check_command(&args.command),
-        sandbox.check_account(&args.name, user, user == server.default_user),
-    ] {
-        if let SandboxDecision::Deny { reason } = decision {
-            reasons.push(reason);
-            if exit_code == 0 {
-                exit_code = ErrorKind::Policy.exit_code();
+    let (name, command) = super::resolve_run_target(args.target, &config)?;
+    let mut errors = Vec::new();
+    let checked = super::check_run_access(
+        &name,
+        &command,
+        args.user.as_deref(),
+        args.yes,
+        sandbox.as_ref(),
+        &config,
+        |error| {
+            errors.push(error);
+            Ok(())
+        },
+    );
+    match checked {
+        Ok((_, user, account)) => {
+            if let Err(error) =
+                super::check_run_privilege(&name, user, account, args.as_root, args.no_password)
+            {
+                errors.push(error);
             }
         }
+        // Preserve the error envelope when account resolution is the first
+        // failure; an earlier safety/policy denial remains the primary result.
+        Err(error) if errors.is_empty() => return Err(error),
+        Err(error) => errors.push(error),
     }
-    if args.as_root && !args.no_password && account.privilege.is_none() {
-        reasons.push(format!(
-            "privilege is not configured; run 'sshw privilege set {} --account {}'",
-            args.name, user
-        ));
-        if exit_code == 0 {
-            exit_code = ErrorKind::Config.exit_code();
-        }
-    }
-    if args.no_password
-        && account
-            .privilege
-            .as_ref()
-            .is_some_and(|p| p.method != crate::config::PrivilegeMethod::Sudo)
-    {
-        reasons.push(
-            "--no-password requires a sudo privilege path; this account is configured for su"
-                .to_string(),
-        );
-        if exit_code == 0 {
-            exit_code = ErrorKind::Config.exit_code();
-        }
-    }
+    let exit_code = errors
+        .first()
+        .map(|error| crate::output::classify_error(error).exit_code())
+        .unwrap_or(0);
+    let reasons: Vec<_> = errors
+        .iter()
+        .map(|error| redact_secrets(&error.to_string()))
+        .collect();
+    let user = args
+        .user
+        .as_deref()
+        .or_else(|| {
+            config
+                .servers
+                .get(&name)
+                .map(|server| server.default_user.as_str())
+        })
+        .unwrap_or("unresolved");
     let mut value = json!({"ok":true,"allowed":reasons.is_empty(),"home":ctx.home.root,
-        "home_source":ctx.home.description,"server":args.name,"user":user,"reasons":reasons,
+        "home_source":ctx.home.description,"server":name,"user":user,"reasons":reasons,
         "connection_tested":false,"credentials_checked":false});
     redact_json(&mut value);
     let stdout = if json_output {
@@ -296,7 +298,7 @@ fn check_run(
         format!(
             "home: {}\nserver/account: {}/{}\nlocal checks: {}\n{}\nSSH and credentials were not tested.\n",
             ctx.home.root.display(),
-            args.name,
+            name,
             user,
             if reasons.is_empty() {
                 "allowed"

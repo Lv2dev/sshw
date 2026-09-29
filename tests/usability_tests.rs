@@ -816,6 +816,205 @@ fn policy_checks_all_restrictions_and_validates_account_entries() {
     );
 }
 
+fn assert_run_check_failure(home: &Path, arguments: &[&str], expected: i32) {
+    let mut execute_args = vec!["run"];
+    execute_args.extend_from_slice(arguments);
+    execute_args.push("--json");
+    let mut check_args = vec!["policy", "check"];
+    check_args.extend_from_slice(arguments);
+    check_args.push("--json");
+    let executed = run(home, &execute_args, "");
+    let checked = run(home, &check_args, "");
+    assert_eq!(
+        executed.status.code(),
+        Some(expected),
+        "{execute_args:?}: {executed:?}"
+    );
+    assert_eq!(
+        checked.status.code(),
+        Some(expected),
+        "{check_args:?}: {checked:?}"
+    );
+    let executed: Value = serde_json::from_slice(&executed.stdout).unwrap();
+    let checked: Value = serde_json::from_slice(&checked.stdout).unwrap();
+    if checked["ok"] == true {
+        assert_eq!(checked["allowed"], false);
+        assert_eq!(
+            checked["reasons"][0], executed["error"]["message"],
+            "{arguments:?}"
+        );
+        assert_eq!(checked["connection_tested"], false);
+        assert_eq!(checked["credentials_checked"], false);
+    } else {
+        assert_eq!(checked["error"], executed["error"], "{arguments:?}");
+    }
+}
+
+#[test]
+fn run_preflight_matches_first_failure_across_combined_local_errors() {
+    let home = home();
+    add(home.path());
+    successful(home.path(), &["default", "web"], "");
+    assert_run_check_failure(home.path(), &["web", "sudo id", "--user", "missing"], 2);
+    assert_run_check_failure(home.path(), &["web", "whoami", "--user", "missing"], 3);
+    assert_run_check_failure(home.path(), &["missing", "sudo id"], 3);
+    assert_run_check_failure(home.path(), &["web", "whoami", "--as-root"], 3);
+    successful(
+        home.path(),
+        &["account", "add", "web", "auditor", "--auth", "agent"],
+        "",
+    );
+    successful(home.path(), &["policy", "init"], "");
+    successful(home.path(), &["policy", "allow", "command", "uptime"], "");
+    successful(home.path(), &["policy", "enable"], "");
+    assert_run_check_failure(home.path(), &["web", "whoami", "--user", "missing"], 7);
+    assert_run_check_failure(home.path(), &["web", "sudo id", "--user", "missing"], 2);
+    assert_run_check_failure(home.path(), &["web", "uptime", "--user", "missing"], 3);
+    assert_run_check_failure(
+        home.path(),
+        &["web", "uptime", "--user", "auditor", "--as-root"],
+        7,
+    );
+    let check = run(
+        home.path(),
+        &[
+            "policy", "check", "web", "sudo id", "--user", "missing", "--json",
+        ],
+        "",
+    );
+    let value: Value = serde_json::from_slice(&check.stdout).unwrap();
+    assert_eq!(value["reasons"].as_array().unwrap().len(), 3);
+    assert!(
+        value["reasons"][2]
+            .as_str()
+            .unwrap()
+            .contains("unknown account")
+    );
+}
+
+#[test]
+fn run_preflight_resolves_default_server_without_credentials_or_writes() {
+    let home = home();
+    successful(
+        home.path(),
+        &[
+            "add",
+            "web",
+            "--host",
+            "127.0.0.1",
+            "--user",
+            "deploy",
+            "--password-stdin",
+        ],
+        "fixture-only\n",
+    );
+    successful(home.path(), &["default", "web"], "");
+    let before_config = std::fs::read(home.path().join("servers.json")).unwrap();
+    let before_audit = std::fs::read(home.path().join("audit.jsonl")).unwrap();
+    let implicit = successful(home.path(), &["policy", "check", "uptime", "--json"], "");
+    let explicit = successful(
+        home.path(),
+        &["policy", "check", "web", "uptime", "--json"],
+        "",
+    );
+    let implicit: Value = serde_json::from_slice(&implicit.stdout).unwrap();
+    let explicit: Value = serde_json::from_slice(&explicit.stdout).unwrap();
+    assert_eq!(implicit, explicit);
+    assert_eq!(implicit["allowed"], true);
+    assert_eq!(implicit["server"], "web");
+    assert_eq!(implicit["user"], "deploy");
+    assert_eq!(implicit["connection_tested"], false);
+    assert_eq!(implicit["credentials_checked"], false);
+    assert_eq!(
+        std::fs::read(home.path().join("servers.json")).unwrap(),
+        before_config
+    );
+    assert_eq!(
+        std::fs::read(home.path().join("audit.jsonl")).unwrap(),
+        before_audit
+    );
+    assert_run_check_failure(home.path(), &["sudo id"], 2);
+    let human = run(home.path(), &["policy", "check", "sudo id"], "");
+    assert_eq!(human.status.code(), Some(2));
+    assert!(
+        String::from_utf8(human.stdout)
+            .unwrap()
+            .contains("web/deploy")
+    );
+}
+
+#[test]
+fn run_preflight_matches_config_policy_loading_and_target_errors() {
+    let home = home();
+    assert_run_check_failure(home.path(), &["uptime"], 3);
+    assert_run_check_failure(home.path(), &["sudo id", "--policy"], 7);
+    add(home.path());
+    std::fs::write(home.path().join("policy.json"), "{").unwrap();
+    assert_run_check_failure(home.path(), &["web", "sudo id", "--user", "missing"], 7);
+    assert_run_check_failure(home.path(), &["missing", "sudo id"], 7);
+    std::fs::write(home.path().join("servers.json"), "{").unwrap();
+    assert_run_check_failure(home.path(), &["web", "sudo id", "--user", "missing"], 3);
+}
+
+#[test]
+fn run_preflight_keeps_privilege_modes_and_checks_metadata_only() {
+    let home = home();
+    add(home.path());
+    successful(home.path(), &["default", "web"], "");
+    let missing = run(
+        home.path(),
+        &["policy", "check", "whoami", "--as-root", "--json"],
+        "",
+    );
+    assert_eq!(missing.status.code(), Some(3));
+    let value: Value = serde_json::from_slice(&missing.stdout).unwrap();
+    assert_eq!(value["ok"], true);
+    assert_eq!(value["allowed"], false);
+    successful(
+        home.path(),
+        &[
+            "policy",
+            "check",
+            "whoami",
+            "--as-root",
+            "--no-password",
+            "--json",
+        ],
+        "",
+    );
+    successful(
+        home.path(),
+        &[
+            "privilege",
+            "set",
+            "web",
+            "--method",
+            "su",
+            "--password-stdin",
+        ],
+        "fixture-only\n",
+    );
+    assert_run_check_failure(home.path(), &["whoami", "--as-root", "--no-password"], 3);
+    successful(
+        home.path(),
+        &[
+            "privilege",
+            "set",
+            "web",
+            "--user",
+            "service",
+            "--no-password",
+            "--force",
+        ],
+        "",
+    );
+    successful(
+        home.path(),
+        &["policy", "check", "whoami", "--as-root", "--json"],
+        "",
+    );
+}
+
 #[test]
 fn policy_json_remains_valid_when_redacting_a_rule() {
     let home = home();

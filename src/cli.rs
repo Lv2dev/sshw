@@ -721,6 +721,58 @@ fn build_sandbox(policy_path: &Path, forced: bool) -> anyhow::Result<Box<dyn San
     }
 }
 
+/// Shared local checks, in execution order. Execution returns each denial
+/// immediately; preflight records independent denials and keeps inspecting.
+/// An unresolved account stops checks that depend on that account's metadata.
+fn check_run_access<'a>(
+    name: &str,
+    command: &str,
+    user: Option<&str>,
+    yes: bool,
+    sandbox: &dyn Sandbox,
+    config: &'a SshwConfig,
+    mut on_denied: impl FnMut(anyhow::Error) -> anyhow::Result<()>,
+) -> anyhow::Result<(&'a ServerConfig, &'a str, &'a AccountConfig)> {
+    if let SafetyDecision::Block { reason } = classify_command(command, yes) {
+        on_denied(app_error(ErrorKind::Safety, reason))?;
+    }
+    if let SandboxDecision::Deny { reason } = sandbox.check_command(command) {
+        on_denied(app_error(ErrorKind::Policy, reason))?;
+    }
+    let server = get_server(config, name)?;
+    let (user, account) = select_account(name, server, user)?;
+    if let SandboxDecision::Deny { reason } =
+        sandbox.check_account(name, user, user == server.default_user)
+    {
+        on_denied(app_error(ErrorKind::Policy, reason))?;
+    }
+    Ok((server, user, account))
+}
+
+fn check_run_privilege(
+    name: &str,
+    user: &str,
+    account: &AccountConfig,
+    as_root: bool,
+    no_password: bool,
+) -> anyhow::Result<()> {
+    if as_root && !no_password && account.privilege.is_none() {
+        return Err(privilege::missing_privilege(name, user));
+    }
+    if no_password
+        && account
+            .privilege
+            .as_ref()
+            .is_some_and(|privilege| privilege.method != PrivilegeMethod::Sudo)
+    {
+        return Err(app_error(
+            ErrorKind::Config,
+            "--no-password requires a sudo privilege path; this account is configured for su",
+        ));
+    }
+    Ok(())
+}
+
 fn run_remote<C, S>(
     args: RunArgs,
     sandbox: &dyn Sandbox,
@@ -743,22 +795,15 @@ where
     } = args;
     let (server_name, command) = resolve_run_target(target, config)?;
 
-    match classify_command(&command, yes) {
-        SafetyDecision::Allow => {}
-        SafetyDecision::Block { reason } => return Err(app_error(ErrorKind::Safety, reason)),
-    }
-
-    if let SandboxDecision::Deny { reason } = sandbox.check_command(&command) {
-        return Err(app_error(ErrorKind::Policy, reason));
-    }
-
-    let server = get_server(config, &server_name)?;
-    let (login_user, account) = select_account(&server_name, server, user.as_deref())?;
-    if let SandboxDecision::Deny { reason } =
-        sandbox.check_account(&server_name, login_user, login_user == server.default_user)
-    {
-        return Err(app_error(ErrorKind::Policy, reason));
-    }
+    let (server, login_user, account) = check_run_access(
+        &server_name,
+        &command,
+        user.as_deref(),
+        yes,
+        sandbox,
+        config,
+        Err,
+    )?;
     if stream
         && as_root
         && account
@@ -772,6 +817,7 @@ where
         ));
     }
     let auth = resolve_auth(account, login_user, credentials)?;
+    check_run_privilege(&server_name, login_user, account, as_root, no_password)?;
     let ssh_target = SshTarget::new(server, login_user);
     let privileged = if no_password
         || (as_root
@@ -780,16 +826,6 @@ where
                 .as_ref()
                 .is_some_and(|privilege| privilege.no_password))
     {
-        if account
-            .privilege
-            .as_ref()
-            .is_some_and(|p| p.method != PrivilegeMethod::Sudo)
-        {
-            return Err(app_error(
-                ErrorKind::Config,
-                "--no-password requires a sudo privilege path; this account is configured for su",
-            ));
-        }
         let target_user = account
             .privilege
             .as_ref()
@@ -1703,6 +1739,62 @@ mod runtime_backend_tests {
     use crate::home::ResolvedHome;
     use crate::ssh::{HostKeyInfo, RunResult, TransferResult};
     use std::cell::Cell;
+
+    #[test]
+    fn run_access_short_circuits_execution_and_collects_preflight_denials_in_order() {
+        struct TraceSandbox(std::cell::RefCell<Vec<&'static str>>);
+        impl Sandbox for TraceSandbox {
+            fn check_command(&self, _: &str) -> SandboxDecision {
+                self.0.borrow_mut().push("command");
+                SandboxDecision::Deny {
+                    reason: "command denied".into(),
+                }
+            }
+            fn check_account(&self, _: &str, _: &str, _: bool) -> SandboxDecision {
+                self.0.borrow_mut().push("account");
+                SandboxDecision::Deny {
+                    reason: "account denied".into(),
+                }
+            }
+            fn check_put(&self, _: &str) -> SandboxDecision {
+                unreachable!()
+            }
+            fn check_get(&self, _: &str) -> SandboxDecision {
+                unreachable!()
+            }
+        }
+        let mut config = SshwConfig::default();
+        config.servers.insert(
+            "web".into(),
+            ServerConfig::single_account("localhost", 22, "deploy", AuthConfig::Agent),
+        );
+        let sandbox = TraceSandbox(Default::default());
+        let error =
+            check_run_access("web", "sudo id", None, false, &sandbox, &config, Err).unwrap_err();
+        assert_eq!(crate::output::classify_error(&error), ErrorKind::Safety);
+        assert!(
+            sandbox.0.borrow().is_empty(),
+            "execution must not call later checks after failure"
+        );
+        let mut errors = Vec::new();
+        let (_, user, _) =
+            check_run_access("web", "sudo id", None, false, &sandbox, &config, |error| {
+                errors.push(error);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(user, "deploy");
+        assert_eq!(*sandbox.0.borrow(), ["command", "account"]);
+        let reasons: Vec<_> = errors.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            reasons,
+            [
+                error.to_string(),
+                "command denied".into(),
+                "account denied".into()
+            ]
+        );
+    }
 
     #[test]
     fn streamed_failure_shows_causes_without_replaying_output() {
