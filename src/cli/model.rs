@@ -509,7 +509,7 @@ pub struct RunArgs {
     /// Grammar: `[server] <command>`. With one value it is the command and the
     /// default server is used; with two, the first is the server name. Quote
     /// the command so it stays one argument.
-    #[arg(value_name = "TARGET", num_args = 1..=2)]
+    #[arg(value_name = "TARGET", num_args = 1..=2, required = true)]
     pub target: Vec<String>,
     /// Use this registered login account instead of the server default.
     #[arg(long, value_name = "USER")]
@@ -545,7 +545,7 @@ pub struct PutArgs {
     /// Grammar: `[server] <local> <remote>`. With two values the default server
     /// is used; with three, the first is the server name. In Git Bash/MSYS,
     /// write an absolute remote path as `remote:/path` to prevent conversion.
-    #[arg(value_name = "TARGET", num_args = 2..=3)]
+    #[arg(value_name = "TARGET", num_args = 2..=3, required = true)]
     pub target: Vec<String>,
     /// Use this registered login account instead of the server default.
     #[arg(long, value_name = "USER")]
@@ -582,7 +582,7 @@ pub struct GetArgs {
     /// Grammar: `[server] <remote> <local>`. With two values the default server
     /// is used; with three, the first is the server name. In Git Bash/MSYS,
     /// write an absolute remote path as `remote:/path` to prevent conversion.
-    #[arg(value_name = "TARGET", num_args = 2..=3)]
+    #[arg(value_name = "TARGET", num_args = 2..=3, required = true)]
     pub target: Vec<String>,
     /// Use this registered login account instead of the server default.
     #[arg(long, value_name = "USER")]

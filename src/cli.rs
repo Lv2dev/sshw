@@ -1674,7 +1674,7 @@ where
 /// usage errors get the dedicated `usage` kind / exit code 9 (distinct from the
 /// safety code 2), surfaced as a JSON envelope on stdout when `--json` was
 /// requested, or clap's formatted message on stderr otherwise.
-fn parse_error_output(err: clap::Error, json: bool) -> CommandOutput {
+fn parse_error_output(mut err: clap::Error, json: bool) -> CommandOutput {
     use clap::error::ErrorKind as ClapErrorKind;
 
     if matches!(
@@ -1692,7 +1692,12 @@ fn parse_error_output(err: clap::Error, json: bool) -> CommandOutput {
 
     let kind = ErrorKind::Usage;
     let exit_code = kind.exit_code();
-    let rendered = err.render().to_string();
+    redact_clap_context(&mut err);
+    if json {
+        // Retain diagnostics and correction tips, not the full usage banner.
+        let _ = err.remove(clap::error::ContextKind::Usage);
+    }
+    let rendered = redact_usage_text(&err.render().to_string());
 
     if json {
         let response = ErrorResponse {
@@ -1719,15 +1724,68 @@ fn parse_error_output(err: clap::Error, json: bool) -> CommandOutput {
     }
 }
 
-/// Condense clap's multi-line usage error into a concise single-line message for
-/// the JSON envelope (the first non-empty line, minus clap's `error: ` prefix).
+fn redact_clap_context(error: &mut clap::Error) {
+    use clap::error::ContextValue;
+    // Mask values before clap embeds them in prose or correction suggestions.
+    // In particular, a PEM marker must not gain a prefix before redaction.
+    let contexts: Vec<_> = error
+        .context()
+        .map(|(kind, value)| {
+            let value = match value {
+                ContextValue::String(text) => ContextValue::String(redact_usage_text(text)),
+                ContextValue::Strings(values) => ContextValue::Strings(
+                    values
+                        .iter()
+                        .map(|value| redact_usage_text(value))
+                        .collect(),
+                ),
+                ContextValue::StyledStr(text) => {
+                    ContextValue::StyledStr(redact_usage_text(&text.to_string()).into())
+                }
+                ContextValue::StyledStrs(values) => ContextValue::StyledStrs(
+                    values
+                        .iter()
+                        .map(|value| redact_usage_text(&value.to_string()).into())
+                        .collect(),
+                ),
+                _ => value.clone(),
+            };
+            (kind, value)
+        })
+        .collect();
+    for (kind, value) in contexts {
+        let _ = error.insert(kind, value);
+    }
+}
+
+fn redact_usage_text(text: &str) -> String {
+    if text.contains("-----BEGIN") && text.contains("PRIVATE KEY") {
+        // A suggestion can repeat a key after a prose prefix. Discard that
+        // diagnostic fragment rather than trying to recover its key boundary.
+        "[redacted private key]".to_string()
+    } else {
+        redact_secrets(text)
+    }
+}
+
+/// Compact the already-redacted diagnostic, retaining missing argument lists,
+/// accepted values and correction tips. Only remove the generic help footer.
 fn clap_usage_summary(rendered: &str) -> String {
-    rendered
+    let mut lines: Vec<_> = rendered
         .lines()
         .map(str::trim)
-        .find(|line| !line.is_empty())
-        .map(|line| line.trim_start_matches("error: ").to_string())
-        .unwrap_or_else(|| rendered.trim().to_string())
+        .filter(|line| !line.is_empty())
+        .collect();
+    if lines
+        .last()
+        .is_some_and(|line| line.starts_with("For more information, try "))
+    {
+        lines.pop();
+    }
+    if let Some(first) = lines.first_mut() {
+        *first = first.trim_start_matches("error: ");
+    }
+    lines.join(" ")
 }
 
 #[cfg(test)]
@@ -2154,6 +2212,77 @@ mod parse_error_tests {
 
     fn parse_err(args: &[&str]) -> clap::Error {
         Cli::try_parse_from(args).unwrap_err()
+    }
+
+    #[test]
+    fn operation_target_arity_accepts_defaults_and_explicit_servers() {
+        for (prefix, minimum) in [
+            (vec!["sshw", "run"], 1),
+            (vec!["sshw", "put"], 2),
+            (vec!["sshw", "get"], 2),
+            (vec!["sshw", "policy", "check"], 1),
+            (vec!["sshw", "policy", "check-put"], 2),
+            (vec!["sshw", "policy", "check-get"], 2),
+        ] {
+            for count in 0..=minimum + 2 {
+                let mut args = prefix.clone();
+                args.extend(std::iter::repeat_n("fixture", count));
+                let result = Cli::try_parse_from(&args);
+                if count == minimum || count == minimum + 1 {
+                    assert!(result.is_ok(), "{args:?}: {result:?}");
+                } else {
+                    let output = parse_error_output(result.unwrap_err(), true);
+                    assert_eq!(output.exit_code, 9, "{args:?}");
+                }
+            }
+            for json in [false, true] {
+                let mut args = prefix.clone();
+                if json {
+                    args.push("--json");
+                }
+                args.push("--help");
+                let output = parse_error_output(parse_err(&args), json);
+                assert_eq!(output.exit_code, 0);
+                assert!(output.stderr.is_empty());
+                assert!(output.stdout.contains("Usage:"));
+            }
+        }
+        let output = parse_error_output(parse_err(&["sshw", "--version"]), false);
+        assert_eq!(output.exit_code, 0);
+        assert!(output.stdout.starts_with("sshw "));
+    }
+
+    #[test]
+    fn usage_diagnostics_redact_input_before_formatting_and_compacting() {
+        for value in [
+            "password=fixture-sensitive",
+            "Bearer fixture-sensitive",
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture-sensitive\n-----END OPENSSH PRIVATE KEY-----",
+        ] {
+            let argument = format!("--mode={value}");
+            for json in [false, true] {
+                let error = parse_err(&["sshw", "put", "local", "remote", &argument]);
+                let output = parse_error_output(error, json);
+                assert_eq!(output.exit_code, 9);
+                assert!(!output.stdout.contains("fixture-sensitive"));
+                assert!(!output.stderr.contains("fixture-sensitive"));
+                assert!(format!("{}{}", output.stdout, output.stderr).contains("redacted"));
+                if json {
+                    serde_json::from_str::<serde_json::Value>(&output.stdout).unwrap();
+                }
+            }
+        }
+        // Unknown option errors can repeat an input in a styled "pass it as a
+        // value" tip. That copy must also be masked before adding a prefix.
+        let key = "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture-sensitive\n-----END OPENSSH PRIVATE KEY-----";
+        for json in [false, true] {
+            let output =
+                parse_error_output(parse_err(&["sshw", "put", "local", "remote", key]), json);
+            assert_eq!(output.exit_code, 9);
+            assert!(!output.stdout.contains("fixture-sensitive"));
+            assert!(!output.stderr.contains("fixture-sensitive"));
+            assert!(format!("{}{}", output.stdout, output.stderr).contains("redacted"));
+        }
     }
 
     #[test]

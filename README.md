@@ -427,6 +427,8 @@ Every single-object `--json` success response (`add`, `show`, `trust`, `run`, `p
 
 `default`, `account default`, profile state changes, and all policy subcommands support `--json`. Existing list commands retain their array-on-success format. A completed `run` retains `ok:true` for compatibility; use `command_succeeded` (or `exit_status == 0`) to judge remote success. A policy check uses `allowed`, and doctor uses `local_checks_passed`; each says explicitly that remote connectivity was not tested.
 
+Missing operation targets are usage errors (exit 9), rejected before loading the home or writing an audit record. The server name remains optional for `run`/`put`/`get` and their policy checks, but the command or source/destination operands are required. JSON usage messages retain missing argument names, accepted values and correction tips while omitting the full usage banner and generic help footer. Input diagnostics are redacted before rendering; explicit help and version requests still exit 0.
+
 Invalid CLI arguments exit with code `9` (`usage`), kept distinct from `safety` (2) so an agent can tell "called sshw wrong" apart from "a safety rail blocked the operation". With `--json`, a usage error is emitted as the same envelope on stdout (`{"ok":false,"error":{"kind":"usage",...}}`); otherwise the parser's message goes to stderr. `--help`/`--version` print to stdout and exit `0`.
 
 These codes are sshw's own operational failures. When `run` connects and the remote command itself exits non-zero, sshw exits with code `8` — kept separate so a remote status can never be read as an sshw failure (e.g. a remote `grep` finding nothing). Exit `0` means the remote command succeeded. The real remote status is reported in `run --json` as `exit_status`, and in human mode as a `note: remote command exited with status N` line on stderr.
@@ -899,6 +901,8 @@ sshw doctor --json
 단일 object를 반환하는 `--json` 성공 응답(`add`, `show`, `trust`, `run`, `put`, `get`, `remove`, `doctor`, `account add`, `account show`, `account remove`, `profile show`, `privilege set`, `privilege show`, `privilege clear`)은 모두 `"ok":true`를 포함해 오류 envelope의 `"ok":false`와 대칭을 이루므로, 소비자가 `ok`로 분기할 수 있습니다. `list`, `account list`, `profile list`는 성공 시 JSON 배열을 반환하며(래핑 object 없음), 실패 시에는 동일한 `{"ok":false,...}` envelope를 출력합니다.
 
 `default`, `account default`, profile 상태 변경과 모든 policy 하위 명령도 `--json`을 지원합니다. 기존 list 명령의 성공 배열 형식은 유지합니다. 완료된 `run`의 `ok:true`는 호환성을 위해 유지하므로 원격 성공은 `command_succeeded` 또는 `exit_status == 0`으로 판단하세요. 정책 검사는 `allowed`, doctor는 `local_checks_passed`를 사용하며 실제 원격 연결을 검사한 것은 아닙니다.
+
+필수 작업 인자가 없으면 home 로딩이나 감사 기록 전에 사용법 오류(exit9)로 거부합니다. `run`·`put`·`get`과 대응 policy 검사에서 서버명은 생략할 수 있지만 명령 또는 source/destination은 반드시 필요합니다. JSON 사용 오류 메시지는 누락된 인자 이름·허용 값·수정 제안을 유지하고 전체 사용 구문과 반복 도움말 문구는 제외합니다. 입력 진단은 렌더링 전에 마스킹하며, 명시적인 도움말·버전 요청은 기존처럼 exit0입니다.
 
 잘못된 CLI 인자는 exit code `9`(`usage`)로 끝나며, `safety`(2)와 분리해 에이전트가 "sshw를 잘못 호출함"과 "safety rail이 차단함"을 구분할 수 있습니다. `--json`이면 usage 오류도 동일한 envelope로 stdout에 출력하고(`{"ok":false,"error":{"kind":"usage",...}}`), 아니면 파서 메시지를 stderr로 보냅니다. `--help`/`--version`은 stdout으로 출력하고 exit `0`입니다.
 

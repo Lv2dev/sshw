@@ -42,7 +42,7 @@ pub enum PolicyCommand {
 #[derive(Debug, Args)]
 pub struct PolicyTransferCheckArgs {
     /// Same target order as put/get: [server] <source> <destination>.
-    #[arg(value_name = "TARGET", num_args = 2..=3)]
+    #[arg(value_name = "TARGET", num_args = 2..=3, required = true)]
     pub target: Vec<String>,
     /// Registered login account (default: server default).
     #[arg(long)]
@@ -77,7 +77,7 @@ pub enum PolicyRule {
 pub struct PolicyCheckArgs {
     /// Same target order as run: [server] <command>. With one value, use the
     /// default server. Quote the entire remote command as one argument.
-    #[arg(value_name = "TARGET", num_args = 1..=2)]
+    #[arg(value_name = "TARGET", num_args = 1..=2, required = true)]
     pub target: Vec<String>,
     /// Registered login account (default: server default).
     #[arg(long)]

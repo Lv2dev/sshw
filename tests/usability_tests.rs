@@ -65,6 +65,110 @@ fn add(home: &Path) {
 }
 
 #[test]
+fn missing_operation_targets_fail_during_parsing_without_state_writes() {
+    let home = home();
+    let untouched_home = home.path().join("not-created");
+    // Parsing must take precedence even over broken runtime state.
+    std::fs::write(home.path().join("servers.json"), "{").unwrap();
+    std::fs::write(home.path().join("policy.json"), "{").unwrap();
+    for command in [
+        vec!["run"],
+        vec!["put"],
+        vec!["get"],
+        vec!["policy", "check"],
+        vec!["policy", "check-put"],
+        vec!["policy", "check-get"],
+    ] {
+        for json in [false, true] {
+            let mut args = command.clone();
+            if json {
+                args.push("--json");
+            }
+            let fresh = run(&untouched_home, &args, "");
+            assert_eq!(fresh.status.code(), Some(9), "{args:?}: {fresh:?}");
+            assert!(
+                !untouched_home.exists(),
+                "invalid arguments must not create a home"
+            );
+            let output = run(home.path(), &args, "");
+            assert_eq!(output.status.code(), Some(9), "{args:?}: {output:?}");
+            if json {
+                assert!(output.stderr.is_empty());
+                let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(value["error"]["kind"], "usage");
+                assert!(
+                    value["error"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("TARGET")
+                );
+            } else {
+                assert!(output.stdout.is_empty());
+                assert!(String::from_utf8(output.stderr).unwrap().contains("TARGET"));
+            }
+        }
+    }
+    assert!(!home.path().join("audit.jsonl").exists());
+    assert!(!home.path().join(".sshw.lock").exists());
+    assert_eq!(
+        std::fs::read_to_string(home.path().join("servers.json")).unwrap(),
+        "{"
+    );
+}
+
+#[test]
+fn json_usage_preserves_required_arguments_suggestions_and_value_guidance() {
+    let home = home();
+    for (args, expected) in [
+        (
+            vec!["add", "web", "--json"],
+            vec!["--host <HOST>", "--user <USER>"],
+        ),
+        (
+            vec!["put", "web", "local", "remote", "--atmoic", "--json"],
+            vec!["--atmoic", "--atomic"],
+        ),
+        (
+            vec![
+                "add",
+                "web",
+                "--host",
+                "localhost",
+                "--user",
+                "deploy",
+                "--auth",
+                "agnet",
+                "--json",
+            ],
+            vec!["agnet", "agent", "password"],
+        ),
+        (
+            vec!["put", "local", "remote", "--mode", "999", "--json"],
+            vec!["999", "use octal permissions"],
+        ),
+        (
+            vec!["run", "uptime", "--stream", "--json"],
+            vec!["--stream", "--json"],
+        ),
+    ] {
+        let output = run(home.path(), &args, "");
+        assert_eq!(output.status.code(), Some(9));
+        assert!(output.stderr.is_empty());
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["ok"], false);
+        assert_eq!(value["error"]["kind"], "usage");
+        assert_eq!(value["error"]["exit_code"], 9);
+        let message = value["error"]["message"].as_str().unwrap();
+        for expected in expected {
+            assert!(message.contains(expected), "{args:?}: {message}");
+        }
+        assert!(!message.contains("Usage:"), "{message}");
+        assert!(!message.contains("For more information"), "{message}");
+    }
+    assert!(!home.path().join("audit.jsonl").exists());
+}
+
+#[test]
 fn upload_diagnostics_reject_missing_files_and_directories_locally() {
     let home = home();
     add(home.path());
