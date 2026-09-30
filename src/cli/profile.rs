@@ -9,8 +9,8 @@ use super::{
     ProfileListArgs, ProfileRemoveArgs, ProfileShowArgs, ok,
 };
 use crate::error::ResultErrorKindExt;
-use crate::home::generate_profile_id;
-use crate::output::{DefaultChange, ErrorKind};
+use crate::home::{ResolvedHome, generate_profile_id};
+use crate::output::{DefaultChange, ErrorKind, redact_secrets};
 use crate::profile::{
     ProfileEntry, ProfileRegistry, RegistryRevision, load_registry_for_removal_with_revision,
     load_registry_with_revision, save_registry_if_unchanged, validate_profile_name,
@@ -80,16 +80,28 @@ fn profile_add(
         ));
     }
 
-    let id = registry
-        .profiles
-        .get(&args.name)
+    let previous = registry.profiles.get(&args.name).cloned();
+    let id = previous
+        .as_ref()
         .filter(|entry| same_profile_home(&entry.home, &home))
         .map(|entry| entry.id.clone())
         .unwrap_or_else(|| generate_profile_id(&args.name, &home));
+    let target = ResolvedHome::profile(home.clone(), &id, format!("profile '{}'", args.name));
+    super::load_active_config(&target).map_err(|error| {
+        let detail = redact_secrets(&error.to_string());
+        error.context(format!("cannot connect profile '{}' to target home {}: {detail}; profile registry was not changed", redact_secrets(&args.name), redact_secrets(&home.display().to_string())))
+    })?;
+    let namespace_changed = previous.as_ref().is_some_and(|entry| entry.id != id);
+    let action = if previous.is_some() {
+        "updated"
+    } else {
+        "added"
+    };
+    let warning = namespace_changed.then_some("home changed; a fresh credential namespace was created. Previous home and keyring entries are left intact; password credentials must be registered again when needed");
     registry.profiles.insert(
         args.name.clone(),
         ProfileEntry {
-            id,
+            id: id.clone(),
             home: home.clone(),
         },
     );
@@ -99,16 +111,29 @@ fn profile_add(
 
     save_registry_if_unchanged(registry_path, registry, revision)?;
     if args.json {
-        return Ok(ok(format!(
-            "{}\n",
-            json!({"ok":true,"action":"added","name":args.name,"home":home})
-        )));
+        let mut output = json!({"ok":true,"action":action,"name":args.name,"home":home,"id":id,"namespace_changed":namespace_changed});
+        if let Some(warning) = warning {
+            output["warning"] = json!(warning);
+        }
+        if namespace_changed && let Some(previous) = &previous {
+            output["previous_home"] = json!(redact_secrets(&previous.home.display().to_string()));
+        }
+        return Ok(ok(format!("{}\n", output)));
     }
-    Ok(ok(format!(
-        "added profile {} -> {}\n",
-        args.name,
-        home.display()
-    )))
+    let mut message = format!("{action} profile {} -> {}\n", args.name, home.display());
+    if let Some(warning) = warning {
+        if let Some(previous) = &previous {
+            message.push_str(&format!(
+                "home changed: {} -> {}\n",
+                redact_secrets(&previous.home.display().to_string()),
+                redact_secrets(&home.display().to_string())
+            ));
+        }
+        message.push_str(&format!("warning: {warning}\n"));
+    } else if previous.is_some() {
+        message.push_str("credential namespace unchanged\n");
+    }
+    Ok(ok(message))
 }
 
 fn same_profile_home(existing: &Path, requested: &Path) -> bool {
@@ -128,6 +153,33 @@ fn normalize_profile_home(home: &Path) -> anyhow::Result<std::path::PathBuf> {
             home.display()
         )
     })?;
+    // Missing homes are valid, but no existing part of the path may be a file.
+    // Windows can report NotFound for a missing child beneath a regular file.
+    let mut ancestor = absolute.as_path();
+    loop {
+        match fs::metadata(ancestor) {
+            Ok(metadata) if metadata.is_dir() => break,
+            Ok(_) => {
+                return Err(anyhow::anyhow!(
+                    "profile home '{}' requires a directory; '{}' is not a directory",
+                    absolute.display(),
+                    ancestor.display()
+                ));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                let Some(parent) = ancestor.parent() else {
+                    return Err(err.into());
+                };
+                ancestor = parent;
+            }
+            Err(err) => {
+                return Err(anyhow::anyhow!(
+                    "failed to resolve profile home '{}': {err}",
+                    absolute.display()
+                ));
+            }
+        }
+    }
     match fs::canonicalize(&absolute) {
         Ok(canonical) => Ok(canonical),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(absolute),

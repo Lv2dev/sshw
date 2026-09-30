@@ -435,7 +435,8 @@ pub struct AddArgs {
     /// TCP port of the SSH server (default: 22).
     #[arg(long, default_value_t = 22)]
     pub port: u16,
-    /// Remote username to log in as.
+    /// Remote username to register and make the default login account. Use
+    /// `account add` to add an account while keeping the current default.
     #[arg(long)]
     pub user: String,
     /// Authentication method (default: password).

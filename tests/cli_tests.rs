@@ -5610,6 +5610,524 @@ fn profile_removal_reports_only_effective_default_changes() {
     }
 }
 
+#[test]
+fn server_update_reports_default_login_account_change() {
+    for user in ["deploy", "ops"] {
+        for json in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("servers.json");
+            let mut config = agent_accounts_config(&path);
+            set_default_privilege(
+                &mut config,
+                "server-alpha",
+                PrivilegeConfig {
+                    method: PrivilegeMethod::Sudo,
+                    user: "root".into(),
+                    credential: None,
+                    no_password: true,
+                },
+            );
+            save_config(&path, &config).unwrap();
+            let original_accounts = config.servers["server-alpha"].accounts.clone();
+            let mut args = vec![
+                "sshw",
+                "add",
+                "server-alpha",
+                "--host",
+                "192.0.2.10",
+                "--port",
+                "2222",
+                "--user",
+                user,
+                "--auth",
+                "agent",
+            ];
+            if json {
+                args.push("--json");
+            }
+            let mut prompts = NoPasswordPrompter { prompts: vec![] };
+            let output = execute_for_runtime(
+                Cli::try_parse_from(args).unwrap(),
+                &path,
+                &FakeCredentialStore::default(),
+                &FakeSshClient::default(),
+                &mut prompts,
+            );
+            assert_eq!(output.exit_code, 0, "{}{}", output.stdout, output.stderr);
+            assert_eq!(prompts.prompts.len(), 1);
+            assert_eq!(
+                prompts.prompts[0].contains("default login account will change: deploy -> ops"),
+                user == "ops"
+            );
+            let saved = load_config(&path).unwrap();
+            assert_eq!(saved.servers["server-alpha"].default_user, user);
+            assert_eq!(saved.servers["server-alpha"].accounts, original_accounts);
+            if json {
+                let value: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+                assert_eq!(value["user"], user);
+                if user == "ops" {
+                    assert_eq!(
+                        value["default_change"],
+                        serde_json::json!({"resource":"account","previous":"deploy","current":"ops"})
+                    );
+                } else {
+                    assert!(value.get("default_change").is_none());
+                }
+            } else {
+                assert_eq!(
+                    output
+                        .stdout
+                        .contains("default account changed: deploy -> ops"),
+                    user == "ops"
+                );
+            }
+        }
+    }
+    let help = Cli::try_parse_from(["sshw", "add", "--help"])
+        .unwrap_err()
+        .to_string();
+    assert!(help.contains("default login account") && help.contains("account add"));
+}
+
+#[test]
+fn server_update_cleanup_failure_retains_account_change() {
+    for json in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("servers.json");
+        let namespace = ResolvedHome::from_config_path(&path).namespace;
+        let mut config = agent_accounts_config(&path);
+        config
+            .servers
+            .get_mut("server-alpha")
+            .unwrap()
+            .accounts
+            .get_mut("ops")
+            .unwrap()
+            .auth = AuthConfig::Password {
+            credential: namespace.new_account_credential_key(
+                CredentialPurpose::Login,
+                "server-alpha",
+                "ops",
+            ),
+        };
+        save_config(&path, &config).unwrap();
+        let store = FakeCredentialStore {
+            delete_error: Some("keyring delete failed".into()),
+            ..Default::default()
+        };
+        let mut args = vec![
+            "sshw",
+            "add",
+            "server-alpha",
+            "--host",
+            "192.0.2.10",
+            "--port",
+            "2222",
+            "--user",
+            "ops",
+            "--auth",
+            "agent",
+            "--force",
+        ];
+        if json {
+            args.push("--json");
+        }
+        let output = execute_for_runtime(
+            Cli::try_parse_from(args).unwrap(),
+            &path,
+            &store,
+            &FakeSshClient::default(),
+            &mut FakePrompter::default(),
+        );
+        assert_eq!(output.exit_code, 4);
+        assert_eq!(
+            load_config(&path).unwrap().servers["server-alpha"].default_user,
+            "ops"
+        );
+        if json {
+            let value: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+            assert_eq!(value["mutation"]["config_applied"], true);
+            assert_eq!(
+                value["mutation"]["default_change"],
+                serde_json::json!({"resource":"account","previous":"deploy","current":"ops"})
+            );
+        } else {
+            assert!(
+                output
+                    .stderr
+                    .contains("default account changed: deploy -> ops")
+            );
+        }
+        assert!(store.requested.borrow().is_empty());
+    }
+}
+
+#[test]
+fn profile_rejects_incompatible_target_before_registry_write() {
+    for existing in [false, true] {
+        for kind in ["login", "privilege", "malformed"] {
+            for json in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let active = temp.path().join("active/servers.json");
+                let registry_path = temp.path().join("active/profiles.json");
+                let store = FakeCredentialStore::default();
+                let ssh = FakeSshClient::default();
+                if existing {
+                    let previous = temp.path().join("previous");
+                    execute(
+                        Cli::try_parse_from([
+                            "sshw",
+                            "profile",
+                            "add",
+                            "prod",
+                            "--home",
+                            previous.to_str().unwrap(),
+                        ])
+                        .unwrap(),
+                        &active,
+                        &store,
+                        &ssh,
+                        &mut FakePrompter::default(),
+                    )
+                    .unwrap();
+                }
+                let registry_before = std::fs::read(&registry_path).ok();
+                let target = temp.path().join("target");
+                std::fs::create_dir_all(&target).unwrap();
+                let target_config = target.join("servers.json");
+                let foreign = CredentialNamespace::profile("foreign-profile");
+                let mut config = agent_accounts_config(&target_config);
+                if kind == "login" {
+                    config
+                        .servers
+                        .get_mut("server-alpha")
+                        .unwrap()
+                        .accounts
+                        .get_mut("deploy")
+                        .unwrap()
+                        .auth = AuthConfig::Password {
+                        credential: foreign.new_account_credential_key(
+                            CredentialPurpose::Login,
+                            "server-alpha",
+                            "deploy",
+                        ),
+                    };
+                } else if kind == "privilege" {
+                    set_default_privilege(
+                        &mut config,
+                        "server-alpha",
+                        PrivilegeConfig {
+                            method: PrivilegeMethod::Sudo,
+                            user: "root".into(),
+                            no_password: false,
+                            credential: Some(foreign.new_account_credential_key(
+                                CredentialPurpose::Privilege,
+                                "server-alpha",
+                                "deploy",
+                            )),
+                        },
+                    );
+                }
+                if kind == "malformed" {
+                    std::fs::write(&target_config, "{\"version\":99}").unwrap();
+                } else {
+                    save_config(&target_config, &config).unwrap();
+                }
+                let target_before = std::fs::read(&target_config).unwrap();
+                let mut args = vec![
+                    "sshw",
+                    "profile",
+                    "add",
+                    "prod",
+                    "--home",
+                    target.to_str().unwrap(),
+                ];
+                if existing {
+                    args.push("--force");
+                }
+                if json {
+                    args.push("--json");
+                }
+                let output = execute_for_runtime(
+                    Cli::try_parse_from(args).unwrap(),
+                    &active,
+                    &store,
+                    &ssh,
+                    &mut FakePrompter::default(),
+                );
+                assert_eq!(output.exit_code, 3, "{}{}", output.stdout, output.stderr);
+                let rendered = format!("{}{}", output.stdout, output.stderr);
+                assert!(rendered.contains("profile registry was not changed"));
+                assert!(rendered.contains("servers.json"));
+                assert_eq!(std::fs::read(&registry_path).ok(), registry_before);
+                assert_eq!(std::fs::read(&target_config).unwrap(), target_before);
+                assert!(!target.join(".sshw.lock").exists());
+                assert!(!target.join("audit.jsonl").exists());
+                assert!(store.requested.borrow().is_empty() && store.deleted.borrow().is_empty());
+                assert!(ssh.run_commands.borrow().is_empty());
+                if json {
+                    let value: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+                    assert_eq!(value["ok"], false);
+                    assert_eq!(value["error"]["kind"], "config");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn profile_updates_preserve_compatible_legacy_namespace_and_report_moves() {
+    for json in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let active = temp.path().join("active/servers.json");
+        let registry_path = temp.path().join("active/profiles.json");
+        let original = temp.path().join("original");
+        let store = FakeCredentialStore::default();
+        let ssh = FakeSshClient::default();
+        execute(
+            Cli::try_parse_from([
+                "sshw",
+                "profile",
+                "add",
+                "prod",
+                "--home",
+                original.to_str().unwrap(),
+            ])
+            .unwrap(),
+            &active,
+            &store,
+            &ssh,
+            &mut FakePrompter::default(),
+        )
+        .unwrap();
+        assert!(
+            !original.exists(),
+            "registration should not create an empty target home"
+        );
+        let first = sshw::profile::load_registry(&registry_path)
+            .unwrap()
+            .profiles["prod"]
+            .clone();
+        std::fs::create_dir_all(&original).unwrap();
+        let legacy = serde_json::json!({"version":1,"default":"web","servers":{"web":{"host":"192.0.2.10","port":22,"user":"deploy","auth":{"type":"password","credential":CredentialNamespace::profile(&first.id).legacy_credential_key("web")}}}}).to_string();
+        std::fs::write(original.join("servers.json"), &legacy).unwrap();
+        let mut args = vec![
+            "sshw",
+            "profile",
+            "add",
+            "prod",
+            "--home",
+            original.to_str().unwrap(),
+            "--force",
+        ];
+        if json {
+            args.push("--json");
+        }
+        let same = execute_for_runtime(
+            Cli::try_parse_from(args).unwrap(),
+            &active,
+            &store,
+            &ssh,
+            &mut FakePrompter::default(),
+        );
+        assert_eq!(same.exit_code, 0, "{}{}", same.stdout, same.stderr);
+        if json {
+            let value: serde_json::Value = serde_json::from_str(&same.stdout).unwrap();
+            assert_eq!(value["action"], "updated");
+            assert_eq!(value["id"], first.id);
+            assert_eq!(value["namespace_changed"], false);
+            assert!(value.get("warning").is_none());
+        } else {
+            assert!(
+                same.stdout.contains("updated profile prod")
+                    && same.stdout.contains("credential namespace unchanged")
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(original.join("servers.json")).unwrap(),
+            legacy
+        );
+        let same_entry = sshw::profile::load_registry(&registry_path)
+            .unwrap()
+            .profiles["prod"]
+            .clone();
+        assert_eq!(same_entry.id, first.id);
+        let vacant = temp.path().join("vacant");
+        let mut args = vec![
+            "sshw",
+            "profile",
+            "add",
+            "prod",
+            "--home",
+            vacant.to_str().unwrap(),
+            "--force",
+        ];
+        if json {
+            args.push("--json");
+        }
+        let moved = execute_for_runtime(
+            Cli::try_parse_from(args).unwrap(),
+            &active,
+            &store,
+            &ssh,
+            &mut FakePrompter::default(),
+        );
+        assert_eq!(moved.exit_code, 0);
+        let registry = sshw::profile::load_registry(&registry_path).unwrap();
+        assert_ne!(registry.profiles["prod"].id, first.id);
+        assert_eq!(registry.default.as_deref(), Some("prod"));
+        assert!(!vacant.exists());
+        if json {
+            let value: serde_json::Value = serde_json::from_str(&moved.stdout).unwrap();
+            assert_eq!(value["action"], "updated");
+            assert_eq!(value["namespace_changed"], true);
+            assert_eq!(
+                value["previous_home"],
+                serde_json::to_value(&same_entry.home).unwrap()
+            );
+            assert!(
+                value["warning"]
+                    .as_str()
+                    .unwrap()
+                    .contains("password credentials")
+            );
+        } else {
+            assert!(
+                moved.stdout.contains("fresh credential namespace")
+                    && moved.stdout.contains("home changed:")
+            );
+        }
+        assert!(store.requested.borrow().is_empty() && store.deleted.borrow().is_empty());
+    }
+}
+
+#[test]
+fn profile_registration_accepts_agent_target_without_rewriting_or_secret_access() {
+    for existing in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let active = temp.path().join("active/servers.json");
+        let store = FakeCredentialStore::default();
+        let ssh = FakeSshClient::default();
+        if existing {
+            let old = temp.path().join("old");
+            execute(
+                Cli::try_parse_from([
+                    "sshw",
+                    "profile",
+                    "add",
+                    "prod",
+                    "--home",
+                    old.to_str().unwrap(),
+                ])
+                .unwrap(),
+                &active,
+                &store,
+                &ssh,
+                &mut FakePrompter::default(),
+            )
+            .unwrap();
+        }
+        let target = temp.path().join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        let path = target.join("servers.json");
+        let mut config = agent_accounts_config(&path);
+        set_default_privilege(
+            &mut config,
+            "server-alpha",
+            PrivilegeConfig {
+                method: PrivilegeMethod::Sudo,
+                user: "root".into(),
+                credential: None,
+                no_password: true,
+            },
+        );
+        let before = serde_json::to_vec(&config).unwrap();
+        std::fs::write(&path, &before).unwrap();
+        let output = execute_for_runtime(
+            Cli::try_parse_from([
+                "sshw",
+                "profile",
+                "add",
+                "prod",
+                "--home",
+                target.to_str().unwrap(),
+                "--force",
+                "--json",
+            ])
+            .unwrap(),
+            &active,
+            &store,
+            &ssh,
+            &mut FakePrompter::default(),
+        );
+        assert_eq!(output.exit_code, 0, "{}{}", output.stdout, output.stderr);
+        let value: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+        assert_eq!(value["namespace_changed"], existing);
+        assert_eq!(value["action"], if existing { "updated" } else { "added" });
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(!target.join(".sshw.lock").exists() && !target.join("audit.jsonl").exists());
+        assert!(store.requested.borrow().is_empty() && store.deleted.borrow().is_empty());
+        assert!(ssh.run_commands.borrow().is_empty());
+    }
+}
+
+#[test]
+fn profile_registration_rejects_file_home_and_file_parent() {
+    for child in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let active = temp.path().join("active/servers.json");
+        let registry_path = temp.path().join("active/profiles.json");
+        let original = temp.path().join("original");
+        let store = FakeCredentialStore::default();
+        let ssh = FakeSshClient::default();
+        execute(
+            Cli::try_parse_from([
+                "sshw",
+                "profile",
+                "add",
+                "prod",
+                "--home",
+                original.to_str().unwrap(),
+            ])
+            .unwrap(),
+            &active,
+            &store,
+            &ssh,
+            &mut FakePrompter::default(),
+        )
+        .unwrap();
+        let before = std::fs::read(&registry_path).unwrap();
+        let file = temp.path().join("file-parent");
+        std::fs::write(&file, "keep this file").unwrap();
+        let target = if child {
+            file.join("missing/home")
+        } else {
+            file.clone()
+        };
+        let output = execute_for_runtime(
+            Cli::try_parse_from([
+                "sshw",
+                "profile",
+                "add",
+                "prod",
+                "--home",
+                target.to_str().unwrap(),
+                "--force",
+                "--json",
+            ])
+            .unwrap(),
+            &active,
+            &store,
+            &ssh,
+            &mut FakePrompter::default(),
+        );
+        assert_eq!(output.exit_code, 3, "{}{}", output.stdout, output.stderr);
+        assert_eq!(std::fs::read(&registry_path).unwrap(), before);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "keep this file");
+        assert!(store.requested.borrow().is_empty() && store.deleted.borrow().is_empty());
+    }
+}
+
 fn assert_json_error(
     output: sshw::cli::CommandOutput,
     exit_code: i32,

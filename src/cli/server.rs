@@ -13,7 +13,7 @@ use crate::config::{
 use crate::credentials::CredentialStore;
 use crate::error::{ResultErrorKindExt, app_error, credential_cleanup_error};
 use crate::home::{CredentialNamespace, CredentialPurpose, validate_server_name};
-use crate::output::{DefaultChange, ErrorKind, ServerOutput};
+use crate::output::{DefaultChange, ErrorKind, ServerOutput, redact_secrets};
 use crate::ssh::SshClient;
 use serde_json::json;
 use std::path::Path;
@@ -35,6 +35,23 @@ where
     validate_account_user(&args.user).with_error_kind(ErrorKind::Config)?;
 
     let previous_server = config.servers.get(&args.name).cloned();
+    let default_change = previous_server.as_ref().and_then(|previous| {
+        DefaultChange::between(
+            "account",
+            Some(previous.default_user.clone()),
+            Some(args.user.clone()),
+        )
+    });
+    let account_notice = default_change
+        .as_ref()
+        .map(|change| {
+            format!(
+                "; default login account will change: {} -> {}",
+                redact_secrets(change.previous.as_deref().unwrap_or("none")),
+                redact_secrets(change.current.as_deref().unwrap_or("none"))
+            )
+        })
+        .unwrap_or_default();
     let action = if previous_server.is_some() {
         "updated"
     } else {
@@ -51,19 +68,19 @@ where
     }
     let prompt = if args.replace {
         format!(
-            "replace server '{}' and remove its existing accounts and privilege settings? [y/N] ",
+            "replace server '{}' and remove its existing accounts and privilege settings{account_notice}? [y/N] ",
             args.name
         )
     } else {
         format!(
-            "update account '{}/{}' (other accounts and privilege settings are preserved)? [y/N] ",
+            "update account '{}/{}' (other accounts and privilege settings are preserved{account_notice})? [y/N] ",
             args.name, args.user
         )
     };
     if previous_server.is_some()
         && !args.force
         && !prompter
-            .confirm_with_option(&prompt, "--force")
+            .confirm_with_option(&redact_secrets(&prompt), "--force")
             .with_error_kind(ErrorKind::Config)?
     {
         return Err(app_error(ErrorKind::Config, "add cancelled"));
@@ -150,7 +167,11 @@ where
     }
     if let Some(err) = cleanup_error {
         return Err(credential_cleanup_error(
-            err, action, &args.name, None, None,
+            err,
+            action,
+            &args.name,
+            None,
+            default_change,
         ));
     }
 
@@ -165,7 +186,11 @@ where
             "ok": true,
             "action": action,
             "server": args.name,
+            "user": redact_secrets(&config.servers[&args.name].default_user),
         });
+        if let Some(change) = default_change {
+            output["default_change"] = serde_json::to_value(change.redacted())?;
+        }
         if let (Some(map), Some(warning)) = (output.as_object_mut(), warning) {
             map.insert(
                 "warning".to_string(),
@@ -176,6 +201,9 @@ where
     }
 
     let mut message = format!("{action} {}\n", args.name);
+    if let Some(change) = default_change {
+        message.push_str(&change.human_message());
+    }
     if previous_server.is_none() || args.replace {
         message.push_str(&format!(
             "next: sshw trust {}\nthen: sshw run {} \"hostname\"\n",

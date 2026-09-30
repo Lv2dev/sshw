@@ -149,6 +149,10 @@ sshw profile remove prod                  # removes the registry entry only; hom
 
 Each profile stores a stable id and its home path. The first profile added becomes the default. `profile add --force` preserves the existing id when the normalized home is unchanged; moving the name to a different home creates a fresh namespace. The selection mechanism is part of the credential boundary: opening a profile-owned directory with `--home` does not reuse that profile's credentials. Removing a profile leaves its directory and native keyring entries physically intact, but removes the trusted namespace binding; re-adding a removed profile creates a fresh credential namespace and requires credentials to be registered again. Use `--force` instead of remove/re-add when updating the same profile and home.
 
+프로필 추가·갱신은 사용할 namespace로 대상 `servers.json`의 형식·기본값·계정·자격 증명 참조를 검사한 뒤 registry를 저장합니다. 호환되지 않으면 경로와 원인을 안내하고 기존 연결과 기본값을 보존하며, `--force`로도 검사를 건너뛰지 않습니다. 없는 home과 호환되는 agent/무비밀번호 설정은 허용하지만 경로의 기존 부분이 파일이면 거부합니다. 검사는 대상 파일을 바꾸거나 비밀번호/keyring/SSH를 조회하지 않으며, 이후 파일 변경은 실행 시 다시 검증합니다.
+
+`profile add` 결과는 신규 `added`와 기존 항목 갱신 `updated`를 구분합니다. JSON에는 `id`·`namespace_changed`를 추가하고, 경로 이동으로 namespace가 바뀌면 `previous_home`과 재등록 안내 `warning`도 제공합니다. 같은 home의 갱신은 namespace를 보존합니다. 경로 변경은 서버 파일이나 비밀을 옮기지 않으며 이전 home/keyring은 남습니다. 복사한 비밀번호 설정이 호환되지 않으면 빈 home 또는 호환되는 설정을 선택하고 필요한 비밀번호를 새 연결에서 등록하세요.
+
 기본 서버나 프로필을 삭제하면 기존처럼 이름순 첫 번째 남은 항목이 기본값이 됩니다. 삭제 결과에는 이전·새 기본값을 표시하고, JSON은 실제 전환이 있을 때만 `default_change` 객체에 `resource`(`server` 또는 `profile`), `previous`(이전 이름), `current`(새 이름)를 추가합니다. 마지막 항목을 삭제하면 `current`는 `null`입니다. 등록된 기본 프로필이 없으면 명시적인 home/profile 선택이 없는 호출은 기본 home을 사용합니다. 이후 서버를 생략한 명령은 새 기본 서버를 사용하므로 삭제 결과를 확인하세요.
 
 Registries are validated strictly. If an older release stored a relative profile home, normal selection/list/show/default operations fail closed. `sshw doctor` reports `registry_valid: false` and an actionable `registry_message`; `sshw profile remove <affected-name>` is the only recovery exception and succeeds only when removing that exact entry leaves a fully valid registry. It never resolves or migrates the relative path against the current working directory.
@@ -273,6 +277,8 @@ sshw policy <init|show|enable|disable|allow|remove|check> ... [--json]
 ```
 
 `add`, `account add`, and `profile add` take `--force` to confirm an update non-interactively. Updating a server at the same host/port preserves its other accounts and the updated account's privilege settings; only the selected login credential is rotated. Changing host or port requires `--replace`, which explicitly resets the account set and privilege settings and cleans up stale credentials. Use a new server name to keep the old endpoint available. `--force` alone never authorizes endpoint replacement.
+
+`add --user`는 지정한 계정을 등록하고 기본 로그인 계정으로 선택합니다. 갱신으로 기본 계정이 바뀌면 확인 문구와 human 결과에 이전·새 계정을 표시하고, JSON에 `user` 및 `default_change`(`resource:"account"`, `previous`, `current`)를 추가합니다. 같은 기본 계정의 갱신에는 전환 정보를 붙이지 않습니다. 저장 후 자격 증명 정리만 실패해도 전환은 `mutation.default_change`에 남습니다. 기존 기본값을 유지하며 계정을 추가하려면 `account add`를 사용하세요.
 
 Global flags (available on every command): `--home <path>`, `--profile <name>`, `--policy`, `--timeout <seconds>`.
 
@@ -628,6 +634,10 @@ sshw profile remove prod                  # registry 항목만 제거. home 디�
 
 각 profile은 stable id와 home 경로를 저장합니다. 처음 추가한 profile이 default가 됩니다. 정규화된 home이 같으면 `profile add --force`는 기존 id를 보존하고, 다른 home으로 바꾸면 새 namespace를 만듭니다. profile 선택 방식 자체가 credential 경계이므로 profile 소유 디렉터리를 `--home`으로 열어도 그 profile credential을 재사용하지 않습니다. profile을 제거하면 디렉터리와 native keyring 항목은 물리적으로 남지만 신뢰된 namespace 연결은 사라집니다. 제거한 profile을 다시 추가하면 새 credential namespace가 만들어지므로 credential을 다시 등록해야 합니다. 같은 profile/home 갱신에는 remove/re-add 대신 `--force`를 사용하세요.
 
+프로필 추가·갱신은 사용할 namespace로 대상 `servers.json`의 형식·기본값·계정·자격 증명 참조를 검사한 뒤 registry를 저장합니다. 호환되지 않으면 경로와 원인을 안내하고 기존 연결과 기본값을 보존하며, `--force`로도 검사를 건너뛰지 않습니다. 없는 home과 호환되는 agent/무비밀번호 설정은 허용하지만 경로의 기존 부분이 파일이면 거부합니다. 검사는 대상 파일을 바꾸거나 비밀번호/keyring/SSH를 조회하지 않으며, 이후 파일 변경은 실행 시 다시 검증합니다.
+
+결과는 신규 `added`와 기존 항목 갱신 `updated`를 구분합니다. JSON에는 `id`·`namespace_changed`를 추가하고, 경로 이동으로 namespace가 바뀌면 `previous_home`과 재등록 안내 `warning`도 제공합니다. 같은 home의 갱신은 namespace를 보존합니다. 경로 변경은 서버 파일이나 비밀을 옮기지 않으며 이전 home/keyring은 남습니다. 복사한 비밀번호 설정이 호환되지 않으면 빈 home 또는 호환되는 설정을 선택하고 필요한 비밀번호를 새 연결에서 등록하세요.
+
 registry는 엄격하게 검증합니다. 이전 릴리스가 상대경로 profile home을 저장한 경우 일반 선택/list/show/default 작업은 fail-closed합니다. `sshw doctor`는 `registry_valid: false`와 조치 가능한 `registry_message`를 보고합니다. 유일한 복구 예외인 `sshw profile remove <문제-profile>`은 그 항목을 제거한 뒤 나머지 registry가 완전히 유효할 때만 성공하며, 상대경로를 현재 작업 디렉터리 기준으로 해석하거나 자동 이동하지 않습니다.
 
 ### 비밀번호 인증
@@ -748,6 +758,8 @@ sshw policy <init|show|enable|disable|allow|remove|check> ... [--json]
 ```
 
 `add`, `account add`, `profile add`는 `--force`로 갱신을 비대화형 승인합니다. 같은 host/port의 서버를 갱신하면 다른 계정과 해당 계정의 privilege 설정을 보존하고 선택한 login credential만 갱신합니다. host/port 변경은 `--replace`가 필요하며 전체 계정·privilege 설정을 초기화하고 오래된 credential을 정리합니다. 이전 endpoint를 유지하려면 새 서버 이름을 쓰세요. `--force`만으로 endpoint 교체를 승인하지 않습니다.
+
+`add --user`는 지정한 계정을 등록하고 기본 로그인 계정으로 선택합니다. 갱신으로 기본 계정이 바뀌면 확인 문구와 human 결과에 이전·새 계정을 표시하고, JSON에 `user` 및 `default_change`(`resource:"account"`, `previous`, `current`)를 추가합니다. 같은 기본 계정의 갱신에는 전환 정보를 붙이지 않습니다. 저장 후 자격 증명 정리만 실패해도 전환은 `mutation.default_change`에 남습니다. 기존 기본값을 유지하며 계정을 추가하려면 `account add`를 사용하세요.
 
 전역 플래그(모든 명령에서 사용): `--home <path>`, `--profile <name>`, `--policy`, `--timeout <seconds>`.
 

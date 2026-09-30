@@ -8,6 +8,11 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 
 ## [Unreleased]
 
+### 등록·갱신 영향 안내
+- 서버 `add --user`로 기존 기본 로그인 계정이 바뀌면 확인 문구와 human/JSON에 이전·새 계정을 표시합니다. JSON에 `user`와 계정 전환의 `default_change`를 추가하고, 저장 후 정리 실패에도 전환을 보존합니다. 기존 선택 동작은 유지하며 도움말에 `account add`와의 차이를 명시합니다.
+- 프로필 추가·갱신은 사용할 namespace로 대상 서버 설정을 검사한 뒤 registry를 저장합니다. 호환되지 않는 자격 증명 참조·잘못된 설정·파일로 막힌 home 경로를 config/3으로 거부하고 기존 연결·기본값·대상 파일을 보존합니다. 빈 home·agent 설정·같은 home의 namespace 및 v1 설정 호환은 유지합니다.
+- 프로필 결과는 신규 `added`와 갱신 `updated`를 구분하고 JSON에 `id`·`namespace_changed`를 추가합니다. 경로 이동으로 namespace가 바뀌면 `previous_home`과 비밀번호 재등록 안내도 표시합니다. 비밀 조회/이전이나 대상 설정 재저장은 수행하지 않습니다.
+
 ### 설정 변경 결과 안내
 - 서버·계정·권한 설정 저장 후 이전 자격 증명 정리가 실패하면 설정은 이미 적용됐다는 사실과 원인을 표시합니다. JSON에 `mutation.config_applied`·`failed_stage`·변경 대상/작업을 추가하며 기존 auth/4와 오류 envelope, 저장 후 정리 순서를 유지합니다.
 - 기본 서버·프로필 삭제로 기본값이 바뀌면 이전·새 값을 human 출력과 JSON `default_change`로 안내합니다. 마지막 항목 삭제의 기본값 없음, 등록된 기본 프로필이 없을 때 기본 home 선택도 설명합니다. 자동 기본값 선택과 프로필의 home/keyring 보존 경고는 유지합니다.
