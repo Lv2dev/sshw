@@ -9,7 +9,7 @@ use crate::config::{
     save_config_if_unchanged, validate_account_user,
 };
 use crate::credentials::CredentialStore;
-use crate::error::{ResultErrorKindExt, app_error, classified_error};
+use crate::error::{ResultErrorKindExt, app_error, credential_cleanup_error};
 use crate::home::{CredentialNamespace, CredentialPurpose, validate_server_name};
 use crate::output::ErrorKind;
 use serde_json::{Value, json};
@@ -111,7 +111,9 @@ where
         {
             credentials
                 .delete_password_for(CredentialPurpose::Login, credential, &args.user)
-                .with_error_kind(ErrorKind::Auth)?;
+                .map_err(|err| {
+                    credential_cleanup_error(err, "updated", &args.name, Some(&args.user), None)
+                })?;
         }
     }
 
@@ -296,7 +298,13 @@ where
         cleanup_error.get_or_insert(err);
     }
     if let Some(err) = cleanup_error {
-        return Err(classified_error(ErrorKind::Auth, err));
+        return Err(credential_cleanup_error(
+            err,
+            "removed",
+            &args.name,
+            Some(&args.user),
+            None,
+        ));
     }
 
     if args.json {

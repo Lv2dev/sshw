@@ -149,6 +149,8 @@ sshw profile remove prod                  # removes the registry entry only; hom
 
 Each profile stores a stable id and its home path. The first profile added becomes the default. `profile add --force` preserves the existing id when the normalized home is unchanged; moving the name to a different home creates a fresh namespace. The selection mechanism is part of the credential boundary: opening a profile-owned directory with `--home` does not reuse that profile's credentials. Removing a profile leaves its directory and native keyring entries physically intact, but removes the trusted namespace binding; re-adding a removed profile creates a fresh credential namespace and requires credentials to be registered again. Use `--force` instead of remove/re-add when updating the same profile and home.
 
+기본 서버나 프로필을 삭제하면 기존처럼 이름순 첫 번째 남은 항목이 기본값이 됩니다. 삭제 결과에는 이전·새 기본값을 표시하고, JSON은 실제 전환이 있을 때만 `default_change` 객체에 `resource`(`server` 또는 `profile`), `previous`(이전 이름), `current`(새 이름)를 추가합니다. 마지막 항목을 삭제하면 `current`는 `null`입니다. 등록된 기본 프로필이 없으면 명시적인 home/profile 선택이 없는 호출은 기본 home을 사용합니다. 이후 서버를 생략한 명령은 새 기본 서버를 사용하므로 삭제 결과를 확인하세요.
+
 Registries are validated strictly. If an older release stored a relative profile home, normal selection/list/show/default operations fail closed. `sshw doctor` reports `registry_valid: false` and an actionable `registry_message`; `sshw profile remove <affected-name>` is the only recovery exception and succeeds only when removing that exact entry leaves a fully valid registry. It never resolves or migrates the relative path against the current working directory.
 
 ### Password Auth
@@ -198,6 +200,8 @@ sshw get server-alpha /var/log/app.log ./app.log --user deploy
 ```
 
 Password accounts store a distinct credential per server and username. Updating an account rotates only its login credential and preserves its account-specific privilege configuration. Removing a non-default account publishes the config removal before deleting that account's login and privilege credentials. A default account cannot be removed until another registered account becomes the default. `trust` remains server-only because every account on an endpoint shares the same host/port host-key boundary.
+
+서버·계정·권한 설정의 변경이나 삭제는 설정을 저장한 뒤 이전 자격 증명을 정리합니다. 정리만 실패한 경우에도 종료 코드 `4`와 `ok:false`/`error`를 유지하되, 설정 변경은 이미 저장됐다는 안내와 원인을 표시합니다. JSON에는 `mutation` 객체의 `config_applied:true`, `failed_stage:"credential_cleanup"`, `action`, `server`, 해당 시 `account`를 추가합니다. 서버 삭제로 기본값도 바뀌었다면 같은 객체 안에 `default_change`가 포함됩니다. 현재 상태는 `show`·`list`·`account show`·`privilege show`로 확인할 수 있습니다. 이미 적용된 명령을 반복해도 참조가 사라진 이전 자격 증명을 정리할 수 있다고 보장하지 않습니다. 저장이 실패한 경우에는 적용 완료 정보를 붙이지 않습니다.
 
 ### Credential Backends
 

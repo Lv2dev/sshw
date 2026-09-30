@@ -8,6 +8,11 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 
 ## [Unreleased]
 
+### 설정 변경 결과 안내
+- 서버·계정·권한 설정 저장 후 이전 자격 증명 정리가 실패하면 설정은 이미 적용됐다는 사실과 원인을 표시합니다. JSON에 `mutation.config_applied`·`failed_stage`·변경 대상/작업을 추가하며 기존 auth/4와 오류 envelope, 저장 후 정리 순서를 유지합니다.
+- 기본 서버·프로필 삭제로 기본값이 바뀌면 이전·새 값을 human 출력과 JSON `default_change`로 안내합니다. 마지막 항목 삭제의 기본값 없음, 등록된 기본 프로필이 없을 때 기본 home 선택도 설명합니다. 자동 기본값 선택과 프로필의 home/keyring 보존 경고는 유지합니다.
+- 기본 서버 전환 후 자격 증명 정리에 실패해도 적용된 기본값 전환을 오류의 `mutation.default_change`에 보존합니다. 새 설명 필드와 원인에는 비밀 마스킹을 적용합니다. Rust API의 `ErrorResponse`에는 `mutation: Option<ConfigMutationOutput>` 필드가 추가됩니다.
+
 ### 정책 판정·변경 결과 안내
 - `policy check/check-put/check-get`에서 정책 활성·비활성·`--policy` 강제 적용 상태, 매칭된 명령/경로/계정 규칙과 기본 계정의 암묵 허용을 표시합니다. 쉘 구문의 정확한 명령 규칙 요구, `..` 경로 차단, 원자적 업로드의 부모 경로 판정도 설명합니다.
 - JSON에 `policy` 설명을 추가하며 기존 `allowed`·`reasons`·첫 실패 종료 코드를 유지합니다. 설명은 실제 검사와 같은 정책 snapshot과 matcher를 사용하고 비밀을 마스킹하며 자격 증명이나 SSH를 조회하지 않습니다.

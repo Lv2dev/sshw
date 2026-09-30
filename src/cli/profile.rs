@@ -10,7 +10,7 @@ use super::{
 };
 use crate::error::ResultErrorKindExt;
 use crate::home::generate_profile_id;
-use crate::output::ErrorKind;
+use crate::output::{DefaultChange, ErrorKind};
 use crate::profile::{
     ProfileEntry, ProfileRegistry, RegistryRevision, load_registry_for_removal_with_revision,
     load_registry_with_revision, save_registry_if_unchanged, validate_profile_name,
@@ -231,6 +231,7 @@ fn profile_remove(
     revision: &RegistryRevision,
     registry: &mut ProfileRegistry,
 ) -> anyhow::Result<CommandOutput> {
+    let previous_default = registry.default.clone();
     if registry.profiles.remove(&args.name).is_none() {
         return Err(anyhow::anyhow!("unknown profile '{}'", args.name));
     }
@@ -239,14 +240,21 @@ fn profile_remove(
     }
 
     save_registry_if_unchanged(registry_path, registry, revision)?;
+    let default_change =
+        DefaultChange::between("profile", previous_default, registry.default.clone());
     if args.json {
-        return Ok(ok(format!(
-            "{}\n",
-            json!({"ok":true,"action":"removed","name":args.name,"warning":"home and keyring entries left intact; re-adding requires credentials to be registered again"})
-        )));
+        let mut output = json!({"ok":true,"action":"removed","name":args.name,"warning":"home and keyring entries left intact; re-adding requires credentials to be registered again"});
+        if let Some(change) = default_change {
+            output["default_change"] = serde_json::to_value(change.redacted())?;
+        }
+        return Ok(ok(format!("{}\n", output)));
     }
-    Ok(ok(format!(
+    let mut message = format!(
         "removed profile {} (home and keyring entries left intact; re-adding creates a fresh credential namespace)\n",
         args.name
-    )))
+    );
+    if let Some(change) = default_change {
+        message.push_str(&change.human_message());
+    }
+    Ok(ok(message))
 }

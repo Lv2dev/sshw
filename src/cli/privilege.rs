@@ -8,7 +8,7 @@ use crate::config::{
     ConfigRevision, PrivilegeConfig, PrivilegeMethod, SshwConfig, save_config_if_unchanged,
 };
 use crate::credentials::CredentialStore;
-use crate::error::{ResultErrorKindExt, app_error};
+use crate::error::{ResultErrorKindExt, app_error, credential_cleanup_error};
 use crate::home::{CredentialNamespace, CredentialPurpose, validate_server_name};
 use crate::output::ErrorKind;
 use serde_json::json;
@@ -126,7 +126,9 @@ where
         {
             credentials
                 .delete_password_for(CredentialPurpose::Privilege, credential, &previous.user)
-                .with_error_kind(ErrorKind::Auth)?;
+                .map_err(|err| {
+                    credential_cleanup_error(err, "set", &args.name, Some(&login_user), None)
+                })?;
         }
     }
 
@@ -260,7 +262,9 @@ where
     if let Some(credential) = &privilege.credential {
         credentials
             .delete_password_for(CredentialPurpose::Privilege, credential, &privilege.user)
-            .with_error_kind(ErrorKind::Auth)?;
+            .map_err(|err| {
+                credential_cleanup_error(err, "cleared", &args.name, Some(&login_user), None)
+            })?;
     }
     if args.json {
         let output = json!({

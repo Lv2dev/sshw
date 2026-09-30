@@ -1604,6 +1604,7 @@ fn error_json_line(response: &ErrorResponse) -> String {
             let fallback = ErrorResponse {
                 ok: false,
                 partial_output: None,
+                mutation: None,
                 error: crate::output::ErrorBody {
                     kind: ErrorKind::Unknown,
                     message: format!("failed to serialize error response: {err}"),
@@ -1709,6 +1710,7 @@ fn parse_error_output(mut err: clap::Error, json: bool) -> CommandOutput {
         let response = ErrorResponse {
             ok: false,
             partial_output: None,
+            mutation: None,
             error: crate::output::ErrorBody {
                 kind,
                 message: clap_usage_summary(&rendered),

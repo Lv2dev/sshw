@@ -5212,6 +5212,404 @@ fn policy_disabled_in_file_allows_everything_without_flag() {
     assert_eq!(out.stdout, "ok\n");
 }
 
+#[test]
+fn cleanup_failures_report_saved_mutations() {
+    let commands = [
+        (
+            vec![
+                "add",
+                "server-alpha",
+                "--host",
+                "192.0.2.10",
+                "--port",
+                "2222",
+                "--user",
+                "deploy",
+                "--auth",
+                "agent",
+                "--force",
+            ],
+            "updated",
+            None,
+        ),
+        (vec!["remove", "server-alpha", "--yes"], "removed", None),
+        (
+            vec![
+                "account",
+                "add",
+                "server-alpha",
+                "ops",
+                "--auth",
+                "agent",
+                "--force",
+            ],
+            "updated",
+            Some("ops"),
+        ),
+        (
+            vec!["account", "remove", "server-alpha", "ops", "--yes"],
+            "removed",
+            Some("ops"),
+        ),
+        (
+            vec![
+                "privilege",
+                "set",
+                "server-alpha",
+                "--no-password",
+                "--force",
+            ],
+            "set",
+            Some("deploy"),
+        ),
+        (
+            vec!["privilege", "clear", "server-alpha", "--yes"],
+            "cleared",
+            Some("deploy"),
+        ),
+    ];
+    for (command, action, account) in commands {
+        for json in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("servers.json");
+            let namespace = ResolvedHome::from_config_path(&path).namespace;
+            let mut config = sample_config(&path);
+            config.servers.insert(
+                "server-beta".into(),
+                ServerConfig::single_account("192.0.2.11", 22, "deploy", AuthConfig::Agent),
+            );
+            config
+                .servers
+                .get_mut("server-alpha")
+                .unwrap()
+                .accounts
+                .insert(
+                    "ops".into(),
+                    AccountConfig {
+                        auth: AuthConfig::Password {
+                            credential: namespace.new_account_credential_key(
+                                CredentialPurpose::Login,
+                                "server-alpha",
+                                "ops",
+                            ),
+                        },
+                        privilege: None,
+                    },
+                );
+            set_default_privilege(
+                &mut config,
+                "server-alpha",
+                PrivilegeConfig {
+                    method: PrivilegeMethod::Sudo,
+                    user: "root".into(),
+                    credential: Some(privilege_credential(&path, "server-alpha")),
+                    no_password: false,
+                },
+            );
+            save_config(&path, &config).unwrap();
+            let store = FakeCredentialStore {
+                delete_error: Some("keyring delete failed\npassword=fixture-cleanup-secret\n-----BEGIN OPENSSH PRIVATE KEY-----\nfixture-private-key\n-----END OPENSSH PRIVATE KEY-----".into()),
+                ..FakeCredentialStore::default()
+            };
+            let ssh = FakeSshClient::default();
+            let mut args = vec!["sshw"];
+            args.extend(command.iter().copied());
+            if json {
+                args.push("--json");
+            }
+            let output = execute_for_runtime(
+                Cli::try_parse_from(args).unwrap(),
+                &path,
+                &store,
+                &ssh,
+                &mut FakePrompter::default(),
+            );
+            assert_eq!(output.exit_code, 4, "{command:?}");
+            let rendered = format!("{}{}", output.stdout, output.stderr);
+            assert!(
+                rendered.contains("configuration changes saved"),
+                "{rendered}"
+            );
+            assert!(rendered.contains("keyring delete failed"), "{rendered}");
+            assert!(!rendered.contains("fixture-cleanup-secret"), "{rendered}");
+            assert!(!rendered.contains("fixture-private-key"), "{rendered}");
+            if json {
+                assert!(output.stderr.is_empty());
+                let body: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+                assert_eq!(body["ok"], false);
+                assert_eq!(body["error"]["kind"], "auth");
+                assert_eq!(body["error"]["exit_code"], 4);
+                assert_eq!(body["mutation"]["config_applied"], true);
+                assert_eq!(body["mutation"]["failed_stage"], "credential_cleanup");
+                assert_eq!(body["mutation"]["action"], action);
+                assert_eq!(body["mutation"]["server"], "server-alpha");
+                assert_eq!(body["mutation"]["account"].as_str(), account);
+                if command[0] == "remove" {
+                    assert_eq!(
+                        body["mutation"]["default_change"],
+                        serde_json::json!({"resource":"server", "previous":"server-alpha", "current":"server-beta"})
+                    );
+                } else {
+                    assert!(body["mutation"].get("default_change").is_none());
+                }
+            } else {
+                assert!(output.stdout.is_empty());
+                if command[0] == "remove" {
+                    assert!(
+                        output
+                            .stderr
+                            .contains("default server changed: server-alpha -> server-beta")
+                    );
+                }
+            }
+            let saved = load_config(&path).unwrap();
+            match command.as_slice() {
+                ["add", ..] => assert!(matches!(
+                    saved.servers["server-alpha"].accounts["deploy"].auth,
+                    AuthConfig::Agent
+                )),
+                ["remove", ..] => {
+                    assert!(!saved.servers.contains_key("server-alpha"));
+                    assert_eq!(saved.default.as_deref(), Some("server-beta"));
+                }
+                ["account", "add", ..] => assert!(matches!(
+                    saved.servers["server-alpha"].accounts["ops"].auth,
+                    AuthConfig::Agent
+                )),
+                ["account", "remove", ..] => {
+                    assert!(!saved.servers["server-alpha"].accounts.contains_key("ops"))
+                }
+                ["privilege", "set", ..] => assert!(
+                    default_privilege(&saved, "server-alpha")
+                        .unwrap()
+                        .no_password
+                ),
+                ["privilege", "clear", ..] => {
+                    assert!(default_privilege(&saved, "server-alpha").is_none())
+                }
+                _ => unreachable!(),
+            }
+            assert!(store.requested.borrow().is_empty());
+            assert!(ssh.run_commands.borrow().is_empty());
+        }
+    }
+}
+
+#[test]
+fn server_removal_reports_only_effective_default_changes() {
+    for (default, remove, last) in [
+        (Some("server-alpha"), "server-alpha", false),
+        (Some("server-alpha"), "server-beta", false),
+        (Some("server-alpha"), "server-alpha", true),
+        (None, "server-beta", false),
+    ] {
+        for json in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("servers.json");
+            let mut config = sample_config(&path);
+            config
+                .servers
+                .get_mut("server-alpha")
+                .unwrap()
+                .accounts
+                .get_mut("deploy")
+                .unwrap()
+                .auth = AuthConfig::Agent;
+            if !last {
+                config.servers.insert(
+                    "server-beta".into(),
+                    ServerConfig::single_account("192.0.2.11", 22, "deploy", AuthConfig::Agent),
+                );
+            }
+            config.default = default.map(str::to_owned);
+            save_config(&path, &config).unwrap();
+            let mut args = vec!["sshw", "remove", remove, "--yes"];
+            if json {
+                args.push("--json");
+            }
+            let output = execute_for_runtime(
+                Cli::try_parse_from(args).unwrap(),
+                &path,
+                &FakeCredentialStore::default(),
+                &FakeSshClient::default(),
+                &mut FakePrompter::default(),
+            );
+            assert_eq!(output.exit_code, 0);
+            let saved = load_config(&path).unwrap();
+            let changed = default == Some(remove);
+            let expected = if changed {
+                if last { None } else { Some("server-beta") }
+            } else {
+                default
+            };
+            assert_eq!(saved.default.as_deref(), expected);
+            if json {
+                let body: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+                assert_eq!(body["server"], remove);
+                if changed {
+                    assert_eq!(
+                        body["default_change"],
+                        serde_json::json!({"resource":"server", "previous":default, "current":expected})
+                    );
+                } else {
+                    assert!(body.get("default_change").is_none());
+                }
+            } else {
+                assert!(output.stdout.starts_with(&format!("removed {remove}\n")));
+                assert_eq!(output.stdout.contains("default server changed:"), changed);
+                if changed {
+                    assert!(
+                        output
+                            .stdout
+                            .contains(&format!("{remove} -> {}", expected.unwrap_or("none")))
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn save_conflicts_do_not_report_applied_mutations() {
+    struct ConcurrentEdit<'a>(&'a Path);
+    impl Prompter for ConcurrentEdit<'_> {
+        fn confirm(&mut self, _: &str) -> anyhow::Result<bool> {
+            let mut bytes = std::fs::read(self.0)?;
+            bytes.push(b'\n');
+            std::fs::write(self.0, bytes)?;
+            Ok(true)
+        }
+        fn password(&mut self, _: &str) -> anyhow::Result<String> {
+            panic!("no password required")
+        }
+        fn password_stdin(&mut self) -> anyhow::Result<String> {
+            panic!("no password required")
+        }
+    }
+    for command in [
+        vec!["remove", "server-alpha"],
+        vec!["privilege", "clear", "server-alpha"],
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("servers.json");
+        let mut config = sample_config(&path);
+        set_default_privilege(
+            &mut config,
+            "server-alpha",
+            PrivilegeConfig {
+                method: PrivilegeMethod::Sudo,
+                user: "root".into(),
+                credential: Some(privilege_credential(&path, "server-alpha")),
+                no_password: false,
+            },
+        );
+        save_config(&path, &config).unwrap();
+        let store = FakeCredentialStore::default();
+        let mut args = vec!["sshw"];
+        args.extend(command);
+        args.push("--json");
+        let output = execute_for_runtime(
+            Cli::try_parse_from(args).unwrap(),
+            &path,
+            &store,
+            &FakeSshClient::default(),
+            &mut ConcurrentEdit(&path),
+        );
+        assert_eq!(output.exit_code, 3);
+        let body: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+        assert!(body.get("mutation").is_none());
+        assert!(body.get("default_change").is_none());
+        assert!(!output.stdout.contains("configuration changes saved"));
+        assert_eq!(load_config(&path).unwrap(), config);
+        assert!(
+            store.deleted.borrow().is_empty(),
+            "save conflict must precede credential cleanup"
+        );
+    }
+}
+
+#[test]
+fn profile_removal_reports_only_effective_default_changes() {
+    for (remove, last) in [("zeta", false), ("alpha", false), ("zeta", true)] {
+        for json in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("servers.json");
+            let store = FakeCredentialStore::default();
+            let ssh = FakeSshClient::default();
+            for name in if last {
+                vec!["zeta"]
+            } else {
+                vec!["zeta", "alpha"]
+            } {
+                let home = temp.path().join(name);
+                execute(
+                    Cli::try_parse_from([
+                        "sshw",
+                        "profile",
+                        "add",
+                        name,
+                        "--home",
+                        home.to_str().unwrap(),
+                    ])
+                    .unwrap(),
+                    &path,
+                    &store,
+                    &ssh,
+                    &mut FakePrompter::default(),
+                )
+                .unwrap();
+            }
+            let mut args = vec!["sshw", "profile", "remove", remove];
+            if json {
+                args.push("--json");
+            }
+            let output = execute_for_runtime(
+                Cli::try_parse_from(args).unwrap(),
+                &path,
+                &store,
+                &ssh,
+                &mut FakePrompter::default(),
+            );
+            assert_eq!(output.exit_code, 0);
+            let saved = sshw::profile::load_registry(&temp.path().join("profiles.json")).unwrap();
+            let expected = if remove == "alpha" {
+                Some("zeta")
+            } else if last {
+                None
+            } else {
+                Some("alpha")
+            };
+            assert_eq!(saved.default.as_deref(), expected);
+            if json {
+                let body: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+                assert_eq!(body["name"], remove);
+                assert!(
+                    body["warning"]
+                        .as_str()
+                        .unwrap()
+                        .contains("home and keyring entries left intact")
+                );
+                if remove == "zeta" {
+                    assert_eq!(
+                        body["default_change"],
+                        serde_json::json!({"resource":"profile", "previous":"zeta", "current":expected})
+                    );
+                } else {
+                    assert!(body.get("default_change").is_none());
+                }
+            } else {
+                assert_eq!(
+                    output.stdout.contains("default profile changed:"),
+                    remove == "zeta"
+                );
+                if last {
+                    assert!(output.stdout.contains("built-in default home"));
+                }
+            }
+        }
+    }
+}
+
 fn assert_json_error(
     output: sshw::cli::CommandOutput,
     exit_code: i32,
