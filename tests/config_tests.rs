@@ -402,6 +402,36 @@ fn privilege_modes_reject_ambiguous_or_unsupported_authentication() {
 }
 
 #[test]
+fn privilege_target_validation_rejects_empty_and_control_users_in_all_formats() {
+    for user in ["", "   ", "service\nextra", "service\r", "service\0"] {
+        for (method, no_password) in [("sudo", false), ("su", false), ("sudo", true)] {
+            let mut value = serde_json::json!({"method":method,"user":user});
+            if no_password {
+                value["no_password"] = serde_json::json!(true);
+            } else {
+                value["credential"] = serde_json::json!("existing-key");
+            }
+            assert!(serde_json::from_value::<PrivilegeConfig>(value.clone()).is_err());
+            for config in [
+                serde_json::json!({"version":1,"default":"web","servers":{"web":{"host":"localhost","port":22,"user":"deploy","auth":{"type":"agent"}}},"privileges":{"web":value}}),
+                serde_json::json!({"version":2,"default":"web","servers":{"web":{"host":"localhost","port":22,"default_user":"deploy","accounts":{"deploy":{"auth":{"type":"agent"},"privilege":value}}}}}),
+            ] {
+                assert!(serde_json::from_value::<SshwConfig>(config).is_err());
+            }
+            let mut privilege = PrivilegeConfig {
+                method: PrivilegeMethod::Sudo,
+                user: user.into(),
+                credential: None,
+                no_password: true,
+            };
+            assert!(privilege.validate().is_err());
+            privilege.user = "service's $literal".into();
+            privilege.validate().unwrap();
+        }
+    }
+}
+
+#[test]
 fn config_relationships_reject_dangling_server_and_user_defaults() {
     let namespace = CredentialNamespace::profile("default");
     let mut config = SshwConfig {

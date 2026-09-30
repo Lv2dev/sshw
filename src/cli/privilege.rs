@@ -6,11 +6,13 @@ use super::{
 };
 use crate::config::{
     ConfigRevision, PrivilegeConfig, PrivilegeMethod, SshwConfig, save_config_if_unchanged,
+    validate_account_user,
 };
 use crate::credentials::CredentialStore;
 use crate::error::{ResultErrorKindExt, app_error, credential_cleanup_error};
 use crate::home::{CredentialNamespace, CredentialPurpose, validate_server_name};
-use crate::output::ErrorKind;
+use crate::output::{ErrorKind, redact_secrets};
+use anyhow::Context;
 use serde_json::json;
 use std::path::Path;
 
@@ -34,6 +36,9 @@ where
         ));
     }
     validate_server_name(&args.name).with_error_kind(ErrorKind::Config)?;
+    validate_account_user(&args.user)
+        .context("invalid privilege target user")
+        .with_error_kind(ErrorKind::Config)?;
     let server = get_server(config, &args.name)?;
     let login_user = args
         .account
@@ -306,6 +311,41 @@ pub(super) fn method_label(method: PrivilegeMethod) -> &'static str {
     match method {
         PrivilegeMethod::Sudo => "sudo",
         PrivilegeMethod::Su => "su",
+    }
+}
+
+pub(super) fn recovery_step(
+    server: &str,
+    login_user: &str,
+    privilege: &PrivilegeConfig,
+    persistent: bool,
+) -> String {
+    let method = method_label(privilege.method);
+    if !persistent {
+        return format!(
+            "supply SSHW_PRIVILEGE_PASSWORD at run time for login account {} ({method} target {}); session-only passwords are not persisted. Keep the same home/profile selection and never put the password in arguments",
+            quote_local_argument(login_user),
+            quote_local_argument(&privilege.user)
+        );
+    }
+    let command = format!(
+        "sshw privilege set --account={} --method {method} --user={} -- {}",
+        quote_local_argument(login_user),
+        quote_local_argument(&privilege.user),
+        quote_local_argument(server)
+    );
+    format!(
+        "using the same home/profile selection, run `{command}` to register the privilege password again; confirm the update, or insert --force before -- for non-interactive use"
+    )
+}
+
+fn quote_local_argument(value: &str) -> String {
+    let value = redact_secrets(value);
+    if cfg!(windows) {
+        // PowerShell single-quoted literals escape an apostrophe by doubling it.
+        format!("'{}'", value.replace('\'', "''"))
+    } else {
+        super::shell_quote(&value)
     }
 }
 

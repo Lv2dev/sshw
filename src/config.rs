@@ -286,6 +286,7 @@ impl<'de> Deserialize<'de> for PrivilegeConfig {
 
 impl PrivilegeConfig {
     pub fn validate(&self) -> Result<(), &'static str> {
+        validate_user_value(&self.user)?;
         match (self.no_password, self.method, &self.credential) {
             (true, PrivilegeMethod::Sudo, None) | (false, _, Some(_)) => Ok(()),
             (true, PrivilegeMethod::Su, _) => Err("no_password requires method sudo"),
@@ -481,11 +482,15 @@ fn validate_credential_owner<'a>(
 }
 
 pub fn validate_account_user(user: &str) -> anyhow::Result<()> {
+    validate_user_value(user).map_err(anyhow::Error::msg)
+}
+
+fn validate_user_value(user: &str) -> Result<(), &'static str> {
     if user.trim().is_empty() {
-        return Err(anyhow::anyhow!("user cannot be empty"));
+        return Err("user cannot be empty");
     }
     if user.chars().any(char::is_control) {
-        return Err(anyhow::anyhow!("user must not contain control characters"));
+        return Err("user must not contain control characters");
     }
     Ok(())
 }

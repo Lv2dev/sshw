@@ -8,6 +8,10 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 
 ## [Unreleased]
 
+### 승격 대상 검사·복구 안내
+- 승격 대상 계정에도 로그인 계정과 같은 빈 값·제어 문자 검사를 적용합니다. `privilege set`은 확인·비밀번호 입력·저장 전에 config/3으로 거부하고, v1/v2 설정 로딩과 사전 검사도 같은 기준을 따릅니다. 정상 계정명과 비밀번호/무비밀번호 설정은 유지합니다.
+- `doctor`의 누락된 승격 비밀번호 안내는 기존 로그인 계정·승격 방식·대상을 보존합니다. 저장 가능한 백엔드는 안전하게 인용한 재등록 명령과 확인/`--force` 사용법을, 세션 전용 백엔드는 `SSHW_PRIVILEGE_PASSWORD` 사용법을 안내합니다. 기존 home/profile 선택을 유지하도록 설명하고 안내 값도 마스킹합니다.
+
 ### 등록·갱신 영향 안내
 - 서버 `add --user`로 기존 기본 로그인 계정이 바뀌면 확인 문구와 human/JSON에 이전·새 계정을 표시합니다. JSON에 `user`와 계정 전환의 `default_change`를 추가하고, 저장 후 정리 실패에도 전환을 보존합니다. 기존 선택 동작은 유지하며 도움말에 `account add`와의 차이를 명시합니다.
 - 프로필 추가·갱신은 사용할 namespace로 대상 서버 설정을 검사한 뒤 registry를 저장합니다. 호환되지 않는 자격 증명 참조·잘못된 설정·파일로 막힌 home 경로를 config/3으로 거부하고 기존 연결·기본값·대상 파일을 보존합니다. 빈 home·agent 설정·같은 home의 namespace 및 v1 설정 호환은 유지합니다.

@@ -1314,7 +1314,12 @@ where
                         issue(
                             "privilege_credential",
                             format!("missing privilege credential for {name}/{user}"),
-                            format!("sshw privilege set {name} --account {user}"),
+                            privilege::recovery_step(
+                                name,
+                                user,
+                                privilege,
+                                credentials.is_persistent(),
+                            ),
                         );
                     }
                 }

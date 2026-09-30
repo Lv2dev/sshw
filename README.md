@@ -406,6 +406,10 @@ sshw doctor
 sshw doctor --json
 ```
 
+누락된 승격 비밀번호의 복구 안내는 저장된 로그인 계정·승격 방식·대상을 유지합니다. 저장 가능한 백엔드는 재등록 명령을 제공하며, 기존 `--home`/`--profile` 선택으로 실행하세요. 인용 구문은 Windows에서 PowerShell, 다른 OS에서 POSIX 셸 기준입니다. 갱신 확인이 필요하며 비대화형 실행은 명령의 `--` 앞에 `--force`를 넣습니다. stdin으로 입력하려면 `--password-stdin`도 `--` 앞에 넣으세요. 세션 전용 백엔드는 재등록으로 비밀번호가 유지되지 않으므로 `SSHW_PRIVILEGE_PASSWORD`를 실행 시 제공하도록 안내합니다. 비밀번호를 명령 인자에 넣지 마세요.
+
+승격 대상의 빈 값·공백만 있는 값·제어 문자는 등록과 v1/v2 설정 로딩에서 config/3으로 거부합니다. 등록은 확인이나 비밀번호 입력 전에 중단하며, 잘못된 대상이 저장된 기존 파일은 `doctor`의 config 진단과 표시된 경로를 확인해 수정하세요. 같은 설정을 사용하는 사전 검사·실행도 거부합니다. 원격 계정의 존재나 sudoers 허용 여부를 검사하는 기능은 아닙니다.
+
 `doctor` reports the active home/source, storage paths, config/registry/policy validity, linked libraries, audit writability, credential-backend health, missing login and privilege credentials, and local SSH agent availability. `issues` includes a suggested next step for each local problem. `local_checks_passed` summarizes those checks while `connection_tested:false` makes clear that reachability, matching host keys, authentication and sudoers were not tested. `ok:true` means the diagnostic ran, even when local issues exist. A corrupt registry is diagnosed from a recoverable home; conflicting home/profile selectors are still rejected.
 
 ### JSON Error Contract
@@ -883,6 +887,10 @@ policy는 fail-closed입니다. `--policy`인데 파일이 없으면 에러이�
 ### Doctor
 
 `local_checks_passed`는 로컬 검사 결과이고 `issues`에는 문제와 다음 조치가 담깁니다. SSH agent와 누락된 privilege credential도 확인합니다. `connection_tested:false`이며 원격 접속·host key 일치·sudoers를 검사하지는 않습니다. `ok:true`는 진단 실행 성공을 뜻합니다.
+
+승격 대상의 빈 값·공백만 있는 값·제어 문자는 등록과 v1/v2 설정 로딩에서 config/3으로 거부합니다. 등록은 확인이나 비밀번호 입력 전에 중단하며, 잘못된 대상이 저장된 기존 파일은 `doctor`의 config 진단과 표시된 경로를 확인해 수정하세요. 같은 설정을 사용하는 사전 검사·실행도 거부합니다. 원격 계정의 존재나 sudoers 허용 여부를 검사하는 기능은 아닙니다.
+
+누락된 승격 비밀번호의 복구 안내는 저장된 로그인 계정·승격 방식·대상을 유지합니다. 저장 가능한 백엔드는 재등록 명령을 제공하며, 기존 `--home`/`--profile` 선택으로 실행하세요. 인용 구문은 Windows에서 PowerShell, 다른 OS에서 POSIX 셸 기준입니다. 갱신 확인이 필요하며 비대화형 실행은 명령의 `--` 앞에 `--force`를 넣습니다. stdin으로 입력하려면 `--password-stdin`도 `--` 앞에 넣으세요. 세션 전용 백엔드는 재등록으로 비밀번호가 유지되지 않으므로 `SSHW_PRIVILEGE_PASSWORD`를 실행 시 제공하도록 안내합니다. 비밀번호를 명령 인자에 넣지 마세요.
 
 ```bash
 sshw doctor
