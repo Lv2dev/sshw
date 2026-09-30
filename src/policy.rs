@@ -147,24 +147,33 @@ pub struct PolicyRules {
 
 impl PolicyRules {
     pub fn allows_command(&self, command: &str) -> bool {
+        self.command_match(command).is_some()
+    }
+
+    fn command_match(&self, command: &str) -> Option<(&str, &'static str)> {
         let command = command.trim();
         let has_meta = contains_shell_metacharacters(command);
-        self.allow_commands.iter().any(|entry| {
+        self.allow_commands.iter().find_map(|entry| {
             let entry = entry.trim();
             if entry.is_empty() {
-                return false;
+                return None;
             }
             // An exact full-command entry is always honored.
             if entry == command {
-                return true;
+                let kind = if has_meta {
+                    "exact"
+                } else {
+                    command_matches_simple(entry, command).unwrap_or("exact")
+                };
+                return Some((entry, kind));
             }
             // A command containing shell metacharacters can do more than run a
             // single program, so program-name / glob matches must not apply to
             // it: only an exact allowlist entry permits it.
             if has_meta {
-                return false;
+                return None;
             }
-            command_matches_simple(entry, command)
+            command_matches_simple(entry, command).map(|kind| (entry, kind))
         })
     }
 
@@ -177,11 +186,106 @@ impl PolicyRules {
     }
 
     pub fn allows_account(&self, server: &str, user: &str, is_default: bool) -> bool {
-        is_default
-            || self
-                .allow_accounts
-                .iter()
-                .any(|entry| entry.server == server && entry.user == user)
+        is_default || self.account_match(server, user).is_some()
+    }
+
+    fn account_match(&self, server: &str, user: &str) -> Option<&AccountRule> {
+        self.allow_accounts
+            .iter()
+            .find(|entry| entry.server == server && entry.user == user)
+    }
+}
+
+/// A policy-only decision, independent of safety, account existence and I/O.
+/// Strings are redacted by the presentation layer before being displayed.
+#[derive(Debug, Serialize)]
+pub(crate) struct PolicyExplanation {
+    pub allowed: bool,
+    pub reason: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matched_rule: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub match_type: Option<&'static str>,
+}
+
+impl PolicyExplanation {
+    fn decision(allowed: bool, reason: &'static str) -> Self {
+        Self {
+            allowed,
+            reason,
+            matched_rule: None,
+            match_type: None,
+        }
+    }
+
+    fn matched(rule: &str, kind: &'static str) -> Self {
+        Self {
+            matched_rule: Some(rule.to_string()),
+            match_type: Some(kind),
+            ..Self::decision(true, "matched_rule")
+        }
+    }
+}
+
+impl Policy {
+    pub(crate) fn explain_command(&self, command: &str) -> PolicyExplanation {
+        let Self::Enabled(rules) = self else {
+            return PolicyExplanation::decision(true, "policy_disabled");
+        };
+        if let Some((rule, kind)) = rules.command_match(command) {
+            return PolicyExplanation::matched(rule, kind);
+        }
+        PolicyExplanation::decision(
+            false,
+            if contains_shell_metacharacters(command.trim()) {
+                "exact_command_required"
+            } else {
+                "no_matching_rule"
+            },
+        )
+    }
+
+    pub(crate) fn explain_path(&self, path: &str, upload: bool) -> PolicyExplanation {
+        let Self::Enabled(rules) = self else {
+            return PolicyExplanation::decision(true, "policy_disabled");
+        };
+        let entries = if upload {
+            &rules.allow_put_paths
+        } else {
+            &rules.allow_get_paths
+        };
+        if let Some(rule) = path_match(entries, path) {
+            return PolicyExplanation::matched(rule, "path");
+        }
+        PolicyExplanation::decision(
+            false,
+            if has_parent_traversal(path) {
+                "parent_traversal"
+            } else {
+                "no_matching_rule"
+            },
+        )
+    }
+
+    pub(crate) fn explain_account(
+        &self,
+        server: &str,
+        user: &str,
+        is_default: bool,
+    ) -> PolicyExplanation {
+        let Self::Enabled(rules) = self else {
+            return PolicyExplanation::decision(true, "policy_disabled");
+        };
+        if is_default {
+            return PolicyExplanation::decision(true, "default_account");
+        }
+        if let Some(entry) = rules.account_match(server, user) {
+            return PolicyExplanation::matched(
+                &format!("{}/{}", entry.server, entry.user),
+                "account",
+            );
+        }
+        PolicyExplanation::decision(false, "no_matching_rule")
     }
 }
 
@@ -310,14 +414,14 @@ pub(crate) fn save_policy_if_unchanged(
     crate::storage::write_owner_only_atomic(path, &contents)
 }
 
-fn command_matches_simple(entry: &str, command: &str) -> bool {
+fn command_matches_simple(entry: &str, command: &str) -> Option<&'static str> {
     if let Some(prefix) = entry.strip_suffix('*') {
         // An empty/whitespace-only prefix ("*") would match everything,
         // including destructive commands; refuse it.
         if prefix.trim().is_empty() {
-            return false;
+            return None;
         }
-        return command.starts_with(prefix);
+        return command.starts_with(prefix).then_some("prefix");
     }
 
     // A bare program name (no whitespace) matches the command's program basename.
@@ -325,10 +429,10 @@ fn command_matches_simple(entry: &str, command: &str) -> bool {
         && let Some(program) = command.split_whitespace().next()
     {
         let basename = program.rsplit(['/', '\\']).next().unwrap_or(program);
-        return basename == entry;
+        return (basename == entry).then_some("program");
     }
 
-    false
+    None
 }
 
 fn contains_shell_metacharacters(command: &str) -> bool {
@@ -341,17 +445,21 @@ fn contains_shell_metacharacters(command: &str) -> bool {
 }
 
 fn path_is_allowed(allowlist: &[String], path: &str) -> bool {
+    path_match(allowlist, path).is_some()
+}
+
+fn path_match<'a>(allowlist: &'a [String], path: &str) -> Option<&'a str> {
     // Reject parent-directory traversal outright so it cannot escape an
     // allowed prefix lexically (e.g. /srv/app/../../etc).
     if has_parent_traversal(path) {
-        return false;
+        return None;
     }
-    allowlist.iter().any(|allowed| {
+    allowlist.iter().find_map(|allowed| {
         // Skip empty entries (which would otherwise match every absolute
         // path) and normalize a trailing slash so "/srv/app/" behaves like
         // "/srv/app".
         let allowed = allowed.trim().trim_end_matches('/');
-        !allowed.is_empty() && path_within(allowed, path)
+        (!allowed.is_empty() && path_within(allowed, path)).then_some(allowed)
     })
 }
 

@@ -857,6 +857,311 @@ fn policy_mutation_rejects_corruption_and_preserves_existing_file() {
 }
 
 #[test]
+fn policy_checks_explain_matching_rules_disabled_state_and_shell_syntax() {
+    let home = home();
+    add(home.path());
+    successful(home.path(), &["policy", "init"], "");
+    successful(home.path(), &["policy", "allow", "command", "whoami"], "");
+    successful(home.path(), &["policy", "allow", "command", "who*"], "");
+    successful(home.path(), &["policy", "enable"], "");
+    let check = |command: &str, forced: bool| {
+        let mut args = vec!["policy", "check", "web", command, "--json"];
+        if forced {
+            args.push("--policy");
+        }
+        let output = run(home.path(), &args, "");
+        (
+            output.status.code(),
+            serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+        )
+    };
+    let (_, value) = check("whoami", false);
+    assert_eq!(
+        value["policy"]["checks"]["command"]["match_type"],
+        "program"
+    );
+    assert_eq!(
+        value["policy"]["checks"]["account"]["reason"],
+        "default_account"
+    );
+    successful(home.path(), &["policy", "remove", "command", "whoami"], "");
+    let (_, value) = check("whoami", false);
+    assert_eq!(value["allowed"], true);
+    assert_eq!(value["reasons"], json!([]));
+    assert_eq!(value["policy"]["checks"]["command"]["matched_rule"], "who*");
+    assert_eq!(value["policy"]["checks"]["command"]["match_type"], "prefix");
+    let (status, value) = check("whoami; echo done", false);
+    assert_eq!(status, Some(7));
+    assert_eq!(
+        value["policy"]["checks"]["command"]["reason"],
+        "exact_command_required"
+    );
+    successful(
+        home.path(),
+        &["policy", "allow", "command", "whoami; echo done"],
+        "",
+    );
+    let (_, value) = check("whoami; echo done", false);
+    assert_eq!(value["policy"]["checks"]["command"]["match_type"], "exact");
+    successful(home.path(), &["policy", "disable"], "");
+    let (_, value) = check("date", false);
+    assert_eq!(value["policy"]["enforced"], false);
+    assert_eq!(
+        value["policy"]["checks"]["command"]["reason"],
+        "policy_disabled"
+    );
+    let (status, value) = check("date", true);
+    assert_eq!(status, Some(7));
+    assert_eq!(value["policy"]["enforced"], true);
+    assert_eq!(value["policy"]["forced"], true);
+    assert_eq!(
+        value["policy"]["checks"]["command"]["reason"],
+        "no_matching_rule"
+    );
+    let human = successful(home.path(), &["policy", "check", "web", "date"], "");
+    assert!(
+        String::from_utf8(human.stdout)
+            .unwrap()
+            .contains("policy disabled")
+    );
+}
+
+#[test]
+fn policy_transfer_checks_explain_paths_accounts_and_atomic_parent() {
+    let home = home();
+    add(home.path());
+    successful(
+        home.path(),
+        &["account", "add", "web", "ops", "--auth", "agent"],
+        "",
+    );
+    successful(home.path(), &["policy", "init"], "");
+    successful(
+        home.path(),
+        &["policy", "allow", "account", "web", "ops"],
+        "",
+    );
+    successful(
+        home.path(),
+        &["policy", "allow", "put", "/srv/app/release"],
+        "",
+    );
+    successful(home.path(), &["policy", "allow", "get", "/var/log"], "");
+    successful(home.path(), &["policy", "enable"], "");
+    let local = home.path().join("upload");
+    std::fs::write(&local, "fixture").unwrap();
+    let output = run(
+        home.path(),
+        &[
+            "policy",
+            "check-put",
+            "web",
+            local.to_str().unwrap(),
+            "remote:/srv/app/release",
+            "--atomic",
+            "--yes",
+            "--user",
+            "ops",
+            "--json",
+        ],
+        "",
+    );
+    assert_eq!(output.status.code(), Some(7));
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        value["policy"]["checks"]["put"]["matched_rule"],
+        "/srv/app/release"
+    );
+    assert_eq!(value["policy"]["checks"]["atomic_parent"]["allowed"], false);
+    assert_eq!(
+        value["policy"]["checks"]["account"]["match_type"],
+        "account"
+    );
+    assert_eq!(value["local_file_checked"], false);
+    let destination = home.path().join("download");
+    let output = successful(
+        home.path(),
+        &[
+            "policy",
+            "check-get",
+            "web",
+            "remote:/var/log/app",
+            destination.to_str().unwrap(),
+            "--json",
+        ],
+        "",
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["policy"]["checks"]["get"]["matched_rule"], "/var/log");
+    assert_eq!(value["policy"]["checks"]["get"]["match_type"], "path");
+    assert!(!destination.exists());
+}
+
+#[test]
+fn policy_mutations_report_changes_and_preserve_no_op_files() {
+    let home = home();
+    add(home.path());
+    let path = home.path().join("policy.json");
+    let legacy = "{ \"enabled\": false, \"allow_commands\": [\"id\"] }\n";
+    std::fs::write(&path, legacy).unwrap();
+    for (args, change) in [
+        (
+            vec!["policy", "allow", "command", "id", "--json"],
+            "already_present",
+        ),
+        (
+            vec!["policy", "remove", "command", "idd", "--json"],
+            "not_found",
+        ),
+        (vec!["policy", "disable", "--json"], "unchanged"),
+    ] {
+        let output = successful(home.path(), &args, "");
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["changed"], false);
+        assert_eq!(value["change"], change);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), legacy);
+    }
+    for kind in ["command", "put", "get"] {
+        let entry = if kind == "command" {
+            "uptime"
+        } else {
+            "/srv/app"
+        };
+        for (action, changed, change) in [
+            ("allow", true, "added"),
+            ("allow", false, "already_present"),
+            ("remove", true, "removed"),
+            ("remove", false, "not_found"),
+        ] {
+            let output = successful(home.path(), &["policy", action, kind, entry, "--json"], "");
+            let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(value["changed"], changed);
+            assert_eq!(value["change"], change);
+        }
+    }
+    let output = successful(home.path(), &["policy", "remove", "command", "missing"], "");
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("not found")
+    );
+    let output = successful(home.path(), &["policy", "show", "--json"], "");
+    assert!(
+        serde_json::from_slice::<Value>(&output.stdout)
+            .unwrap()
+            .get("changed")
+            .is_none()
+    );
+}
+
+#[test]
+fn policy_matched_rule_explanations_redact_secrets() {
+    let home = home();
+    add(home.path());
+    let command = "echo token=policy-explanation-fixture";
+    std::fs::write(
+        home.path().join("policy.json"),
+        json!({"version":2,"enabled":true,"allow_commands":[command]}).to_string(),
+    )
+    .unwrap();
+    for json in [false, true] {
+        let mut args = vec!["policy", "check", "web", command];
+        if json {
+            args.push("--json");
+        }
+        let output = successful(home.path(), &args, "");
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(!text.contains("policy-explanation-fixture"));
+        assert!(text.contains("<redacted>"));
+    }
+}
+
+#[test]
+fn policy_explanations_keep_safety_and_traversal_blocks_distinct() {
+    let home = home();
+    add(home.path());
+    std::fs::write(
+        home.path().join("policy.json"),
+        json!({"version":2,"enabled":true,"allow_commands":["rm"],"allow_get_paths":["/var/log"]})
+            .to_string(),
+    )
+    .unwrap();
+    let output = run(
+        home.path(),
+        &["policy", "check", "web", "rm -rf /tmp/fixture", "--json"],
+        "",
+    );
+    assert_eq!(output.status.code(), Some(2));
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["allowed"], false);
+    assert_eq!(value["policy"]["checks"]["command"]["allowed"], true);
+    assert_eq!(value["reasons"].as_array().unwrap().len(), 1);
+    let destination = home.path().join("download");
+    let output = run(
+        home.path(),
+        &[
+            "policy",
+            "check-get",
+            "web",
+            "remote:/var/log/../etc",
+            destination.to_str().unwrap(),
+            "--json",
+        ],
+        "",
+    );
+    assert_eq!(output.status.code(), Some(7));
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        value["policy"]["checks"]["get"]["reason"],
+        "parent_traversal"
+    );
+    assert!(!destination.exists());
+}
+
+#[test]
+fn policy_account_mutations_and_state_changes_report_no_ops() {
+    let home = home();
+    add(home.path());
+    successful(
+        home.path(),
+        &["account", "add", "web", "ops", "--auth", "agent"],
+        "",
+    );
+    let output = successful(home.path(), &["policy", "init", "--json"], "");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()["changed"],
+        true
+    );
+    for (action, changed, change) in [
+        ("allow", true, "added"),
+        ("allow", false, "already_present"),
+        ("remove", true, "removed"),
+        ("remove", false, "not_found"),
+    ] {
+        let output = successful(
+            home.path(),
+            &["policy", action, "account", "web", "ops", "--json"],
+            "",
+        );
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["changed"], changed);
+        assert_eq!(value["change"], change);
+    }
+    for (action, changed) in [
+        ("enable", true),
+        ("enable", false),
+        ("disable", true),
+        ("disable", false),
+    ] {
+        let output = successful(home.path(), &["policy", action, "--json"], "");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&output.stdout).unwrap()["changed"],
+            changed
+        );
+    }
+}
+
+#[test]
 fn policy_checks_all_restrictions_and_validates_account_entries() {
     let home = home();
     add(home.path());

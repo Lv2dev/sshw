@@ -715,9 +715,15 @@ fn audit_descriptor(command: &Command, config: &SshwConfig) -> Option<AuditDescr
 }
 
 fn build_sandbox(policy_path: &Path, forced: bool) -> anyhow::Result<Box<dyn Sandbox>> {
-    match resolve_policy(policy_path, forced).with_error_kind(ErrorKind::Policy)? {
-        Policy::Disabled => Ok(Box::new(NoopSandbox)),
-        Policy::Enabled(rules) => Ok(Box::new(PolicyOnlySandbox::new(rules))),
+    Ok(sandbox_from_policy(
+        resolve_policy(policy_path, forced).with_error_kind(ErrorKind::Policy)?,
+    ))
+}
+
+fn sandbox_from_policy(policy: Policy) -> Box<dyn Sandbox> {
+    match policy {
+        Policy::Disabled => Box::new(NoopSandbox),
+        Policy::Enabled(rules) => Box::new(PolicyOnlySandbox::new(rules)),
     }
 }
 
