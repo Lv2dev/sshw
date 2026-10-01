@@ -1,3 +1,4 @@
+use super::known_hosts::read_known_hosts_file;
 use super::{HostKeyInfo, PartialRunError, RunResult, SshClient, SshTarget, TransferResult};
 use crate::config::ServerConfig;
 use crate::credentials::AuthMaterial;
@@ -1352,24 +1353,6 @@ fn verify_known_host(
         known_hosts.check_port(&server.host, server.port, key),
         server,
     )
-}
-
-fn read_known_hosts_file(known_hosts: &mut ssh2::KnownHosts, path: &Path) -> anyhow::Result<()> {
-    let content = fs::read_to_string(path)
-        .with_context(|| format!("failed to read known_hosts file: {}", path.display()))?;
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        let mut entry = String::with_capacity(line.len() + 1);
-        entry.push_str(line);
-        entry.push('\n');
-        known_hosts
-            .read_str(&entry, KnownHostFileKind::OpenSSH)
-            .with_context(|| format!("failed to parse known_hosts file: {}", path.display()))?;
-    }
-    Ok(())
 }
 
 fn write_known_hosts_file(known_hosts: &ssh2::KnownHosts, path: &Path) -> anyhow::Result<()> {

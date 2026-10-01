@@ -424,6 +424,10 @@ sshw doctor --json
 
 `doctor` reports the active home/source, storage paths, config/registry/policy validity, linked libraries, audit writability, credential-backend health, missing login and privilege credentials, and local SSH agent availability. `issues` includes a suggested next step for each local problem. `local_checks_passed` summarizes those checks while `connection_tested:false` makes clear that reachability, matching host keys, authentication and sudoers were not tested. `ok:true` means the diagnostic ran, even when local issues exist. A corrupt registry is diagnosed from a recoverable home; conflicting home/profile selectors are still rejected.
 
+The local host-key check reads and parses the active home's `known_hosts` using the connection parser and checks each server's endpoint, including hashed hosts and non-default ports. JSON `host_trust` reports `entry_present:true/false`, or `null` when reading, parsing or inspection fails, and always `key_match_checked:false`. Empty files and entries for other servers are not ready. Repair unreadable or invalid files before retrying the suggested trust command. An existing entry does not prove that it matches the remote server's current key; normal connections still verify that key.
+
+Login credential lookup failures from `run`, `put`, and `get` show the selected server/account and the redacted backend cause. Session-only homes require `SSHW_PASSWORD` at run time. Persistent backends suggest `sshw doctor` and password re-registration through `account add` if the entry is missing. Keep the same home/profile selection; confirm an update or insert `--force` and `--password-stdin` before the command's `--` for non-interactive secret-manager input. These commands preserve the selected account's privilege settings and do not put secrets in arguments.
+
 ### JSON Error Contract
 
 Commands that support `--json` (`add`, `list`, `show`, `trust`, `run`, `put`, `get`, `remove`, `doctor`, `account add`, `account list`, `account show`, `account remove`, `profile list`, `profile show`, `privilege set`, `privilege show`, `privilege clear`) return a structured error envelope on runtime failures:
@@ -907,6 +911,10 @@ policy는 fail-closed입니다. `--policy`인데 파일이 없으면 에러이�
 ### Doctor
 
 `local_checks_passed`는 로컬 검사 결과이고 `issues`에는 문제와 다음 조치가 담깁니다. SSH agent와 누락된 privilege credential도 확인합니다. `connection_tested:false`이며 원격 접속·host key 일치·sudoers를 검사하지는 않습니다. `ok:true`는 진단 실행 성공을 뜻합니다.
+
+host key 로컬 검사는 실제 연결과 공유하는 파서로 활성 home의 `known_hosts`를 읽고 key 데이터와 서버별 등록 여부를 확인합니다. 해시 host와 비표준 포트도 같은 매칭 규칙을 사용합니다. JSON `host_trust`의 `entry_present`는 등록 있음/없음에 true/false, 읽기·파싱·검사 실패에는 null이며 `key_match_checked`는 항상 false입니다. 빈 파일이나 다른 서버의 등록만으로 로컬 검사가 통과하지 않습니다. 읽기 불가·손상 파일은 먼저 수정한 뒤 제안된 trust 명령을 실행하세요. 등록 있음도 현재 원격 key와의 일치를 보장하지 않으며 실제 연결에서는 기존처럼 검증합니다.
+
+`run`·`put`·`get`의 로그인 자격 증명 조회 실패에는 선택한 서버/계정과 마스킹한 백엔드 원인을 표시합니다. 세션 전용 home은 실행 시 `SSHW_PASSWORD`가 필요합니다. 저장 백엔드는 `sshw doctor`로 상태를 확인하고 항목이 없을 때 `account add`로 비밀번호를 재등록하도록 안내합니다. 같은 home/profile을 선택하고 갱신을 확인하세요. 비대화형 입력은 안내 명령의 `--` 앞에 `--force`·`--password-stdin`을 넣어 비밀 관리자 pipe를 사용합니다. 계정의 기존 승격 설정은 유지하며 비밀번호를 명령 인자에 넣지 않습니다.
 
 승격 대상의 빈 값·공백만 있는 값·제어 문자는 등록과 v1/v2 설정 로딩에서 config/3으로 거부합니다. 등록은 확인이나 비밀번호 입력 전에 중단하며, 잘못된 대상이 저장된 기존 파일은 `doctor`의 config 진단과 표시된 경로를 확인해 수정하세요. 같은 설정을 사용하는 사전 검사·실행도 거부합니다. 원격 계정의 존재나 sudoers 허용 여부를 검사하는 기능은 아닙니다.
 

@@ -33,6 +33,14 @@ pub(super) fn run(server: &str, command: &str) -> String {
     )
 }
 
+pub(super) fn account_password(server: &str, login_user: &str) -> String {
+    format!(
+        "sshw account add --auth password -- {} {}",
+        quote_local_argument(server),
+        quote_local_argument(login_user),
+    )
+}
+
 pub(super) fn privilege_set(
     server: &str,
     login_user: &str,

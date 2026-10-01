@@ -54,7 +54,7 @@ where
         config,
     )?;
     check_put_source(&local)?;
-    let auth = resolve_auth(account, login_user, credentials)?;
+    let auth = resolve_auth(&server_name, account, login_user, credentials)?;
     let ssh_target = SshTarget::new(server, login_user);
     let result = with_msys_remote_path_hint(
         if atomic {
@@ -115,7 +115,7 @@ where
         sandbox,
         config,
     )?;
-    let auth = resolve_auth(account, login_user, credentials)?;
+    let auth = resolve_auth(&server_name, account, login_user, credentials)?;
     let ssh_target = SshTarget::new(server, login_user);
     let result = with_msys_remote_path_hint(
         ssh.get(&ssh_target, &auth, &remote.value, &local, yes)

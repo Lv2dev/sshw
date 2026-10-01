@@ -16,6 +16,7 @@ use crate::policy::{Policy, describe_policy, resolve_policy};
 use crate::profile::{load_registry, resolve_home_with_registry};
 use crate::safety::{SafetyDecision, classify_command, command_program};
 use crate::sandbox::{NoopSandbox, PolicyOnlySandbox, Sandbox, SandboxDecision};
+use crate::ssh::known_hosts::LocalKnownHosts;
 use crate::ssh::ssh2_client::{
     Ssh2Client, runtime_library_versions, su_begin_marker, su_end_prefix,
 };
@@ -823,7 +824,7 @@ where
             "--stream is not supported with su PTY; use the ordinary buffered run or a sudo privilege path",
         ));
     }
-    let auth = resolve_auth(account, login_user, credentials)?;
+    let auth = resolve_auth(&server_name, account, login_user, credentials)?;
     check_run_privilege(&server_name, login_user, account, as_root, no_password)?;
     let ssh_target = SshTarget::new(server, login_user);
     let privileged = if no_password
@@ -1286,6 +1287,7 @@ where
         );
     }
     let mut uses_agent = false;
+    let mut host_trust = Vec::new();
     if let Ok(config) = &config_result {
         if config.servers.is_empty() {
             issue(
@@ -1294,13 +1296,62 @@ where
                 "sshw add web --host <host> --user <user>".to_string(),
             );
         }
+        let local_hosts = if config.servers.is_empty() {
+            None
+        } else {
+            Some(LocalKnownHosts::load(&home.known_hosts_path))
+        };
         for (name, server) in &config.servers {
-            if !home.known_hosts_path.is_file() {
-                issue(
-                    "host_trust",
-                    format!("no known_hosts file for server '{name}'"),
-                    hints::trust(name),
-                );
+            let hosts = local_hosts.as_ref().expect("servers are not empty");
+            let inspection = hosts
+                .as_ref()
+                .map_err(redacted_error_detail)
+                .and_then(|hosts| {
+                    hosts
+                        .has_entry(&server.host, server.port)
+                        .map_err(|error| redacted_error_detail(&error))
+                });
+            let (entry_present, message) = match &inspection {
+                Ok(true) => (
+                    Some(true),
+                    "local entry found; remote key not checked".to_string(),
+                ),
+                Ok(false) => (
+                    Some(false),
+                    format!(
+                        "no local host key entry for server {} ({}:{}); remote key not checked",
+                        hints::quote_local_argument(name),
+                        redact_secrets(&server.host),
+                        server.port
+                    ),
+                ),
+                Err(detail) => (
+                    None,
+                    format!(
+                        "cannot inspect local host keys for server {}: {detail}; remote key not checked",
+                        hints::quote_local_argument(name)
+                    ),
+                ),
+            };
+            host_trust.push(json!({"server":redact_secrets(name),"host":redact_secrets(&server.host),"port":server.port,"entry_present":entry_present,"key_match_checked":false,"message":message}));
+            if entry_present != Some(true) {
+                let missing_file = hosts.as_ref().err().is_some_and(|error| {
+                    error.chain().any(|cause| {
+                        cause
+                            .downcast_ref::<io::Error>()
+                            .is_some_and(|error| error.kind() == io::ErrorKind::NotFound)
+                    })
+                });
+                let next_step = if inspection.is_err() && !missing_file {
+                    format!(
+                        "check read access and repair known_hosts at {}; then run {}",
+                        hints::quote_local_argument(&home.known_hosts_path.display().to_string()),
+                        hints::trust(name)
+                    )
+                } else {
+                    hints::trust(name)
+                };
+                issue("host_trust", message, next_step);
             }
             for (user, account) in &server.accounts {
                 uses_agent |= matches!(account.auth, AuthConfig::Agent);
@@ -1378,6 +1429,7 @@ where
             "config_valid": config_valid,
             "config_message": config_message,
             "known_hosts_path": home.known_hosts_path,
+            "host_trust": host_trust,
             "policy_path": home.policy_path,
             "policy_present": policy.present,
             "policy_valid": policy.valid,
@@ -1428,6 +1480,13 @@ where
             missing_credentials.join(", ")
         ));
     }
+    for entry in &host_trust {
+        stdout.push_str(&format!(
+            "host trust {}: {}\n",
+            entry["server"].as_str().unwrap_or_default(),
+            entry["message"].as_str().unwrap_or_default()
+        ));
+    }
     stdout.push_str(&format!(
         "local checks: {} (SSH connectivity and host-key matching are not tested)\n",
         if issues.is_empty() {
@@ -1447,6 +1506,7 @@ where
 }
 
 fn resolve_auth<C>(
+    server_name: &str,
     account: &AccountConfig,
     login_user: &str,
     credentials: &C,
@@ -1458,17 +1518,31 @@ where
         AuthConfig::Password { credential } => {
             let password = credentials
                 .get_password_for(CredentialPurpose::Login, credential, login_user)
-                .with_error_kind(ErrorKind::Auth)
-                .with_context(|| {
-                    format!(
-                        "missing credential entry for {} and user {}",
-                        credential, login_user
-                    )
-                })?;
+                .map_err(|error| {
+                    let detail = redacted_error_detail(&error);
+                    let recovery = if credentials.is_persistent() {
+                        format!("using the same home/profile selection, run sshw doctor to check the credential backend; if the entry is missing, run `{}` to register the account password again. Confirm the update, or insert --force and --password-stdin before -- for non-interactive secret-manager input", hints::account_password(server_name, login_user))
+                    } else {
+                        "supply SSHW_PASSWORD at run time using the same home/profile selection; session-only passwords are not persisted. Never put the password in arguments".to_string()
+                    };
+                    error.context(format!("failed to load login credential for server {} account {}\ncaused by: {detail}\nnext: {recovery}", hints::quote_local_argument(server_name), hints::quote_local_argument(login_user)))
+                })
+                .with_error_kind(ErrorKind::Auth)?;
             Ok(AuthMaterial::Password(password))
         }
         AuthConfig::Agent => Ok(AuthMaterial::Agent),
     }
+}
+
+fn redacted_error_detail(error: &anyhow::Error) -> String {
+    let mut details = Vec::new();
+    for cause in error.chain() {
+        let detail = redact_secrets(&cause.to_string());
+        if details.last() != Some(&detail) {
+            details.push(detail);
+        }
+    }
+    details.join("\ncaused by: ")
 }
 
 /// Split a positional `target` into its optional leading server name and the

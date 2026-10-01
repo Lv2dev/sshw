@@ -1172,7 +1172,20 @@ fn json_run_missing_credential_returns_auth_error() {
         json["error"]["message"]
             .as_str()
             .unwrap()
-            .contains("missing credential entry")
+            .contains("failed to load login credential")
+    );
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("caused by: missing credential")
+    );
+    assert!(
+        json["error"]["causes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|cause| cause == "missing credential")
     );
     assert!(ssh.run_commands.borrow().is_empty());
 }

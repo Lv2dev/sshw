@@ -8,6 +8,10 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 
 ## [Unreleased]
 
+### host key 로컬 진단·실행 인증 오류
+- `doctor`는 실제 연결과 공유하는 `known_hosts` 파서로 파일 읽기·파싱·key 데이터와 서버별 등록 여부를 확인합니다. 빈 파일·다른 서버만 등록된 파일은 등록 누락으로, 읽기/파싱 실패는 미확인으로 표시하고 복구 방법을 안내합니다. JSON `host_trust`에 서버별 `entry_present`(미확인은 null)와 `key_match_checked:false`를 추가하며 원격 접속/key 일치는 검사하지 않습니다.
+- `run`·`put`·`get`의 로그인 자격 증명 조회 실패에 서버·로그인 계정과 마스킹한 원래 원인을 표시합니다. 세션 전용 백엔드는 `SSHW_PASSWORD`, 저장 백엔드는 같은 home/profile의 doctor 및 계정 비밀번호 재등록 방법을 안내합니다. 원래 source·auth/4·JSON envelope/causes와 검사 순서를 유지합니다.
+
 ### 기본 프로필 전환·비밀번호 입력 복구
 - `profile default`는 등록된 home과 기존 credential namespace로 대상 서버 설정과 경로를 다시 검사한 뒤 기본값을 저장합니다. 잘못된 설정·호환되지 않는 자격 증명 참조·파일로 막힌 경로는 config/3으로 거부하며 이전 기본값과 대상 파일을 보존합니다. 빈 home 선택 및 손상된 현재 프로필에서 정상 프로필로의 전환은 유지합니다.
 - `add`·`account add`·`privilege set`의 비밀번호 terminal 입력이 실패하면 대화형 터미널에서 재실행하거나 비밀 관리자에서 pipe로 전달하는 `--password-stdin` 사용법을 안내합니다. 원래 OS 오류·auth/4·JSON 구조를 유지하고 stdin 입력은 명시적인 옵션으로만 사용합니다.

@@ -1,4 +1,5 @@
 pub(crate) mod atomic_upload;
+pub(crate) mod known_hosts;
 pub mod ssh2_client;
 
 use crate::config::ServerConfig;
