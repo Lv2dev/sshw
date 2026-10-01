@@ -77,27 +77,34 @@ impl<'de> Deserialize<'de> for SshwConfig {
         let version = u32::try_from(version)
             .map_err(|_| serde::de::Error::custom("config version is out of range"))?;
 
-        match version {
+        let config = match version {
             CONFIG_VERSION => {
                 let wire: ConfigV2Wire =
                     serde_json::from_value(value).map_err(serde::de::Error::custom)?;
                 debug_assert_eq!(wire.version, CONFIG_VERSION);
-                Ok(Self {
+                Self {
                     version: CONFIG_VERSION,
                     default: wire.default,
                     servers: wire.servers,
                     credential_backend: wire.credential_backend,
-                })
+                }
             }
             LEGACY_CONFIG_VERSION => {
                 let wire: ConfigV1Wire =
                     serde_json::from_value(value).map_err(serde::de::Error::custom)?;
-                migrate_v1(wire).map_err(serde::de::Error::custom)
+                migrate_v1(wire).map_err(serde::de::Error::custom)?
             }
-            unsupported => Err(serde::de::Error::custom(format!(
-                "unsupported config version {unsupported}; supported versions are {LEGACY_CONFIG_VERSION} and {CONFIG_VERSION}"
-            ))),
+            unsupported => {
+                return Err(serde::de::Error::custom(format!(
+                    "unsupported config version {unsupported}; supported versions are {LEGACY_CONFIG_VERSION} and {CONFIG_VERSION}"
+                )));
+            }
+        };
+        for (name, server) in &config.servers {
+            validate_server_endpoint(name, &server.host, server.port)
+                .map_err(serde::de::Error::custom)?;
         }
+        Ok(config)
     }
 }
 
@@ -413,6 +420,7 @@ pub fn validate_config_credential_references(
     for (name, server) in &config.servers {
         validate_server_name(name)
             .map_err(|err| anyhow::anyhow!("invalid server name '{name}': {err}"))?;
+        validate_server_endpoint(name, &server.host, server.port)?;
         if !server.accounts.contains_key(&server.default_user) {
             return Err(anyhow::anyhow!(
                 "default user '{}' is not registered for server '{name}'",
@@ -483,6 +491,24 @@ fn validate_credential_owner<'a>(
 
 pub fn validate_account_user(user: &str) -> anyhow::Result<()> {
     validate_user_value(user).map_err(anyhow::Error::msg)
+}
+
+pub(crate) fn validate_server_endpoint(name: &str, host: &str, port: u16) -> anyhow::Result<()> {
+    let reason = if host.trim().is_empty() {
+        Some("host must not be empty or whitespace")
+    } else if host.chars().any(char::is_control) {
+        Some("host must not contain control characters")
+    } else if port == 0 {
+        Some("port must be between 1 and 65535")
+    } else {
+        None
+    };
+    if let Some(reason) = reason {
+        return Err(anyhow::anyhow!(
+            "invalid endpoint for server '{name}': {reason}"
+        ));
+    }
+    Ok(())
 }
 
 fn validate_user_value(user: &str) -> Result<(), &'static str> {

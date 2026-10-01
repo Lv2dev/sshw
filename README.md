@@ -165,6 +165,8 @@ sshw add server-alpha --host 192.0.2.10 --port 2222 --user deploy
 
 Password auth is the default. `sshw` prompts for the password with hidden input and stores it in the active credential backend under the home's namespace.
 
+Registration rejects empty/whitespace-only hosts, control characters in hosts, and port `0` before confirmation or password input, with `config`/exit `3`. Ports are `1..65535`. The same checks apply when loading v1/v2 settings; `doctor` reports invalid settings with the server name and cause. Host values are preserved, including IPv6 addresses. These are metadata checks and do not resolve DNS or test connectivity. Correct an invalid saved endpoint in the reported `servers.json` path.
+
 For non-interactive registration, pipe the password from a secret manager:
 
 ```bash
@@ -204,6 +206,8 @@ sshw get server-alpha /var/log/app.log ./app.log --user deploy
 ```
 
 Password accounts store a distinct credential per server and username. Updating an account rotates only its login credential and preserves its account-specific privilege configuration. Removing a non-default account publishes the config removal before deleting that account's login and privilege credentials. A default account cannot be removed until another registered account becomes the default. `trust` remains server-only because every account on an endpoint shares the same host/port host-key boundary.
+
+Human `account list/show` output includes the privilege method, target user, and authentication mode, such as `sudo -> service (no password)` or `su -> root (password)`. An omitted saved target defaults to `root`; accounts without privilege settings show `none`. The login account is listed separately. Human target labels mask secret patterns; the JSON structure is unchanged.
 
 서버·계정·권한 설정의 변경이나 삭제는 설정을 저장한 뒤 이전 자격 증명을 정리합니다. 정리만 실패한 경우에도 종료 코드 `4`와 `ok:false`/`error`를 유지하되, 설정 변경은 이미 저장됐다는 안내와 원인을 표시합니다. JSON에는 `mutation` 객체의 `config_applied:true`, `failed_stage:"credential_cleanup"`, `action`, `server`, 해당 시 `account`를 추가합니다. 서버 삭제로 기본값도 바뀌었다면 같은 객체 안에 `default_change`가 포함됩니다. 현재 상태는 `show`·`list`·`account show`·`privilege show`로 확인할 수 있습니다. 이미 적용된 명령을 반복해도 참조가 사라진 이전 자격 증명을 정리할 수 있다고 보장하지 않습니다. 저장이 실패한 경우에는 적용 완료 정보를 붙이지 않습니다.
 
@@ -656,6 +660,8 @@ sshw add server-alpha --host 192.0.2.10 --port 2222 --user deploy
 
 비밀번호 인증이 기본값입니다. `sshw`는 숨김 입력으로 비밀번호를 받아 활성 credential backend의 home namespace 키로 저장합니다.
 
+등록 시 빈 호스트·공백만 있는 호스트·호스트의 제어 문자·포트 `0`은 확인 질문이나 비밀번호 입력 전에 `config`/종료 코드 `3`으로 거부합니다. 포트 범위는 `1..65535`입니다. v1/v2 설정 로딩에도 같은 검사를 적용하며, `doctor`는 잘못된 설정의 서버 이름과 원인을 표시합니다. IPv6를 포함한 호스트 입력값은 그대로 유지하고 DNS 조회나 연결 검사는 하지 않습니다. 잘못 저장된 주소는 안내된 `servers.json` 경로에서 수정하세요.
+
 비대화형 등록에서는 secret manager 출력에서 비밀번호를 pipe로 전달할 수 있습니다.
 
 ```bash
@@ -679,6 +685,8 @@ agent auth는 비밀을 저장하지 않고 활성 SSH agent를 사용합니다.
 각 server endpoint에는 여러 SSH username을 명시적으로 등록할 수 있습니다. `--user`를 생략하면 server의 `default_user`를 사용하고, `--user <name>`은 등록된 account만 선택하며 임의 username override로 동작하지 않습니다.
 
 canonical selector는 명시적 `--user` 플래그입니다. 기존 server alias에는 `@`가 들어갈 수 있어 target 해석이 모호해지므로 `user@alias`는 파싱하지 않습니다.
+
+`account list/show`의 일반 출력은 `sudo -> service (no password)` 또는 `su -> root (password)`처럼 승격 방식·대상 사용자·비밀번호 사용 여부를 함께 표시합니다. 저장 설정에서 대상을 생략하면 기존처럼 `root`이며, 승격 설정이 없으면 `none`입니다. 로그인 계정은 별도로 표시하고 대상의 민감한 패턴은 마스킹합니다. JSON 구조는 유지합니다.
 
 ```bash
 sshw account add server-alpha ops                         # 비밀번호 prompt

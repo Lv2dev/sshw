@@ -5,13 +5,13 @@ use super::{
     AuthArg, CommandOutput, Prompter, get_server, ok,
 };
 use crate::config::{
-    AccountConfig, AuthConfig, ConfigRevision, PrivilegeMethod, SshwConfig,
-    save_config_if_unchanged, validate_account_user,
+    AccountConfig, AuthConfig, ConfigRevision, SshwConfig, save_config_if_unchanged,
+    validate_account_user,
 };
 use crate::credentials::CredentialStore;
 use crate::error::{ResultErrorKindExt, app_error, credential_cleanup_error};
 use crate::home::{CredentialNamespace, CredentialPurpose, validate_server_name};
-use crate::output::ErrorKind;
+use crate::output::{ErrorKind, redact_secrets};
 use serde_json::{Value, json};
 use std::path::Path;
 
@@ -350,19 +350,27 @@ fn auth_label(auth: &AuthConfig) -> &'static str {
     }
 }
 
-fn privilege_label(account: &AccountConfig) -> &'static str {
-    if account
-        .privilege
-        .as_ref()
-        .is_some_and(|privilege| privilege.no_password)
-    {
-        return "sudo (no password)";
-    }
-    match account.privilege.as_ref().map(|privilege| privilege.method) {
-        Some(PrivilegeMethod::Sudo) => "sudo",
-        Some(PrivilegeMethod::Su) => "su",
-        None => "none",
-    }
+fn privilege_label(account: &AccountConfig) -> String {
+    let Some(privilege) = &account.privilege else {
+        return "none".into();
+    };
+    let redacted = redact_secrets(&privilege.user);
+    // Hide the assignment too, so final output redaction preserves the
+    // authentication label after a target containing a secret pattern.
+    let target = if redacted != privilege.user {
+        "<redacted>"
+    } else {
+        &redacted
+    };
+    let authentication = if privilege.no_password {
+        "no password"
+    } else {
+        "password"
+    };
+    format!(
+        "{} -> {target} ({authentication})",
+        super::privilege::method_label(privilege.method)
+    )
 }
 
 pub(super) fn unknown_account(server: &str, user: &str) -> anyhow::Error {

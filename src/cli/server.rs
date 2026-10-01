@@ -8,7 +8,7 @@ use super::{
 };
 use crate::config::{
     AccountConfig, AuthConfig, ConfigRevision, ServerConfig, SshwConfig, save_config_if_unchanged,
-    validate_account_user,
+    validate_account_user, validate_server_endpoint,
 };
 use crate::credentials::CredentialStore;
 use crate::error::{ResultErrorKindExt, app_error, credential_cleanup_error};
@@ -33,6 +33,8 @@ where
 {
     validate_server_name(&args.name).with_error_kind(ErrorKind::Config)?;
     validate_account_user(&args.user).with_error_kind(ErrorKind::Config)?;
+    validate_server_endpoint(&args.name, &args.host, args.port)
+        .with_error_kind(ErrorKind::Config)?;
 
     let previous_server = config.servers.get(&args.name).cloned();
     let default_change = previous_server.as_ref().and_then(|previous| {

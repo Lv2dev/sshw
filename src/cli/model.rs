@@ -429,10 +429,11 @@ pub struct ProfileRemoveArgs {
 pub struct AddArgs {
     /// Server name (the alias used by run/put/get/trust).
     pub name: String,
-    /// Hostname or IP address to connect to.
+    /// Hostname or IP address (nonblank, no control characters). Registration
+    /// does not resolve the address or test the connection.
     #[arg(long)]
     pub host: String,
-    /// TCP port of the SSH server (default: 22).
+    /// TCP port of the SSH server, from 1 to 65535 (default: 22).
     #[arg(long, default_value_t = 22)]
     pub port: u16,
     /// Remote username to register and make the default login account. Use

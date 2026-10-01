@@ -16,6 +16,58 @@ fn new_config_starts_empty() {
 }
 
 #[test]
+fn endpoint_account_programmatic_config_rejects_invalid_addresses() {
+    let namespace = CredentialNamespace::profile("default");
+    for (host, port) in [
+        ("", 22),
+        (" \t ", 22),
+        ("bad\nhost", 22),
+        ("bad\u{7f}host", 22),
+        ("localhost", 0),
+    ] {
+        let mut config = SshwConfig::default();
+        config.servers.insert(
+            "web".into(),
+            ServerConfig::single_account(host, port, "deploy", AuthConfig::Agent),
+        );
+        let error = validate_config_credential_references(&config, &namespace).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("invalid endpoint for server 'web'")
+        );
+    }
+}
+
+#[test]
+fn endpoint_account_valid_addresses_preserve_values_for_v1_and_v2() {
+    for version in [1, 2] {
+        for host in [
+            "localhost",
+            "server.internal",
+            "192.0.2.10",
+            "::1",
+            "[::1]",
+            "fe80::1%eth0",
+        ] {
+            for port in [1, 22, 65535] {
+                let server = if version == 1 {
+                    serde_json::json!({"host":host,"port":port,"user":"deploy","auth":{"type":"agent"}})
+                } else {
+                    serde_json::json!({"host":host,"port":port,"default_user":"deploy","accounts":{"deploy":{"auth":{"type":"agent"}}}})
+                };
+                let config: SshwConfig = serde_json::from_value(
+                    serde_json::json!({"version":version,"servers":{"web":server}}),
+                )
+                .unwrap();
+                assert_eq!(config.servers["web"].host, host);
+                assert_eq!(config.servers["web"].port, port);
+            }
+        }
+    }
+}
+
+#[test]
 fn config_serializes_password_and_agent_auth_without_secrets() {
     let mut config = SshwConfig::default();
     config.servers.insert(

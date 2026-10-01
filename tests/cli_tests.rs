@@ -55,6 +55,248 @@ fn parses_add_with_default_password_auth() {
 }
 
 #[test]
+fn endpoint_account_registration_rejects_bad_addresses_before_prompts_and_secrets() {
+    for (host, port) in [
+        ("", "22"),
+        ("   ", "22"),
+        ("bad\nhost", "22"),
+        ("bad\rhost", "22"),
+        ("bad\0host", "22"),
+        ("bad\thost", "22"),
+        ("localhost", "0"),
+    ] {
+        for name in ["server-alpha", "new-server"] {
+            for auth in ["agent", "password", "password-stdin"] {
+                for json in [false, true] {
+                    let temp = tempfile::tempdir().unwrap();
+                    let path = temp.path().join("servers.json");
+                    save_config(&path, &agent_accounts_config(&path)).unwrap();
+                    let before = std::fs::read(&path).unwrap();
+                    let store = FakeCredentialStore::default();
+                    let ssh = FakeSshClient::default();
+                    let mut prompts = NoPasswordPrompter { prompts: vec![] };
+                    let mut args = vec![
+                        "sshw",
+                        "add",
+                        name,
+                        "--host",
+                        host,
+                        "--port",
+                        port,
+                        "--user",
+                        "deploy",
+                        "--replace",
+                        "--auth",
+                        if auth == "agent" { "agent" } else { "password" },
+                    ];
+                    if auth == "password-stdin" {
+                        args.push("--password-stdin");
+                    }
+                    if json {
+                        args.push("--json");
+                    }
+                    let output = execute_for_runtime(
+                        Cli::try_parse_from(args).unwrap(),
+                        &path,
+                        &store,
+                        &ssh,
+                        &mut prompts,
+                    );
+                    assert_eq!(output.exit_code, 3, "{}{}", output.stdout, output.stderr);
+                    assert!(
+                        format!("{}{}", output.stdout, output.stderr)
+                            .contains("invalid endpoint for server")
+                    );
+                    assert!(prompts.prompts.is_empty());
+                    assert_eq!(std::fs::read(&path).unwrap(), before);
+                    assert!(
+                        store.values.borrow().is_empty()
+                            && store.requested.borrow().is_empty()
+                            && store.deleted.borrow().is_empty()
+                    );
+                    assert!(ssh.selected_users.borrow().is_empty());
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn endpoint_account_invalid_stored_addresses_fail_closed_and_remain_diagnosable() {
+    for version in [1, 2] {
+        for (host, port) in [("", 22), ("  ", 22), ("bad\nhost", 22), ("localhost", 0)] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("servers.json");
+            let server = if version == 1 {
+                serde_json::json!({"host":host,"port":port,"user":"deploy","auth":{"type":"agent"}})
+            } else {
+                serde_json::json!({"host":host,"port":port,"default_user":"deploy","accounts":{"deploy":{"auth":{"type":"agent"}}}})
+            };
+            let before = serde_json::json!({"version":version,"default":"web","credential_backend":"session_only","servers":{"web":server}}).to_string();
+            std::fs::write(&path, &before).unwrap();
+            assert!(
+                load_config(&path)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("invalid endpoint for server 'web'")
+            );
+            let store = FakeCredentialStore::default();
+            let ssh = FakeSshClient::default();
+            for args in [
+                vec!["sshw", "show", "web", "--json"],
+                vec!["sshw", "policy", "check", "web", "hostname", "--json"],
+                vec!["sshw", "run", "web", "hostname", "--json"],
+                vec!["sshw", "put", "web", "missing", "/tmp/file", "--json"],
+                vec!["sshw", "get", "web", "/tmp/file", "missing", "--json"],
+            ] {
+                let output = execute_for_runtime(
+                    Cli::try_parse_from(args).unwrap(),
+                    &path,
+                    &store,
+                    &ssh,
+                    &mut NoPasswordPrompter { prompts: vec![] },
+                );
+                assert_eq!(output.exit_code, 3, "{}{}", output.stdout, output.stderr);
+                let value: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+                assert_eq!(value["error"]["kind"], "config");
+                assert!(
+                    value["error"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("invalid endpoint for server 'web'")
+                );
+            }
+            let output = execute_for_runtime(
+                Cli::try_parse_from(["sshw", "doctor", "--json"]).unwrap(),
+                &path,
+                &store,
+                &ssh,
+                &mut NoPasswordPrompter { prompts: vec![] },
+            );
+            assert_eq!(output.exit_code, 0);
+            let value: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+            assert_eq!(value["config_valid"], false);
+            assert!(
+                value["config_message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("invalid endpoint for server 'web'")
+            );
+            assert!(
+                value["issues"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|issue| issue["kind"] == "config")
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+            assert!(
+                store.values.borrow().is_empty()
+                    && store.requested.borrow().is_empty()
+                    && store.deleted.borrow().is_empty()
+            );
+            assert!(ssh.selected_users.borrow().is_empty());
+        }
+    }
+}
+
+#[test]
+fn endpoint_account_human_privilege_summaries_show_target_and_authentication() {
+    for (method, target, no_password, expected) in [
+        (
+            PrivilegeMethod::Sudo,
+            "root",
+            true,
+            "sudo -> root (no password)",
+        ),
+        (
+            PrivilegeMethod::Sudo,
+            "service",
+            true,
+            "sudo -> service (no password)",
+        ),
+        (
+            PrivilegeMethod::Sudo,
+            "service",
+            false,
+            "sudo -> service (password)",
+        ),
+        (
+            PrivilegeMethod::Su,
+            "service",
+            false,
+            "su -> service (password)",
+        ),
+        (
+            PrivilegeMethod::Sudo,
+            "password=fixture-value",
+            true,
+            "sudo -> <redacted> (no password)",
+        ),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("servers.json");
+        let mut config = agent_accounts_config(&path);
+        set_default_privilege(
+            &mut config,
+            "server-alpha",
+            PrivilegeConfig {
+                method,
+                user: target.into(),
+                credential: (!no_password).then(|| privilege_credential(&path, "server-alpha")),
+                no_password,
+            },
+        );
+        save_config(&path, &config).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let store = FakeCredentialStore::default();
+        let ssh = FakeSshClient::default();
+        for args in [
+            vec!["sshw", "account", "list", "server-alpha"],
+            vec!["sshw", "account", "show", "server-alpha", "deploy"],
+        ] {
+            let output = execute(
+                Cli::try_parse_from(args).unwrap(),
+                &path,
+                &store,
+                &ssh,
+                &mut NoPasswordPrompter { prompts: vec![] },
+            )
+            .unwrap();
+            assert!(output.stdout.contains(expected), "{}", output.stdout);
+            assert!(!output.stdout.contains("fixture-value"));
+            assert!(output.stdout.contains("deploy"));
+        }
+        if !target.starts_with("password=") {
+            let output = execute(
+                Cli::try_parse_from([
+                    "sshw",
+                    "account",
+                    "show",
+                    "server-alpha",
+                    "deploy",
+                    "--json",
+                ])
+                .unwrap(),
+                &path,
+                &store,
+                &ssh,
+                &mut NoPasswordPrompter { prompts: vec![] },
+            )
+            .unwrap();
+            let value: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+            assert_eq!(
+                value["privilege"],
+                serde_json::json!({"method":method,"user":target,"no_password":no_password,"credential":if no_password { None } else { Some(privilege_credential(&path, "server-alpha")) }})
+            );
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(store.requested.borrow().is_empty() && store.deleted.borrow().is_empty());
+        assert!(ssh.selected_users.borrow().is_empty());
+    }
+}
+
+#[test]
 fn parses_add_with_password_stdin() {
     let cli = Cli::try_parse_from([
         "sshw",
