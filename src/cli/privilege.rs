@@ -332,7 +332,7 @@ pub(super) fn recovery_step(
     let command =
         super::hints::privilege_set(server, login_user, privilege.method, Some(&privilege.user));
     format!(
-        "using the same home/profile selection, run `{command}` to register the privilege password again; confirm the update, or insert --force before -- for non-interactive use"
+        "using the same home/profile selection, run `{command}` to register the privilege password again; confirm the update, or insert --force and --password-stdin before -- for non-interactive secret-manager input"
     )
 }
 

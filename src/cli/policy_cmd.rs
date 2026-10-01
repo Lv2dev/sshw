@@ -28,9 +28,10 @@ pub enum PolicyCommand {
     Init,
     /// Show the active home's policy and how command rules are interpreted.
     Show,
-    /// Enable the configured allowlist. Empty lists deny operations.
+    /// Enable the saved allowlist. Empty lists deny operations.
     Enable,
-    /// Disable allowlist enforcement (safety checks still apply).
+    /// Disable the saved allowlist; --policy still forces enforcement.
+    /// Safety checks still apply.
     Disable,
     /// Add an allowlist entry. This does not enable the policy automatically.
     Allow(PolicyRuleArgs),
@@ -170,8 +171,10 @@ pub(super) fn run_policy(args: PolicyArgs, ctx: &ExecContext<'_>) -> anyhow::Res
             save_policy_if_unchanged(&ctx.home.policy_path, &file, &revision)
                 .with_error_kind(ErrorKind::Policy)?;
         }
+        let file_present = present || mutating;
+        let enforced = file.enabled || ctx.policy_forced;
         let mut value = json!({"ok":true,"action":action,"path":ctx.home.policy_path,
-            "present":present || mutating,"policy":file,"enforced":file.enabled || ctx.policy_forced});
+            "present":file_present,"policy":file,"enforced":enforced,"forced":ctx.policy_forced});
         if mutating {
             value["changed"] = json!(changed);
             value["change"] = json!(change);
@@ -185,8 +188,37 @@ pub(super) fn run_policy(args: PolicyArgs, ctx: &ExecContext<'_>) -> anyhow::Res
         } else {
             String::new()
         };
+        let saved_enabled = if file_present {
+            file.enabled.to_string()
+        } else {
+            "not configured".to_string()
+        };
+        let reason = if ctx.policy_forced {
+            "forced by --policy"
+        } else if !file_present {
+            "policy file missing"
+        } else if file.enabled {
+            "enabled in policy file"
+        } else {
+            "disabled in policy file"
+        };
+        let mut status = format!(
+            "policy file: {}\nsaved enabled: {saved_enabled}\npolicy enforcement: {} ({reason})\n",
+            if file_present { "present" } else { "missing" },
+            if enforced { "on" } else { "off" }
+        );
+        if !file_present {
+            status.push_str("next: using the same home/profile selection, run `sshw policy init` to create the policy file\n");
+            if ctx.policy_forced {
+                status.push_str(
+                    "--policy requires a policy file; operations fail closed until it exists\n",
+                );
+            }
+        } else if ctx.policy_forced && !file.enabled {
+            status.push_str("next: remove --policy from the invocation to use the saved disabled setting; keep the same home/profile selection\n");
+        }
         Ok(ok(format!(
-            "policy {action}: {}\n{outcome}{}\nBare program rules allow that program's arguments and subprocesses. Shell metacharacters require an exact full-command rule. Default accounts are implicitly allowed.\nCheck a command: sshw policy check <server> \"<command>\"\n",
+            "policy {action}: {}\n{outcome}{status}{}\nBare program rules allow that program's arguments and subprocesses. Shell metacharacters require an exact full-command rule. Default accounts are implicitly allowed.\nCheck a command: sshw policy check <server> \"<command>\"\n",
             ctx.home.policy_path.display(),
             redact_secrets(&serde_json::to_string_pretty(&file)?)
         )))

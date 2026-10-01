@@ -1,6 +1,9 @@
 use clap::Parser;
-use sshw::cli::{Cli, Prompter, execute_for_runtime};
-use sshw::config::{AccountConfig, AuthConfig, ServerConfig, SshwConfig, load_config, save_config};
+use sshw::cli::{Cli, Prompter, execute, execute_for_runtime};
+use sshw::config::{
+    AccountConfig, AuthConfig, PrivilegeConfig, PrivilegeMethod, ServerConfig, SshwConfig,
+    load_config, save_config,
+};
 use sshw::credentials::{AuthMaterial, CredentialStore, CredentialStoreHealth};
 use sshw::home::{CredentialPurpose, ResolvedHome};
 use sshw::ssh::{HostKeyInfo, RunResult, SshClient, SshTarget, TransferResult};
@@ -386,4 +389,322 @@ fn login_error_redacts_separate_causes_and_preserves_quoted_recovery_arguments()
             "'operator'\"'\"'s $literal'"
         }));
     }
+}
+
+fn privilege_config(path: &Path, name: &str, login: &str, target: &str, method: PrivilegeMethod) {
+    config(path, "example.test", 2222, name, login);
+    let mut file = load_config(path).unwrap();
+    let account = file
+        .servers
+        .get_mut(name)
+        .unwrap()
+        .accounts
+        .get_mut(login)
+        .unwrap();
+    account.auth = AuthConfig::Agent;
+    account.privilege = Some(PrivilegeConfig {
+        method,
+        user: target.into(),
+        no_password: false,
+        credential: Some(
+            ResolvedHome::from_config_path(path)
+                .namespace
+                .new_account_credential_key(CredentialPurpose::Privilege, name, login),
+        ),
+    });
+    save_config(path, &file).unwrap();
+}
+
+#[test]
+fn privilege_lookup_errors_show_the_cause_and_backend_specific_recovery() {
+    for method in [PrivilegeMethod::Sudo, PrivilegeMethod::Su] {
+        for persistent in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("servers.json");
+            privilege_config(&path, "web", "deploy", "service", method);
+            let before = std::fs::read(&path).unwrap();
+            let store = Store {
+                persistent,
+                error: Some("credential store locked; permission denied"),
+                reads: Cell::new(0),
+            };
+            for json in [false, true] {
+                let mut args = vec!["sshw", "run", "web", "whoami", "--as-root"];
+                if json {
+                    args.push("--json");
+                }
+                let output = execute_for_runtime(
+                    Cli::try_parse_from(args).unwrap(),
+                    &path,
+                    &store,
+                    &NoNetwork,
+                    &mut NoPrompts,
+                );
+                assert_eq!(output.exit_code, 4, "{output:?}");
+                let value = json
+                    .then(|| serde_json::from_str::<serde_json::Value>(&output.stdout).unwrap());
+                let message = value
+                    .as_ref()
+                    .map(|v| v["error"]["message"].as_str().unwrap())
+                    .unwrap_or(&output.stderr);
+                assert!(
+                    message.contains("credential store locked; permission denied"),
+                    "{message}"
+                );
+                assert!(
+                    message.contains("web")
+                        && message.contains("deploy")
+                        && message.contains("service")
+                );
+                assert!(message.contains(if method == PrivilegeMethod::Sudo {
+                    "sudo"
+                } else {
+                    "su"
+                }));
+                assert!(message.contains("same home/profile"));
+                if persistent {
+                    assert!(
+                        message.contains("sshw doctor")
+                            && message.contains("if the entry is missing")
+                            && message.contains("privilege set")
+                    );
+                    assert!(message.contains("--force") && message.contains("--password-stdin"));
+                } else {
+                    assert!(message.contains("SSHW_PRIVILEGE_PASSWORD"));
+                }
+                assert!(!message.contains("missing credential entry for"));
+                if let Some(value) = value {
+                    assert_eq!(value["error"]["kind"], "auth");
+                    assert!(
+                        value["error"]["causes"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|c| c
+                                .as_str()
+                                .unwrap()
+                                .contains("credential store locked; permission denied"))
+                    );
+                }
+            }
+            assert_eq!(store.reads.get(), 2);
+            let error = execute(
+                Cli::try_parse_from(["sshw", "run", "web", "whoami", "--as-root"]).unwrap(),
+                &path,
+                &store,
+                &NoNetwork,
+                &mut NoPrompts,
+            )
+            .unwrap_err();
+            assert!(error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
+            }));
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+    }
+}
+
+#[test]
+fn privilege_lookup_error_redacts_causes_and_keeps_quoted_recovery_targets() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    privilege_config(
+        &path,
+        "-stage west",
+        "operator's $literal",
+        "-service's $target",
+        PrivilegeMethod::Su,
+    );
+    let store = Store {
+        persistent: true,
+        error: Some(
+            "token=disposable-token\n-----BEGIN PRIVATE KEY-----\ndisposable-key\n-----END PRIVATE KEY-----\nbackend unavailable",
+        ),
+        reads: Cell::new(0),
+    };
+    for json in [false, true] {
+        let mut args = vec!["sshw", "run", "--as-root"];
+        if json {
+            args.push("--json");
+        }
+        args.extend(["--", "-stage west", "whoami"]);
+        let output = execute_for_runtime(
+            Cli::try_parse_from(args).unwrap(),
+            &path,
+            &store,
+            &NoNetwork,
+            &mut NoPrompts,
+        );
+        assert_eq!(output.exit_code, 4);
+        let rendered = format!("{}{}", output.stdout, output.stderr);
+        assert!(
+            !rendered.contains("disposable-token")
+                && !rendered.contains("disposable-key")
+                && !rendered.contains("BEGIN PRIVATE KEY")
+        );
+        let message = if json {
+            serde_json::from_str::<serde_json::Value>(&output.stdout).unwrap()["error"]["message"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        } else {
+            output.stderr
+        };
+        assert!(
+            message.contains("backend unavailable")
+                && message.contains("--password-stdin")
+                && message.contains("--method su")
+        );
+        assert!(message.contains("-- '-stage west'"));
+        assert!(message.contains(if cfg!(windows) {
+            "--account='operator''s $literal'"
+        } else {
+            "--account='operator'\"'\"'s $literal'"
+        }));
+        assert!(message.contains(if cfg!(windows) {
+            "--user='-service''s $target'"
+        } else {
+            "--user='-service'\"'\"'s $target'"
+        }));
+    }
+}
+
+#[test]
+fn policy_management_reports_file_saved_and_forced_state_without_mutation() {
+    for enabled in [None, Some(false), Some(true)] {
+        for forced in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("servers.json");
+            config(&path, "example.test", 2222, "web", "deploy");
+            let policy = temp.path().join("policy.json");
+            if let Some(enabled) = enabled {
+                std::fs::write(
+                    &policy,
+                    format!("{{\"version\":2,\"enabled\":{enabled}}}\n"),
+                )
+                .unwrap();
+            }
+            let before = std::fs::read(&policy).ok();
+            let store = Store {
+                persistent: false,
+                error: None,
+                reads: Cell::new(0),
+            };
+            for json in [false, true] {
+                let mut args = vec!["sshw"];
+                if forced {
+                    args.push("--policy");
+                }
+                args.extend(["policy", "show"]);
+                if json {
+                    args.push("--json");
+                }
+                let output = execute_for_runtime(
+                    Cli::try_parse_from(args).unwrap(),
+                    &path,
+                    &store,
+                    &NoNetwork,
+                    &mut NoPrompts,
+                );
+                assert_eq!(output.exit_code, 0, "{output:?}");
+                let enforced = enabled.unwrap_or(false) || forced;
+                if json {
+                    let value: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+                    assert_eq!(value["present"], enabled.is_some());
+                    assert_eq!(value["policy"]["enabled"], enabled.unwrap_or(false));
+                    assert_eq!(value["enforced"], enforced);
+                    assert_eq!(value["forced"], forced);
+                } else {
+                    assert!(
+                        output.stdout.contains(if enabled.is_some() {
+                            "policy file: present"
+                        } else {
+                            "policy file: missing"
+                        }),
+                        "{}",
+                        output.stdout
+                    );
+                    assert!(output.stdout.contains(&format!(
+                            "saved enabled: {}",
+                            enabled
+                                .map(|v| v.to_string())
+                                .unwrap_or_else(|| "not configured".into())
+                        )));
+                    assert!(output.stdout.contains(if enforced {
+                        "policy enforcement: on"
+                    } else {
+                        "policy enforcement: off"
+                    }));
+                    assert_eq!(output.stdout.contains("forced by --policy"), forced);
+                    if enabled.is_none() {
+                        assert!(
+                            output.stdout.contains("sshw policy init")
+                                && output.stdout.contains("same home/profile")
+                        );
+                    }
+                }
+            }
+            assert_eq!(std::fs::read(&policy).ok(), before);
+            assert_eq!(store.reads.get(), 0);
+        }
+    }
+}
+
+#[test]
+fn policy_disable_reports_force_and_preserves_unchanged_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    config(&path, "example.test", 2222, "web", "deploy");
+    let policy = temp.path().join("policy.json");
+    std::fs::write(&policy, "{ \"version\":1, \"enabled\":true }\n").unwrap();
+    let store = Store {
+        persistent: false,
+        error: None,
+        reads: Cell::new(0),
+    };
+    let output = execute_for_runtime(
+        Cli::try_parse_from(["sshw", "--policy", "policy", "disable"]).unwrap(),
+        &path,
+        &store,
+        &NoNetwork,
+        &mut NoPrompts,
+    );
+    assert_eq!(output.exit_code, 0);
+    assert!(
+        output.stdout.contains("saved enabled: false")
+            && output
+                .stdout
+                .contains("policy enforcement: on (forced by --policy)")
+    );
+    assert!(
+        output
+            .stdout
+            .contains("remove --policy from the invocation")
+    );
+    let before = std::fs::read(&policy).unwrap();
+    for forced in [false, true] {
+        let mut args = vec!["sshw"];
+        if forced {
+            args.push("--policy");
+        }
+        args.extend(["policy", "disable", "--json"]);
+        let output = execute_for_runtime(
+            Cli::try_parse_from(args).unwrap(),
+            &path,
+            &store,
+            &NoNetwork,
+            &mut NoPrompts,
+        );
+        assert_eq!(output.exit_code, 0);
+        let value: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+        assert_eq!(value["changed"], false);
+        assert_eq!(value["change"], "unchanged");
+        assert_eq!(value["enforced"], forced);
+        assert_eq!(value["forced"], forced);
+        assert_eq!(value["policy"]["enabled"], false);
+        assert_eq!(std::fs::read(&policy).unwrap(), before);
+    }
+    assert_eq!(store.reads.get(), 0);
 }

@@ -8,6 +8,10 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 
 ## [Unreleased]
 
+### 승격 인증 오류·정책 적용 상태
+- `run --as-root`의 sudo/su 승격 비밀번호 조회 실패에 서버·로그인 계정·승격 방식/대상과 마스킹한 원래 원인을 표시합니다. 세션 전용은 `SSHW_PRIVILEGE_PASSWORD`, 저장 백엔드는 doctor 및 항목 부재 시 기존 승격 설정을 보존하는 재등록 방법을 안내합니다. source·auth/4·JSON causes·비밀번호 검증과 실행 순서를 유지합니다.
+- 정책 관리의 일반 출력에 파일 존재·저장 enabled·현재 enforcement와 `--policy` 강제 적용 원인을 표시합니다. 파일이 없으면 초기화 방법을, 비활성 저장값에도 강제 적용 중이면 `--policy` 해제 방법을 안내합니다. JSON에는 `forced`를 추가하며 기존 `present`·`enforced`·저장/allowlist/no-op 계약을 유지합니다.
+
 ### host key 로컬 진단·실행 인증 오류
 - `doctor`는 실제 연결과 공유하는 `known_hosts` 파서로 파일 읽기·파싱·key 데이터와 서버별 등록 여부를 확인합니다. 빈 파일·다른 서버만 등록된 파일은 등록 누락으로, 읽기/파싱 실패는 미확인으로 표시하고 복구 방법을 안내합니다. JSON `host_trust`에 서버별 `entry_present`(미확인은 null)와 `key_match_checked:false`를 추가하며 원격 접속/key 일치는 검사하지 않습니다.
 - `run`·`put`·`get`의 로그인 자격 증명 조회 실패에 서버·로그인 계정과 마스킹한 원래 원인을 표시합니다. 세션 전용 백엔드는 `SSHW_PASSWORD`, 저장 백엔드는 같은 home/profile의 doctor 및 계정 비밀번호 재등록 방법을 안내합니다. 원래 source·auth/4·JSON envelope/causes와 검사 순서를 유지합니다.

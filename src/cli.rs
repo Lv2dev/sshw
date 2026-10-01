@@ -21,7 +21,6 @@ use crate::ssh::ssh2_client::{
     Ssh2Client, runtime_library_versions, su_begin_marker, su_end_prefix,
 };
 use crate::ssh::{SshClient, SshTarget};
-use anyhow::Context;
 use clap::Parser;
 use serde_json::json;
 use std::ffi::OsStr;
@@ -999,15 +998,21 @@ where
         .ok_or_else(|| privilege::missing_privilege(server_name, login_user))?;
 
     match privilege.method {
-        PrivilegeMethod::Sudo => sudo_execution(command, privilege, credentials),
-        PrivilegeMethod::Su => su_execution(command, privilege, credentials),
+        PrivilegeMethod::Sudo => {
+            sudo_execution(server_name, login_user, command, privilege, credentials)
+        }
+        PrivilegeMethod::Su => {
+            su_execution(server_name, login_user, command, privilege, credentials)
+        }
     }
 }
 
 /// Fetch the stored privilege password for `privilege` and validate its shape.
 /// Shared by the sudo and su execution builders so the credential lookup,
-/// missing-entry context, and non-empty/single-line validation stay identical.
+/// failure context, and non-empty/single-line validation stay identical.
 fn fetch_validated_privilege_password<C>(
+    server_name: &str,
+    login_user: &str,
     privilege: &PrivilegeConfig,
     credentials: &C,
 ) -> anyhow::Result<Zeroizing<String>>
@@ -1023,19 +1028,30 @@ where
     let password = Zeroizing::new(
         credentials
             .get_password_for(CredentialPurpose::Privilege, credential, &privilege.user)
-            .with_error_kind(ErrorKind::Auth)
-            .with_context(|| {
-                format!(
-                    "missing credential entry for {} and privilege user {}",
-                    credential, privilege.user
-                )
-            })?,
+            .map_err(|error| {
+                let detail = redacted_error_detail(&error);
+                let persistent = credentials.is_persistent();
+                let recovery = privilege::recovery_step(server_name, login_user, privilege, persistent);
+                let recovery = if persistent {
+                    format!("check the credential backend with sshw doctor; if the entry is missing, {recovery}")
+                } else {
+                    recovery
+                };
+                error.context(format!(
+                    "failed to load privilege credential for server {} login account {} ({} target {})\ncaused by: {detail}\nnext: {recovery}",
+                    hints::quote_local_argument(server_name), hints::quote_local_argument(login_user),
+                    privilege::method_label(privilege.method), hints::quote_local_argument(&privilege.user)
+                ))
+            })
+            .with_error_kind(ErrorKind::Auth)?,
     );
     privilege::validate_privilege_password(password.as_str())?;
     Ok(password)
 }
 
 fn sudo_execution<C>(
+    server_name: &str,
+    login_user: &str,
     command: &str,
     privilege: &PrivilegeConfig,
     credentials: &C,
@@ -1043,7 +1059,8 @@ fn sudo_execution<C>(
 where
     C: CredentialStore,
 {
-    let password = fetch_validated_privilege_password(privilege, credentials)?;
+    let password =
+        fetch_validated_privilege_password(server_name, login_user, privilege, credentials)?;
     Ok(PrivilegedExecution {
         command: sudo_command(command, &privilege.user),
         stdin: Some(Zeroizing::new(format!("{}\n", password.as_str()))),
@@ -1054,6 +1071,8 @@ where
 }
 
 fn su_execution<C>(
+    server_name: &str,
+    login_user: &str,
     command: &str,
     privilege: &PrivilegeConfig,
     credentials: &C,
@@ -1061,7 +1080,8 @@ fn su_execution<C>(
 where
     C: CredentialStore,
 {
-    let password = fetch_validated_privilege_password(privilege, credentials)?;
+    let password =
+        fetch_validated_privilege_password(server_name, login_user, privilege, credentials)?;
     let marker_nonce = su_marker_nonce();
     Ok(PrivilegedExecution {
         command: su_command(command, &privilege.user, &marker_nonce),
