@@ -65,6 +65,78 @@ fn add(home: &Path) {
 }
 
 #[test]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn password_prompt_without_terminal_explains_recovery_and_preserves_os_cause() {
+    let home = home();
+    add(home.path());
+    let path = home.path().join("servers.json");
+    let before = std::fs::read(&path).unwrap();
+    for args in [
+        vec!["add", "new", "--host", "192.0.2.11", "--user", "deploy"],
+        vec!["account", "add", "web", "operator"],
+        vec![
+            "privilege",
+            "set",
+            "web",
+            "--method",
+            "sudo",
+            "--user",
+            "service",
+        ],
+    ] {
+        for json in [false, true] {
+            #[cfg(target_os = "windows")]
+            let mut command = {
+                use std::os::windows::process::CommandExt;
+                let mut command = Command::new(env!("CARGO_BIN_EXE_sshw"));
+                command.creation_flags(0x00000008); // DETACHED_PROCESS: no controlling console.
+                command
+            };
+            #[cfg(target_os = "linux")]
+            let mut command = {
+                let mut command = Command::new("setsid");
+                command.arg("--wait").arg(env!("CARGO_BIN_EXE_sshw"));
+                command
+            };
+            command
+                .env("SSHW_HOME", home.path())
+                .env_remove("SSHW_PASSWORD")
+                .env_remove("SSHW_PRIVILEGE_PASSWORD")
+                .args(&args)
+                .stdin(Stdio::null());
+            if json {
+                command.arg("--json");
+            }
+            let output = command.output().unwrap();
+            assert_eq!(output.status.code(), Some(4), "{args:?}: {output:?}");
+            let rendered = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                rendered.contains("interactive terminal")
+                    && rendered.contains("--password-stdin")
+                    && rendered.contains("secret manager"),
+                "{rendered}"
+            );
+            assert!(
+                rendered.contains("os error"),
+                "original I/O cause was lost: {rendered}"
+            );
+            if json {
+                assert!(output.stderr.is_empty());
+                let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(value["error"]["kind"], "auth");
+            } else {
+                assert!(output.stdout.is_empty());
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+    }
+}
+
+#[test]
 fn missing_operation_targets_fail_during_parsing_without_state_writes() {
     let home = home();
     let untouched_home = home.path().join("not-created");

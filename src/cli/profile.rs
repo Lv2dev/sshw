@@ -86,11 +86,7 @@ fn profile_add(
         .filter(|entry| same_profile_home(&entry.home, &home))
         .map(|entry| entry.id.clone())
         .unwrap_or_else(|| generate_profile_id(&args.name, &home));
-    let target = ResolvedHome::profile(home.clone(), &id, format!("profile '{}'", args.name));
-    super::load_active_config(&target).map_err(|error| {
-        let detail = redact_secrets(&error.to_string());
-        error.context(format!("cannot connect profile '{}' to target home {}: {detail}; profile registry was not changed", redact_secrets(&args.name), redact_secrets(&home.display().to_string())))
-    })?;
+    validate_profile_target(&args.name, &home, &id)?;
     let namespace_changed = previous.as_ref().is_some_and(|entry| entry.id != id);
     let action = if previous.is_some() {
         "updated"
@@ -153,16 +149,28 @@ fn normalize_profile_home(home: &Path) -> anyhow::Result<std::path::PathBuf> {
             home.display()
         )
     })?;
+    validate_profile_home_directory(&absolute)?;
+    match fs::canonicalize(&absolute) {
+        Ok(canonical) => Ok(canonical),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(absolute),
+        Err(err) => Err(anyhow::anyhow!(
+            "failed to resolve profile home '{}': {err}",
+            absolute.display()
+        )),
+    }
+}
+
+fn validate_profile_home_directory(home: &Path) -> anyhow::Result<()> {
     // Missing homes are valid, but no existing part of the path may be a file.
     // Windows can report NotFound for a missing child beneath a regular file.
-    let mut ancestor = absolute.as_path();
+    let mut ancestor = home;
     loop {
         match fs::metadata(ancestor) {
             Ok(metadata) if metadata.is_dir() => break,
             Ok(_) => {
                 return Err(anyhow::anyhow!(
                     "profile home '{}' requires a directory; '{}' is not a directory",
-                    absolute.display(),
+                    home.display(),
                     ancestor.display()
                 ));
             }
@@ -175,19 +183,22 @@ fn normalize_profile_home(home: &Path) -> anyhow::Result<std::path::PathBuf> {
             Err(err) => {
                 return Err(anyhow::anyhow!(
                     "failed to resolve profile home '{}': {err}",
-                    absolute.display()
+                    home.display()
                 ));
             }
         }
     }
-    match fs::canonicalize(&absolute) {
-        Ok(canonical) => Ok(canonical),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(absolute),
-        Err(err) => Err(anyhow::anyhow!(
-            "failed to resolve profile home '{}': {err}",
-            absolute.display()
-        )),
-    }
+    Ok(())
+}
+
+fn validate_profile_target(name: &str, home: &Path, id: &str) -> anyhow::Result<()> {
+    let target = ResolvedHome::profile(home.to_path_buf(), id, format!("profile '{name}'"));
+    validate_profile_home_directory(home)
+        .and_then(|()| super::load_active_config(&target).map(|_| ()))
+        .map_err(|error| {
+            let detail = redact_secrets(&error.to_string());
+            error.context(format!("cannot connect profile '{}' to target home {}: {detail}; profile registry was not changed", redact_secrets(name), redact_secrets(&home.display().to_string())))
+        })
 }
 
 fn profile_list(
@@ -262,9 +273,11 @@ fn profile_default(
     revision: &RegistryRevision,
     registry: &mut ProfileRegistry,
 ) -> anyhow::Result<CommandOutput> {
-    if !registry.profiles.contains_key(&args.name) {
-        return Err(anyhow::anyhow!("unknown profile '{}'", args.name));
-    }
+    let entry = registry
+        .profiles
+        .get(&args.name)
+        .ok_or_else(|| anyhow::anyhow!("unknown profile '{}'", args.name))?;
+    validate_profile_target(&args.name, &entry.home, &entry.id)?;
 
     registry.default = Some(args.name.clone());
     save_registry_if_unchanged(registry_path, registry, revision)?;

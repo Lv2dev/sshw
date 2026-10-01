@@ -34,7 +34,12 @@ impl Prompter for TerminalPrompter {
     }
 
     fn password(&mut self, prompt: &str) -> anyhow::Result<String> {
-        Ok(rpassword::prompt_password(prompt)?)
+        rpassword::prompt_password(prompt).map_err(|error| {
+            let detail = crate::output::redact_secrets(&error.to_string());
+            anyhow::Error::new(error).context(format!(
+                "cannot read password from the terminal: {detail}; run in an interactive terminal, or pipe the password from a secret manager and pass --password-stdin"
+            ))
+        })
     }
 
     fn password_stdin(&mut self) -> anyhow::Result<String> {

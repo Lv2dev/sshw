@@ -149,6 +149,8 @@ sshw profile remove prod                  # removes the registry entry only; hom
 
 Each profile stores a stable id and its home path. The first profile added becomes the default. `profile add --force` preserves the existing id when the normalized home is unchanged; moving the name to a different home creates a fresh namespace. The selection mechanism is part of the credential boundary: opening a profile-owned directory with `--home` does not reuse that profile's credentials. Removing a profile leaves its directory and native keyring entries physically intact, but removes the trusted namespace binding; re-adding a removed profile creates a fresh credential namespace and requires credentials to be registered again. Use `--force` instead of remove/re-add when updating the same profile and home.
 
+`profile default <name>` rechecks the target's settings and home path using its registered credential namespace before saving the default. Invalid settings or incompatible credential references fail with config/3 and leave the previous default intact. Empty homes remain valid. You can switch away from a damaged current profile to a valid target; the check does not read secrets, connect over SSH, or rewrite the target's files or namespace.
+
 프로필 추가·갱신은 사용할 namespace로 대상 `servers.json`의 형식·기본값·계정·자격 증명 참조를 검사한 뒤 registry를 저장합니다. 호환되지 않으면 경로와 원인을 안내하고 기존 연결과 기본값을 보존하며, `--force`로도 검사를 건너뛰지 않습니다. 없는 home과 호환되는 agent/무비밀번호 설정은 허용하지만 경로의 기존 부분이 파일이면 거부합니다. 검사는 대상 파일을 바꾸거나 비밀번호/keyring/SSH를 조회하지 않으며, 이후 파일 변경은 실행 시 다시 검증합니다.
 
 `profile add` 결과는 신규 `added`와 기존 항목 갱신 `updated`를 구분합니다. JSON에는 `id`·`namespace_changed`를 추가하고, 경로 이동으로 namespace가 바뀌면 `previous_home`과 재등록 안내 `warning`도 제공합니다. 같은 home의 갱신은 namespace를 보존합니다. 경로 변경은 서버 파일이나 비밀을 옮기지 않으며 이전 home/keyring은 남습니다. 복사한 비밀번호 설정이 호환되지 않으면 빈 home 또는 호환되는 설정을 선택하고 필요한 비밀번호를 새 연결에서 등록하세요.
@@ -174,6 +176,8 @@ secret-manager-read deploy/server-alpha | sshw add server-alpha --host 192.0.2.1
 ```
 
 `--password-stdin` is valid only with password auth. It reads stdin once, strips one final LF or CRLF, rejects empty input, and avoids placing the password in argv or shell history. `sshw` intentionally does not provide `--password <value>`.
+
+If `add`, `account add`, or `privilege set` cannot read a password from the controlling terminal, the auth/4 error includes the original OS cause and suggests an interactive terminal or `--password-stdin` with a secret-manager pipe. Redirecting stdin alone does not enable password input; pass the option explicitly. A working controlling terminal still supports hidden password input when stdin is redirected.
 
 On Linux the native backend requires a working Secret Service provider (GNOME Keyring, KWallet). `sshw doctor` reports availability; `sshw` never falls back to plaintext storage.
 
@@ -646,6 +650,8 @@ sshw profile remove prod                  # registry 항목만 제거. home 디�
 
 각 profile은 stable id와 home 경로를 저장합니다. 처음 추가한 profile이 default가 됩니다. 정규화된 home이 같으면 `profile add --force`는 기존 id를 보존하고, 다른 home으로 바꾸면 새 namespace를 만듭니다. profile 선택 방식 자체가 credential 경계이므로 profile 소유 디렉터리를 `--home`으로 열어도 그 profile credential을 재사용하지 않습니다. profile을 제거하면 디렉터리와 native keyring 항목은 물리적으로 남지만 신뢰된 namespace 연결은 사라집니다. 제거한 profile을 다시 추가하면 새 credential namespace가 만들어지므로 credential을 다시 등록해야 합니다. 같은 profile/home 갱신에는 remove/re-add 대신 `--force`를 사용하세요.
 
+`profile default <name>`은 등록된 credential namespace로 대상 설정과 home 경로를 다시 검사한 뒤 기본값을 저장합니다. 잘못된 설정이나 호환되지 않는 자격 증명 참조는 config/3으로 거부하고 이전 기본값을 보존합니다. 빈 home은 허용하며 현재 프로필이 손상됐더라도 정상 대상으로 전환할 수 있습니다. 검사는 비밀 조회·SSH 접속·대상 파일 재저장·namespace 변경을 수행하지 않습니다.
+
 프로필 추가·갱신은 사용할 namespace로 대상 `servers.json`의 형식·기본값·계정·자격 증명 참조를 검사한 뒤 registry를 저장합니다. 호환되지 않으면 경로와 원인을 안내하고 기존 연결과 기본값을 보존하며, `--force`로도 검사를 건너뛰지 않습니다. 없는 home과 호환되는 agent/무비밀번호 설정은 허용하지만 경로의 기존 부분이 파일이면 거부합니다. 검사는 대상 파일을 바꾸거나 비밀번호/keyring/SSH를 조회하지 않으며, 이후 파일 변경은 실행 시 다시 검증합니다.
 
 결과는 신규 `added`와 기존 항목 갱신 `updated`를 구분합니다. JSON에는 `id`·`namespace_changed`를 추가하고, 경로 이동으로 namespace가 바뀌면 `previous_home`과 재등록 안내 `warning`도 제공합니다. 같은 home의 갱신은 namespace를 보존합니다. 경로 변경은 서버 파일이나 비밀을 옮기지 않으며 이전 home/keyring은 남습니다. 복사한 비밀번호 설정이 호환되지 않으면 빈 home 또는 호환되는 설정을 선택하고 필요한 비밀번호를 새 연결에서 등록하세요.
@@ -669,6 +675,8 @@ secret-manager-read deploy/server-alpha | sshw add server-alpha --host 192.0.2.1
 ```
 
 `--password-stdin`은 password auth에서만 유효합니다. stdin을 한 번 읽고 마지막 LF 또는 CRLF 하나만 제거하며, 빈 입력은 거부합니다. 이 경로는 비밀번호를 argv나 shell history에 남기지 않기 위한 것이며, `sshw`는 의도적으로 `--password <value>` 인자를 제공하지 않습니다.
+
+`add`·`account add`·`privilege set`이 제어 터미널에서 비밀번호를 읽지 못하면 auth/4 오류에 원래 OS 원인과 대화형 터미널 또는 비밀 관리자 pipe를 통한 `--password-stdin` 사용법을 안내합니다. stdin 리디렉션만으로 비밀번호를 자동 입력하지 않으므로 옵션을 명시하세요. 제어 터미널이 정상이라면 stdin이 리디렉션돼 있어도 숨김 비밀번호 입력을 사용할 수 있습니다.
 
 Linux의 native backend는 동작하는 Secret Service provider(GNOME Keyring, KWallet)가 필요합니다. `sshw doctor`가 가용성을 보고하며, 평문 저장으로 fallback하지 않습니다.
 

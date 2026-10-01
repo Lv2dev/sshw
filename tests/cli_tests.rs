@@ -10,6 +10,7 @@ use sshw::config::{
 use sshw::credentials::session_store::SessionOnlyStore;
 use sshw::credentials::{AuthMaterial, CredentialStore, CredentialStoreHealth};
 use sshw::home::{CredentialNamespace, CredentialPurpose, ResolvedHome};
+use sshw::profile::{ProfileEntry, ProfileRegistry, load_registry, save_registry};
 use sshw::ssh::{HostKeyInfo, RunResult, SshClient, SshTarget, TransferResult};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -6003,6 +6004,314 @@ fn server_update_cleanup_failure_retains_account_change() {
             );
         }
         assert!(store.requested.borrow().is_empty());
+    }
+}
+
+#[test]
+fn profile_default_rejects_invalid_targets_without_changing_registry_or_secrets() {
+    for kind in ["json", "endpoint", "default", "login", "privilege"] {
+        for json in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let active = temp.path().join("active/servers.json");
+            let registry_path = temp.path().join("active/profiles.json");
+            let target = temp.path().join("target");
+            let path = target.join("servers.json");
+            let registry = ProfileRegistry {
+                default: Some("current".into()),
+                profiles: BTreeMap::from([
+                    (
+                        "current".into(),
+                        ProfileEntry {
+                            id: "p_1111111111111111".into(),
+                            home: temp.path().join("current"),
+                        },
+                    ),
+                    (
+                        "target".into(),
+                        ProfileEntry {
+                            id: "p_2222222222222222".into(),
+                            home: target.clone(),
+                        },
+                    ),
+                ]),
+                ..ProfileRegistry::default()
+            };
+            save_registry(&registry_path, &registry).unwrap();
+            let mut config = agent_accounts_config(&path);
+            let foreign = CredentialNamespace::profile("foreign-id");
+            match kind {
+                "endpoint" => config.servers.get_mut("server-alpha").unwrap().port = 0,
+                "default" => config.default = Some("missing".into()),
+                "login" => {
+                    config
+                        .servers
+                        .get_mut("server-alpha")
+                        .unwrap()
+                        .accounts
+                        .get_mut("deploy")
+                        .unwrap()
+                        .auth = AuthConfig::Password {
+                        credential: foreign.new_account_credential_key(
+                            CredentialPurpose::Login,
+                            "server-alpha",
+                            "deploy",
+                        ),
+                    }
+                }
+                "privilege" => set_default_privilege(
+                    &mut config,
+                    "server-alpha",
+                    PrivilegeConfig {
+                        method: PrivilegeMethod::Sudo,
+                        user: "service".into(),
+                        no_password: false,
+                        credential: Some(foreign.new_account_credential_key(
+                            CredentialPurpose::Privilege,
+                            "server-alpha",
+                            "deploy",
+                        )),
+                    },
+                ),
+                _ => (),
+            }
+            std::fs::create_dir_all(&target).unwrap();
+            let bytes = if kind == "json" {
+                b"{ broken".to_vec()
+            } else {
+                serde_json::to_vec(&config).unwrap()
+            };
+            std::fs::write(&path, &bytes).unwrap();
+            let before = std::fs::read(&registry_path).unwrap();
+            let store = FakeCredentialStore::default();
+            let ssh = FakeSshClient::default();
+            let mut prompts = NoPasswordPrompter { prompts: vec![] };
+            let mut args = vec!["sshw", "profile", "default", "target"];
+            if json {
+                args.push("--json");
+            }
+            let output = execute_for_runtime(
+                Cli::try_parse_from(args).unwrap(),
+                &active,
+                &store,
+                &ssh,
+                &mut prompts,
+            );
+            assert_eq!(
+                output.exit_code, 3,
+                "{kind}: {}{}",
+                output.stdout, output.stderr
+            );
+            let rendered = format!("{}{}", output.stdout, output.stderr);
+            assert!(
+                rendered.contains("servers.json")
+                    && rendered.contains("profile registry was not changed"),
+                "{rendered}"
+            );
+            if json {
+                let value: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+                assert_eq!(value["error"]["kind"], "config");
+            }
+            assert_eq!(std::fs::read(&registry_path).unwrap(), before);
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            assert_eq!(load_registry(&registry_path).unwrap(), registry);
+            assert!(!target.join(".sshw.lock").exists() && !target.join("audit.jsonl").exists());
+            assert!(prompts.prompts.is_empty());
+            assert!(
+                store.values.borrow().is_empty()
+                    && store.requested.borrow().is_empty()
+                    && store.deleted.borrow().is_empty()
+            );
+            assert!(ssh.selected_users.borrow().is_empty());
+        }
+    }
+}
+
+#[test]
+fn profile_default_recovers_to_compatible_targets_and_preserves_namespace() {
+    for kind in ["missing", "legacy", "password", "agent", "no-password"] {
+        for json in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let current = temp.path().join("current");
+            std::fs::create_dir_all(&current).unwrap();
+            let active = current.join("servers.json");
+            std::fs::write(&active, "{ damaged current default").unwrap();
+            let registry_path = current.join("profiles.json");
+            let target = temp.path().join("target");
+            let path = target.join("servers.json");
+            let mut registry = ProfileRegistry {
+                default: Some("current".into()),
+                profiles: BTreeMap::from([
+                    (
+                        "current".into(),
+                        ProfileEntry {
+                            id: "p_1111111111111111".into(),
+                            home: current,
+                        },
+                    ),
+                    (
+                        "target".into(),
+                        ProfileEntry {
+                            id: "p_2222222222222222".into(),
+                            home: target.clone(),
+                        },
+                    ),
+                ]),
+                ..ProfileRegistry::default()
+            };
+            save_registry(&registry_path, &registry).unwrap();
+            let namespace = CredentialNamespace::profile("p_2222222222222222");
+            let bytes = if kind == "missing" {
+                None
+            } else {
+                std::fs::create_dir_all(&target).unwrap();
+                let bytes = if kind == "legacy" {
+                    serde_json::to_vec(&serde_json::json!({"version":1,"default":"web","servers":{"web":{"host":"192.0.2.10","port":22,"user":"deploy","auth":{"type":"password","credential":namespace.legacy_credential_key("web")}}}})).unwrap()
+                } else {
+                    let mut config = agent_accounts_config(&path);
+                    if kind == "password" {
+                        config
+                            .servers
+                            .get_mut("server-alpha")
+                            .unwrap()
+                            .accounts
+                            .get_mut("deploy")
+                            .unwrap()
+                            .auth = AuthConfig::Password {
+                            credential: namespace.new_account_credential_key(
+                                CredentialPurpose::Login,
+                                "server-alpha",
+                                "deploy",
+                            ),
+                        };
+                        set_default_privilege(
+                            &mut config,
+                            "server-alpha",
+                            PrivilegeConfig {
+                                method: PrivilegeMethod::Su,
+                                user: "service".into(),
+                                no_password: false,
+                                credential: Some(namespace.new_account_credential_key(
+                                    CredentialPurpose::Privilege,
+                                    "server-alpha",
+                                    "deploy",
+                                )),
+                            },
+                        );
+                    } else if kind == "no-password" {
+                        set_default_privilege(
+                            &mut config,
+                            "server-alpha",
+                            PrivilegeConfig {
+                                method: PrivilegeMethod::Sudo,
+                                user: "service".into(),
+                                no_password: true,
+                                credential: None,
+                            },
+                        );
+                    }
+                    serde_json::to_vec(&config).unwrap()
+                };
+                std::fs::write(&path, &bytes).unwrap();
+                Some(bytes)
+            };
+            let store = FakeCredentialStore::default();
+            let ssh = FakeSshClient::default();
+            let mut prompts = NoPasswordPrompter { prompts: vec![] };
+            let mut args = vec!["sshw", "profile", "default", "target"];
+            if json {
+                args.push("--json");
+            }
+            let output = execute_for_runtime(
+                Cli::try_parse_from(args).unwrap(),
+                &active,
+                &store,
+                &ssh,
+                &mut prompts,
+            );
+            assert_eq!(
+                output.exit_code, 0,
+                "{kind}: {}{}",
+                output.stdout, output.stderr
+            );
+            if json {
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&output.stdout).unwrap(),
+                    serde_json::json!({"ok":true,"action":"default","name":"target"})
+                );
+            }
+            registry.default = Some("target".into());
+            assert_eq!(load_registry(&registry_path).unwrap(), registry);
+            assert_eq!(std::fs::read(&path).ok(), bytes);
+            assert_eq!(
+                std::fs::read_to_string(&active).unwrap(),
+                "{ damaged current default"
+            );
+            assert!(!target.join(".sshw.lock").exists() && !target.join("audit.jsonl").exists());
+            if kind == "missing" {
+                assert!(!target.exists());
+            }
+            assert!(prompts.prompts.is_empty());
+            assert!(
+                store.values.borrow().is_empty()
+                    && store.requested.borrow().is_empty()
+                    && store.deleted.borrow().is_empty()
+            );
+            assert!(ssh.selected_users.borrow().is_empty());
+        }
+    }
+}
+
+#[test]
+fn profile_default_rejects_home_replaced_with_file_and_file_parent() {
+    for child in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let active = temp.path().join("active/servers.json");
+        let registry_path = temp.path().join("active/profiles.json");
+        let parent = temp.path().join("target");
+        let home = if child {
+            parent.join("missing/home")
+        } else {
+            parent.clone()
+        };
+        let registry = ProfileRegistry {
+            default: Some("current".into()),
+            profiles: BTreeMap::from([
+                (
+                    "current".into(),
+                    ProfileEntry {
+                        id: "p_1111111111111111".into(),
+                        home: temp.path().join("current"),
+                    },
+                ),
+                (
+                    "target".into(),
+                    ProfileEntry {
+                        id: "p_2222222222222222".into(),
+                        home,
+                    },
+                ),
+            ]),
+            ..ProfileRegistry::default()
+        };
+        save_registry(&registry_path, &registry).unwrap();
+        let before = std::fs::read(&registry_path).unwrap();
+        std::fs::write(&parent, "preserve file").unwrap();
+        for json in [false, true] {
+            let mut args = vec!["sshw", "profile", "default", "target"];
+            if json {
+                args.push("--json");
+            }
+            let output = execute_for_runtime(
+                Cli::try_parse_from(args).unwrap(),
+                &active,
+                &FakeCredentialStore::default(),
+                &FakeSshClient::default(),
+                &mut NoPasswordPrompter { prompts: vec![] },
+            );
+            assert_eq!(output.exit_code, 3, "{}{}", output.stdout, output.stderr);
+            assert_eq!(std::fs::read(&registry_path).unwrap(), before);
+            assert_eq!(std::fs::read_to_string(&parent).unwrap(), "preserve file");
+        }
     }
 }
 

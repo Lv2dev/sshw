@@ -8,6 +8,10 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 
 ## [Unreleased]
 
+### 기본 프로필 전환·비밀번호 입력 복구
+- `profile default`는 등록된 home과 기존 credential namespace로 대상 서버 설정과 경로를 다시 검사한 뒤 기본값을 저장합니다. 잘못된 설정·호환되지 않는 자격 증명 참조·파일로 막힌 경로는 config/3으로 거부하며 이전 기본값과 대상 파일을 보존합니다. 빈 home 선택 및 손상된 현재 프로필에서 정상 프로필로의 전환은 유지합니다.
+- `add`·`account add`·`privilege set`의 비밀번호 terminal 입력이 실패하면 대화형 터미널에서 재실행하거나 비밀 관리자에서 pipe로 전달하는 `--password-stdin` 사용법을 안내합니다. 원래 OS 오류·auth/4·JSON 구조를 유지하고 stdin 입력은 명시적인 옵션으로만 사용합니다.
+
 ### 서버 주소 검사·계정 권한 표시
 - 서버 등록은 빈 호스트·공백만 있는 호스트·제어 문자·포트 `0`을 확인 질문·비밀번호 입력 전에 config/3으로 거부합니다. 같은 검사를 v1/v2 설정 로딩 및 메모리 설정 검증에도 적용해 doctor에서 서버 이름과 원인을 진단합니다. 정상 hostname/IP/IPv6 값과 포트1..65535는 유지하며 DNS/접속 검사나 입력 자동 변경은 하지 않습니다.
 - `account list/show`의 일반 출력에 승격 방식·대상 사용자·비밀번호 사용 여부를 함께 표시합니다. 기존 로그인 계정·승격 실행·JSON 구조를 유지하고 대상의 민감한 패턴은 마스킹합니다.
