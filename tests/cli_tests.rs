@@ -4804,13 +4804,15 @@ fn transfer_boundaries_type_backend_errors_as_ssh() {
         )
         .unwrap();
     let ssh = FakeSshClient::with_transfer_error("blocked by policy and requires --yes");
+    let local = temp.path().join("fixture.txt");
+    std::fs::write(&local, "fixture").unwrap();
 
     for cli in [
         Cli::try_parse_from([
             "sshw",
             "put",
             "server-alpha",
-            "fixture.txt",
+            local.to_str().unwrap(),
             "/srv/app/fixture.txt",
             "--json",
         ])
@@ -6462,6 +6464,359 @@ fn doctor_privilege_recovery_masks_sensitive_target_metadata() {
         assert!(!output.stdout.contains("fixture-only"));
         assert!(output.stdout.contains("--method su") && output.stdout.contains("<redacted>"));
         assert!(output.stdout.contains("-- 'server-alpha'"));
+    }
+}
+
+#[test]
+fn transfer_hint_invalid_upload_source_stops_before_credentials() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    let directory = temp.path().join("directory");
+    std::fs::create_dir(&directory).unwrap();
+    for config in [sample_config(&path), agent_accounts_config(&path)] {
+        save_config(&path, &config).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        for source in [temp.path().join("missing"), directory.clone()] {
+            for atomic in [false, true] {
+                for json in [false, true] {
+                    let mut args = vec!["sshw", "put", source.to_str().unwrap(), "/tmp/app"];
+                    if atomic {
+                        args.push("--atomic");
+                    }
+                    if json {
+                        args.push("--json");
+                    }
+                    let store = FakeCredentialStore::default();
+                    let ssh = FakeSshClient::default();
+                    let output = execute_for_runtime(
+                        Cli::try_parse_from(args).unwrap(),
+                        &path,
+                        &store,
+                        &ssh,
+                        &mut FakePrompter::default(),
+                    );
+                    assert_eq!(output.exit_code, 6, "{}{}", output.stdout, output.stderr);
+                    let diagnostic = format!("{}{}", output.stdout, output.stderr);
+                    assert!(
+                        diagnostic.contains(
+                            source
+                                .to_str()
+                                .unwrap()
+                                .rsplit(std::path::MAIN_SEPARATOR)
+                                .next()
+                                .unwrap()
+                        )
+                    );
+                    assert!(store.requested.borrow().is_empty());
+                    assert!(ssh.put_calls.borrow().is_empty());
+                    assert_eq!(std::fs::read(&path).unwrap(), before);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn transfer_hint_readable_upload_reaches_auth_and_safety_stays_first() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &sample_config(&path)).unwrap();
+    let source = temp.path().join("app");
+    std::fs::write(&source, "fixture").unwrap();
+    let store = FakeCredentialStore::default();
+    let ssh = FakeSshClient::default();
+    for atomic in [false, true] {
+        let mut args = vec![
+            "sshw",
+            "put",
+            source.to_str().unwrap(),
+            "/tmp/app",
+            "--json",
+        ];
+        if atomic {
+            args.push("--atomic");
+        }
+        assert_json_error(
+            execute_for_runtime(
+                Cli::try_parse_from(args).unwrap(),
+                &path,
+                &store,
+                &ssh,
+                &mut FakePrompter::default(),
+            ),
+            4,
+            "auth",
+            "missing credential",
+        );
+    }
+    assert_eq!(store.requested.borrow().len(), 2);
+    store.requested.borrow_mut().clear();
+    let missing = temp.path().join("missing");
+    let output = execute_for_runtime(
+        Cli::try_parse_from([
+            "sshw",
+            "put",
+            missing.to_str().unwrap(),
+            "/etc/app",
+            "--json",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut FakePrompter::default(),
+    );
+    assert_json_error(output, 2, "safety", "requires --yes");
+    assert!(store.requested.borrow().is_empty() && ssh.put_calls.borrow().is_empty());
+    store
+        .set_password(
+            &login_credential(&path, "server-alpha"),
+            "deploy",
+            "fixture-only",
+        )
+        .unwrap();
+    execute(
+        Cli::try_parse_from(["sshw", "put", source.to_str().unwrap(), "/tmp/app"]).unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut FakePrompter::default(),
+    )
+    .unwrap();
+    assert_eq!(ssh.put_calls.borrow().as_slice(), ["/tmp/app"]);
+}
+
+fn run_local_hint(command: &str, home: &Path) -> std::process::Output {
+    let quote = |value: &str| {
+        if cfg!(windows) {
+            format!("'{}'", value.replace('\'', "''"))
+        } else {
+            format!("'{}'", value.replace('\'', "'\"'\"'"))
+        }
+    };
+    let script = format!(
+        "{}{} --home {} {}{}",
+        if cfg!(windows) { "& " } else { "" },
+        quote(env!("CARGO_BIN_EXE_sshw")),
+        quote(home.to_str().unwrap()),
+        command.strip_prefix("sshw ").unwrap(),
+        if cfg!(windows) {
+            "; exit $LASTEXITCODE"
+        } else {
+            ""
+        }
+    );
+    let mut shell = if cfg!(windows) {
+        let mut shell = std::process::Command::new("pwsh");
+        shell.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
+        shell
+    } else {
+        let mut shell = std::process::Command::new("sh");
+        shell.args(["-c", &script]);
+        shell
+    };
+    shell
+        .env_remove("SSHW_HOME")
+        .env_remove("SSHW_PROFILE")
+        .env_remove("SSHW_PASSWORD")
+        .env_remove("SSHW_PRIVILEGE_PASSWORD")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn transfer_hint_first_use_commands_preserve_server_names_in_local_shell() {
+    for name in ["web", "stage west", "-staging", "O'Brien $literal"] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("servers.json");
+        let output = execute(
+            Cli::try_parse_from([
+                "sshw",
+                "add",
+                "--host",
+                "localhost",
+                "--user",
+                "deploy",
+                "--auth",
+                "agent",
+                "--",
+                name,
+            ])
+            .unwrap(),
+            &path,
+            &FakeCredentialStore::default(),
+            &FakeSshClient::default(),
+            &mut FakePrompter::default(),
+        )
+        .unwrap();
+        let empty = tempfile::tempdir().unwrap();
+        let hints: Vec<_> = output
+            .stdout
+            .lines()
+            .filter_map(|line| {
+                line.strip_prefix("next: ")
+                    .or_else(|| line.strip_prefix("then: "))
+            })
+            .collect();
+        assert_eq!(hints.len(), 2);
+        for hint in hints {
+            // An empty home ensures valid trust/run arguments stop at server
+            // lookup before SSH. This exercises the actual native CLI parser.
+            let result = run_local_hint(hint, empty.path());
+            let message = String::from_utf8_lossy(&result.stderr);
+            assert_eq!(result.status.code(), Some(3), "{hint}: {message}");
+            assert!(
+                message.contains(&format!("unknown server '{name}'")),
+                "{message}"
+            );
+        }
+    }
+}
+
+#[test]
+fn transfer_hint_doctor_host_trust_preserves_server_names() {
+    for name in ["stage west", "-staging", "O'Brien $literal"] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("servers.json");
+        execute(
+            Cli::try_parse_from([
+                "sshw",
+                "add",
+                "--host",
+                "localhost",
+                "--user",
+                "deploy",
+                "--auth",
+                "agent",
+                "--",
+                name,
+            ])
+            .unwrap(),
+            &path,
+            &FakeCredentialStore::default(),
+            &FakeSshClient::default(),
+            &mut FakePrompter::default(),
+        )
+        .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let output = execute_for_runtime(
+            Cli::try_parse_from(["sshw", "doctor", "--json"]).unwrap(),
+            &path,
+            &FakeCredentialStore::default(),
+            &FakeSshClient::default(),
+            &mut FakePrompter::default(),
+        );
+        let value: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+        let step = value["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|issue| issue["kind"] == "host_trust")
+            .unwrap()["next_step"]
+            .as_str()
+            .unwrap();
+        let human = execute_for_runtime(
+            Cli::try_parse_from(["sshw", "doctor"]).unwrap(),
+            &path,
+            &FakeCredentialStore::default(),
+            &FakeSshClient::default(),
+            &mut FakePrompter::default(),
+        );
+        assert!(human.stdout.contains(step));
+        let empty = tempfile::tempdir().unwrap();
+        let result = run_local_hint(step, empty.path());
+        assert_eq!(result.status.code(), Some(3));
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains(&format!("unknown server '{name}'"))
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+}
+
+#[test]
+fn transfer_hint_missing_privilege_command_preserves_login_account() {
+    for name in ["stage west", "-staging", "O'Brien $literal"] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("servers.json");
+        let login = "operator's $literal";
+        let mut config = SshwConfig {
+            credential_backend: sshw::config::CredentialBackend::SessionOnly,
+            default: Some(name.into()),
+            ..SshwConfig::default()
+        };
+        config.servers.insert(
+            name.into(),
+            ServerConfig::single_account("localhost", 22, login, AuthConfig::Agent),
+        );
+        save_config(&path, &config).unwrap();
+        let output = execute_for_runtime(
+            Cli::try_parse_from(["sshw", "run", "--as-root", "--json", "--", name, "hostname"])
+                .unwrap(),
+            &path,
+            &FakeCredentialStore::default(),
+            &FakeSshClient::default(),
+            &mut FakePrompter::default(),
+        );
+        let value: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+        let message = value["error"]["message"].as_str().unwrap();
+        let command = message
+            .split('`')
+            .nth(1)
+            .expect("copyable privilege command");
+        let (options, positional) = command.rsplit_once(" -- ").unwrap();
+        let result = run_local_hint(
+            &format!("{options} --no-password -- {positional}"),
+            temp.path(),
+        );
+        assert!(
+            result.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let saved = load_config(&path).unwrap();
+        let server = &saved.servers[name];
+        assert_eq!(server.default_user, login);
+        let privilege = server.accounts[login].privilege.as_ref().unwrap();
+        assert_eq!(privilege.method, PrivilegeMethod::Sudo);
+        assert_eq!(privilege.user, "root");
+        assert!(privilege.no_password && privilege.credential.is_none());
+    }
+}
+
+#[test]
+fn transfer_hint_sensitive_account_does_not_remove_recovery_command() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    let mut config = SshwConfig {
+        default: Some("web".into()),
+        ..SshwConfig::default()
+    };
+    config.servers.insert(
+        "web".into(),
+        ServerConfig::single_account("localhost", 22, "password=fixture-only", AuthConfig::Agent),
+    );
+    save_config(&path, &config).unwrap();
+    for json in [false, true] {
+        let mut args = vec!["sshw", "run", "web", "hostname", "--as-root"];
+        if json {
+            args.push("--json");
+        }
+        let output = execute_for_runtime(
+            Cli::try_parse_from(args).unwrap(),
+            &path,
+            &FakeCredentialStore::default(),
+            &FakeSshClient::default(),
+            &mut FakePrompter::default(),
+        );
+        let diagnostic = format!("{}{}", output.stdout, output.stderr);
+        assert_eq!(output.exit_code, 3);
+        assert!(!diagnostic.contains("fixture-only"));
+        assert!(
+            diagnostic.contains("<redacted>") && diagnostic.contains("-- 'web'"),
+            "{diagnostic}"
+        );
     }
 }
 

@@ -30,6 +30,7 @@ use std::time::Duration;
 use zeroize::Zeroizing;
 
 mod account;
+mod hints;
 mod model;
 mod policy_cmd;
 mod privilege;
@@ -1298,7 +1299,7 @@ where
                 issue(
                     "host_trust",
                     format!("no known_hosts file for server '{name}'"),
-                    format!("sshw trust {name}"),
+                    hints::trust(name),
                 );
             }
             for (user, account) in &server.accounts {

@@ -206,8 +206,9 @@ where
     }
     if previous_server.is_none() || args.replace {
         message.push_str(&format!(
-            "next: sshw trust {}\nthen: sshw run {} \"hostname\"\n",
-            args.name, args.name
+            "next: {}\nthen: {}\n",
+            super::hints::trust(&args.name),
+            super::hints::run(&args.name, "hostname")
         ));
     }
     if let Some(warning) = warning {

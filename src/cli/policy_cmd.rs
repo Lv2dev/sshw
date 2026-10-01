@@ -407,7 +407,7 @@ fn check_transfer(
         if upload {
             // Readability at this instant, without reading contents. Actual
             // transfer still opens and checks its own retained file handle.
-            crate::ssh::ssh2_client::open_regular_local_file(&local)?;
+            transfer::check_put_source(&local)?;
         }
         Ok(())
     });

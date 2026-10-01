@@ -53,6 +53,7 @@ where
         sandbox,
         config,
     )?;
+    check_put_source(&local)?;
     let auth = resolve_auth(account, login_user, credentials)?;
     let ssh_target = SshTarget::new(server, login_user);
     let result = with_msys_remote_path_hint(
@@ -153,6 +154,12 @@ pub(super) fn check_put_access<'a>(
 ) -> anyhow::Result<(&'a ServerConfig, &'a str, &'a AccountConfig)> {
     check_put_path(remote, yes, atomic, sandbox)?;
     checked_account(name, user, get_server(config, name)?, sandbox)
+}
+
+pub(super) fn check_put_source(local: &std::path::Path) -> anyhow::Result<()> {
+    // This checks readiness now. The transfer still opens, validates and keeps
+    // its own handle so later path replacements cannot change what it sends.
+    crate::ssh::ssh2_client::open_regular_local_file(local).map(|_| ())
 }
 
 pub(super) fn check_get_access<'a>(

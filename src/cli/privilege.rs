@@ -11,7 +11,7 @@ use crate::config::{
 use crate::credentials::CredentialStore;
 use crate::error::{ResultErrorKindExt, app_error, credential_cleanup_error};
 use crate::home::{CredentialNamespace, CredentialPurpose, validate_server_name};
-use crate::output::{ErrorKind, redact_secrets};
+use crate::output::ErrorKind;
 use anyhow::Context;
 use serde_json::json;
 use std::path::Path;
@@ -299,10 +299,11 @@ fn authentication_label(no_password: bool) -> &'static str {
 }
 
 pub(super) fn missing_privilege(server: &str, login_user: &str) -> anyhow::Error {
+    let command = super::hints::privilege_set(server, login_user, PrivilegeMethod::Sudo, None);
     app_error(
         ErrorKind::Config,
         format!(
-            "privilege configuration missing for account '{server}/{login_user}'; run 'sshw privilege set {server} --account {login_user} --method sudo' first"
+            "privilege configuration missing for account '{server}/{login_user}'\nusing the same home/profile selection, run `{command}` first"
         ),
     )
 }
@@ -324,29 +325,15 @@ pub(super) fn recovery_step(
     if !persistent {
         return format!(
             "supply SSHW_PRIVILEGE_PASSWORD at run time for login account {} ({method} target {}); session-only passwords are not persisted. Keep the same home/profile selection and never put the password in arguments",
-            quote_local_argument(login_user),
-            quote_local_argument(&privilege.user)
+            super::hints::quote_local_argument(login_user),
+            super::hints::quote_local_argument(&privilege.user)
         );
     }
-    let command = format!(
-        "sshw privilege set --account={} --method {method} --user={} -- {}",
-        quote_local_argument(login_user),
-        quote_local_argument(&privilege.user),
-        quote_local_argument(server)
-    );
+    let command =
+        super::hints::privilege_set(server, login_user, privilege.method, Some(&privilege.user));
     format!(
         "using the same home/profile selection, run `{command}` to register the privilege password again; confirm the update, or insert --force before -- for non-interactive use"
     )
-}
-
-fn quote_local_argument(value: &str) -> String {
-    let value = redact_secrets(value);
-    if cfg!(windows) {
-        // PowerShell single-quoted literals escape an apostrophe by doubling it.
-        format!("'{}'", value.replace('\'', "''"))
-    } else {
-        super::shell_quote(&value)
-    }
 }
 
 pub(super) fn validate_privilege_password(password: &str) -> anyhow::Result<()> {
