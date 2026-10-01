@@ -454,13 +454,39 @@ fn path_match<'a>(allowlist: &'a [String], path: &str) -> Option<&'a str> {
     if has_parent_traversal(path) {
         return None;
     }
+    // Only drive-absolute and backslash-prefixed UNC paths use Windows
+    // separators. Backslashes in POSIX and relative paths remain literal.
+    let windows_path = is_windows_absolute_path(path).then(|| path.replace('\\', "/"));
     allowlist.iter().find_map(|allowed| {
         // Skip empty entries (which would otherwise match every absolute
         // path) and normalize a trailing slash so "/srv/app/" behaves like
         // "/srv/app".
+        let windows_rule = is_windows_absolute_path(allowed.trim());
         let allowed = allowed.trim().trim_end_matches('/');
-        (!allowed.is_empty() && path_within(allowed, path)).then_some(allowed)
+        if allowed.is_empty() {
+            return None;
+        }
+        let within = if windows_rule {
+            let normalized = allowed.replace('\\', "/");
+            let normalized = normalized.trim_end_matches('/');
+            !normalized.is_empty()
+                && windows_path
+                    .as_deref()
+                    .is_some_and(|path| path_within(normalized, path))
+        } else {
+            path_within(allowed, path)
+        };
+        within.then_some(allowed)
     })
+}
+
+fn is_windows_absolute_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    path.starts_with(r"\\")
+        || (bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'/' | b'\\'))
 }
 
 /// Lexical containment: `path` equals `allowed` or is a path-separated child of

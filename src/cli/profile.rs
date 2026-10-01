@@ -192,13 +192,16 @@ fn validate_profile_home_directory(home: &Path) -> anyhow::Result<()> {
 }
 
 fn validate_profile_target(name: &str, home: &Path, id: &str) -> anyhow::Result<()> {
+    inspect_profile_target(name, home, id).map_err(|error| {
+        let detail = redact_secrets(&error.to_string());
+        error.context(format!("cannot connect profile '{}' to target home {}: {detail}; profile registry was not changed", redact_secrets(name), redact_secrets(&home.display().to_string())))
+    })
+}
+
+fn inspect_profile_target(name: &str, home: &Path, id: &str) -> anyhow::Result<()> {
     let target = ResolvedHome::profile(home.to_path_buf(), id, format!("profile '{name}'"));
     validate_profile_home_directory(home)
         .and_then(|()| super::load_active_config(&target).map(|_| ()))
-        .map_err(|error| {
-            let detail = redact_secrets(&error.to_string());
-            error.context(format!("cannot connect profile '{}' to target home {}: {detail}; profile registry was not changed", redact_secrets(name), redact_secrets(&home.display().to_string())))
-        })
 }
 
 fn profile_list(
@@ -304,13 +307,34 @@ fn profile_remove(
         registry.default = registry.profiles.keys().next().cloned();
     }
 
-    save_registry_if_unchanged(registry_path, registry, revision)?;
     let default_change =
         DefaultChange::between("profile", previous_default, registry.default.clone());
+    let target_warning = default_change.as_ref().and_then(|_| {
+        let name = registry.default.as_ref()?;
+        let entry = registry.profiles.get(name)?;
+        let error = inspect_profile_target(name, &entry.home, &entry.id).err()?;
+        let message = format!(
+            "cannot validate automatically selected default profile {}: {}; removal was completed, but commands using this profile may fail",
+            super::hints::quote_local_argument(name),
+            super::redacted_error_detail(&error)
+        );
+        let next_step = format!(
+            "repair the settings/home at {}; inspect with sshw --profile={} doctor (unset SSHW_HOME and omit --home); or choose a valid profile from sshw profile list and run sshw profile default -- {}",
+            super::hints::quote_local_argument(&entry.home.display().to_string()),
+            super::hints::quote_local_argument(name),
+            super::hints::quote_local_argument("<valid-profile>")
+        );
+        Some(json!({"name":redact_secrets(name),"home":redact_secrets(&entry.home.display().to_string()),
+            "message":message,"next_step":next_step}))
+    });
+    save_registry_if_unchanged(registry_path, registry, revision)?;
     if args.json {
         let mut output = json!({"ok":true,"action":"removed","name":args.name,"warning":"home and keyring entries left intact; re-adding requires credentials to be registered again"});
         if let Some(change) = default_change {
             output["default_change"] = serde_json::to_value(change.redacted())?;
+        }
+        if let Some(warning) = target_warning {
+            output["default_target_warning"] = warning;
         }
         return Ok(ok(format!("{}\n", output)));
     }
@@ -320,6 +344,13 @@ fn profile_remove(
     );
     if let Some(change) = default_change {
         message.push_str(&change.human_message());
+    }
+    if let Some(warning) = target_warning {
+        message.push_str(&format!(
+            "warning: {}\nnext: {}\n",
+            warning["message"].as_str().unwrap_or_default(),
+            warning["next_step"].as_str().unwrap_or_default()
+        ));
     }
     Ok(ok(message))
 }

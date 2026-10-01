@@ -151,6 +151,8 @@ Each profile stores a stable id and its home path. The first profile added becom
 
 `profile default <name>` rechecks the target's settings and home path using its registered credential namespace before saving the default. Invalid settings or incompatible credential references fail with config/3 and leave the previous default intact. Empty homes remain valid. You can switch away from a damaged current profile to a valid target; the check does not read secrets, connect over SSH, or rewrite the target's files or namespace.
 
+Removing the default profile also checks the automatically selected next profile's local settings. Removal still succeeds and keeps the existing name order. If the new default cannot be validated, human output and JSON `default_target_warning` report its name, home, masked cause, and recovery steps alongside `default_change`. Repair that home or use `sshw profile list` and `sshw profile default <valid-name>` to switch. Other removals, an empty target home, and removal of the last profile do not produce this warning. The check does not read secrets or test SSH connectivity.
+
 프로필 추가·갱신은 사용할 namespace로 대상 `servers.json`의 형식·기본값·계정·자격 증명 참조를 검사한 뒤 registry를 저장합니다. 호환되지 않으면 경로와 원인을 안내하고 기존 연결과 기본값을 보존하며, `--force`로도 검사를 건너뛰지 않습니다. 없는 home과 호환되는 agent/무비밀번호 설정은 허용하지만 경로의 기존 부분이 파일이면 거부합니다. 검사는 대상 파일을 바꾸거나 비밀번호/keyring/SSH를 조회하지 않으며, 이후 파일 변경은 실행 시 다시 검증합니다.
 
 `profile add` 결과는 신규 `added`와 기존 항목 갱신 `updated`를 구분합니다. JSON에는 `id`·`namespace_changed`를 추가하고, 경로 이동으로 namespace가 바뀌면 `previous_home`과 재등록 안내 `warning`도 제공합니다. 같은 home의 갱신은 namespace를 보존합니다. 경로 변경은 서버 파일이나 비밀을 옮기지 않으며 이전 home/keyring은 남습니다. 복사한 비밀번호 설정이 호환되지 않으면 빈 home 또는 호환되는 설정을 선택하고 필요한 비밀번호를 새 연결에서 등록하세요.
@@ -390,6 +392,8 @@ Policy is **off by default**. Turn it on for an invocation with `--policy`, or p
 ```
 
 When enforcing, default accounts remain available, but a non-default `--user` must exactly match a structured `allow_accounts` entry. Existing policy v1 files remain valid and allow only default accounts. `run` commands must match `allow_commands` and `put`/`get` paths must be under `allow_put_paths`/`allow_get_paths`. A command containing shell metacharacters (`;`, `&`, `|`, `` ` ``, `$`, `(`, `)`, `<`, `>`) only matches an **exact** allowlist entry. Transfer paths containing `..` are rejected. Denied operations return exit code 7 (`policy`).
+
+`policy allow put/get` rejects root-only `/` and repeated-slash rules because they grant no access; choose a specific directory such as `/srv/app` or `/var/log`. Existing root-only entries remain inactive and can be removed with `policy remove`. Windows drive-absolute paths (`C:\Data` or `C:/Data`) and UNC paths beginning with `\\` recognize both separators for children and trailing separators, while preserving case and directory boundaries. POSIX and relative paths keep literal backslashes. This matching does not rewrite the path sent to SSH or canonicalize it. `put --atomic` still requires forward slashes in the actual SFTP destination.
 
 Policy fails closed: with `--policy`, a missing policy file is an error, and a present-but-invalid file is always an error. An inactive policy file (`"enabled": false`) is still rejected when it has an unknown field or unsupported version; rename or remove an intentionally unused invalid file before running remote operations.
 
@@ -660,6 +664,8 @@ sshw profile remove prod                  # registry 항목만 제거. home 디�
 
 `profile default <name>`은 등록된 credential namespace로 대상 설정과 home 경로를 다시 검사한 뒤 기본값을 저장합니다. 잘못된 설정이나 호환되지 않는 자격 증명 참조는 config/3으로 거부하고 이전 기본값을 보존합니다. 빈 home은 허용하며 현재 프로필이 손상됐더라도 정상 대상으로 전환할 수 있습니다. 검사는 비밀 조회·SSH 접속·대상 파일 재저장·namespace 변경을 수행하지 않습니다.
 
+기본 프로필을 삭제할 때도 이름순으로 자동 선택되는 다음 프로필의 로컬 설정을 검사합니다. 삭제는 기존처럼 성공하며, 새 기본값을 검사할 수 없으면 일반 출력과 JSON `default_target_warning`에 이름·home·마스킹된 원인·복구 방법을 `default_change`와 함께 표시합니다. 해당 home을 복구하거나 `sshw profile list`와 `sshw profile default <정상-이름>`으로 전환하세요. 기본값이 아닌 항목 삭제·빈 대상 home·마지막 프로필 삭제에는 이 경고가 없습니다. 비밀 조회나 SSH 접속은 검사하지 않습니다.
+
 프로필 추가·갱신은 사용할 namespace로 대상 `servers.json`의 형식·기본값·계정·자격 증명 참조를 검사한 뒤 registry를 저장합니다. 호환되지 않으면 경로와 원인을 안내하고 기존 연결과 기본값을 보존하며, `--force`로도 검사를 건너뛰지 않습니다. 없는 home과 호환되는 agent/무비밀번호 설정은 허용하지만 경로의 기존 부분이 파일이면 거부합니다. 검사는 대상 파일을 바꾸거나 비밀번호/keyring/SSH를 조회하지 않으며, 이후 파일 변경은 실행 시 다시 검증합니다.
 
 결과는 신규 `added`와 기존 항목 갱신 `updated`를 구분합니다. JSON에는 `id`·`namespace_changed`를 추가하고, 경로 이동으로 namespace가 바뀌면 `previous_home`과 재등록 안내 `warning`도 제공합니다. 같은 home의 갱신은 namespace를 보존합니다. 경로 변경은 서버 파일이나 비밀을 옮기지 않으며 이전 home/keyring은 남습니다. 복사한 비밀번호 설정이 호환되지 않으면 빈 home 또는 호환되는 설정을 선택하고 필요한 비밀번호를 새 연결에서 등록하세요.
@@ -895,6 +901,8 @@ policy는 **기본 off**입니다. 호출별로 `--policy`로 켜거나, home의
 ```
 
 적용 시 default account는 계속 허용되지만 non-default `--user`는 구조화된 `allow_accounts`의 exact server/user 항목과 일치해야 합니다. 기존 policy v1은 계속 유효하며 default account만 허용합니다. `run` 명령은 `allow_commands`에, `put`/`get` 경로는 `allow_put_paths`/`allow_get_paths` 하위에 매칭돼야 합니다. 쉘 메타문자(`;`, `&`, `|`, `` ` ``, `$`, `(`, `)`, `<`, `>`)를 포함한 명령은 **정확히 일치하는** allowlist 항목에만 매칭됩니다. `..`를 포함한 전송 경로는 거부됩니다. 거부된 작업은 exit code 7(`policy`)을 반환합니다.
+
+`policy allow put/get`은 아무 접근도 허용하지 않는 `/`·반복 슬래시 규칙을 거절하고 `/srv/app`이나 `/var/log`처럼 구체적인 디렉터리를 지정하도록 안내합니다. 기존 파일의 루트-only 항목은 계속 비활성이며 `policy remove`로 제거할 수 있습니다. Windows drive 절대 경로(`C:\Data`, `C:/Data`)와 `\\`로 시작하는 UNC 경로는 두 구분자의 하위 경로·끝 구분자를 인식하고 대소문자·디렉터리 경계를 유지합니다. POSIX·상대 경로의 역슬래시는 문자 그대로 처리하며 SSH에 전달하는 경로를 바꾸거나 canonicalize하지 않습니다. `put --atomic`의 실제 SFTP 목적지는 계속 forward slash를 요구합니다.
 
 policy는 fail-closed입니다. `--policy`인데 파일이 없으면 에러이고, 파일이 있으나 유효하지 않으면 항상 에러입니다. `"enabled": false`인 비활성 policy도 unknown field나 지원하지 않는 version이 있으면 거부됩니다. 의도적으로 사용하지 않는 잘못된 파일은 원격 작업 전에 이름을 바꾸거나 제거하세요.
 

@@ -5869,6 +5869,381 @@ fn profile_removal_reports_only_effective_default_changes() {
 }
 
 #[test]
+fn path_rules_root_only_registration_fails_without_saving_and_legacy_removal_works() {
+    for operation in ["put", "get"] {
+        for entry in ["/", "///", " / ", "remote:/", "remote:///", "", "*"] {
+            for json in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let path = temp.path().join("servers.json");
+                let policy = temp.path().join("policy.json");
+                let before = r#"{"version":1,"enabled":true}"#;
+                std::fs::write(&policy, before).unwrap();
+                let store = FakeCredentialStore::default();
+                let ssh = FakeSshClient::default();
+                let mut prompts = NoPasswordPrompter { prompts: vec![] };
+                let mut args = vec!["sshw", "policy", "allow", operation, entry];
+                if json {
+                    args.push("--json");
+                }
+                let output = execute_for_runtime(
+                    Cli::try_parse_from(args).unwrap(),
+                    &path,
+                    &store,
+                    &ssh,
+                    &mut prompts,
+                );
+                assert_eq!(output.exit_code, 7, "{}{}", output.stdout, output.stderr);
+                if entry
+                    .trim()
+                    .trim_start_matches("remote:")
+                    .trim_end_matches('/')
+                    .is_empty()
+                    && !entry.is_empty()
+                {
+                    assert!(format!("{}{}", output.stdout, output.stderr).contains("root-only"));
+                    assert!(format!("{}{}", output.stdout, output.stderr).contains("/srv/app"));
+                }
+                assert_eq!(std::fs::read_to_string(&policy).unwrap(), before);
+                assert!(!path.exists());
+                assert!(
+                    store.values.borrow().is_empty()
+                        && store.requested.borrow().is_empty()
+                        && store.deleted.borrow().is_empty()
+                );
+                assert!(ssh.selected_users.borrow().is_empty() && prompts.prompts.is_empty());
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("servers.json");
+        let policy = temp.path().join("policy.json");
+        std::fs::write(
+            &policy,
+            serde_json::json!({"version":1,"enabled":true,
+            "allow_put_paths":["/","///"],"allow_get_paths":["/","///"]})
+            .to_string(),
+        )
+        .unwrap();
+        let sshw::policy::Policy::Enabled(rules) =
+            sshw::policy::resolve_policy(&policy, false).unwrap()
+        else {
+            panic!("expected enabled policy");
+        };
+        assert!(!rules.allows_put("/tmp/file") && !rules.allows_get("/tmp/file"));
+        let output = execute_for_runtime(
+            Cli::try_parse_from(["sshw", "policy", "remove", operation, "/", "--json"]).unwrap(),
+            &path,
+            &FakeCredentialStore::default(),
+            &FakeSshClient::default(),
+            &mut FakePrompter::default(),
+        );
+        assert_eq!(output.exit_code, 0);
+        let body: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+        assert_eq!(body["change"], "removed");
+    }
+}
+
+#[test]
+fn path_rules_windows_preflight_and_transfers_agree_and_atomic_keeps_forward_slash_requirement() {
+    for (entry, remote) in [
+        (r"C:\Data\", r"remote:C:\Data\file"),
+        (r"\\server\share\", r"remote:\\server\share\file"),
+        (r"C:\Data", "remote:C:/Data/file"),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("servers.json");
+        let policy = temp.path().join("policy.json");
+        save_config(&path, &agent_accounts_config(&path)).unwrap();
+        std::fs::write(
+            &policy,
+            serde_json::json!({"version":2,"enabled":true,
+            "allow_put_paths":[entry],"allow_get_paths":[entry]})
+            .to_string(),
+        )
+        .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let policy_before = std::fs::read(&policy).unwrap();
+        let local = temp.path().join("source");
+        std::fs::write(&local, "payload").unwrap();
+        let store = FakeCredentialStore::default();
+        let ssh = FakeSshClient::default();
+        for (command, upload) in [
+            ("check-put", true),
+            ("check-get", false),
+            ("put", true),
+            ("get", false),
+        ] {
+            let target = if upload {
+                vec![local.to_str().unwrap(), remote]
+            } else {
+                vec![remote, local.to_str().unwrap()]
+            };
+            let mut args = vec!["sshw"];
+            if command.starts_with("check-") {
+                args.push("policy");
+            }
+            args.extend([command, "server-alpha"]);
+            args.extend(target);
+            args.extend(["--yes", "--json"]);
+            let output = execute_for_runtime(
+                Cli::try_parse_from(args).unwrap(),
+                &path,
+                &store,
+                &ssh,
+                &mut FakePrompter::default(),
+            );
+            assert_eq!(output.exit_code, 0, "{}{}", output.stdout, output.stderr);
+            if command.starts_with("check-") {
+                let body: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+                assert_eq!(body["allowed"], true);
+                assert_eq!(
+                    body["policy"]["checks"][if upload { "put" } else { "get" }]["reason"],
+                    "matched_rule"
+                );
+            }
+        }
+        if remote.contains('\\') {
+            for args in [
+                vec![
+                    "sshw",
+                    "policy",
+                    "check-put",
+                    "server-alpha",
+                    local.to_str().unwrap(),
+                    remote,
+                    "--atomic",
+                    "--json",
+                ],
+                vec![
+                    "sshw",
+                    "put",
+                    "server-alpha",
+                    local.to_str().unwrap(),
+                    remote,
+                    "--atomic",
+                    "--json",
+                ],
+            ] {
+                let output = execute_for_runtime(
+                    Cli::try_parse_from(args).unwrap(),
+                    &path,
+                    &store,
+                    &ssh,
+                    &mut FakePrompter::default(),
+                );
+                assert_eq!(output.exit_code, 3);
+                assert!(output.stdout.contains("forward slashes"));
+            }
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(std::fs::read(&policy).unwrap(), policy_before);
+        assert!(store.requested.borrow().is_empty());
+        assert_eq!(ssh.put_calls.borrow().len(), 1);
+        assert_eq!(ssh.get_calls.borrow().len(), 1);
+    }
+}
+
+#[test]
+fn path_rules_profile_removal_warns_only_for_an_invalid_automatic_default() {
+    for kind in ["json", "namespace", "file", "healthy", "empty"] {
+        for json in [false, true] {
+            for remove in ["z-active", "a-fallback"] {
+                let temp = tempfile::tempdir().unwrap();
+                let path = temp.path().join("servers.json");
+                let registry_path = temp.path().join("profiles.json");
+                let target = temp.path().join("fallback");
+                let registry = ProfileRegistry {
+                    default: Some("z-active".into()),
+                    profiles: BTreeMap::from([
+                        (
+                            "z-active".into(),
+                            ProfileEntry {
+                                id: "p_active".into(),
+                                home: temp.path().join("active"),
+                            },
+                        ),
+                        (
+                            "a-fallback".into(),
+                            ProfileEntry {
+                                id: "p_fallback".into(),
+                                home: target.clone(),
+                            },
+                        ),
+                    ]),
+                    ..ProfileRegistry::default()
+                };
+                save_registry(&registry_path, &registry).unwrap();
+                if kind == "file" {
+                    std::fs::write(&target, "file").unwrap();
+                } else if kind != "empty" {
+                    std::fs::create_dir(&target).unwrap();
+                    let config_path = target.join("servers.json");
+                    if kind == "json" {
+                        std::fs::write(&config_path, "{broken").unwrap();
+                    } else {
+                        let mut config = agent_accounts_config(&config_path);
+                        if kind == "namespace" {
+                            config
+                                .servers
+                                .get_mut("server-alpha")
+                                .unwrap()
+                                .accounts
+                                .get_mut("deploy")
+                                .unwrap()
+                                .auth = AuthConfig::Password {
+                                credential: CredentialNamespace::profile("foreign")
+                                    .new_account_credential_key(
+                                        CredentialPurpose::Login,
+                                        "server-alpha",
+                                        "deploy",
+                                    ),
+                            };
+                        }
+                        save_config(&config_path, &config).unwrap();
+                    }
+                }
+                let before = if kind == "file" {
+                    Some(std::fs::read(&target).unwrap())
+                } else {
+                    std::fs::read(target.join("servers.json")).ok()
+                };
+                let store = FakeCredentialStore::default();
+                let ssh = FakeSshClient::default();
+                let mut prompts = NoPasswordPrompter { prompts: vec![] };
+                let mut args = vec!["sshw", "profile", "remove", remove];
+                if json {
+                    args.push("--json");
+                }
+                let output = execute_for_runtime(
+                    Cli::try_parse_from(args).unwrap(),
+                    &path,
+                    &store,
+                    &ssh,
+                    &mut prompts,
+                );
+                assert_eq!(output.exit_code, 0, "{}{}", output.stdout, output.stderr);
+                let saved = load_registry(&registry_path).unwrap();
+                let switched = remove == "z-active";
+                let expected = if switched { "a-fallback" } else { "z-active" };
+                assert_eq!(saved.default.as_deref(), Some(expected));
+                assert_eq!(saved.profiles[expected], registry.profiles[expected]);
+                assert!(!saved.profiles.contains_key(remove));
+                let warns = switched && !matches!(kind, "healthy" | "empty");
+                if json {
+                    let body: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+                    assert_eq!(body.get("default_target_warning").is_some(), warns);
+                    if warns {
+                        assert_eq!(body["default_target_warning"]["name"], "a-fallback");
+                        assert!(
+                            body["default_target_warning"]["message"]
+                                .as_str()
+                                .unwrap()
+                                .contains("removal was completed")
+                        );
+                        assert!(
+                            body["default_target_warning"]["next_step"]
+                                .as_str()
+                                .unwrap()
+                                .contains("sshw profile default --")
+                        );
+                    }
+                } else {
+                    assert_eq!(
+                        output
+                            .stdout
+                            .contains("cannot validate automatically selected default profile"),
+                        warns
+                    );
+                    if warns {
+                        assert!(output.stdout.contains("sshw profile default --"));
+                    }
+                }
+                let after = if kind == "file" {
+                    Some(std::fs::read(&target).unwrap())
+                } else {
+                    std::fs::read(target.join("servers.json")).ok()
+                };
+                assert_eq!(after, before);
+                assert!(
+                    store.values.borrow().is_empty()
+                        && store.requested.borrow().is_empty()
+                        && store.deleted.borrow().is_empty()
+                );
+                assert!(ssh.selected_users.borrow().is_empty() && prompts.prompts.is_empty());
+                if kind == "empty" {
+                    assert!(!target.exists());
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn path_rules_profile_warning_redacts_causes_and_quotes_recovery_selection() {
+    for json in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("servers.json");
+        let target = temp.path().join("fallback");
+        let name = "-broken's $literal";
+        let registry = ProfileRegistry {
+            default: Some("active".into()),
+            profiles: BTreeMap::from([
+                (
+                    "active".into(),
+                    ProfileEntry {
+                        id: "p_active".into(),
+                        home: temp.path().join("active"),
+                    },
+                ),
+                (
+                    name.into(),
+                    ProfileEntry {
+                        id: "p_target".into(),
+                        home: target.clone(),
+                    },
+                ),
+            ]),
+            ..ProfileRegistry::default()
+        };
+        save_registry(&temp.path().join("profiles.json"), &registry).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(
+            target.join("servers.json"),
+            r#"{"version":2,"token=profile-warning-secret":true}"#,
+        )
+        .unwrap();
+        let mut args = vec!["sshw", "profile", "remove", "active"];
+        if json {
+            args.push("--json");
+        }
+        let output = execute_for_runtime(
+            Cli::try_parse_from(args).unwrap(),
+            &path,
+            &FakeCredentialStore::default(),
+            &FakeSshClient::default(),
+            &mut FakePrompter::default(),
+        );
+        assert_eq!(output.exit_code, 0);
+        assert!(!output.stdout.contains("profile-warning-secret"));
+        assert!(!output.stdout.contains("registry was not changed"));
+        let hint = if json {
+            serde_json::from_str::<serde_json::Value>(&output.stdout).unwrap()["default_target_warning"]["next_step"].as_str().unwrap().to_string()
+        } else {
+            output.stdout
+        };
+        let quoted = if cfg!(windows) {
+            "'-broken''s $literal'"
+        } else {
+            r#"'-broken'"'"'s $literal'"#
+        };
+        assert!(
+            hint.contains(&format!("--profile={quoted} doctor")),
+            "{hint}"
+        );
+        assert!(hint.contains("SSHW_HOME"));
+    }
+}
+
+#[test]
 fn server_update_reports_default_login_account_change() {
     for user in ["deploy", "ops"] {
         for json in [false, true] {

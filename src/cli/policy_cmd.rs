@@ -277,6 +277,15 @@ fn change_rule(
     }
     if adding
         && !matches!(rule, PolicyRule::Command { .. })
+        && value.trim().trim_end_matches('/').is_empty()
+    {
+        return Err(app_error(
+            ErrorKind::Policy,
+            "root-only policy paths ('/' or repeated slashes) do not grant access; specify a directory such as '/srv/app' or '/var/log'",
+        ));
+    }
+    if adding
+        && !matches!(rule, PolicyRule::Command { .. })
         && value.split(['/', '\\']).any(|part| part == "..")
     {
         return Err(app_error(

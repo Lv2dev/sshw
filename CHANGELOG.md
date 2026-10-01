@@ -8,6 +8,10 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 
 ## [Unreleased]
 
+### 경로 권한 규칙·프로필 자동 전환 안내
+- `policy allow put/get`은 접근을 허용하지 않는 `/`·반복 슬래시 규칙을 저장 전에 policy/7로 거절하고 구체적인 디렉터리 예시를 안내합니다. 기존 항목의 비활성/삭제 의미와 v1/v2 호환을 유지합니다. Windows drive 절대 경로·UNC 경로는 하위 경로 구분자를 인식하며 대소문자·경계·부모 이동 차단·POSIX 역슬래시 의미와 atomic SFTP 경로 요구사항을 보존합니다.
+- 기본 프로필 삭제는 이름순으로 선택된 다음 프로필을 읽기 전용 검사하고, 불량이면 삭제 완료 상태·원인·복구 방법을 일반 출력과 JSON `default_target_warning`에 표시합니다. 삭제 성공·자동 선택 순서·기존 `warning`/`default_change`·home/keyring 보존을 유지하며 비밀 조회나 SSH 접속은 하지 않습니다.
+
 ### 승격 인증 오류·정책 적용 상태
 - `run --as-root`의 sudo/su 승격 비밀번호 조회 실패에 서버·로그인 계정·승격 방식/대상과 마스킹한 원래 원인을 표시합니다. 세션 전용은 `SSHW_PRIVILEGE_PASSWORD`, 저장 백엔드는 doctor 및 항목 부재 시 기존 승격 설정을 보존하는 재등록 방법을 안내합니다. source·auth/4·JSON causes·비밀번호 검증과 실행 순서를 유지합니다.
 - 정책 관리의 일반 출력에 파일 존재·저장 enabled·현재 enforcement와 `--policy` 강제 적용 원인을 표시합니다. 파일이 없으면 초기화 방법을, 비활성 저장값에도 강제 적용 중이면 `--policy` 해제 방법을 안내합니다. JSON에는 `forced`를 추가하며 기존 `present`·`enforced`·저장/allowlist/no-op 계약을 유지합니다.
