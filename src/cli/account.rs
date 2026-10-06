@@ -221,18 +221,27 @@ pub(super) fn default_account(
     if !server.accounts.contains_key(&args.user) {
         return Err(unknown_account(&args.name, &args.user));
     }
-    server.default_user = args.user.clone();
-    save_config_if_unchanged(config_path, config, revision).with_error_kind(ErrorKind::Config)?;
+    let changed = server.default_user != args.user;
+    if changed {
+        server.default_user = args.user.clone();
+        save_config_if_unchanged(config_path, config, revision)
+            .with_error_kind(ErrorKind::Config)?;
+    }
     if args.json {
         return Ok(ok(format!(
             "{}\n",
-            json!({"ok":true,"action":"default","server":args.name,"user":args.user})
+            json!({"ok":true,"action":"default","server":args.name,"user":args.user,"changed":changed,
+                "change":if changed { "updated" } else { "unchanged" }})
         )));
     }
-    Ok(ok(format!(
-        "default account for {} set to {}\n",
-        args.name, args.user
-    )))
+    Ok(ok(if changed {
+        format!("default account for {} set to {}\n", args.name, args.user)
+    } else {
+        format!(
+            "default account for {} already set to {} (unchanged)\n",
+            args.name, args.user
+        )
+    }))
 }
 
 pub(super) fn remove_account<C, P>(

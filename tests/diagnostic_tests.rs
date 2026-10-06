@@ -96,6 +96,84 @@ impl Prompter for NoPrompts {
 }
 
 #[test]
+fn default_audit_doctor_reports_path_causes_and_preserves_existing_metadata() {
+    for kind in ["missing", "file", "directory"] {
+        for json_output in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("servers.json");
+            config(&path, "example.test", 2222, "web", "deploy");
+            std::fs::write(
+                temp.path().join("known_hosts"),
+                format!("[example.test]:2222 {KEY}\n"),
+            )
+            .unwrap();
+            let audit = temp.path().join("audit.jsonl");
+            if kind == "file" {
+                std::fs::write(&audit, "existing audit data\n").unwrap();
+            }
+            if kind == "directory" {
+                std::fs::create_dir(&audit).unwrap();
+            }
+            let before = std::fs::read(&path).unwrap();
+            let store = Store {
+                persistent: true,
+                error: None,
+                reads: Cell::new(0),
+            };
+            let mut args = vec!["sshw", "doctor"];
+            if json_output {
+                args.push("--json");
+            }
+            let output = execute_for_runtime(
+                Cli::try_parse_from(args).unwrap(),
+                &path,
+                &store,
+                &NoNetwork,
+                &mut NoPrompts,
+            );
+            assert_eq!(output.exit_code, 0);
+            if kind == "directory" {
+                assert!(output.stdout.contains("cannot open existing audit log"));
+                assert!(output.stdout.contains("parent directory"));
+                if json_output {
+                    let body: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+                    assert_eq!(body["audit_writable"], false);
+                    assert_eq!(body["local_checks_passed"], false);
+                    assert!(
+                        body["audit_message"]
+                            .as_str()
+                            .unwrap()
+                            .contains("audit.jsonl")
+                    );
+                }
+            } else if json_output {
+                let body: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+                assert_eq!(body["audit_writable"], true);
+                assert_eq!(body["local_checks_passed"], true);
+                assert!(body["audit_message"].is_null());
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            if kind == "file" {
+                assert_eq!(
+                    std::fs::read_to_string(&audit).unwrap(),
+                    "existing audit data\n"
+                );
+            }
+            if kind == "missing" {
+                assert!(!audit.exists());
+            }
+            assert!(std::fs::read_dir(temp.path()).unwrap().all(|entry| {
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".sshw-audit-check-")
+            }));
+        }
+    }
+}
+
+#[test]
 fn empty_diagnostics_blank_commands_fail_before_credentials_and_match_preflight() {
     for command in ["", "   ", "\t\r\n", "\u{2003}"] {
         for explicit in [false, true] {

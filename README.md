@@ -296,6 +296,8 @@ Global flags (available on every command): `--home <path>`, `--profile <name>`, 
 
 When the name is omitted for `run`/`put`/`get`, the configured default server is used. When `--user` is omitted, that server's default account is used.
 
+`default <name>`, `account default <server> <user>`, and `profile default <name>` keep an already selected default without rewriting the config or registry. Human output marks it unchanged; JSON retains the existing action/target fields and adds `changed:false`/`change:"unchanged"` (`true`/`"updated"` for a real change). No-ops preserve the original bytes, modification time, and v1 format. Target validation, locks, and audit recording still apply; a damaged profile target is rejected even when already the default. The query-only `default` response is unchanged.
+
 ### Safer transfers and live output
 
 Atomic upload errors identify the failed step, its cause, the destination and temporary path, and the cleanup/replacement state. If the server's file-creation response is lost, the temporary file may exist but its creation is unconfirmed; sshw does not automatically delete that path. Inspect the path and ownership before retrying. Confirmed temporary files are cleaned up on failure when the connection and permissions allow it.
@@ -429,6 +431,8 @@ sshw doctor --json
 승격 대상의 빈 값·공백만 있는 값·제어 문자는 등록과 v1/v2 설정 로딩에서 config/3으로 거부합니다. 등록은 확인이나 비밀번호 입력 전에 중단하며, 잘못된 대상이 저장된 기존 파일은 `doctor`의 config 진단과 표시된 경로를 확인해 수정하세요. 같은 설정을 사용하는 사전 검사·실행도 거부합니다. 원격 계정의 존재나 sudoers 허용 여부를 검사하는 기능은 아닙니다.
 
 `doctor` reports the active home/source, storage paths, config/registry/policy validity, linked libraries, audit writability, credential-backend health, missing login and privilege credentials, and local SSH agent availability. `issues` includes a suggested next step for each local problem. `local_checks_passed` summarizes those checks while `connection_tested:false` makes clear that reachability, matching host keys, authentication and sudoers were not tested. `ok:true` means the diagnostic ran, even when local issues exist. A corrupt registry is diagnosed from a recoverable home; conflicting home/profile selectors are still rejected.
+
+If the audit log is absent, doctor creates and immediately removes a private empty sibling probe in its existing parent to check creation permission. Unix probes are owner-only; neither `audit.jsonl` nor missing parents are created. Existing logs are only opened for append readiness without writing records or changing contents/permissions. Failures report a masked path/cause and recovery step; JSON `audit_message` is null on success. A creation probe can update the parent directory modification time. This point-in-time check does not guarantee a later record or lock succeeds, and the existing best-effort recording and doctor exit0/`ok:true` remain unchanged.
 
 The local host-key check reads and parses the active home's `known_hosts` using the connection parser and checks each server's endpoint, including hashed hosts and non-default ports. JSON `host_trust` reports `entry_present:true/false`, or `null` when reading, parsing or inspection fails, and always `key_match_checked:false`. Empty files and entries for other servers are not ready. Repair unreadable or invalid files before retrying the suggested trust command. An existing entry does not prove that it matches the remote server's current key; normal connections still verify that key.
 
@@ -930,6 +934,8 @@ policy는 fail-closed입니다. `--policy`인데 파일이 없으면 에러이�
 
 `local_checks_passed`는 로컬 검사 결과이고 `issues`에는 문제와 다음 조치가 담깁니다. SSH agent와 누락된 privilege credential도 확인합니다. `connection_tested:false`이며 원격 접속·host key 일치·sudoers를 검사하지는 않습니다. `ok:true`는 진단 실행 성공을 뜻합니다.
 
+감사 파일이 없으면 기존 부모 폴더에 비밀 없는 private 임시 파일을 생성하고 즉시 정리해 새 로그의 생성 권한을 확인합니다. Unix probe는 owner-only이며 기존 `audit.jsonl`이나 없는 부모는 만들지 않습니다. 기존 로그는 append용 열기만 확인하고 내용·권한을 바꾸거나 레코드를 추가하지 않습니다. 실패하면 경로·원인·복구 방법을 표시하고 JSON `audit_message`에 마스킹한 원인을 제공합니다(성공은 null). 파일 생성 probe는 부모 폴더의 mtime을 바꿀 수 있습니다. 이 시점의 준비 상태가 이후 기록/lock 성공을 보장하지는 않으며, 실제 기록 실패의 best-effort 의미와 doctor exit0/`ok:true`는 유지합니다.
+
 host key 로컬 검사는 실제 연결과 공유하는 파서로 활성 home의 `known_hosts`를 읽고 key 데이터와 서버별 등록 여부를 확인합니다. 해시 host와 비표준 포트도 같은 매칭 규칙을 사용합니다. JSON `host_trust`의 `entry_present`는 등록 있음/없음에 true/false, 읽기·파싱·검사 실패에는 null이며 `key_match_checked`는 항상 false입니다. 빈 파일이나 다른 서버의 등록만으로 로컬 검사가 통과하지 않습니다. 읽기 불가·손상 파일은 먼저 수정한 뒤 제안된 trust 명령을 실행하세요. 등록 있음도 현재 원격 key와의 일치를 보장하지 않으며 실제 연결에서는 기존처럼 검증합니다.
 
 `run`·`put`·`get`의 로그인 자격 증명 조회 실패에는 선택한 서버/계정과 마스킹한 백엔드 원인을 표시합니다. 세션 전용 home은 실행 시 `SSHW_PASSWORD`가 필요합니다. 저장 백엔드는 `sshw doctor`로 상태를 확인하고 항목이 없을 때 `account add`로 비밀번호를 재등록하도록 안내합니다. 같은 home/profile을 선택하고 갱신을 확인하세요. 비대화형 입력은 안내 명령의 `--` 앞에 `--force`·`--password-stdin`을 넣어 비밀 관리자 pipe를 사용합니다. 계정의 기존 승격 설정은 유지하며 비밀번호를 명령 인자에 넣지 않습니다.
@@ -977,6 +983,8 @@ sshw doctor --json
 단일 object를 반환하는 `--json` 성공 응답(`add`, `show`, `trust`, `run`, `put`, `get`, `remove`, `doctor`, `account add`, `account show`, `account remove`, `profile show`, `privilege set`, `privilege show`, `privilege clear`)은 모두 `"ok":true`를 포함해 오류 envelope의 `"ok":false`와 대칭을 이루므로, 소비자가 `ok`로 분기할 수 있습니다. `list`, `account list`, `profile list`는 성공 시 JSON 배열을 반환하며(래핑 object 없음), 실패 시에는 동일한 `{"ok":false,...}` envelope를 출력합니다.
 
 `default`, `account default`, profile 상태 변경과 모든 policy 하위 명령도 `--json`을 지원합니다. 기존 list 명령의 성공 배열 형식은 유지합니다. 완료된 `run`의 `ok:true`는 호환성을 위해 유지하므로 원격 성공은 `command_succeeded` 또는 `exit_status == 0`으로 판단하세요. 정책 검사는 `allowed`, doctor는 `local_checks_passed`를 사용하며 실제 원격 연결을 검사한 것은 아닙니다.
+
+`default <이름>`·`account default <서버> <계정>`·`profile default <이름>`은 이미 선택된 기본값이면 설정/registry를 다시 쓰지 않습니다. 일반 출력은 변경 없음을 표시하고, JSON은 기존 action/대상 필드와 함께 `changed:false`/`change:"unchanged"`를 제공합니다. 실제 변경은 `true`/`"updated"`입니다. no-op은 원본 bytes·mtime·v1 형식을 보존하며 대상 검증·lock·감사 기록은 유지합니다. 이미 기본값인 프로필도 대상이 손상됐으면 거절하고, 조회 전용 `default` 응답은 그대로입니다.
 
 빈 값·공백뿐인 원격 명령은 `run`과 `policy check`에서 입력 오류(usage/9)로 거절합니다. 빈 원격 경로도 `put/get`과 `policy check-put/get`에서 자격 증명 조회·SSH 전에 같은 방식으로 거절합니다. 변수를 확인하고 명령·경로를 인용하세요. 예: `sshw run web "uptime"`, `sshw put web ./app /srv/app/app`. 원본 값을 trim하거나 바꾸지 않으며 공백이 들어간 경로와 공백만으로 된 파일명도 문자 그대로 유지합니다. 기존 설정/정책 로딩·서버 선택 오류의 우선순위도 유지합니다.
 

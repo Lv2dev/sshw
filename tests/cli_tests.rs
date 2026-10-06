@@ -3817,6 +3817,234 @@ fn default_command_prints_and_updates_default_server() {
 }
 
 #[test]
+fn default_audit_server_account_noops_preserve_files_and_remain_audited() {
+    for version in [1, 2] {
+        for account in [false, true] {
+            for json_output in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let path = temp.path().join("servers.json");
+                let server = if version == 1 {
+                    serde_json::json!({"host":"example.test","port":22,"user":"deploy","auth":{"type":"agent"}})
+                } else {
+                    serde_json::json!({"host":"example.test","port":22,"default_user":"deploy","accounts":{
+                        "deploy":{"auth":{"type":"agent"}},"ops":{"auth":{"type":"agent"}}}})
+                };
+                std::fs::write(&path, serde_json::json!({"version":version,"default":"web","servers":{"web":server},"credential_backend":"session_only"}).to_string()).unwrap();
+                let before = std::fs::read(&path).unwrap();
+                let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+                let home = ResolvedHome::from_config_path(&path);
+                let registry = temp.path().join("profiles.json");
+                let audit_path = temp.path().join("audit.jsonl");
+                let audit = FileAuditSink::new(audit_path.clone());
+                let ctx = ExecContext {
+                    home: &home,
+                    registry_path: &registry,
+                    policy_forced: false,
+                    audit: &audit,
+                };
+                let store = FakeCredentialStore::default();
+                let ssh = FakeSshClient::default();
+                for _ in 0..2 {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    let mut args = if account {
+                        vec!["sshw", "account", "default", "web", "deploy"]
+                    } else {
+                        vec!["sshw", "default", "web"]
+                    };
+                    if json_output {
+                        args.push("--json");
+                    }
+                    let output = execute_with(
+                        Cli::try_parse_from(args).unwrap(),
+                        &ctx,
+                        &store,
+                        &ssh,
+                        &mut FakePrompter::default(),
+                    )
+                    .unwrap();
+                    assert_eq!(output.exit_code, 0);
+                    assert_eq!(std::fs::read(&path).unwrap(), before);
+                    assert_eq!(
+                        std::fs::metadata(&path).unwrap().modified().unwrap(),
+                        modified
+                    );
+                    if json_output {
+                        let body: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+                        assert_eq!(body["action"], "default");
+                        assert_eq!(body["changed"], false);
+                        assert_eq!(body["change"], "unchanged");
+                    } else {
+                        assert!(output.stdout.contains("unchanged"));
+                    }
+                }
+                let records: Vec<serde_json::Value> = std::fs::read_to_string(&audit_path)
+                    .unwrap()
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+                assert_eq!(records.len(), 2);
+                assert!(
+                    records
+                        .iter()
+                        .all(|record| record["status"] == "ok" && record["exit_code"] == 0)
+                );
+                assert!(
+                    store.requested.borrow().is_empty()
+                        && store.deleted.borrow().is_empty()
+                        && store.values.borrow().is_empty()
+                );
+                assert!(ssh.selected_users.borrow().is_empty());
+            }
+        }
+    }
+    for args in [
+        vec!["sshw", "default", "server-beta", "--json"],
+        vec![
+            "sshw",
+            "account",
+            "default",
+            "server-alpha",
+            "ops",
+            "--json",
+        ],
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("servers.json");
+        let mut config = agent_accounts_config(&path);
+        config.servers.insert(
+            "server-beta".into(),
+            ServerConfig::single_account("example.test", 22, "deploy", AuthConfig::Agent),
+        );
+        save_config(&path, &config).unwrap();
+        let output = execute_for_runtime(
+            Cli::try_parse_from(args.clone()).unwrap(),
+            &path,
+            &FakeCredentialStore::default(),
+            &FakeSshClient::default(),
+            &mut FakePrompter::default(),
+        );
+        assert_eq!(output.exit_code, 0);
+        let body: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+        assert_eq!(body["changed"], true);
+        assert_eq!(body["change"], "updated");
+        let before = std::fs::read(&path).unwrap();
+        let output = execute_for_runtime(
+            Cli::try_parse_from(args).unwrap(),
+            &path,
+            &FakeCredentialStore::default(),
+            &FakeSshClient::default(),
+            &mut FakePrompter::default(),
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&output.stdout).unwrap()["changed"],
+            false
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+}
+
+#[test]
+fn default_audit_profile_noop_preserves_registry_and_still_validates_target() {
+    for json_output in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("servers.json");
+        let registry_path = temp.path().join("profiles.json");
+        let target = temp.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        let registry = ProfileRegistry {
+            default: Some("primary".into()),
+            profiles: BTreeMap::from([
+                (
+                    "primary".into(),
+                    ProfileEntry {
+                        id: "p_primary".into(),
+                        home: target.clone(),
+                    },
+                ),
+                (
+                    "other".into(),
+                    ProfileEntry {
+                        id: "p_other".into(),
+                        home: temp.path().join("other"),
+                    },
+                ),
+            ]),
+            ..ProfileRegistry::default()
+        };
+        std::fs::write(&registry_path, serde_json::to_string(&registry).unwrap()).unwrap();
+        let before = std::fs::read(&registry_path).unwrap();
+        let modified = std::fs::metadata(&registry_path)
+            .unwrap()
+            .modified()
+            .unwrap();
+        let store = FakeCredentialStore::default();
+        let ssh = FakeSshClient::default();
+        for _ in 0..2 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            let mut args = vec!["sshw", "profile", "default", "primary"];
+            if json_output {
+                args.push("--json");
+            }
+            let output = execute_for_runtime(
+                Cli::try_parse_from(args).unwrap(),
+                &path,
+                &store,
+                &ssh,
+                &mut FakePrompter::default(),
+            );
+            assert_eq!(output.exit_code, 0);
+            assert_eq!(std::fs::read(&registry_path).unwrap(), before);
+            assert_eq!(
+                std::fs::metadata(&registry_path)
+                    .unwrap()
+                    .modified()
+                    .unwrap(),
+                modified
+            );
+            if json_output {
+                let body: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+                assert_eq!(body["changed"], false);
+                assert_eq!(body["change"], "unchanged");
+            } else {
+                assert!(output.stdout.contains("unchanged"));
+            }
+        }
+        std::fs::write(target.join("servers.json"), "{broken").unwrap();
+        let output = execute_for_runtime(
+            Cli::try_parse_from(["sshw", "profile", "default", "primary", "--json"]).unwrap(),
+            &path,
+            &store,
+            &ssh,
+            &mut FakePrompter::default(),
+        );
+        assert_eq!(output.exit_code, 3);
+        assert_eq!(std::fs::read(&registry_path).unwrap(), before);
+        let output = execute_for_runtime(
+            Cli::try_parse_from(["sshw", "profile", "default", "other", "--json"]).unwrap(),
+            &path,
+            &store,
+            &ssh,
+            &mut FakePrompter::default(),
+        );
+        assert_eq!(output.exit_code, 0);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&output.stdout).unwrap()["changed"],
+            true
+        );
+        assert_eq!(
+            load_registry(&registry_path).unwrap().default.as_deref(),
+            Some("other")
+        );
+        assert!(
+            store.requested.borrow().is_empty()
+                && store.deleted.borrow().is_empty()
+                && store.values.borrow().is_empty()
+        );
+        assert!(ssh.selected_users.borrow().is_empty());
+    }
+}
+
+#[test]
 fn doctor_json_reports_missing_credentials_without_secrets() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("servers.json");
@@ -6624,7 +6852,7 @@ fn profile_default_recovers_to_compatible_targets_and_preserves_namespace() {
             if json {
                 assert_eq!(
                     serde_json::from_str::<serde_json::Value>(&output.stdout).unwrap(),
-                    serde_json::json!({"ok":true,"action":"default","name":"target"})
+                    serde_json::json!({"ok":true,"action":"default","name":"target","changed":true,"change":"updated"})
                 );
             }
             registry.default = Some("target".into());

@@ -8,6 +8,10 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 
 ## [Unreleased]
 
+### 기본값 재설정·감사 로그 쓰기 진단
+- 이미 같은 기본 서버·로그인 계정·프로필을 지정하면 설정/registry 저장을 생략하고 일반 출력의 변경 없음 및 JSON `changed:false`/`change:"unchanged"`를 표시합니다. 실제 변경은 `changed:true`/`change:"updated"`로 표시하며 기존 action/대상 필드·대상 검증·lock/CAS·감사 기록을 유지합니다. no-op은 v1 형식·원본 bytes/mtime을 보존합니다.
+- `doctor`는 감사 파일이 없을 때 기존 부모에 비밀 없는 private 임시 파일을 생성·정리해 생성 권한을 검사합니다. 기존 로그는 append 준비만 확인하고 내용을 바꾸지 않으며, 없는 부모나 감사 파일을 만들지 않습니다. 실패 원인·경로·복구 방법과 JSON `audit_message`를 추가하고 기존 진단 exit0/`ok:true`·best-effort 기록 계약을 유지합니다.
+
 ### 빈 실행 대상·자격 증명 진단
 - `run`과 `policy check`는 빈 값·공백뿐인 명령을, `put/get`과 대응 사전 검사는 빈 원격 경로를 인증 조회 전에 usage/9로 거절하고 입력 예시를 안내합니다. 같은 target 해석을 사용하며 기존 설정/정책 로딩·서버 오류 순서와 유효한 공백 파일명·원본 명령/경로를 유지합니다.
 - `doctor`는 실행과 같은 승격 비밀번호 형식 검사를 사용하고, 확인된 항목 부재와 조회 불가·형식 오류를 구분해 마스킹한 원인과 복구 방법을 표시합니다. JSON `credential_checks`에 로그인/승격별 `ready`·`missing`·`unavailable`·`invalid` 상태를 추가하고 `missing_credentials`에는 확인된 로그인 부재만 포함합니다. 기존 진단 exit0/`ok:true`·비접속·비밀번호 내용 미출력·passwordless 의미를 유지합니다.

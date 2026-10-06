@@ -1248,7 +1248,10 @@ where
         Err(err) => err.kind() != std::io::ErrorKind::NotFound,
     };
     let policy = describe_policy(&home.policy_path, policy_forced);
-    let audit_writable = audit::is_writable(&home.audit_path);
+    let audit_message = audit::check_writable(&home.audit_path)
+        .err()
+        .map(|error| redacted_error_detail(&error));
+    let audit_writable = audit_message.is_none();
     let health = credentials
         .health_check()
         .unwrap_or_else(|err| CredentialStoreHealth {
@@ -1302,8 +1305,8 @@ where
     if !audit_writable {
         issue(
             "audit",
-            "audit log is not writable".to_string(),
-            "check permissions at the reported audit path".to_string(),
+            format!("audit log is not writable: {}", audit_message.as_deref().unwrap_or_default()),
+            "check create/write permissions at the reported audit path and parent directory; rerun sshw doctor using the same home/profile selection".to_string(),
         );
     }
     for check in &credential_checks {
@@ -1449,6 +1452,7 @@ where
             "policy_enabled": policy.enabled,
             "audit_path": home.audit_path,
             "audit_writable": audit_writable,
+            "audit_message": audit_message,
             "credential_namespace": home.namespace.token(),
             "os": std::env::consts::OS,
             "libssh2_version": library_versions.libssh2,

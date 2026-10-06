@@ -298,15 +298,24 @@ pub(super) fn default_server(
         return Err(unknown_server(&name));
     }
 
-    config.default = Some(name.clone());
-    save_config_if_unchanged(config_path, config, revision).with_error_kind(ErrorKind::Config)?;
+    let changed = config.default.as_deref() != Some(name.as_str());
+    if changed {
+        config.default = Some(name.clone());
+        save_config_if_unchanged(config_path, config, revision)
+            .with_error_kind(ErrorKind::Config)?;
+    }
     if args.json {
         return Ok(ok(format!(
             "{}\n",
-            json!({"ok":true,"action":"default","server":name})
+            json!({"ok":true,"action":"default","server":name,"changed":changed,
+                "change":if changed { "updated" } else { "unchanged" }})
         )));
     }
-    Ok(ok(format!("default set to {name}\n")))
+    Ok(ok(if changed {
+        format!("default set to {name}\n")
+    } else {
+        format!("default already set to {name} (unchanged)\n")
+    }))
 }
 
 pub(super) fn trust_server<S, P>(

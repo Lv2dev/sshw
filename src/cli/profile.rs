@@ -282,15 +282,23 @@ fn profile_default(
         .ok_or_else(|| anyhow::anyhow!("unknown profile '{}'", args.name))?;
     validate_profile_target(&args.name, &entry.home, &entry.id)?;
 
-    registry.default = Some(args.name.clone());
-    save_registry_if_unchanged(registry_path, registry, revision)?;
+    let changed = registry.default.as_deref() != Some(args.name.as_str());
+    if changed {
+        registry.default = Some(args.name.clone());
+        save_registry_if_unchanged(registry_path, registry, revision)?;
+    }
     if args.json {
         return Ok(ok(format!(
             "{}\n",
-            json!({"ok":true,"action":"default","name":args.name})
+            json!({"ok":true,"action":"default","name":args.name,"changed":changed,
+                "change":if changed { "updated" } else { "unchanged" }})
         )));
     }
-    Ok(ok(format!("default profile set to {}\n", args.name)))
+    Ok(ok(if changed {
+        format!("default profile set to {}\n", args.name)
+    } else {
+        format!("default profile already set to {} (unchanged)\n", args.name)
+    }))
 }
 
 fn profile_remove(

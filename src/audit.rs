@@ -1,5 +1,5 @@
 use crate::output::redact_secrets;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::Serialize;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -105,18 +105,72 @@ impl AuditSink for FileAuditSink {
     }
 }
 
-/// Best-effort, non-destructive check of whether the audit log can be written,
-/// for `doctor`. Does not create the file or its parent directory.
+/// Best-effort audit readiness check. Does not create the audit log or missing
+/// parents; a missing log uses a private empty sibling probe, removed before success.
 pub fn is_writable(path: &Path) -> bool {
-    let parent_exists = path.parent().map(Path::exists).unwrap_or(false);
-    if !parent_exists {
-        return false;
+    check_writable(path).is_ok()
+}
+
+/// Check audit append/creation readiness without writing an audit record.
+/// This is a point-in-time check, not a guarantee about a later record or lock.
+pub fn check_writable(path: &Path) -> Result<()> {
+    let open_context = || {
+        format!(
+            "cannot open existing audit log for append at {}",
+            path.display()
+        )
+    };
+    match fs::symlink_metadata(path) {
+        Ok(_) => {
+            let metadata = fs::metadata(path).with_context(open_context)?;
+            if !metadata.is_file() {
+                return Err(anyhow::anyhow!(
+                    "{}: expected a regular file",
+                    open_context()
+                ));
+            }
+            OpenOptions::new()
+                .append(true)
+                .open(path)
+                .with_context(open_context)?;
+            return Ok(());
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("cannot inspect audit log at {}", path.display()));
+        }
     }
-    if path.exists() {
-        OpenOptions::new().append(true).open(path).is_ok()
-    } else {
-        true
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let metadata = fs::metadata(parent)
+        .with_context(|| format!("cannot inspect audit parent directory {}", parent.display()))?;
+    if !metadata.is_dir() {
+        return Err(anyhow::anyhow!(
+            "cannot create audit log at {}: parent {} is not a directory",
+            path.display(),
+            parent.display()
+        ));
     }
+    let probe = tempfile::Builder::new()
+        .prefix(".sshw-audit-check-")
+        .tempfile_in(parent)
+        .with_context(|| {
+            format!(
+                "cannot create audit log at {}: creation probe in parent directory {} failed",
+                path.display(),
+                parent.display()
+            )
+        })?;
+    let probe_path = probe.path().to_path_buf();
+    probe.close().with_context(|| {
+        format!(
+            "cannot remove private audit readiness probe at {}",
+            probe_path.display()
+        )
+    })
 }
 
 fn epoch_millis() -> u128 {
