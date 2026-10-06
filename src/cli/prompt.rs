@@ -3,6 +3,10 @@ use std::io::{self, IsTerminal, Read};
 use std::io::{BufRead, Write};
 
 pub trait Prompter {
+    /// Check readiness without prompting. Existing programmatic prompters remain available.
+    fn ensure_confirmation_available(&mut self, _option: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
     fn confirm(&mut self, prompt: &str) -> anyhow::Result<bool>;
     fn confirm_with_option(&mut self, prompt: &str, _option: &str) -> anyhow::Result<bool> {
         self.confirm(prompt)
@@ -14,16 +18,16 @@ pub trait Prompter {
 pub(crate) struct TerminalPrompter;
 
 impl Prompter for TerminalPrompter {
+    fn ensure_confirmation_available(&mut self, option: &str) -> anyhow::Result<()> {
+        check_confirmation_terminal(io::stdin().is_terminal(), option)
+    }
+
     fn confirm(&mut self, prompt: &str) -> anyhow::Result<bool> {
         self.confirm_with_option(prompt, "--yes")
     }
 
     fn confirm_with_option(&mut self, prompt: &str, option: &str) -> anyhow::Result<bool> {
-        if !io::stdin().is_terminal() {
-            return Err(anyhow::anyhow!(
-                "confirmation requires an interactive terminal; rerun with {option} to confirm"
-            ));
-        }
+        self.ensure_confirmation_available(option)?;
 
         // Read the reply from the controlling terminal (CONIN$ on Windows) instead of the
         // inherited stdin handle. std's buffered stdin read_line can hang under ConPTY
@@ -51,6 +55,15 @@ impl Prompter for TerminalPrompter {
     }
 }
 
+fn check_confirmation_terminal(interactive: bool, option: &str) -> anyhow::Result<()> {
+    if !interactive {
+        return Err(anyhow::anyhow!(
+            "confirmation requires an interactive terminal; rerun with {option} to confirm"
+        ));
+    }
+    Ok(())
+}
+
 fn is_affirmative(answer: &str) -> bool {
     matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
@@ -69,11 +82,7 @@ where
     R: BufRead,
     W: Write,
 {
-    if !interactive {
-        return Err(anyhow::anyhow!(
-            "confirmation requires an interactive terminal; rerun with --yes to confirm"
-        ));
-    }
+    check_confirmation_terminal(interactive, "--yes")?;
 
     let answer = rprompt::prompt_reply_from_bufread(input, output, prompt)?;
     Ok(is_affirmative(&answer))
@@ -115,6 +124,20 @@ fn read_redirected_password(
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
+
+    #[test]
+    fn trust_readiness_uses_the_same_terminal_gate_without_prompting() {
+        for option in ["--yes", "--force"] {
+            assert!(super::check_confirmation_terminal(true, option).is_ok());
+            let error = super::check_confirmation_terminal(false, option).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "confirmation requires an interactive terminal; rerun with {option} to confirm"
+                )
+            );
+        }
+    }
 
     #[test]
     fn local_stdin_terminal_gate_rejects_before_reading_and_keeps_redirected_data() {

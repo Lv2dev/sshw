@@ -129,6 +129,8 @@ Home selection priority, highest first:
 
 `--home` and `--profile` cannot be combined (exit code 3). An explicit `--profile` also conflicts with a non-empty `SSHW_HOME`: unset the environment variable to use the profile, or omit the flag to use the environment home. SSHW never silently substitutes one for the other.
 
+The selected home must be a directory. A file, a child beneath a file, or a failure to inspect the path fails with config/3 before loading servers or policy. Missing directories remain valid and this check creates nothing; relative paths retain their selection and credential namespace. Global `profile` management remains available to repair a bad selected home, and `profile add/default` validate their target before saving. Doctor's invalid-registry recovery still checks its built-in home and never hides an invalid explicit `--home`/`SSHW_HOME`.
+
 ```bash
 sshw --home ./.sshw list
 SSHW_HOME=./.sshw sshw list
@@ -270,6 +272,8 @@ sshw trust server-alpha --yes
 ```
 
 `trust` prints the algorithm and SHA256 fingerprint, confirms unless `--yes`, and re-verifies the fingerprint immediately before writing. If the key changes during the flow, it fails instead of storing the new key.
+
+Without `--yes`, trust checks that confirmation is available after server lookup and before connecting. Noninteractive stdin fails with config/3 and an interactive-terminal/`--yes` hint, even if the endpoint is unreachable. `--yes` keeps the normal connection and fingerprint re-verification flow. Library `Prompter` implementations can override the default `ensure_confirmation_available` hook without prompting; existing implementations remain compatible.
 
 ### Commands
 
@@ -668,6 +672,8 @@ namespace, server, user는 base64url로 인코딩하며 credential을 갱신할 
 
 `--home`과 `--profile`은 함께 쓸 수 없습니다(exit code 3). 명시적 `--profile`과 비어 있지 않은 `SSHW_HOME`도 충돌 오류를 반환합니다. profile을 선택하려면 환경변수를 해제하고, 환경변수 home을 쓰려면 `--profile`을 생략하세요. 한쪽이 다른 쪽을 조용히 가리지 않습니다.
 
+선택한 home은 폴더여야 합니다. 파일·파일 아래 경로·경로 검사 실패는 서버 목록이나 정책을 읽기 전에 config/3으로 거절합니다. 아직 없는 폴더는 허용하며 이 검사로 생성하지 않습니다. 상대 경로의 선택과 credential namespace도 유지합니다. 잘못된 현재 home을 복구할 수 있도록 글로벌 `profile` 관리는 계속 사용할 수 있고, `profile add/default`는 저장 전에 대상 home을 검사합니다. doctor의 손상된 registry 복구도 내장 home을 검사하며 잘못 지정한 `--home`/`SSHW_HOME`을 가리지 않습니다.
+
 ```bash
 sshw --home ./.sshw list
 SSHW_HOME=./.sshw sshw list
@@ -805,6 +811,8 @@ sshw trust server-alpha --yes
 ```
 
 `trust`는 algorithm과 SHA256 fingerprint를 출력하고 `--yes`가 없으면 확인하며, 쓰기 직전에 fingerprint를 다시 검증합니다. 흐름 중 key가 바뀌면 새 key를 저장하지 않고 실패합니다.
+
+`--yes`가 없으면 서버 조회 뒤·SSH 접속 전에 확인 가능 여부를 검사합니다. 비대화형 stdin은 접속할 수 없는 서버에서도 먼저 config/3과 interactive terminal/`--yes` 안내로 중단합니다. `--yes`의 연결 및 지문 재검증은 유지합니다. 라이브러리의 `Prompter`는 입력을 읽지 않는 기본 `ensure_confirmation_available` hook을 재정의할 수 있으며 기존 구현은 그대로 사용할 수 있습니다.
 
 ### 명령
 

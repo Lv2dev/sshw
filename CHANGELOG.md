@@ -8,6 +8,10 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 
 ## [Unreleased]
 
+### home 경로 검사·trust 확인 준비
+- 선택한 home과 가장 가까운 기존 부모를 공통 검사해 파일·파일 아래 경로·경로 검사 실패를 설정/정책 로딩 전에 config/3으로 거절합니다. 경로·마스킹한 원인·폴더/권한 복구 안내와 원래 IO source를 보존하며, 없는 폴더를 만들거나 상대 경로·선택 우선순위·namespace를 변경하지 않습니다. `profile` 관리의 복구 경로와 add/default 대상 검사를 유지하고 doctor의 registry 복구가 잘못된 명시적 home을 숨기지 않게 합니다.
+- `trust`는 `--yes`가 없으면 서버 조회 뒤·SSH 접속 전에 확인 가능 여부를 검사합니다. 비대화형 입력에서는 접속 오류보다 config/3과 interactive/`--yes` 안내를 먼저 표시합니다. 지문 조회 후 확인·저장 직전 재검증과 `--yes` 흐름은 유지합니다. 공개 `Prompter`에 기본 구현이 있는 `ensure_confirmation_available` hook을 추가해 기존 구현의 호환성을 유지합니다.
+
 ### 등록 옵션 검사·동일 프로필 재등록
 - `add/account add`는 기존 대상·endpoint/replace 검증 후 확인 입력 전에 agent/`--password-stdin` 충돌을 config/3으로 안내합니다. 유효한 갱신의 확인/force와 비밀번호 입력·설정 저장·credential 정리를 유지합니다.
 - `profile add --force`는 대상 설정 검사 후 전체 registry가 같으면 저장을 생략하고 일반 출력의 변경 없음과 JSON `changed:false`/`change:"unchanged"`를 표시합니다. 실제 변경은 `true`와 기존 `added/updated` 의미를 표시하며, 기존 action/id/home/namespace_changed·force·lock/audit 및 실제 변경의 CAS/atomic/default/namespace warning을 보존합니다.

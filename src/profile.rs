@@ -1,4 +1,6 @@
-use crate::error::{persistence_context, persistence_error};
+use crate::error::{
+    diagnostic_path, persistence_context, persistence_error, redacted_error_detail,
+};
 use crate::home::{ResolvedHome, builtin_default_home, is_reserved_profile_id};
 use crate::storage::write_owner_only_atomic;
 use anyhow::Result;
@@ -214,6 +216,20 @@ pub fn resolve_home_with_registry(
     registry: &ProfileRegistry,
     sshw_base: &Path,
 ) -> Result<ResolvedHome> {
+    let home = select_home_with_registry(home_flag, env_home, profile_flag, registry, sshw_base)?;
+    validate_home_directory(&home.root)?;
+    Ok(home)
+}
+
+/// Registry management must remain reachable when the selected home needs repair.
+/// Its add/default handlers validate the target home before changing the registry.
+pub(crate) fn select_home_with_registry(
+    home_flag: Option<&Path>,
+    env_home: Option<&OsStr>,
+    profile_flag: Option<&str>,
+    registry: &ProfileRegistry,
+    sshw_base: &Path,
+) -> Result<ResolvedHome> {
     if home_flag.is_some() && profile_flag.is_some() {
         return Err(anyhow::anyhow!("cannot use --home and --profile together"));
     }
@@ -265,6 +281,41 @@ pub fn resolve_home_with_registry(
     }
 
     Ok(builtin_default_home(sshw_base))
+}
+
+pub(crate) fn validate_home_directory(home: &Path) -> Result<()> {
+    let inspect = || -> Result<()> {
+        // Inspect an absolute path without changing the selected path or namespace.
+        // Missing directories are valid; Windows can also report NotFound beneath a file.
+        let absolute = std::path::absolute(home)?;
+        let mut ancestor = absolute.as_path();
+        loop {
+            match fs::metadata(ancestor) {
+                Ok(metadata) if metadata.is_dir() => return Ok(()),
+                Ok(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::NotADirectory,
+                        format!("'{}' is not a directory", diagnostic_path(ancestor)),
+                    )
+                    .into());
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    let Some(parent) = ancestor.parent() else {
+                        return Err(error.into());
+                    };
+                    ancestor = parent;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    };
+    inspect().map_err(|error| {
+        let detail = redacted_error_detail(&error);
+        error.context(format!(
+            "sshw home '{}' requires a directory: {detail}; choose a directory for --home/SSHW_HOME, or repair the selected profile home/path permissions before retrying",
+            diagnostic_path(home)
+        ))
+    })
 }
 
 pub fn validate_profile_name(name: &str) -> Result<()> {

@@ -322,6 +322,11 @@ where
     P: Prompter,
 {
     let server = get_server(config, &args.name)?;
+    if !args.yes {
+        prompter
+            .ensure_confirmation_available("--yes")
+            .with_error_kind(ErrorKind::Config)?;
+    }
     let host_key = ssh.host_key(server).with_error_kind(ErrorKind::Ssh)?;
     let prompt = format!(
         "trust {} {} {}? [y/N] ",

@@ -13,7 +13,8 @@ use crate::home::{ResolvedHome, generate_profile_id};
 use crate::output::{DefaultChange, ErrorKind, redact_secrets};
 use crate::profile::{
     ProfileEntry, ProfileRegistry, RegistryRevision, load_registry_for_removal_with_revision,
-    load_registry_with_revision, save_registry_if_unchanged, validate_profile_name,
+    load_registry_with_revision, save_registry_if_unchanged, validate_home_directory,
+    validate_profile_name,
 };
 use serde_json::json;
 use std::fs;
@@ -158,7 +159,7 @@ fn normalize_profile_home(home: &Path) -> anyhow::Result<std::path::PathBuf> {
             home.display()
         )
     })?;
-    validate_profile_home_directory(&absolute)?;
+    validate_home_directory(&absolute)?;
     match fs::canonicalize(&absolute) {
         Ok(canonical) => Ok(canonical),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(absolute),
@@ -167,37 +168,6 @@ fn normalize_profile_home(home: &Path) -> anyhow::Result<std::path::PathBuf> {
             absolute.display()
         )),
     }
-}
-
-fn validate_profile_home_directory(home: &Path) -> anyhow::Result<()> {
-    // Missing homes are valid, but no existing part of the path may be a file.
-    // Windows can report NotFound for a missing child beneath a regular file.
-    let mut ancestor = home;
-    loop {
-        match fs::metadata(ancestor) {
-            Ok(metadata) if metadata.is_dir() => break,
-            Ok(_) => {
-                return Err(anyhow::anyhow!(
-                    "profile home '{}' requires a directory; '{}' is not a directory",
-                    home.display(),
-                    ancestor.display()
-                ));
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                let Some(parent) = ancestor.parent() else {
-                    return Err(err.into());
-                };
-                ancestor = parent;
-            }
-            Err(err) => {
-                return Err(anyhow::anyhow!(
-                    "failed to resolve profile home '{}': {err}",
-                    home.display()
-                ));
-            }
-        }
-    }
-    Ok(())
 }
 
 fn validate_profile_target(name: &str, home: &Path, id: &str) -> anyhow::Result<()> {
@@ -209,8 +179,7 @@ fn validate_profile_target(name: &str, home: &Path, id: &str) -> anyhow::Result<
 
 fn inspect_profile_target(name: &str, home: &Path, id: &str) -> anyhow::Result<()> {
     let target = ResolvedHome::profile(home.to_path_buf(), id, format!("profile '{name}'"));
-    validate_profile_home_directory(home)
-        .and_then(|()| super::load_active_config(&target).map(|_| ()))
+    validate_home_directory(home).and_then(|()| super::load_active_config(&target).map(|_| ()))
 }
 
 fn profile_list(

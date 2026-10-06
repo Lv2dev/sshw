@@ -13,7 +13,7 @@ use crate::output::{
     ErrorKind, ErrorResponse, RunOutput, filter_startup_stderr_noise, redact_secrets,
 };
 use crate::policy::{Policy, describe_policy, resolve_policy};
-use crate::profile::{load_registry, resolve_home_with_registry};
+use crate::profile::{load_registry, resolve_home_with_registry, select_home_with_registry};
 use crate::safety::{SafetyDecision, classify_command, command_program};
 use crate::sandbox::{NoopSandbox, PolicyOnlySandbox, Sandbox, SandboxDecision};
 use crate::ssh::known_hosts::LocalKnownHosts;
@@ -161,7 +161,7 @@ fn resolve_runtime_with_base(
         })
     ) && cli.profile.is_none()
     {
-        let home = resolve_home_with_registry(
+        let home = select_home_with_registry(
             cli.home.as_deref(),
             env_home,
             None,
@@ -176,11 +176,19 @@ fn resolve_runtime_with_base(
         Ok(resolved) => Ok(resolved),
         Err(_err)
             if matches!(&cli.command, Command::Doctor(_))
-                && !(cli.home.is_some() && cli.profile.is_some())
-                && !(env_home.is_some() && cli.profile.is_some())
+                && cli.home.is_none()
+                && env_home.is_none()
                 && load_registry(&registry_path).is_err() =>
         {
-            Ok((builtin_default_home(sshw_base), registry_path))
+            let home = resolve_home_with_registry(
+                None,
+                None,
+                None,
+                &crate::profile::ProfileRegistry::default(),
+                sshw_base,
+            )
+            .with_error_kind(ErrorKind::Config)?;
+            Ok((home, registry_path))
         }
         Err(err) => Err(err),
     }
@@ -199,7 +207,12 @@ fn resolve_runtime_with_base_strict(
     } else {
         crate::profile::ProfileRegistry::default()
     };
-    let home = resolve_home_with_registry(
+    let resolve = if matches!(&cli.command, Command::Profile(_)) {
+        select_home_with_registry
+    } else {
+        resolve_home_with_registry
+    };
+    let home = resolve(
         cli.home.as_deref(),
         env_home,
         cli.profile.as_deref(),
@@ -2254,6 +2267,70 @@ mod runtime_backend_tests {
         let (resolved, _) = resolve_runtime_with_base(&remove, temp.path(), None).unwrap();
 
         assert_eq!(resolved.root, temp.path().join("profiles").join("default"));
+    }
+
+    #[test]
+    fn home_readiness_doctor_recovery_never_hides_an_invalid_explicit_or_builtin_home() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("profiles.json"), "{").unwrap();
+        let file = temp.path().join("file");
+        std::fs::write(&file, "preserve").unwrap();
+        let explicit =
+            Cli::try_parse_from(["sshw", "--home", file.to_str().unwrap(), "doctor", "--json"])
+                .unwrap();
+        let env = Cli::try_parse_from(["sshw", "doctor", "--json"]).unwrap();
+        for error in [
+            resolve_runtime_with_base(&explicit, temp.path(), None).unwrap_err(),
+            resolve_runtime_with_base(&env, temp.path(), Some(file.as_os_str())).unwrap_err(),
+        ] {
+            assert!(error.to_string().contains("requires a directory"));
+            assert_eq!(ErrorResponse::from_error(&error).error.exit_code, 3);
+        }
+        std::fs::create_dir(temp.path().join("profiles")).unwrap();
+        std::fs::write(temp.path().join("profiles/default"), "preserve").unwrap();
+        let error = resolve_runtime_with_base(&env, temp.path(), None).unwrap_err();
+        assert!(error.to_string().contains("requires a directory"));
+    }
+
+    #[test]
+    fn home_readiness_keeps_registry_management_reachable_for_a_bad_selected_home() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("file");
+        std::fs::write(&file, "preserve").unwrap();
+        let registry = crate::profile::ProfileRegistry {
+            default: Some("bad".into()),
+            profiles: std::collections::BTreeMap::from([(
+                "bad".into(),
+                crate::profile::ProfileEntry {
+                    id: "p_bad".into(),
+                    home: file,
+                },
+            )]),
+            ..Default::default()
+        };
+        crate::profile::save_registry(&temp.path().join("profiles.json"), &registry).unwrap();
+        for argv in [
+            vec!["sshw", "profile", "list"],
+            vec!["sshw", "profile", "show", "bad"],
+            vec!["sshw", "profile", "default", "healthy"],
+            vec!["sshw", "profile", "remove", "bad"],
+        ] {
+            let cli = Cli::try_parse_from(argv).unwrap();
+            assert!(resolve_runtime_with_base(&cli, temp.path(), None).is_ok());
+        }
+        for command in [
+            vec!["sshw", "list"],
+            vec!["sshw", "policy", "show"],
+            vec!["sshw", "doctor"],
+        ] {
+            let error = resolve_runtime_with_base(
+                &Cli::try_parse_from(command).unwrap(),
+                temp.path(),
+                None,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("requires a directory"));
+        }
     }
 
     #[test]

@@ -1470,6 +1470,150 @@ fn confirmation_failure_is_reported_as_config_error() {
 }
 
 #[test]
+fn trust_readiness_checks_before_ssh_but_yes_bypasses_the_gate() {
+    struct Unavailable;
+    impl Prompter for Unavailable {
+        fn ensure_confirmation_available(&mut self, option: &str) -> anyhow::Result<()> {
+            assert_eq!(option, "--yes");
+            Err(anyhow::Error::new(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "fixture terminal access denied",
+            ))
+            .context("fixture confirmation unavailable"))
+        }
+        fn confirm(&mut self, _: &str) -> anyhow::Result<bool> {
+            panic!("must not prompt")
+        }
+        fn password(&mut self, _: &str) -> anyhow::Result<String> {
+            panic!("must not read a password")
+        }
+        fn password_stdin(&mut self) -> anyhow::Result<String> {
+            panic!("must not read stdin")
+        }
+    }
+    for yes in [false, true] {
+        for json in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("servers.json");
+            save_config(&path, &sample_config(&path)).unwrap();
+            let before = std::fs::read(&path).unwrap();
+            let store = FakeCredentialStore::default();
+            let ssh = FakeSshClient::default();
+            let mut argv = vec!["sshw", "trust", "server-alpha"];
+            if yes {
+                argv.push("--yes");
+            }
+            if json {
+                argv.push("--json");
+            }
+            let output = execute_for_runtime(
+                Cli::try_parse_from(argv).unwrap(),
+                &path,
+                &store,
+                &ssh,
+                &mut Unavailable,
+            );
+            assert_eq!(output.exit_code, if yes { 0 } else { 3 });
+            assert_eq!(*ssh.host_key_calls.borrow(), if yes { 2 } else { 0 });
+            assert_eq!(
+                ssh.trusted_expected_fingerprints.borrow().len(),
+                usize::from(yes)
+            );
+            if !yes {
+                assert!(
+                    format!("{}{}", output.stdout, output.stderr)
+                        .contains("fixture confirmation unavailable")
+                );
+                if json {
+                    let body: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+                    assert_eq!(body["error"]["kind"], "config");
+                    assert!(
+                        body["error"]["causes"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|cause| cause == "fixture terminal access denied")
+                    );
+                }
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            assert!(
+                store.requested.borrow().is_empty()
+                    && store.values.borrow().is_empty()
+                    && store.deleted.borrow().is_empty()
+            );
+        }
+    }
+}
+
+#[test]
+fn trust_readiness_keeps_lookup_priority_and_confirms_the_fetched_fingerprint() {
+    struct Recording {
+        available: usize,
+        prompts: Vec<String>,
+        approve: bool,
+    }
+    impl Prompter for Recording {
+        fn ensure_confirmation_available(&mut self, _: &str) -> anyhow::Result<()> {
+            self.available += 1;
+            Ok(())
+        }
+        fn confirm(&mut self, prompt: &str) -> anyhow::Result<bool> {
+            self.prompts.push(prompt.into());
+            Ok(self.approve)
+        }
+        fn password(&mut self, _: &str) -> anyhow::Result<String> {
+            panic!("must not read a password")
+        }
+        fn password_stdin(&mut self) -> anyhow::Result<String> {
+            panic!("must not read stdin")
+        }
+    }
+    for target in ["missing", "server-alpha"] {
+        for approve in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("servers.json");
+            save_config(&path, &sample_config(&path)).unwrap();
+            let store = FakeCredentialStore::default();
+            let ssh = FakeSshClient {
+                host_key_fingerprint: "SHA256:displayed".into(),
+                ..Default::default()
+            };
+            let mut prompts = Recording {
+                available: 0,
+                prompts: vec![],
+                approve,
+            };
+            let output = execute_for_runtime(
+                Cli::try_parse_from(["sshw", "trust", target, "--json"]).unwrap(),
+                &path,
+                &store,
+                &ssh,
+                &mut prompts,
+            );
+            if target == "missing" {
+                assert_eq!(output.exit_code, 3);
+                assert!(output.stdout.contains("unknown server"));
+                assert_eq!(prompts.available, 0);
+                assert!(prompts.prompts.is_empty());
+                assert_eq!(*ssh.host_key_calls.borrow(), 0);
+            } else {
+                assert_eq!(output.exit_code, if approve { 0 } else { 3 });
+                assert_eq!(prompts.available, 1);
+                assert_eq!(prompts.prompts.len(), 1);
+                assert!(prompts.prompts[0].contains("ssh-ed25519 SHA256:displayed"));
+                assert_eq!(*ssh.host_key_calls.borrow(), if approve { 2 } else { 1 });
+                let trusted = ssh.trusted_expected_fingerprints.borrow();
+                assert_eq!(trusted.len(), usize::from(approve));
+                if approve {
+                    assert_eq!(trusted[0], "SHA256:displayed");
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn trust_passes_displayed_fingerprint_to_storage() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("servers.json");
@@ -9156,6 +9300,7 @@ impl CredentialStore for FakeCredentialStore {
 
 #[derive(Default)]
 struct FakeSshClient {
+    host_key_calls: RefCell<usize>,
     selected_users: RefCell<Vec<String>>,
     run_commands: RefCell<Vec<String>>,
     run_stdin: RefCell<Vec<Option<String>>>,
@@ -9212,6 +9357,7 @@ impl FakeSshClient {
 
 impl SshClient for FakeSshClient {
     fn host_key(&self, _server: &ServerConfig) -> anyhow::Result<HostKeyInfo> {
+        *self.host_key_calls.borrow_mut() += 1;
         Ok(HostKeyInfo {
             algorithm: "ssh-ed25519".to_string(),
             fingerprint_sha256: if self.host_key_fingerprint.is_empty() {
