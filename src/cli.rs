@@ -30,6 +30,7 @@ use std::time::Duration;
 use zeroize::Zeroizing;
 
 mod account;
+mod diagnostics;
 mod hints;
 mod model;
 mod policy_cmd;
@@ -1255,10 +1256,17 @@ where
             available: false,
             message: format!("credential store unavailable: {err}"),
         });
-    let missing_credentials = config_result
+    let credential_checks = config_result
         .as_ref()
-        .map(|config| missing_credentials(credentials, config))
+        .map(|config| diagnostics::credential_checks(credentials, config))
         .unwrap_or_default();
+    let missing_credentials: Vec<_> = credential_checks
+        .iter()
+        .filter(|check| {
+            check.purpose == "login" && check.status == diagnostics::CredentialStatus::Missing
+        })
+        .map(|check| format!("{}/{}", check.server, check.user))
+        .collect();
     let library_versions = runtime_library_versions();
     let mut issues = Vec::new();
     let mut issue = |kind: &str, message: String, next_step: String| {
@@ -1298,13 +1306,18 @@ where
             "check permissions at the reported audit path".to_string(),
         );
     }
-    for entry in &missing_credentials {
-        issue(
-            "login_credential",
-            format!("missing login credential for {entry}"),
-            "register the account password again or supply SSHW_PASSWORD for session-only use"
-                .to_string(),
-        );
+    for check in &credential_checks {
+        if let Some(next_step) = &check.next_step {
+            issue(
+                if check.purpose == "login" {
+                    "login_credential"
+                } else {
+                    "privilege_credential"
+                },
+                check.message.clone(),
+                next_step.clone(),
+            );
+        }
     }
     let mut uses_agent = false;
     let mut host_trust = Vec::new();
@@ -1373,28 +1386,8 @@ where
                 };
                 issue("host_trust", message, next_step);
             }
-            for (user, account) in &server.accounts {
+            for account in server.accounts.values() {
                 uses_agent |= matches!(account.auth, AuthConfig::Agent);
-                if let Some(privilege) = &account.privilege
-                    && let Some(credential) = &privilege.credential
-                {
-                    let available = credentials
-                        .get_password_for(CredentialPurpose::Privilege, credential, &privilege.user)
-                        .map(Zeroizing::new)
-                        .is_ok_and(|password| !password.is_empty());
-                    if !available {
-                        issue(
-                            "privilege_credential",
-                            format!("missing privilege credential for {name}/{user}"),
-                            privilege::recovery_step(
-                                name,
-                                user,
-                                privilege,
-                                credentials.is_persistent(),
-                            ),
-                        );
-                    }
-                }
             }
         }
     }
@@ -1464,6 +1457,7 @@ where
             "credential_available": health.available,
             "credential_message": health.message,
             "missing_credentials": missing_credentials,
+            "credential_checks": credential_checks,
         });
         return Ok(ok(format!("{}\n", serde_json::to_string(&output)?)));
     }
@@ -1605,7 +1599,14 @@ fn resolve_run_target(
             ),
         ));
     }
-    Ok((resolve_target_server(name, config)?, rest[0].clone()))
+    let server = resolve_target_server(name, config)?;
+    if rest[0].trim().is_empty() {
+        return Err(app_error(
+            ErrorKind::Usage,
+            "remote command cannot be empty or whitespace; check the command variable and quote the whole command, for example sshw run <server> \"uptime\"",
+        ));
+    }
+    Ok((server, rest[0].clone()))
 }
 
 fn default_server_name(config: &SshwConfig) -> anyhow::Result<String> {
@@ -1638,28 +1639,6 @@ fn select_account<'a>(
 
 fn unknown_server(name: &str) -> anyhow::Error {
     app_error(ErrorKind::Config, format!("unknown server '{name}'"))
-}
-
-fn missing_credentials<C>(credentials: &C, config: &SshwConfig) -> Vec<String>
-where
-    C: CredentialStore,
-{
-    config
-        .servers
-        .iter()
-        .flat_map(|(name, server)| {
-            server
-                .accounts
-                .iter()
-                .filter_map(move |(user, account)| match &account.auth {
-                    AuthConfig::Password { credential } => credentials
-                        .get_password_for(CredentialPurpose::Login, credential, user)
-                        .err()
-                        .map(|_| format!("{name}/{user}")),
-                    AuthConfig::Agent => None,
-                })
-        })
-        .collect()
 }
 
 fn ok(stdout: String) -> CommandOutput {

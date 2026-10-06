@@ -8,6 +8,10 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 
 ## [Unreleased]
 
+### 빈 실행 대상·자격 증명 진단
+- `run`과 `policy check`는 빈 값·공백뿐인 명령을, `put/get`과 대응 사전 검사는 빈 원격 경로를 인증 조회 전에 usage/9로 거절하고 입력 예시를 안내합니다. 같은 target 해석을 사용하며 기존 설정/정책 로딩·서버 오류 순서와 유효한 공백 파일명·원본 명령/경로를 유지합니다.
+- `doctor`는 실행과 같은 승격 비밀번호 형식 검사를 사용하고, 확인된 항목 부재와 조회 불가·형식 오류를 구분해 마스킹한 원인과 복구 방법을 표시합니다. JSON `credential_checks`에 로그인/승격별 `ready`·`missing`·`unavailable`·`invalid` 상태를 추가하고 `missing_credentials`에는 확인된 로그인 부재만 포함합니다. 기존 진단 exit0/`ok:true`·비접속·비밀번호 내용 미출력·passwordless 의미를 유지합니다.
+
 ### 경로 권한 규칙·프로필 자동 전환 안내
 - `policy allow put/get`은 접근을 허용하지 않는 `/`·반복 슬래시 규칙을 저장 전에 policy/7로 거절하고 구체적인 디렉터리 예시를 안내합니다. 기존 항목의 비활성/삭제 의미와 v1/v2 호환을 유지합니다. Windows drive 절대 경로·UNC 경로는 하위 경로 구분자를 인식하며 대소문자·경계·부모 이동 차단·POSIX 역슬래시 의미와 atomic SFTP 경로 요구사항을 보존합니다.
 - 기본 프로필 삭제는 이름순으로 선택된 다음 프로필을 읽기 전용 검사하고, 불량이면 삭제 완료 상태·원인·복구 방법을 일반 출력과 JSON `default_target_warning`에 표시합니다. 삭제 성공·자동 선택 순서·기존 `warning`/`default_change`·home/keyring 보존을 유지하며 비밀 조회나 SSH 접속은 하지 않습니다.

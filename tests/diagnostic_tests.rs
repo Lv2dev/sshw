@@ -95,6 +95,426 @@ impl Prompter for NoPrompts {
     }
 }
 
+#[test]
+fn empty_diagnostics_blank_commands_fail_before_credentials_and_match_preflight() {
+    for command in ["", "   ", "\t\r\n", "\u{2003}"] {
+        for explicit in [false, true] {
+            for json_output in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let path = temp.path().join("servers.json");
+                config(&path, "example.test", 2222, "web", "deploy");
+                let before = std::fs::read(&path).unwrap();
+                let store = Store {
+                    persistent: true,
+                    error: Some("must not query"),
+                    reads: Cell::new(0),
+                };
+                for preflight in [false, true] {
+                    let mut args = vec!["sshw"];
+                    if preflight {
+                        args.extend(["policy", "check"]);
+                    } else {
+                        args.push("run");
+                    }
+                    if explicit {
+                        args.push("web");
+                    }
+                    args.push(command);
+                    if json_output {
+                        args.push("--json");
+                    }
+                    let output = execute_for_runtime(
+                        Cli::try_parse_from(args).unwrap(),
+                        &path,
+                        &store,
+                        &NoNetwork,
+                        &mut NoPrompts,
+                    );
+                    assert_eq!(output.exit_code, 9, "{}{}", output.stdout, output.stderr);
+                    let rendered = format!("{}{}", output.stdout, output.stderr);
+                    assert!(rendered.contains("remote command cannot be empty or whitespace"));
+                    assert!(rendered.contains("sshw run"));
+                    if json_output {
+                        let body: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+                        assert_eq!(body["error"]["kind"], "usage");
+                        assert!(body.get("allowed").is_none());
+                    }
+                }
+                assert_eq!(store.reads.get(), 0);
+                assert_eq!(std::fs::read(&path).unwrap(), before);
+            }
+        }
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    config(&path, "example.test", 2222, "web", "deploy");
+    let store = Store {
+        persistent: true,
+        error: Some("must not query"),
+        reads: Cell::new(0),
+    };
+    for args in [
+        vec!["sshw", "run", "missing", "", "--json"],
+        vec!["sshw", "policy", "check", "missing", "", "--json"],
+    ] {
+        let output = execute_for_runtime(
+            Cli::try_parse_from(args).unwrap(),
+            &path,
+            &store,
+            &NoNetwork,
+            &mut NoPrompts,
+        );
+        assert_eq!(output.exit_code, 3);
+        assert!(output.stdout.contains("unknown server"));
+    }
+    for preflight in [false, true] {
+        let args = if preflight {
+            vec!["sshw", "--policy", "policy", "check", "web", "", "--json"]
+        } else {
+            vec!["sshw", "--policy", "run", "web", "", "--json"]
+        };
+        assert_eq!(
+            execute_for_runtime(
+                Cli::try_parse_from(args).unwrap(),
+                &path,
+                &store,
+                &NoNetwork,
+                &mut NoPrompts
+            )
+            .exit_code,
+            7
+        );
+    }
+    std::fs::write(&path, "{broken").unwrap();
+    for args in [
+        vec!["sshw", "run", "web", "", "--json"],
+        vec!["sshw", "policy", "check", "web", "", "--json"],
+    ] {
+        assert_eq!(
+            execute_for_runtime(
+                Cli::try_parse_from(args).unwrap(),
+                &path,
+                &store,
+                &NoNetwork,
+                &mut NoPrompts
+            )
+            .exit_code,
+            3
+        );
+    }
+    assert_eq!(store.reads.get(), 0);
+}
+
+#[test]
+fn empty_diagnostics_remote_paths_fail_before_local_io_and_preserve_literal_spaces() {
+    for operation in ["put", "get"] {
+        for explicit in [false, true] {
+            for json_output in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let path = temp.path().join("servers.json");
+                config(&path, "example.test", 2222, "web", "deploy");
+                let local = temp.path().join("local");
+                let store = Store {
+                    persistent: true,
+                    error: Some("must not query"),
+                    reads: Cell::new(0),
+                };
+                for preflight in [false, true] {
+                    let mut args = vec!["sshw"];
+                    if preflight {
+                        args.push("policy");
+                    }
+                    let check = format!("check-{operation}");
+                    args.push(if preflight { &check } else { operation });
+                    if explicit {
+                        args.push("web");
+                    }
+                    if operation == "put" {
+                        args.extend([local.to_str().unwrap(), ""]);
+                    } else {
+                        args.extend(["", local.to_str().unwrap()]);
+                    }
+                    if json_output {
+                        args.push("--json");
+                    }
+                    let output = execute_for_runtime(
+                        Cli::try_parse_from(args).unwrap(),
+                        &path,
+                        &store,
+                        &NoNetwork,
+                        &mut NoPrompts,
+                    );
+                    assert_eq!(output.exit_code, 9, "{}{}", output.stdout, output.stderr);
+                    assert!(
+                        format!("{}{}", output.stdout, output.stderr)
+                            .contains("remote path cannot be empty")
+                    );
+                }
+                assert!(!local.exists());
+                assert_eq!(store.reads.get(), 0);
+                if operation == "put" {
+                    std::fs::write(&local, "payload").unwrap();
+                }
+                let mut args = vec!["sshw", "policy"];
+                let check = format!("check-{operation}");
+                args.extend([&check, "web"]);
+                if operation == "put" {
+                    args.extend([local.to_str().unwrap(), "   "]);
+                } else {
+                    args.extend(["   ", local.to_str().unwrap()]);
+                }
+                args.push("--json");
+                let output = execute_for_runtime(
+                    Cli::try_parse_from(args).unwrap(),
+                    &path,
+                    &store,
+                    &NoNetwork,
+                    &mut NoPrompts,
+                );
+                assert_eq!(output.exit_code, 0);
+                let body: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+                assert_eq!(body["allowed"], true);
+                assert_eq!(body["remote"], "   ");
+            }
+        }
+    }
+}
+
+#[test]
+fn empty_diagnostics_doctor_uses_the_execution_privilege_password_validator() {
+    for password in [
+        "",
+        "disposable-first\ndisposable-second",
+        "disposable-first\rdisposable-second",
+        "disposable-valid",
+    ] {
+        for json_output in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("servers.json");
+            privilege_config(&path, "web", "deploy", "service", PrivilegeMethod::Sudo);
+            std::fs::write(
+                temp.path().join("known_hosts"),
+                format!("[example.test]:2222 {KEY}\n"),
+            )
+            .unwrap();
+            let mut saved = load_config(&path).unwrap();
+            saved
+                .servers
+                .get_mut("web")
+                .unwrap()
+                .accounts
+                .get_mut("deploy")
+                .unwrap()
+                .auth = AuthConfig::Password {
+                credential: ResolvedHome::from_config_path(&path)
+                    .namespace
+                    .new_account_credential_key(CredentialPurpose::Login, "web", "deploy"),
+            };
+            saved.servers.get_mut("web").unwrap().host = "example.test".into();
+            saved.servers.get_mut("web").unwrap().port = 2222;
+            save_config(&path, &saved).unwrap();
+            let before = std::fs::read(&path).unwrap();
+            let store = sshw::credentials::session_store::SessionOnlyStore::with_session_passwords(
+                Some("disposable-login".into()),
+                Some(password.into()),
+            );
+            let mut args = vec!["sshw", "doctor"];
+            if json_output {
+                args.push("--json");
+            }
+            let output = execute_for_runtime(
+                Cli::try_parse_from(args).unwrap(),
+                &path,
+                &store,
+                &NoNetwork,
+                &mut NoPrompts,
+            );
+            assert_eq!(output.exit_code, 0);
+            assert!(!output.stdout.contains("disposable-"));
+            let valid = password == "disposable-valid";
+            if json_output {
+                let body: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+                assert_eq!(body["ok"], true);
+                assert_eq!(body["local_checks_passed"], valid);
+                assert_eq!(body["connection_tested"], false);
+                let check = body["credential_checks"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|value| value["purpose"] == "privilege")
+                    .unwrap();
+                assert_eq!(check["status"], if valid { "ready" } else { "invalid" });
+                if !valid {
+                    assert!(
+                        check["next_step"]
+                            .as_str()
+                            .unwrap()
+                            .contains("SSHW_PRIVILEGE_PASSWORD")
+                    );
+                }
+            } else {
+                assert!(output.stdout.contains(if valid {
+                    "local checks: passed"
+                } else {
+                    "local checks: action required"
+                }));
+                if !valid {
+                    assert!(output.stdout.contains("invalid privilege credential"));
+                }
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+    }
+}
+
+struct DiagnosticLookupStore {
+    mode: &'static str,
+    reads: Cell<usize>,
+}
+
+impl CredentialStore for DiagnosticLookupStore {
+    fn set_password(&self, _: &str, _: &str, _: &str) -> anyhow::Result<()> {
+        panic!("unexpected store mutation")
+    }
+    fn delete_password(&self, _: &str, _: &str) -> anyhow::Result<()> {
+        panic!("unexpected store mutation")
+    }
+    fn get_password(&self, _: &str, _: &str) -> anyhow::Result<String> {
+        self.reads.set(self.reads.get() + 1);
+        match self.mode {
+            "missing" => Err(anyhow::Error::new(keyring_core::Error::NoEntry).context("entry not found")),
+            "ready" => Ok("disposable-valid".into()),
+            _ => Err(anyhow::Error::new(std::io::Error::new(
+                if self.mode == "not_found" { std::io::ErrorKind::NotFound } else { std::io::ErrorKind::PermissionDenied },
+                "store locked token=lookup-secret\n-----BEGIN PRIVATE KEY-----\nlookup-private-key\n-----END PRIVATE KEY-----"))
+                .context("cannot reach the credential service")),
+        }
+    }
+    fn health_check(&self) -> anyhow::Result<CredentialStoreHealth> {
+        Ok(CredentialStoreHealth {
+            backend: "fixture".into(),
+            available: self.mode != "unavailable",
+            message: "fixture backend health".into(),
+        })
+    }
+}
+
+#[test]
+fn empty_diagnostics_doctor_distinguishes_typed_absence_from_unavailable_lookups() {
+    for mode in ["missing", "unavailable", "not_found", "ready"] {
+        for json_output in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("servers.json");
+            privilege_config(
+                &path,
+                "-stage west",
+                "operator's $literal",
+                "-service's $literal",
+                PrivilegeMethod::Su,
+            );
+            let mut saved = load_config(&path).unwrap();
+            saved
+                .servers
+                .get_mut("-stage west")
+                .unwrap()
+                .accounts
+                .get_mut("operator's $literal")
+                .unwrap()
+                .auth = AuthConfig::Password {
+                credential: ResolvedHome::from_config_path(&path)
+                    .namespace
+                    .new_account_credential_key(
+                        CredentialPurpose::Login,
+                        "-stage west",
+                        "operator's $literal",
+                    ),
+            };
+            save_config(&path, &saved).unwrap();
+            let before = std::fs::read(&path).unwrap();
+            let store = DiagnosticLookupStore {
+                mode,
+                reads: Cell::new(0),
+            };
+            let mut args = vec!["sshw", "doctor"];
+            if json_output {
+                args.push("--json");
+            }
+            let output = execute_for_runtime(
+                Cli::try_parse_from(args).unwrap(),
+                &path,
+                &store,
+                &NoNetwork,
+                &mut NoPrompts,
+            );
+            assert_eq!(output.exit_code, 0);
+            let status = if mode == "missing" {
+                "missing"
+            } else if mode == "ready" {
+                "ready"
+            } else {
+                "unavailable"
+            };
+            assert!(
+                !output.stdout.contains("lookup-secret")
+                    && !output.stdout.contains("lookup-private-key")
+            );
+            if json_output {
+                let body: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+                assert_eq!(
+                    body["missing_credentials"],
+                    if mode == "missing" {
+                        serde_json::json!(["-stage west/operator's $literal"])
+                    } else {
+                        serde_json::json!([])
+                    }
+                );
+                let checks = body["credential_checks"].as_array().unwrap();
+                assert_eq!(checks.len(), 2);
+                for check in checks {
+                    assert_eq!(check["status"], status);
+                    assert_eq!(check["user"], "operator's $literal");
+                    if status == "unavailable" {
+                        assert!(
+                            check["message"]
+                                .as_str()
+                                .unwrap()
+                                .contains("cannot reach the credential service")
+                        );
+                        assert!(
+                            check["next_step"]
+                                .as_str()
+                                .unwrap()
+                                .contains("rerun sshw doctor")
+                        );
+                        assert!(
+                            !check["next_step"]
+                                .as_str()
+                                .unwrap()
+                                .contains("privilege set")
+                        );
+                    }
+                }
+            } else if status == "unavailable" {
+                assert!(
+                    output.stdout.contains("cannot read login credential")
+                        && output.stdout.contains("cannot read privilege credential")
+                );
+                assert!(
+                    !output.stdout.contains("missing login credential")
+                        && !output.stdout.contains("missing privilege credential")
+                );
+                assert!(
+                    output
+                        .stdout
+                        .contains("cannot reach the credential service")
+                );
+            }
+            assert_eq!(store.reads.get(), 2);
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+    }
+}
+
 fn config(path: &Path, host: &str, port: u16, name: &str, user: &str) {
     let namespace = ResolvedHome::from_config_path(path).namespace;
     save_config(

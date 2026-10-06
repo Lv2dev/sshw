@@ -8777,7 +8777,9 @@ impl CredentialStore for FakeCredentialStore {
             .borrow()
             .get(&(credential.to_string(), user.to_string()))
             .cloned()
-            .ok_or_else(|| anyhow::anyhow!("missing credential"))
+            .ok_or_else(|| {
+                anyhow::Error::new(keyring_core::Error::NoEntry).context("missing credential")
+            })
     }
 
     fn delete_password(&self, credential: &str, user: &str) -> anyhow::Result<()> {

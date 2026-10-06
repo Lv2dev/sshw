@@ -236,7 +236,7 @@ pub(super) fn resolve_put_target(
     Ok((
         server,
         PathBuf::from(&rest[0]),
-        decode_remote_path(&rest[1])?,
+        decode_transfer_remote_path(&rest[1], "put")?,
     ))
 }
 
@@ -250,13 +250,30 @@ pub(super) fn resolve_get_target(
     let server = resolve_target_server(name, config)?;
     Ok((
         server,
-        decode_remote_path(&rest[0])?,
+        decode_transfer_remote_path(&rest[0], "get")?,
         PathBuf::from(&rest[1]),
     ))
 }
 
 pub(super) fn policy_remote_path(path: &str) -> anyhow::Result<String> {
     decode_remote_path(path).map(|remote| remote.value)
+}
+
+fn decode_transfer_remote_path(path: &str, operation: &str) -> anyhow::Result<RemotePath> {
+    if path.is_empty() {
+        let target = if operation == "put" {
+            "<local> <remote>"
+        } else {
+            "<remote> <local>"
+        };
+        return Err(app_error(
+            ErrorKind::Usage,
+            format!(
+                "remote path cannot be empty; check the remote path variable, for example sshw {operation} <server> {target}"
+            ),
+        ));
+    }
+    decode_remote_path(path)
 }
 
 fn decode_remote_path(path: &str) -> anyhow::Result<RemotePath> {
