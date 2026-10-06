@@ -233,11 +233,9 @@ pub(super) fn resolve_put_target(
     let (name, rest) = split_target(&target, 2)
         .ok_or_else(|| app_error(ErrorKind::Config, "put expects [name] <local> <remote>"))?;
     let server = resolve_target_server(name, config)?;
-    Ok((
-        server,
-        PathBuf::from(&rest[0]),
-        decode_transfer_remote_path(&rest[1], "put")?,
-    ))
+    let remote = decode_transfer_remote_path(&rest[1], "put")?;
+    let local = decode_transfer_local_path(&rest[0], "put")?;
+    Ok((server, local, remote))
 }
 
 pub(super) fn resolve_get_target(
@@ -248,15 +246,30 @@ pub(super) fn resolve_get_target(
     let (name, rest) = split_target(&target, 2)
         .ok_or_else(|| app_error(ErrorKind::Config, "get expects [name] <remote> <local>"))?;
     let server = resolve_target_server(name, config)?;
-    Ok((
-        server,
-        decode_transfer_remote_path(&rest[0], "get")?,
-        PathBuf::from(&rest[1]),
-    ))
+    let remote = decode_transfer_remote_path(&rest[0], "get")?;
+    let local = decode_transfer_local_path(&rest[1], "get")?;
+    Ok((server, remote, local))
 }
 
 pub(super) fn policy_remote_path(path: &str) -> anyhow::Result<String> {
     decode_remote_path(path).map(|remote| remote.value)
+}
+
+fn decode_transfer_local_path(path: &str, operation: &str) -> anyhow::Result<PathBuf> {
+    if path.is_empty() {
+        let (label, target) = if operation == "put" {
+            ("source", "<local> <remote>")
+        } else {
+            ("destination", "<remote> <local>")
+        };
+        return Err(app_error(
+            ErrorKind::Usage,
+            format!(
+                "local {label} path cannot be empty; check the local path variable, for example sshw {operation} <server> {target}"
+            ),
+        ));
+    }
+    Ok(PathBuf::from(path))
 }
 
 fn decode_transfer_remote_path(path: &str, operation: &str) -> anyhow::Result<RemotePath> {

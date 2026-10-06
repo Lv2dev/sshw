@@ -44,8 +44,10 @@ impl Prompter for TerminalPrompter {
 
     fn password_stdin(&mut self) -> anyhow::Result<String> {
         let stdin = io::stdin();
-        let mut input = stdin.lock();
-        password_from_reader(&mut input)
+        read_redirected_password(stdin.is_terminal(), || {
+            let mut input = stdin.lock();
+            password_from_reader(&mut input)
+        })
     }
 }
 
@@ -98,9 +100,38 @@ where
     Ok(password)
 }
 
+fn read_redirected_password(
+    interactive: bool,
+    read: impl FnOnce() -> anyhow::Result<String>,
+) -> anyhow::Result<String> {
+    if interactive {
+        return Err(anyhow::anyhow!(
+            "--password-stdin requires redirected input; stdin is a terminal. Omit --password-stdin for hidden terminal input, or pipe/redirect the password from a secret manager. Never put passwords in arguments"
+        ));
+    }
+    read()
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
+
+    #[test]
+    fn local_stdin_terminal_gate_rejects_before_reading_and_keeps_redirected_data() {
+        let error =
+            super::read_redirected_password(true, || panic!("terminal input must not be read"))
+                .unwrap_err();
+        assert!(
+            error.to_string().contains("stdin is a terminal")
+                && error.to_string().contains("hidden terminal input")
+                && error.to_string().contains("pipe/redirect")
+        );
+        let mut source = Cursor::new(b"line-one\nline-two\r\n");
+        let password =
+            super::read_redirected_password(false, || super::password_from_reader(&mut source))
+                .unwrap();
+        assert_eq!(password, "line-one\nline-two");
+    }
 
     #[test]
     fn confirm_from_reader_rejects_non_interactive_stdin() {

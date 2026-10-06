@@ -96,6 +96,145 @@ impl Prompter for NoPrompts {
 }
 
 #[test]
+fn local_stdin_empty_local_paths_are_usage_errors_in_execution_and_preflight() {
+    for operation in ["put", "get"] {
+        for explicit in [false, true] {
+            for json_output in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let path = temp.path().join("servers.json");
+                config(&path, "example.test", 2222, "web", "deploy");
+                let before = std::fs::read(&path).unwrap();
+                let store = Store {
+                    persistent: true,
+                    error: Some("must not query"),
+                    reads: Cell::new(0),
+                };
+                for preflight in [false, true] {
+                    let mut args = vec!["sshw"];
+                    if preflight {
+                        args.push("policy");
+                    }
+                    let check = format!("check-{operation}");
+                    args.push(if preflight { &check } else { operation });
+                    if explicit {
+                        args.push("web");
+                    }
+                    if operation == "put" {
+                        args.extend(["", "/tmp/file"]);
+                    } else {
+                        args.extend(["/tmp/file", ""]);
+                    }
+                    if json_output {
+                        args.push("--json");
+                    }
+                    let output = execute_for_runtime(
+                        Cli::try_parse_from(args).unwrap(),
+                        &path,
+                        &store,
+                        &NoNetwork,
+                        &mut NoPrompts,
+                    );
+                    assert_eq!(output.exit_code, 9, "{}{}", output.stdout, output.stderr);
+                    let message = format!("{}{}", output.stdout, output.stderr);
+                    assert!(
+                        message.contains("local source path cannot be empty")
+                            || message.contains("local destination path cannot be empty")
+                    );
+                    assert!(message.contains("sshw put") || message.contains("sshw get"));
+                    if json_output {
+                        assert_eq!(
+                            serde_json::from_str::<serde_json::Value>(&output.stdout).unwrap()["error"]
+                                ["kind"],
+                            "usage"
+                        );
+                    }
+                }
+                assert_eq!(store.reads.get(), 0);
+                assert_eq!(std::fs::read(&path).unwrap(), before);
+            }
+        }
+    }
+}
+
+#[test]
+fn local_stdin_validation_keeps_remote_and_loading_precedence_and_literal_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    config(&path, "example.test", 2222, "web", "deploy");
+    let store = Store {
+        persistent: true,
+        error: Some("must not query"),
+        reads: Cell::new(0),
+    };
+    for operation in ["put", "get"] {
+        let targets = ["", ""];
+        for preflight in [false, true] {
+            let mut args = vec!["sshw"];
+            if preflight {
+                args.push("policy");
+            }
+            let check = format!("check-{operation}");
+            args.extend([
+                if preflight { &check } else { operation },
+                "web",
+                targets[0],
+                targets[1],
+                "--json",
+            ]);
+            let output = execute_for_runtime(
+                Cli::try_parse_from(args).unwrap(),
+                &path,
+                &store,
+                &NoNetwork,
+                &mut NoPrompts,
+            );
+            assert_eq!(output.exit_code, 9);
+            assert!(output.stdout.contains("remote path cannot be empty"));
+        }
+    }
+    let source = temp.path().join("local file");
+    std::fs::write(&source, "payload").unwrap();
+    let output = execute_for_runtime(
+        Cli::try_parse_from([
+            "sshw",
+            "policy",
+            "check-put",
+            "web",
+            source.to_str().unwrap(),
+            "remote:/tmp/file",
+            "--json",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &NoNetwork,
+        &mut NoPrompts,
+    );
+    assert_eq!(output.exit_code, 0);
+    let body: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+    assert_eq!(body["allowed"], true);
+    assert_eq!(body["local"], source.to_str().unwrap());
+    let output = execute_for_runtime(
+        Cli::try_parse_from(["sshw", "--policy", "get", "web", "/tmp/file", "", "--json"]).unwrap(),
+        &path,
+        &store,
+        &NoNetwork,
+        &mut NoPrompts,
+    );
+    assert_eq!(output.exit_code, 7);
+    std::fs::write(&path, "{broken").unwrap();
+    let output = execute_for_runtime(
+        Cli::try_parse_from(["sshw", "get", "web", "/tmp/file", "", "--json"]).unwrap(),
+        &path,
+        &store,
+        &NoNetwork,
+        &mut NoPrompts,
+    );
+    assert_eq!(output.exit_code, 3);
+    assert_eq!(store.reads.get(), 0);
+}
+
+#[test]
 fn clear_persistence_lock_errors_report_path_stage_recovery_and_io_source() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("servers.json");

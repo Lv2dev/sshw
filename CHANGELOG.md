@@ -8,6 +8,10 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 
 ## [Unreleased]
 
+### 빈 로컬 경로·비밀번호 stdin 터미널 입력
+- `put/get`과 대응 정책 검사는 길이0인 로컬 원본/목적지를 공통 target 해석에서 usage/9로 거절하고 변수 확인·입력 예시를 안내합니다. 설정/정책/default server/remote 검증 순서와 원본·유효한 공백 파일명은 유지합니다.
+- `--password-stdin`의 stdin이 터미널이면 읽기 전에 auth/4로 거절하고 옵션을 생략한 hidden 입력 또는 비밀 관리자의 pipe/redirection 사용법을 안내합니다. 자동 입력 방식 전환 없이 기존 파이프/파일·EOF/CRLF 처리·login 내부 줄바꿈·승격 형식 검증을 보존합니다.
+
 ### 승격 설정 해제·잠금/저장 오류 안내
 - 존재하는 계정의 저장된 승격 설정이 이미 없으면 `privilege clear`는 확인 입력·설정 저장·비밀 삭제 없이 변경 없는 성공으로 처리합니다. JSON은 기존 cleared action/대상 필드와 `changed:false`/`change:"unchanged"`를, 실제 해제는 `true`/`"removed"`를 표시합니다. unknown target·schema·lock/audit와 실제 해제의 credential cleanup/부분 적용 계약은 유지합니다.
 - 공통 잠금과 atomic config/registry 저장 실패에 파일 경로·작업 단계·마스킹한 원인·복구 방법을 표시합니다. 원래 typed source·exit/envelope·timeout/CAS·atomic 저장 및 저장 후 디렉터리 sync 실패의 published 상태를 유지하고, 저장 완료 여부에 따른 자격 증명 정리 판단을 바꾸지 않습니다.
