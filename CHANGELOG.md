@@ -8,6 +8,10 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 
 ## [Unreleased]
 
+### 계정 선택·SSH agent 인증 오류 안내
+- 미등록 로그인 계정 오류에 같은 home/profile의 계정 목록 조회와 새 계정 등록 명령을 안내합니다. 등록 계정 선택이라는 의미를 설명하고, 이름을 개별 마스킹·플랫폼 인용하며 `--` 경계를 유지합니다. config/3·미등록 거부·기존 검사 순서와 설정/비밀 미변경을 보존합니다.
+- `run/put/get`의 SSH agent 인증 실패는 로그인 사용자·host/port·개별 마스킹한 native 원인과 같은 실행 환경의 doctor/agent/키/서버 허용 점검 방법을 표시합니다. 원래 source/type/code·auth/4·JSON causes·host key 검증 후 인증과 비밀번호/승격 동작을 유지하며 agent 시작·키 로드·fallback을 자동 실행하지 않습니다.
+
 ### 승격 설정 검사 순서·연결 오류 안내
 - `run --as-root`는 로그인 비밀번호를 조회하기 전에 필요한 승격 설정과 su/`--no-password` 불일치를 검사합니다. 두 문제가 함께 있으면 config/3 승격 오류를 먼저 안내합니다. 기존 safety/policy/account·stream/su 검사, 일반 로그인 오류와 무설정 `--no-password` 허용 의미는 유지합니다.
 - `run/put/get/trust`의 공통 연결 실패에 주소 해석·TCP·SSH handshake 단계, host/port, 개별 마스킹한 원인과 다음 조치를 표시합니다. 최대 연결 예산은 실제 대기 시간과 구분하며, 원래 오류 타입·ssh/5·JSON causes·deadline/retry·host key/인증 순서를 보존합니다.

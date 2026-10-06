@@ -4,20 +4,24 @@
 use crate::config::PrivilegeMethod;
 use crate::output::redact_secrets;
 
-pub(super) fn quote_local_argument(value: &str) -> String {
+pub(super) fn redacted_argument(value: &str) -> String {
     let redacted = redact_secrets(value);
     // Hide the whole argument when it contains a secret pattern. Keeping its
     // assignment prefix would let later error redaction truncate the command.
-    let value = if redacted.contains("<redacted>") || redacted.contains("[redacted private key]") {
-        "<redacted>"
+    if redacted.contains("<redacted>") || redacted.contains("[redacted private key]") {
+        "<redacted>".into()
     } else {
-        &redacted
-    };
+        redacted
+    }
+}
+
+pub(super) fn quote_local_argument(value: &str) -> String {
+    let value = redacted_argument(value);
     if cfg!(windows) {
         // PowerShell escapes an apostrophe in a literal by doubling it.
         format!("'{}'", value.replace('\'', "''"))
     } else {
-        super::shell_quote(value)
+        super::shell_quote(&value)
     }
 }
 
@@ -36,6 +40,18 @@ pub(super) fn run(server: &str, command: &str) -> String {
 pub(super) fn account_password(server: &str, login_user: &str) -> String {
     format!(
         "sshw account add --auth password -- {} {}",
+        quote_local_argument(server),
+        quote_local_argument(login_user),
+    )
+}
+
+pub(super) fn account_list(server: &str) -> String {
+    format!("sshw account list -- {}", quote_local_argument(server))
+}
+
+pub(super) fn account_add(server: &str, login_user: &str) -> String {
+    format!(
+        "sshw account add -- {} {}",
         quote_local_argument(server),
         quote_local_argument(login_user),
     )

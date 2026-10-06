@@ -731,7 +731,7 @@ fn connect_verified_authenticated(
 ) -> anyhow::Result<Session> {
     let session = connect(server, connect_timeout).with_error_kind(ErrorKind::Ssh)?;
     verify_known_host(&session, server, known_hosts_path).with_error_kind(ErrorKind::Ssh)?;
-    authenticate(&session, user, auth).with_error_kind(ErrorKind::Auth)?;
+    authenticate(&session, server, user, auth).with_error_kind(ErrorKind::Auth)?;
     // Switch from the connect-phase timeout to the operation budget (0 = an
     // explicit opt-out). Individual operation steps tighten this to the
     // absolute deadline's remaining time.
@@ -744,6 +744,15 @@ enum ConnectStage {
     Resolve,
     Tcp,
     Handshake,
+}
+
+fn diagnostic_value(value: &str) -> String {
+    let redacted = redact_secrets(value);
+    if redacted == value {
+        redacted
+    } else {
+        "<redacted>".into()
+    }
 }
 
 fn connect_diagnostic(
@@ -766,12 +775,7 @@ fn connect_diagnostic(
             "check that the endpoint is running SSH and inspect server/network logs before retrying",
         ),
     };
-    let host = redact_secrets(&server.host);
-    let host = if host == server.host {
-        host.as_str()
-    } else {
-        "<redacted>"
-    };
+    let host = diagnostic_value(&server.host);
     let detail = redacted_error_detail(&source);
     source.context(format!(
         "failed to {operation} {host}:{} (connect timeout budget: {} ms)\ncaused by: {detail}\nnext: {recovery}",
@@ -1442,7 +1446,24 @@ fn known_host_verification_result(
     }
 }
 
-fn authenticate(session: &Session, user: &str, auth: &AuthMaterial) -> anyhow::Result<()> {
+fn agent_auth_diagnostic(
+    source: anyhow::Error,
+    server: &ServerConfig,
+    user: &str,
+) -> anyhow::Error {
+    let detail = redacted_error_detail(&source);
+    source.context(format!(
+        "SSH agent authentication failed for login account '{}' at {}:{}\ncaused by: {detail}\nnext: using the same home/profile and execution environment, run `sshw doctor` to check agent availability and identities; check the agent connection and load the intended key if needed, then verify that the server allows this login account/key",
+        diagnostic_value(user), diagnostic_value(&server.host), server.port,
+    ))
+}
+
+fn authenticate(
+    session: &Session,
+    server: &ServerConfig,
+    user: &str,
+    auth: &AuthMaterial,
+) -> anyhow::Result<()> {
     match auth {
         AuthMaterial::Password(password) => {
             session
@@ -1452,7 +1473,7 @@ fn authenticate(session: &Session, user: &str, auth: &AuthMaterial) -> anyhow::R
         AuthMaterial::Agent => {
             session
                 .userauth_agent(user)
-                .context("SSH agent authentication failed")?;
+                .map_err(|error| agent_auth_diagnostic(error.into(), server, user))?;
         }
     }
 
@@ -1546,6 +1567,91 @@ example.test ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB9zU1OEQ2tzYhrXq4/DEjvRNvKv6cU
             super::Ssh2Client::default().connect_timeout(),
             std::time::Duration::from_secs(15)
         );
+    }
+
+    #[test]
+    fn agent_auth_diagnostics_keep_native_source_and_mask_fields_and_causes() {
+        for sensitive in [false, true] {
+            let server = ServerConfig::single_account(
+                if sensitive {
+                    "token=host-marker"
+                } else {
+                    "example.test"
+                },
+                2222,
+                "deploy",
+                AuthConfig::Agent,
+            );
+            let user = if sensitive {
+                "password=user-marker"
+            } else {
+                "deploy"
+            };
+            let native = ssh2::Error::from_errno(ssh2::ErrorCode::Session(
+                libssh2_sys::LIBSSH2_ERROR_AGENT_PROTOCOL,
+            ));
+            let native_message = native.to_string();
+            let source = if sensitive {
+                anyhow::Error::new(native).context("agent unavailable: token=cause-marker\n-----BEGIN PRIVATE KEY-----\nkey-material\n-----END PRIVATE KEY-----")
+            } else {
+                anyhow::Error::new(native)
+            };
+            let error = super::agent_auth_diagnostic(source, &server, user);
+            let error = Err::<(), _>(error)
+                .with_error_kind(ErrorKind::Auth)
+                .unwrap_err();
+            let response = crate::output::ErrorResponse::from_error(&error);
+            let rendered = serde_json::to_string(&response).unwrap();
+            assert_eq!(response.error.exit_code, 4);
+            assert!(
+                response
+                    .error
+                    .message
+                    .contains("SSH agent authentication failed for login account")
+            );
+            assert!(
+                response.error.message.contains("caused by:")
+                    && response.error.message.contains("sshw doctor")
+            );
+            assert!(
+                response
+                    .error
+                    .message
+                    .contains("same home/profile and execution environment")
+            );
+            assert!(
+                response
+                    .error
+                    .causes
+                    .iter()
+                    .any(|cause| cause == &native_message)
+            );
+            assert!(error.chain().any(|cause| {
+                cause.downcast_ref::<ssh2::Error>().is_some_and(|native| {
+                    native.code()
+                        == ssh2::ErrorCode::Session(libssh2_sys::LIBSSH2_ERROR_AGENT_PROTOCOL)
+                })
+            }));
+            if sensitive {
+                assert!(
+                    response
+                        .error
+                        .message
+                        .contains("'<redacted>' at <redacted>:2222")
+                );
+                for marker in ["host-marker", "user-marker", "cause-marker", "key-material"] {
+                    assert!(!rendered.contains(marker), "{rendered}");
+                }
+            } else {
+                assert!(
+                    response
+                        .error
+                        .message
+                        .contains("'deploy' at example.test:2222")
+                );
+                assert!(response.error.message.contains(&native_message));
+            }
+        }
     }
 
     #[test]

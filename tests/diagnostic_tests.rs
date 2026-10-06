@@ -96,6 +96,162 @@ impl Prompter for NoPrompts {
 }
 
 #[test]
+fn account_selection_unknown_account_guides_recovery_without_secret_or_network_access() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    config(&path, "example.test", 2222, "web", "deploy");
+    let local = temp.path().join("source");
+    std::fs::write(&local, "payload").unwrap();
+    let local = local.to_str().unwrap();
+    let destination = temp.path().join("download");
+    let destination = destination.to_str().unwrap();
+    let before = std::fs::read(&path).unwrap();
+    let store = Store {
+        persistent: true,
+        error: Some("must not query"),
+        reads: Cell::new(0),
+    };
+    for command in [
+        vec!["run", "web", "uptime", "--user", "ops"],
+        vec!["put", "web", local, "/tmp/file", "--user", "ops"],
+        vec!["get", "web", "/tmp/file", destination, "--user", "ops"],
+        vec!["policy", "check", "web", "uptime", "--user", "ops"],
+        vec![
+            "policy",
+            "check-put",
+            "web",
+            local,
+            "/tmp/file",
+            "--user",
+            "ops",
+        ],
+        vec![
+            "policy",
+            "check-get",
+            "web",
+            "/tmp/file",
+            destination,
+            "--user",
+            "ops",
+        ],
+        vec!["account", "show", "web", "ops"],
+        vec!["account", "default", "web", "ops"],
+        vec!["account", "remove", "web", "ops", "--yes"],
+        vec!["privilege", "show", "web", "--account", "ops"],
+        vec!["privilege", "clear", "web", "--account", "ops", "--yes"],
+        vec![
+            "privilege",
+            "set",
+            "web",
+            "--account",
+            "ops",
+            "--no-password",
+        ],
+    ] {
+        for json in [false, true] {
+            let mut args = vec!["sshw"];
+            args.extend(command.clone());
+            if json {
+                args.push("--json");
+            }
+            let output = execute_for_runtime(
+                Cli::try_parse_from(args).unwrap(),
+                &path,
+                &store,
+                &NoNetwork,
+                &mut NoPrompts,
+            );
+            assert_eq!(output.exit_code, 3, "{output:?}");
+            let message = format!("{}{}", output.stdout, output.stderr);
+            assert!(message.contains("unknown account 'web/ops'"), "{message}");
+            assert!(message.contains("sshw account list -- 'web'"), "{message}");
+            assert!(
+                message.contains("sshw account add -- 'web' 'ops'"),
+                "{message}"
+            );
+            assert!(
+                message.contains("registered login account")
+                    && message.contains("same home/profile"),
+                "{message}"
+            );
+            if json {
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&output.stdout).unwrap()["error"]["kind"],
+                    "config"
+                );
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+    }
+    assert_eq!(store.reads.get(), 0);
+    assert!(!std::path::Path::new(destination).exists());
+}
+
+#[test]
+fn account_selection_recovery_quotes_arguments_and_masks_sensitive_values() {
+    for (server, missing, sensitive) in [
+        ("-stage's $literal", "-operator's $literal", false),
+        ("token=server-marker", "password=user-marker", true),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("servers.json");
+        config(&path, "example.test", 2222, server, "deploy");
+        let store = Store {
+            persistent: true,
+            error: Some("must not query"),
+            reads: Cell::new(0),
+        };
+        for json in [false, true] {
+            let selector = format!("--user={missing}");
+            let mut args = vec!["sshw", "run", &selector];
+            if json {
+                args.push("--json");
+            }
+            args.extend(["--", server, "uptime"]);
+            let output = execute_for_runtime(
+                Cli::try_parse_from(args).unwrap(),
+                &path,
+                &store,
+                &NoNetwork,
+                &mut NoPrompts,
+            );
+            assert_eq!(output.exit_code, 3);
+            let message = if json {
+                serde_json::from_str::<serde_json::Value>(&output.stdout).unwrap()["error"]["message"].as_str().unwrap().to_owned()
+            } else {
+                output.stderr
+            };
+            if sensitive {
+                assert!(
+                    !message.contains("server-marker") && !message.contains("user-marker"),
+                    "{message}"
+                );
+                assert!(message.contains("sshw account list -- '<redacted>'"));
+                assert!(message.contains("sshw account add -- '<redacted>' '<redacted>'"));
+            } else {
+                assert!(
+                    message.contains(if cfg!(windows) {
+                        "-- '-stage''s $literal'"
+                    } else {
+                        "-- '-stage'\"'\"'s $literal'"
+                    }),
+                    "{message}"
+                );
+                assert!(
+                    message.contains(if cfg!(windows) {
+                        "'-operator''s $literal'"
+                    } else {
+                        "'-operator'\"'\"'s $literal'"
+                    }),
+                    "{message}"
+                );
+            }
+        }
+        assert_eq!(store.reads.get(), 0);
+    }
+}
+
+#[test]
 fn privilege_order_rejects_invalid_elevation_before_credential_reads() {
     for su in [false, true] {
         for explicit in [false, true] {

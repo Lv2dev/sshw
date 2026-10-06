@@ -383,9 +383,18 @@ fn privilege_label(account: &AccountConfig) -> String {
 }
 
 pub(super) fn unknown_account(server: &str, user: &str) -> anyhow::Error {
+    let target = format!(
+        "{}/{}",
+        super::hints::redacted_argument(server),
+        super::hints::redacted_argument(user)
+    );
+    let list = super::hints::account_list(server);
+    let add = super::hints::account_add(server, user);
     app_error(
         ErrorKind::Config,
-        format!("unknown account '{server}/{user}'"),
+        format!(
+            "unknown account '{target}'\nnext: using the same home/profile selection, run `{list}` to see registered login accounts. Account selection requires a registered login account; it does not override the SSH username\nif a new login is needed, register it first with `{add}`. Password auth is the default; insert --auth agent before -- to use SSH-agent auth, or --password-stdin before -- for redirected password input. Never put passwords in arguments"
+        ),
     )
 }
 

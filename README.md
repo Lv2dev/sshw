@@ -191,11 +191,15 @@ sshw add server-beta --host 192.0.2.11 --port 2222 --user deploy --auth agent
 
 Agent auth stores no secret; it uses the active SSH agent.
 
+Agent authentication failures in `run`, `put` and `get` show the selected login user, endpoint, redacted native cause and recovery steps. Run `sshw doctor` with the same home/profile and execution environment, check the agent connection and loaded identities, then verify that the server allows that account/key. An unavailable agent and an agent with no identities can have different causes. These errors retain auth/4 and JSON `causes`; they do not automatically start an agent, load keys, or fall back to password auth. Host-key verification still happens before authentication.
+
 ### Managing Server Accounts
 
 Each server endpoint can hold multiple explicitly registered SSH usernames. Omitting `--user` uses that server's `default_user`; `--user <name>` selects only an existing account and never acts as an ad-hoc username override.
 
 The canonical selector is the explicit `--user` flag. `user@alias` is not parsed because existing server aliases may contain `@`; an exact flag avoids ambiguous target resolution.
+
+An unknown account error (config/3) explains that login selection requires a registered account and shows copyable `account list` and `account add` commands. Use the same home/profile. Registration defaults to hidden password input; insert `--auth agent` before the suggested command's `--` for agent auth, or `--password-stdin` for redirected password input. The error does not register an account or change credentials. Suggested names are masked and quoted for the local shell.
 
 ```bash
 sshw account add server-alpha ops                         # password prompt
@@ -720,7 +724,11 @@ sshw add server-beta --host 192.0.2.11 --port 2222 --user deploy --auth agent
 
 agent auth는 비밀을 저장하지 않고 활성 SSH agent를 사용합니다.
 
+`run`·`put`·`get`의 agent 인증 실패는 선택한 로그인 사용자·host/port·마스킹한 native 원인과 점검 방법을 표시합니다. 같은 home/profile과 실행 환경에서 `sshw doctor`를 실행하고 agent 연결·로드된 키 및 서버의 해당 계정/키 허용을 확인하세요. agent 연결 불가와 키 부재는 원인이 다를 수 있습니다. auth/4·JSON causes와 host key 확인 후 인증 순서를 유지하며 agent 시작·키 로드·비밀번호 fallback을 자동 실행하지 않습니다.
+
 ### 서버 account 관리
+
+미등록 계정 오류(config/3)는 등록된 로그인 계정을 선택해야 한다는 설명과 복사 가능한 `account list`·`account add` 명령을 제공합니다. 같은 home/profile을 사용하세요. 새 등록은 기본적으로 비밀번호 숨김 입력을 사용하며, agent 인증은 안내 명령의 `--` 앞에 `--auth agent`, 비밀번호 pipe/redirection은 `--password-stdin`을 넣습니다. 오류가 계정이나 자격 증명을 자동 변경하지 않으며 이름을 개별 마스킹하고 로컬 셸에 맞게 인용합니다.
 
 각 server endpoint에는 여러 SSH username을 명시적으로 등록할 수 있습니다. `--user`를 생략하면 server의 `default_user`를 사용하고, `--user <name>`은 등록된 account만 선택하며 임의 username override로 동작하지 않습니다.
 
