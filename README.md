@@ -243,6 +243,8 @@ Privilege metadata is scoped to the selected login account. `privilege set/show/
 
 For a server that already permits passwordless sudo, use `sshw run web "id -u" --as-root --no-password`. This runs `sudo -n` without reading a stored privilege password or prompting. It uses the configured sudo target user, or `root` when no privilege configuration exists; a configured `su` path is rejected. The server still enforces sudoers. `privilege set --account` also accepts `--login-user`, and its target `--user` accepts `--target-user`.
 
+`run --as-root` checks the required privilege settings and any su/`--no-password` conflict before looking up the login password. A missing login password therefore no longer hides a local privilege configuration error (config/3). Safety, policy, account selection and stream/su checks still run first. Ordinary login failures remain auth/4, and `--as-root --no-password` still allows an account without saved privilege settings.
+
 To save a passwordless sudo target for a specific login account:
 
 ```bash
@@ -445,6 +447,8 @@ Privilege password lookup failures from `run --as-root` also show the server/log
 Lock and config/profile-registry persistence failures show the reported path, operation stage, masked underlying cause, and a recovery step in human and JSON errors. Check the reported path/parent permissions, file type, filesystem, or active lock holder as indicated. Existing exit codes, JSON causes, timeouts, concurrency checks and atomic writes remain unchanged. A parent-directory sync failure after publication explicitly says the state was published: inspect it before retrying; the original publication marker and credential cleanup decisions are retained.
 
 ### JSON Error Contract
+
+Connection setup failures from `run`, `put`, `get` and `trust` show the failing stage (address resolution, TCP connection or SSH handshake), host/port, redacted underlying cause and a next step. For a refused connection, check the endpoint, whether SSH is listening, and network/firewall access. The displayed `connect timeout budget` is the maximum budget, not elapsed time; the cause identifies an actual timeout or refusal. Errors retain ssh/5 and JSON `causes`. Connection deadlines, retries, host-key verification and authentication behavior remain unchanged.
 
 Commands that support `--json` (`add`, `list`, `show`, `trust`, `run`, `put`, `get`, `remove`, `doctor`, `account add`, `account list`, `account show`, `account remove`, `profile list`, `profile show`, `privilege set`, `privilege show`, `privilege clear`) return a structured error envelope on runtime failures:
 
@@ -766,6 +770,8 @@ privilege metadata는 선택된 login account별로 분리됩니다. `privilege 
 
 서버가 이미 무비밀번호 sudo를 허용한다면 `sshw run web "id -u" --as-root --no-password`를 사용하세요. 저장된 privilege 비밀번호를 읽거나 입력받지 않고 `sudo -n`을 실행합니다. 등록된 sudo 대상 계정을 사용하며 설정이 없으면 root입니다. su 설정이 있으면 거부하고 실제 권한은 원격 sudoers가 결정합니다. `privilege set --account`는 `--login-user`, 대상 `--user`는 `--target-user` 별칭도 지원합니다.
 
+`run --as-root`는 로그인 비밀번호 조회 전에 필요한 승격 설정과 su/`--no-password` 충돌을 검사합니다. 로그인 비밀번호가 없어도 로컬 승격 설정 오류(config/3)를 먼저 안내합니다. 기존 safety/policy/account 선택과 stream/su 검사는 더 먼저 실행합니다. 일반 로그인 오류는 auth/4이며, 저장된 승격 설정 없이 `--as-root --no-password`를 사용하는 의미도 유지합니다.
+
 로그인 계정별 무비밀번호 sudo 대상을 저장하려면 다음과 같이 실행합니다.
 
 ```bash
@@ -960,6 +966,8 @@ sshw doctor --json
 `doctor`는 해석된 home과 선택 경위, registry/config/known_hosts/policy/audit 경로, registry 유효성과 진단(`registry_valid`, `registry_message`), config 파일 존재 여부, 운영체제, 연결된 libssh2 및 OpenSSL 버전/상태, credential namespace, policy present/valid/enabled, audit 쓰기 가능 여부, credential backend 상태, 그리고 누락된 login credential을 `server/user` 항목으로 보고하는 `missing_credentials`를 제공합니다. 손상된 registry도 `doctor` 실행을 막지 않으며, 명시적 home이 이미 해석되지 않았다면 내장 default home에서 registry 오류를 진단합니다. Windows 기본 빌드에서는 libssh2가 OpenSSL 대신 WinCNG를 사용하므로 `openssl_version`이 `not linked (Windows WinCNG backend)`로 표시될 수 있습니다.
 
 ### JSON 오류 계약
+
+`run`·`put`·`get`·`trust`의 연결 준비 실패는 주소 해석·TCP 연결·SSH handshake 중 실패한 단계, host/port, 마스킹한 원래 원인과 다음 조치를 표시합니다. 연결 거부라면 주소/포트·SSH 서비스의 수신 상태·네트워크/방화벽 접근을 확인하세요. `connect timeout budget`은 실제 대기 시간이 아닌 최대 연결 예산이며, 실제 타임아웃/연결 거부는 원인에서 구분합니다. ssh/5·JSON causes 및 연결 deadline/retry·host key 확인·인증 동작은 유지합니다.
 
 `--json`을 지원하는 명령(`add`, `list`, `show`, `trust`, `run`, `put`, `get`, `remove`, `doctor`, `account add`, `account list`, `account show`, `account remove`, `profile list`, `profile show`, `privilege set`, `privilege show`, `privilege clear`)은 런타임 실패 시 구조화된 envelope를 반환합니다.
 

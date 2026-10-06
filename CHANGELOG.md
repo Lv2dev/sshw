@@ -8,6 +8,10 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 
 ## [Unreleased]
 
+### 승격 설정 검사 순서·연결 오류 안내
+- `run --as-root`는 로그인 비밀번호를 조회하기 전에 필요한 승격 설정과 su/`--no-password` 불일치를 검사합니다. 두 문제가 함께 있으면 config/3 승격 오류를 먼저 안내합니다. 기존 safety/policy/account·stream/su 검사, 일반 로그인 오류와 무설정 `--no-password` 허용 의미는 유지합니다.
+- `run/put/get/trust`의 공통 연결 실패에 주소 해석·TCP·SSH handshake 단계, host/port, 개별 마스킹한 원인과 다음 조치를 표시합니다. 최대 연결 예산은 실제 대기 시간과 구분하며, 원래 오류 타입·ssh/5·JSON causes·deadline/retry·host key/인증 순서를 보존합니다.
+
 ### 빈 로컬 경로·비밀번호 stdin 터미널 입력
 - `put/get`과 대응 정책 검사는 길이0인 로컬 원본/목적지를 공통 target 해석에서 usage/9로 거절하고 변수 확인·입력 예시를 안내합니다. 설정/정책/default server/remote 검증 순서와 원본·유효한 공백 파일명은 유지합니다.
 - `--password-stdin`의 stdin이 터미널이면 읽기 전에 auth/4로 거절하고 옵션을 생략한 hidden 입력 또는 비밀 관리자의 pipe/redirection 사용법을 안내합니다. 자동 입력 방식 전환 없이 기존 파이프/파일·EOF/CRLF 처리·login 내부 줄바꿈·승격 형식 검증을 보존합니다.

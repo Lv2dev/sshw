@@ -96,6 +96,178 @@ impl Prompter for NoPrompts {
 }
 
 #[test]
+fn privilege_order_rejects_invalid_elevation_before_credential_reads() {
+    for su in [false, true] {
+        for explicit in [false, true] {
+            for json_output in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let path = temp.path().join("servers.json");
+                config(&path, "example.test", 2222, "web", "deploy");
+                if su {
+                    let mut saved = load_config(&path).unwrap();
+                    saved
+                        .servers
+                        .get_mut("web")
+                        .unwrap()
+                        .accounts
+                        .get_mut("deploy")
+                        .unwrap()
+                        .privilege = Some(PrivilegeConfig {
+                        method: PrivilegeMethod::Su,
+                        user: "root".into(),
+                        credential: Some(
+                            ResolvedHome::from_config_path(&path)
+                                .namespace
+                                .new_account_credential_key(
+                                    CredentialPurpose::Privilege,
+                                    "web",
+                                    "deploy",
+                                ),
+                        ),
+                        no_password: false,
+                    });
+                    save_config(&path, &saved).unwrap();
+                }
+                let before = std::fs::read(&path).unwrap();
+                let store = Store {
+                    persistent: true,
+                    error: Some("credential backend unavailable"),
+                    reads: Cell::new(0),
+                };
+                let expected = if su {
+                    "requires a sudo privilege path"
+                } else {
+                    "privilege configuration missing"
+                };
+                for preflight in [false, true] {
+                    let mut args = vec!["sshw"];
+                    args.extend(if preflight {
+                        vec!["policy", "check"]
+                    } else {
+                        vec!["run"]
+                    });
+                    if explicit {
+                        args.push("web");
+                    }
+                    args.extend(["uptime", "--as-root"]);
+                    if su {
+                        args.push("--no-password");
+                    }
+                    if json_output {
+                        args.push("--json");
+                    }
+                    let output = execute_for_runtime(
+                        Cli::try_parse_from(args).unwrap(),
+                        &path,
+                        &store,
+                        &NoNetwork,
+                        &mut NoPrompts,
+                    );
+                    assert_eq!(output.exit_code, 3, "{output:?}");
+                    assert!(
+                        format!("{}{}", output.stdout, output.stderr).contains(expected),
+                        "{output:?}"
+                    );
+                    if json_output {
+                        let body: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+                        if preflight {
+                            assert_eq!(body["allowed"], false);
+                            assert_eq!(body["credentials_checked"], false);
+                        } else {
+                            assert_eq!(body["error"]["kind"], "config");
+                        }
+                    }
+                }
+                assert_eq!(store.reads.get(), 0);
+                assert_eq!(std::fs::read(&path).unwrap(), before);
+            }
+        }
+    }
+}
+
+#[test]
+fn privilege_order_preserves_valid_login_errors_and_prior_local_denials() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    config(&path, "example.test", 2222, "web", "deploy");
+    let store = Store {
+        persistent: true,
+        error: Some("credential backend unavailable"),
+        reads: Cell::new(0),
+    };
+    for extra in [vec![], vec!["--as-root", "--no-password"]] {
+        let mut args = vec!["sshw", "run", "web", "uptime", "--json"];
+        args.extend(extra);
+        let output = execute_for_runtime(
+            Cli::try_parse_from(args).unwrap(),
+            &path,
+            &store,
+            &NoNetwork,
+            &mut NoPrompts,
+        );
+        assert_eq!(output.exit_code, 4, "{output:?}");
+        assert!(output.stdout.contains("failed to load login credential"));
+    }
+    assert_eq!(store.reads.get(), 2);
+    let mut saved = load_config(&path).unwrap();
+    saved
+        .servers
+        .get_mut("web")
+        .unwrap()
+        .accounts
+        .get_mut("deploy")
+        .unwrap()
+        .privilege = Some(PrivilegeConfig {
+        method: PrivilegeMethod::Su,
+        user: "root".into(),
+        no_password: false,
+        credential: Some(
+            ResolvedHome::from_config_path(&path)
+                .namespace
+                .new_account_credential_key(CredentialPurpose::Privilege, "web", "deploy"),
+        ),
+    });
+    save_config(&path, &saved).unwrap();
+    let output = execute_for_runtime(
+        Cli::try_parse_from([
+            "sshw",
+            "run",
+            "web",
+            "uptime",
+            "--as-root",
+            "--no-password",
+            "--stream",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &NoNetwork,
+        &mut NoPrompts,
+    );
+    assert_eq!(output.exit_code, 9);
+    assert_eq!(store.reads.get(), 2);
+    std::fs::write(temp.path().join("policy.json"), r#"{"version":2,"enabled":true,"allow_commands":[],"allow_put_paths":[],"allow_get_paths":[],"allow_accounts":[]}"#).unwrap();
+    let output = execute_for_runtime(
+        Cli::try_parse_from([
+            "sshw",
+            "run",
+            "web",
+            "uptime",
+            "--as-root",
+            "--no-password",
+            "--json",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &NoNetwork,
+        &mut NoPrompts,
+    );
+    assert_eq!(output.exit_code, 7);
+    assert_eq!(store.reads.get(), 2);
+}
+
+#[test]
 fn local_stdin_empty_local_paths_are_usage_errors_in_execution_and_preflight() {
     for operation in ["put", "get"] {
         for explicit in [false, true] {

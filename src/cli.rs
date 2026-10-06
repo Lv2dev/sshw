@@ -824,8 +824,8 @@ where
             "--stream is not supported with su PTY; use the ordinary buffered run or a sudo privilege path",
         ));
     }
-    let auth = resolve_auth(&server_name, account, login_user, credentials)?;
     check_run_privilege(&server_name, login_user, account, as_root, no_password)?;
+    let auth = resolve_auth(&server_name, account, login_user, credentials)?;
     let ssh_target = SshTarget::new(server, login_user);
     let privileged = if no_password
         || (as_root

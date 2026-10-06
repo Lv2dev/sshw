@@ -2,8 +2,10 @@ use super::known_hosts::read_known_hosts_file;
 use super::{HostKeyInfo, PartialRunError, RunResult, SshClient, SshTarget, TransferResult};
 use crate::config::ServerConfig;
 use crate::credentials::AuthMaterial;
-use crate::error::{ResultErrorKindExt, app_error, classified_error, classified_io_error};
-use crate::output::ErrorKind;
+use crate::error::{
+    ResultErrorKindExt, app_error, classified_error, classified_io_error, redacted_error_detail,
+};
+use crate::output::{ErrorKind, redact_secrets};
 use anyhow::Context;
 use base64::Engine;
 use directories::BaseDirs;
@@ -737,6 +739,47 @@ fn connect_verified_authenticated(
     Ok(session)
 }
 
+#[derive(Clone, Copy)]
+enum ConnectStage {
+    Resolve,
+    Tcp,
+    Handshake,
+}
+
+fn connect_diagnostic(
+    source: anyhow::Error,
+    server: &ServerConfig,
+    timeout: Duration,
+    stage: ConnectStage,
+) -> anyhow::Error {
+    let (operation, recovery) = match stage {
+        ConnectStage::Resolve => (
+            "resolve",
+            "check the configured host/port, DNS availability and network connectivity",
+        ),
+        ConnectStage::Tcp => (
+            "connect to",
+            "check the configured host/port, that the SSH service is listening, and network/firewall access",
+        ),
+        ConnectStage::Handshake => (
+            "complete SSH handshake with",
+            "check that the endpoint is running SSH and inspect server/network logs before retrying",
+        ),
+    };
+    let host = redact_secrets(&server.host);
+    let host = if host == server.host {
+        host.as_str()
+    } else {
+        "<redacted>"
+    };
+    let detail = redacted_error_detail(&source);
+    source.context(format!(
+        "failed to {operation} {host}:{} (connect timeout budget: {} ms)\ncaused by: {detail}\nnext: {recovery}",
+        server.port,
+        timeout.as_millis(),
+    ))
+}
+
 fn connect(server: &ServerConfig, timeout: Duration) -> anyhow::Result<Session> {
     let address = format!("{}:{}", server.host, server.port);
     let deadline = ConnectDeadline::new(timeout);
@@ -746,27 +789,44 @@ fn connect(server: &ServerConfig, timeout: Duration) -> anyhow::Result<Session> 
             .to_socket_addrs()
             .map(|addresses| addresses.collect())
     })
-    .with_context(|| format!("failed to resolve {address}"))?;
+    .map_err(|error| connect_diagnostic(error, server, timeout, ConnectStage::Resolve))?;
     let mut last_error = None;
     let mut resolved_any = false;
     for socket_addr in socket_addrs {
         resolved_any = true;
         let mut kex_retries_remaining = WINDOWS_KEX_HANDSHAKE_RETRIES;
         loop {
-            let remaining = deadline.remaining()?;
+            let remaining = deadline
+                .remaining()
+                .map_err(|error| connect_diagnostic(error, server, timeout, ConnectStage::Tcp))?;
             match TcpStream::connect_timeout(&socket_addr, remaining) {
                 Ok(tcp) => {
-                    tcp.set_read_timeout(Some(deadline.remaining()?))?;
-                    tcp.set_write_timeout(Some(deadline.remaining()?))?;
-                    let mut session = Session::new()?;
-                    session.set_timeout(timeout_millis(deadline.remaining()?));
-                    session.set_tcp_stream(tcp);
-                    match session.handshake() {
-                        Ok(()) => return Ok(session),
-                        Err(err) if should_retry_windows_kex(&err, kex_retries_remaining) => {
+                    let handshake = (|| -> anyhow::Result<Session> {
+                        tcp.set_read_timeout(Some(deadline.remaining()?))?;
+                        tcp.set_write_timeout(Some(deadline.remaining()?))?;
+                        let mut session = Session::new()?;
+                        session.set_timeout(timeout_millis(deadline.remaining()?));
+                        session.set_tcp_stream(tcp);
+                        session.handshake()?;
+                        Ok(session)
+                    })();
+                    match handshake {
+                        Ok(session) => return Ok(session),
+                        Err(err)
+                            if err.downcast_ref::<ssh2::Error>().is_some_and(|error| {
+                                should_retry_windows_kex(error, kex_retries_remaining)
+                            }) =>
+                        {
                             kex_retries_remaining -= 1;
                         }
-                        Err(err) => return Err(err.into()),
+                        Err(err) => {
+                            return Err(connect_diagnostic(
+                                err,
+                                server,
+                                timeout,
+                                ConnectStage::Handshake,
+                            ));
+                        }
                     }
                 }
                 Err(err) => {
@@ -778,20 +838,18 @@ fn connect(server: &ServerConfig, timeout: Duration) -> anyhow::Result<Session> 
     }
 
     if !resolved_any {
-        return Err(anyhow::anyhow!("failed to resolve {address}"));
+        return Err(connect_diagnostic(
+            anyhow::anyhow!("resolver returned no addresses"),
+            server,
+            timeout,
+            ConnectStage::Resolve,
+        ));
     }
 
     let err = last_error
         .map(anyhow::Error::from)
         .unwrap_or_else(|| anyhow::anyhow!("no resolved address was reachable"));
-    Err(err).with_context(|| {
-        format!(
-            "failed to connect to {}:{} within {} seconds",
-            server.host,
-            server.port,
-            timeout.as_secs()
-        )
-    })
+    Err(connect_diagnostic(err, server, timeout, ConnectStage::Tcp))
 }
 
 fn should_retry_windows_kex(error: &ssh2::Error, retries_remaining: usize) -> bool {
@@ -1491,6 +1549,101 @@ example.test ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB9zU1OEQ2tzYhrXq4/DEjvRNvKv6cU
     }
 
     #[test]
+    fn connect_diagnostics_keep_typed_causes_and_redact_endpoint_and_secrets() {
+        for (stage, operation) in [
+            (super::ConnectStage::Resolve, "resolve"),
+            (super::ConnectStage::Tcp, "connect to"),
+        ] {
+            let server = ServerConfig::single_account(
+                "token=endpoint-secret",
+                2222,
+                "deploy",
+                AuthConfig::Agent,
+            );
+            let error = anyhow::Error::new(std::io::Error::new(std::io::ErrorKind::ConnectionRefused,
+                "socket failure: password=cause-secret\n-----BEGIN PRIVATE KEY-----\nprivate-material\n-----END PRIVATE KEY-----"))
+                .context("setup denied");
+            let error = super::connect_diagnostic(
+                error,
+                &server,
+                std::time::Duration::from_millis(250),
+                stage,
+            );
+            let error = Err::<(), _>(error)
+                .with_error_kind(ErrorKind::Ssh)
+                .unwrap_err();
+            let response = crate::output::ErrorResponse::from_error(&error);
+            let rendered = serde_json::to_string(&response).unwrap();
+            for secret in ["endpoint-secret", "cause-secret", "private-material"] {
+                assert!(!rendered.contains(secret), "{rendered}");
+            }
+            assert_eq!(response.error.exit_code, 5);
+            assert!(
+                response
+                    .error
+                    .message
+                    .contains(&format!("failed to {operation} <redacted>:2222"))
+            );
+            assert!(
+                response.error.message.contains("setup denied")
+                    && response.error.message.contains("socket failure")
+            );
+            assert!(
+                response
+                    .error
+                    .message
+                    .contains("connect timeout budget: 250 ms")
+                    && response.error.message.contains("next: check")
+            );
+            assert!(error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::ConnectionRefused)
+            }));
+        }
+    }
+
+    #[test]
+    fn connect_diagnostics_keep_native_handshake_error_and_recovery() {
+        let server = ServerConfig::single_account("127.0.0.1", 2222, "deploy", AuthConfig::Agent);
+        let native = ssh2::Error::from_errno(ssh2::ErrorCode::Session(
+            libssh2_sys::LIBSSH2_ERROR_KEY_EXCHANGE_FAILURE,
+        ));
+        let message = native.to_string();
+        let error = super::connect_diagnostic(
+            native.into(),
+            &server,
+            std::time::Duration::from_secs(15),
+            super::ConnectStage::Handshake,
+        );
+        let error = Err::<(), _>(error)
+            .with_error_kind(ErrorKind::Ssh)
+            .unwrap_err();
+        let response = crate::output::ErrorResponse::from_error(&error);
+        assert_eq!(response.error.exit_code, 5);
+        assert!(
+            response
+                .error
+                .message
+                .contains("complete SSH handshake with 127.0.0.1:2222")
+        );
+        assert!(response.error.message.contains(&message));
+        assert!(
+            response
+                .error
+                .message
+                .contains("next: check that the endpoint is running SSH")
+        );
+        assert!(response.error.causes.iter().any(|cause| cause == &message));
+        assert!(error.chain().any(|cause| {
+            cause.downcast_ref::<ssh2::Error>().is_some_and(|native| {
+                native.code()
+                    == ssh2::ErrorCode::Session(libssh2_sys::LIBSSH2_ERROR_KEY_EXCHANGE_FAILURE)
+            })
+        }));
+    }
+
+    #[test]
     fn resolver_wait_is_bounded_by_the_total_connect_deadline() {
         let (release_sender, release_receiver) = std::sync::mpsc::channel();
         let deadline = super::ConnectDeadline::new(std::time::Duration::from_millis(25));
@@ -1502,6 +1655,28 @@ example.test ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB9zU1OEQ2tzYhrXq4/DEjvRNvKv6cU
         release_sender.send(()).unwrap();
 
         assert!(err.to_string().contains("connect phase timed out"));
+        let server = ServerConfig::single_account("example.test", 22, "deploy", AuthConfig::Agent);
+        let err = super::connect_diagnostic(
+            err,
+            &server,
+            std::time::Duration::from_millis(25),
+            super::ConnectStage::Resolve,
+        );
+        let response = crate::output::ErrorResponse::from_error(&err);
+        assert_eq!(response.error.exit_code, 5);
+        assert!(
+            response
+                .error
+                .message
+                .contains("timed out after 25 milliseconds")
+        );
+        assert!(
+            response
+                .error
+                .message
+                .contains("connect timeout budget: 25 ms")
+                && response.error.message.contains("DNS availability")
+        );
     }
 
     #[test]
