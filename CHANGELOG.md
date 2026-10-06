@@ -8,6 +8,10 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 
 ## [Unreleased]
 
+### 등록 옵션 검사·동일 프로필 재등록
+- `add/account add`는 기존 대상·endpoint/replace 검증 후 확인 입력 전에 agent/`--password-stdin` 충돌을 config/3으로 안내합니다. 유효한 갱신의 확인/force와 비밀번호 입력·설정 저장·credential 정리를 유지합니다.
+- `profile add --force`는 대상 설정 검사 후 전체 registry가 같으면 저장을 생략하고 일반 출력의 변경 없음과 JSON `changed:false`/`change:"unchanged"`를 표시합니다. 실제 변경은 `true`와 기존 `added/updated` 의미를 표시하며, 기존 action/id/home/namespace_changed·force·lock/audit 및 실제 변경의 CAS/atomic/default/namespace warning을 보존합니다.
+
 ### 계정 선택·SSH agent 인증 오류 안내
 - 미등록 로그인 계정 오류에 같은 home/profile의 계정 목록 조회와 새 계정 등록 명령을 안내합니다. 등록 계정 선택이라는 의미를 설명하고, 이름을 개별 마스킹·플랫폼 인용하며 `--` 경계를 유지합니다. config/3·미등록 거부·기존 검사 순서와 설정/비밀 미변경을 보존합니다.
 - `run/put/get`의 SSH agent 인증 실패는 로그인 사용자·host/port·개별 마스킹한 native 원인과 같은 실행 환경의 doctor/agent/키/서버 허용 점검 방법을 표시합니다. 원래 source/type/code·auth/4·JSON causes·host key 검증 후 인증과 비밀번호/승격 동작을 유지하며 agent 시작·키 로드·fallback을 자동 실행하지 않습니다.

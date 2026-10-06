@@ -1523,6 +1523,16 @@ where
     Ok(ok(stdout))
 }
 
+fn check_registration_auth(auth: AuthArg, password_stdin: bool) -> anyhow::Result<()> {
+    if password_stdin && matches!(auth, AuthArg::Agent) {
+        return Err(app_error(
+            ErrorKind::Config,
+            "--password-stdin cannot be used with --auth agent",
+        ));
+    }
+    Ok(())
+}
+
 fn resolve_auth<C>(
     server_name: &str,
     account: &AccountConfig,

@@ -7213,26 +7213,35 @@ fn profile_updates_preserve_compatible_legacy_namespace_and_report_moves() {
             &mut FakePrompter::default(),
         );
         assert_eq!(same.exit_code, 0, "{}{}", same.stdout, same.stderr);
+        let same_entry = sshw::profile::load_registry(&registry_path)
+            .unwrap()
+            .profiles["prod"]
+            .clone();
+        let changed = same_entry != first;
         if json {
             let value: serde_json::Value = serde_json::from_str(&same.stdout).unwrap();
             assert_eq!(value["action"], "updated");
             assert_eq!(value["id"], first.id);
             assert_eq!(value["namespace_changed"], false);
+            assert_eq!(value["changed"], changed);
+            assert_eq!(
+                value["change"],
+                if changed { "updated" } else { "unchanged" }
+            );
             assert!(value.get("warning").is_none());
         } else {
             assert!(
-                same.stdout.contains("updated profile prod")
-                    && same.stdout.contains("credential namespace unchanged")
+                same.stdout.contains(if changed {
+                    "updated profile prod"
+                } else {
+                    "(unchanged)"
+                }) && same.stdout.contains("credential namespace unchanged")
             );
         }
         assert_eq!(
             std::fs::read_to_string(original.join("servers.json")).unwrap(),
             legacy
         );
-        let same_entry = sshw::profile::load_registry(&registry_path)
-            .unwrap()
-            .profiles["prod"]
-            .clone();
         assert_eq!(same_entry.id, first.id);
         let vacant = temp.path().join("vacant");
         let mut args = vec![

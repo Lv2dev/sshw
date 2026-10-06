@@ -68,6 +68,7 @@ where
             "changing a server's host or port requires --replace (removes its accounts and privilege settings); use a new server name to keep the existing configuration",
         ));
     }
+    super::check_registration_auth(args.auth, args.password_stdin)?;
     let prompt = if args.replace {
         format!(
             "replace server '{}' and remove its existing accounts and privilege settings{account_notice}? [y/N] ",
@@ -112,15 +113,7 @@ where
             new_password_credential = Some((credential.clone(), args.user.clone()));
             AuthConfig::Password { credential }
         }
-        AuthArg::Agent => {
-            if args.password_stdin {
-                return Err(app_error(
-                    ErrorKind::Config,
-                    "--password-stdin cannot be used with --auth agent",
-                ));
-            }
-            AuthConfig::Agent
-        }
+        AuthArg::Agent => AuthConfig::Agent,
     };
 
     let mut accounts = previous_server

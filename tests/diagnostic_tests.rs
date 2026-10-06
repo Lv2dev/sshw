@@ -1,5 +1,6 @@
 use clap::Parser;
-use sshw::cli::{Cli, Prompter, execute, execute_for_runtime};
+use sshw::audit::FileAuditSink;
+use sshw::cli::{Cli, ExecContext, Prompter, execute, execute_for_runtime, execute_with};
 use sshw::config::{
     AccountConfig, AuthConfig, PrivilegeConfig, PrivilegeMethod, ServerConfig, SshwConfig,
     load_config, save_config,
@@ -93,6 +94,257 @@ impl Prompter for NoPrompts {
     fn password_stdin(&mut self) -> anyhow::Result<String> {
         panic!("unexpected stdin read")
     }
+}
+
+#[test]
+fn registration_validation_rejects_conflicting_auth_before_confirm_or_secret_input() {
+    for account in [false, true] {
+        for existing in [false, true] {
+            for force in [false, true] {
+                for json in [false, true] {
+                    let temp = tempfile::tempdir().unwrap();
+                    let path = temp.path().join("servers.json");
+                    config(&path, "example.test", 2222, "web", "deploy");
+                    let before = std::fs::read(&path).unwrap();
+                    let store = Store {
+                        persistent: true,
+                        error: Some("must not query"),
+                        reads: Cell::new(0),
+                    };
+                    let mut args = if account {
+                        vec![
+                            "sshw",
+                            "account",
+                            "add",
+                            "web",
+                            if existing { "deploy" } else { "ops" },
+                        ]
+                    } else {
+                        vec![
+                            "sshw",
+                            "add",
+                            if existing { "web" } else { "new" },
+                            "--host",
+                            "example.test",
+                            "--port",
+                            "2222",
+                            "--user",
+                            "deploy",
+                        ]
+                    };
+                    args.extend(["--auth", "agent", "--password-stdin"]);
+                    if force {
+                        args.push("--force");
+                    }
+                    if json {
+                        args.push("--json");
+                    }
+                    let output = execute_for_runtime(
+                        Cli::try_parse_from(args).unwrap(),
+                        &path,
+                        &store,
+                        &NoNetwork,
+                        &mut NoPrompts,
+                    );
+                    assert_eq!(output.exit_code, 3, "{output:?}");
+                    assert!(
+                        format!("{}{}", output.stdout, output.stderr)
+                            .contains("--password-stdin cannot be used with --auth agent"),
+                        "{output:?}"
+                    );
+                    assert_eq!(std::fs::read(&path).unwrap(), before);
+                    assert_eq!(store.reads.get(), 0);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn registration_validation_preserves_target_and_replace_error_precedence() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    config(&path, "example.test", 2222, "web", "deploy");
+    let store = Store {
+        persistent: true,
+        error: Some("must not query"),
+        reads: Cell::new(0),
+    };
+    for (mut args, expected) in [
+        (
+            vec![
+                "sshw",
+                "add",
+                "web",
+                "--host",
+                "different.test",
+                "--port",
+                "2222",
+                "--user",
+                "deploy",
+            ],
+            "requires --replace",
+        ),
+        (
+            vec!["sshw", "account", "add", "absent", "deploy"],
+            "unknown server",
+        ),
+    ] {
+        args.extend(["--auth", "agent", "--password-stdin", "--json"]);
+        let output = execute_for_runtime(
+            Cli::try_parse_from(args).unwrap(),
+            &path,
+            &store,
+            &NoNetwork,
+            &mut NoPrompts,
+        );
+        assert_eq!(output.exit_code, 3);
+        assert!(output.stdout.contains(expected), "{output:?}");
+    }
+    assert_eq!(store.reads.get(), 0);
+}
+
+#[test]
+fn registration_validation_profile_noop_preserves_bytes_mtime_and_records_audit() {
+    let temp = tempfile::tempdir().unwrap();
+    let target = temp.path().join("target");
+    std::fs::create_dir(&target).unwrap();
+    let target = std::fs::canonicalize(target).unwrap();
+    let registry_path = temp.path().join("profiles.json");
+    let registry = sshw::profile::ProfileRegistry {
+        version: 1,
+        default: Some("repeat".into()),
+        profiles: BTreeMap::from([(
+            "repeat".into(),
+            sshw::profile::ProfileEntry {
+                id: "p_repeat_123".into(),
+                home: target.clone(),
+            },
+        )]),
+    };
+    std::fs::write(&registry_path, serde_json::to_vec(&registry).unwrap()).unwrap();
+    let before = std::fs::read(&registry_path).unwrap();
+    let before_time = std::fs::metadata(&registry_path)
+        .unwrap()
+        .modified()
+        .unwrap();
+    let home = ResolvedHome::from_config_path(&temp.path().join("control.json"));
+    let audit_path = temp.path().join("audit.jsonl");
+    let audit = FileAuditSink::new(audit_path.clone());
+    let ctx = ExecContext {
+        home: &home,
+        registry_path: &registry_path,
+        policy_forced: false,
+        audit: &audit,
+    };
+    let store = Store {
+        persistent: true,
+        error: Some("must not query"),
+        reads: Cell::new(0),
+    };
+    for json in [false, true] {
+        let mut args = vec![
+            "sshw",
+            "profile",
+            "add",
+            "repeat",
+            "--home",
+            target.to_str().unwrap(),
+            "--force",
+        ];
+        if json {
+            args.push("--json");
+        }
+        let output = execute_with(
+            Cli::try_parse_from(args).unwrap(),
+            &ctx,
+            &store,
+            &NoNetwork,
+            &mut NoPrompts,
+        )
+        .unwrap();
+        assert_eq!(output.exit_code, 0);
+        if json {
+            let body: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+            assert_eq!(body["changed"], false);
+            assert_eq!(body["change"], "unchanged");
+            assert_eq!(body["action"], "updated");
+            assert_eq!(body["id"], "p_repeat_123");
+            assert_eq!(body["namespace_changed"], false);
+        } else {
+            assert!(output.stdout.contains("(unchanged)"), "{output:?}");
+        }
+        assert_eq!(std::fs::read(&registry_path).unwrap(), before);
+        assert_eq!(
+            std::fs::metadata(&registry_path)
+                .unwrap()
+                .modified()
+                .unwrap(),
+            before_time
+        );
+    }
+    let audit_records = std::fs::read_to_string(&audit_path).unwrap();
+    assert_eq!(audit_records.lines().count(), 2);
+    assert_eq!(store.reads.get(), 0);
+}
+
+#[test]
+fn registration_validation_profile_keeps_target_validation_force_and_real_changes() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("control.json");
+    let target = temp.path().join("target");
+    std::fs::create_dir(&target).unwrap();
+    let registry_path = temp.path().join("profiles.json");
+    let store = Store {
+        persistent: true,
+        error: Some("must not query"),
+        reads: Cell::new(0),
+    };
+    let call = |force: bool| {
+        let mut args = vec![
+            "sshw",
+            "profile",
+            "add",
+            "repeat",
+            "--home",
+            target.to_str().unwrap(),
+            "--json",
+        ];
+        if force {
+            args.push("--force");
+        }
+        execute_for_runtime(
+            Cli::try_parse_from(args).unwrap(),
+            &path,
+            &store,
+            &NoNetwork,
+            &mut NoPrompts,
+        )
+    };
+    let output = call(false);
+    assert_eq!(output.exit_code, 0);
+    let body: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+    assert_eq!(body["changed"], true);
+    assert_eq!(body["change"], "added");
+    let mut registry = sshw::profile::load_registry(&registry_path).unwrap();
+    let original_id = registry.profiles["repeat"].id.clone();
+    let before = std::fs::read(&registry_path).unwrap();
+    assert_eq!(call(false).exit_code, 3);
+    std::fs::write(target.join("servers.json"), "{broken").unwrap();
+    assert_eq!(call(true).exit_code, 3);
+    assert_eq!(std::fs::read(&registry_path).unwrap(), before);
+    std::fs::remove_file(target.join("servers.json")).unwrap();
+    registry.default = None;
+    sshw::profile::save_registry(&registry_path, &registry).unwrap();
+    let output = call(true);
+    let body: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+    assert_eq!(output.exit_code, 0);
+    assert_eq!(body["changed"], true);
+    assert_eq!(body["change"], "updated");
+    let saved = sshw::profile::load_registry(&registry_path).unwrap();
+    assert_eq!(saved.default.as_deref(), Some("repeat"));
+    assert_eq!(saved.profiles["repeat"].id, original_id);
+    assert_eq!(store.reads.get(), 0);
 }
 
 #[test]

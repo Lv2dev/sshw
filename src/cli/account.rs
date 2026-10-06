@@ -31,6 +31,7 @@ where
     validate_server_name(&args.name).with_error_kind(ErrorKind::Config)?;
     validate_account_user(&args.user).with_error_kind(ErrorKind::Config)?;
     let previous = get_server(config, &args.name)?.account(&args.user).cloned();
+    super::check_registration_auth(args.auth, args.password_stdin)?;
     if previous.is_some()
         && !args.force
         && !prompter
@@ -67,15 +68,7 @@ where
             new_password_credential = Some(credential.clone());
             AuthConfig::Password { credential }
         }
-        AuthArg::Agent => {
-            if args.password_stdin {
-                return Err(app_error(
-                    ErrorKind::Config,
-                    "--password-stdin cannot be used with --auth agent",
-                ));
-            }
-            AuthConfig::Agent
-        }
+        AuthArg::Agent => AuthConfig::Agent,
     };
 
     let account = AccountConfig {

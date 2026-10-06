@@ -94,6 +94,7 @@ fn profile_add(
         "added"
     };
     let warning = namespace_changed.then_some("home changed; a fresh credential namespace was created. Previous home and keyring entries are left intact; password credentials must be registered again when needed");
+    let before = registry.clone();
     registry.profiles.insert(
         args.name.clone(),
         ProfileEntry {
@@ -105,9 +106,13 @@ fn profile_add(
         registry.default = Some(args.name.clone());
     }
 
-    save_registry_if_unchanged(registry_path, registry, revision)?;
+    let changed = *registry != before;
+    if changed {
+        save_registry_if_unchanged(registry_path, registry, revision)?;
+    }
     if args.json {
-        let mut output = json!({"ok":true,"action":action,"name":args.name,"home":home,"id":id,"namespace_changed":namespace_changed});
+        let mut output = json!({"ok":true,"action":action,"name":args.name,"home":home,"id":id,"namespace_changed":namespace_changed,
+            "changed":changed,"change":if changed { action } else { "unchanged" }});
         if let Some(warning) = warning {
             output["warning"] = json!(warning);
         }
@@ -116,7 +121,11 @@ fn profile_add(
         }
         return Ok(ok(format!("{}\n", output)));
     }
-    let mut message = format!("{action} profile {} -> {}\n", args.name, home.display());
+    let mut message = if changed {
+        format!("{action} profile {} -> {}\n", args.name, home.display())
+    } else {
+        format!("profile {} -> {} (unchanged)\n", args.name, home.display())
+    };
     if let Some(warning) = warning {
         if let Some(previous) = &previous {
             message.push_str(&format!(
