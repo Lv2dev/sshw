@@ -1,6 +1,6 @@
+use crate::error::{persistence_context, persistence_error};
 use crate::home::{CredentialNamespace, CredentialPurpose, validate_server_name};
 use crate::storage::write_owner_only_atomic;
-use anyhow::Context;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -374,9 +374,16 @@ fn read_config_contents(path: &Path) -> anyhow::Result<Option<String>> {
 }
 
 pub fn save_config(path: &Path, config: &SshwConfig) -> anyhow::Result<()> {
-    let contents = serde_json::to_string_pretty(config)?;
+    let contents = serde_json::to_string_pretty(config).map_err(|error| {
+        persistence_error(
+            error.into(),
+            "serialize config",
+            path,
+            "check that the config contains supported values before retrying",
+        )
+    })?;
     write_owner_only_atomic(path, &contents)
-        .with_context(|| format!("failed to save config at {}", path.display()))
+        .map_err(|error| persistence_context(error, "save config", path))
 }
 
 pub fn save_config_if_unchanged(

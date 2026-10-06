@@ -1,5 +1,53 @@
 use crate::output::{ConfigMutationOutput, DefaultChange, ErrorKind, redact_secrets};
 use std::fmt;
+use std::path::Path;
+
+pub(crate) fn redacted_error_detail(error: &anyhow::Error) -> String {
+    let mut details = Vec::new();
+    for cause in error.chain() {
+        let detail = redact_secrets(&cause.to_string());
+        if details.last() != Some(&detail) {
+            details.push(detail);
+        }
+    }
+    details.join("\ncaused by: ")
+}
+
+pub(crate) fn diagnostic_path(path: &Path) -> String {
+    let raw = path.display().to_string();
+    let redacted = redact_secrets(&raw);
+    if redacted != raw {
+        "<redacted>".into()
+    } else {
+        raw
+    }
+}
+
+pub(crate) fn persistence_error(
+    source: anyhow::Error,
+    operation: &str,
+    path: &Path,
+    recovery: &str,
+) -> anyhow::Error {
+    let detail = redacted_error_detail(&source);
+    source.context(format!(
+        "failed to {operation} at {}\ncaused by: {detail}\nnext: {recovery}",
+        diagnostic_path(path)
+    ))
+}
+
+/// Add the document's purpose without repeating the nested storage diagnostic.
+pub(crate) fn persistence_context(
+    source: anyhow::Error,
+    operation: &str,
+    path: &Path,
+) -> anyhow::Error {
+    let detail = redact_secrets(&source.to_string());
+    source.context(format!(
+        "failed to {operation} at {}: {detail}",
+        diagnostic_path(path)
+    ))
+}
 
 /// Error wrapper carrying a stable machine-facing kind independently from its
 /// human-readable message and dynamic values.
@@ -41,6 +89,53 @@ pub fn classified_io_error(
 
 pub fn app_error(kind: ErrorKind, message: impl Into<String>) -> anyhow::Error {
     classified_error(kind, anyhow::anyhow!(message.into()))
+}
+
+#[cfg(test)]
+mod persistence_tests {
+    use super::*;
+
+    #[test]
+    fn clear_persistence_diagnostics_redact_paths_causes_and_keep_typed_io() {
+        let source = anyhow::Error::new(std::io::Error::new(std::io::ErrorKind::PermissionDenied,
+            "token=persistence-secret\n-----BEGIN PRIVATE KEY-----\nprivate-material\n-----END PRIVATE KEY-----"))
+            .context("storage service refused the request");
+        let error = persistence_error(
+            source,
+            "write temporary state file",
+            Path::new("token=path-secret"),
+            "check parent permissions before retrying",
+        );
+        let error = persistence_context(
+            error,
+            "save config",
+            Path::new("password=destination-secret"),
+        );
+        let error = classified_error(ErrorKind::Config, error);
+        let response = crate::output::ErrorResponse::from_error(&error);
+        assert_eq!(response.error.exit_code, 3);
+        let rendered = format!("{} {:?}", response.error.message, response.error.causes);
+        for secret in [
+            "persistence-secret",
+            "private-material",
+            "path-secret",
+            "destination-secret",
+        ] {
+            assert!(!rendered.contains(secret), "{rendered}");
+        }
+        assert!(
+            response.error.message.contains("storage service refused")
+                && response
+                    .error
+                    .message
+                    .contains("next: check parent permissions")
+        );
+        assert!(error.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
+        }));
+    }
 }
 
 #[derive(Debug)]

@@ -8,6 +8,10 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 
 ## [Unreleased]
 
+### 승격 설정 해제·잠금/저장 오류 안내
+- 존재하는 계정의 저장된 승격 설정이 이미 없으면 `privilege clear`는 확인 입력·설정 저장·비밀 삭제 없이 변경 없는 성공으로 처리합니다. JSON은 기존 cleared action/대상 필드와 `changed:false`/`change:"unchanged"`를, 실제 해제는 `true`/`"removed"`를 표시합니다. unknown target·schema·lock/audit와 실제 해제의 credential cleanup/부분 적용 계약은 유지합니다.
+- 공통 잠금과 atomic config/registry 저장 실패에 파일 경로·작업 단계·마스킹한 원인·복구 방법을 표시합니다. 원래 typed source·exit/envelope·timeout/CAS·atomic 저장 및 저장 후 디렉터리 sync 실패의 published 상태를 유지하고, 저장 완료 여부에 따른 자격 증명 정리 판단을 바꾸지 않습니다.
+
 ### 기본값 재설정·감사 로그 쓰기 진단
 - 이미 같은 기본 서버·로그인 계정·프로필을 지정하면 설정/registry 저장을 생략하고 일반 출력의 변경 없음 및 JSON `changed:false`/`change:"unchanged"`를 표시합니다. 실제 변경은 `changed:true`/`change:"updated"`로 표시하며 기존 action/대상 필드·대상 검증·lock/CAS·감사 기록을 유지합니다. no-op은 v1 형식·원본 bytes/mtime을 보존합니다.
 - `doctor`는 감사 파일이 없을 때 기존 부모에 비밀 없는 private 임시 파일을 생성·정리해 생성 권한을 검사합니다. 기존 로그는 append 준비만 확인하고 내용을 바꾸지 않으며, 없는 부모나 감사 파일을 만들지 않습니다. 실패 원인·경로·복구 방법과 JSON `audit_message`를 추가하고 기존 진단 exit0/`ok:true`·best-effort 기록 계약을 유지합니다.

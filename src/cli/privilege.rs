@@ -240,10 +240,19 @@ where
     let account = config.servers[&args.name]
         .account(&login_user)
         .ok_or_else(|| super::account::unknown_account(&args.name, &login_user))?;
-    let privilege = account
-        .privilege
-        .clone()
-        .ok_or_else(|| missing_privilege(&args.name, &login_user))?;
+    let Some(privilege) = account.privilege.clone() else {
+        if args.json {
+            return Ok(ok(format!(
+                "{}\n",
+                json!({"ok":true,"action":"cleared","server":args.name,"account":login_user,
+                "changed":false,"change":"unchanged"})
+            )));
+        }
+        return Ok(ok(format!(
+            "privilege already cleared for {}/{} (unchanged)\n",
+            args.name, login_user
+        )));
+    };
 
     if !args.yes
         && !prompter
@@ -277,6 +286,8 @@ where
             "action": "cleared",
             "server": args.name,
             "account": login_user,
+            "changed": true,
+            "change": "removed",
         });
         return Ok(ok(format!("{}\n", serde_json::to_string(&output)?)));
     }

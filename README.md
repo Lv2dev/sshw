@@ -440,6 +440,10 @@ Login credential lookup failures from `run`, `put`, and `get` show the selected 
 
 Privilege password lookup failures from `run --as-root` also show the server/login account, sudo/su method, target user, and redacted backend cause. Session-only homes require `SSHW_PRIVILEGE_PASSWORD` independently of the login password. Persistent backends suggest checking `sshw doctor` before re-registering a missing entry with `privilege set`; the suggested command retains the account, method, and target. Use the same home/profile, confirm the update or insert `--force` and `--password-stdin` before `--`, and keep passwords out of arguments. These local lookup failures retain auth/4 and JSON causes; passwordless elevation and remote sudo/su behavior are unchanged.
 
+`privilege clear` succeeds without prompting or rewriting settings when a registered account already has no saved privilege configuration. JSON retains `action:"cleared"`, server/account fields, and adds `changed:false`/`change:"unchanged"`; a real clear reports `true`/`"removed"`. Unknown targets and invalid settings still fail, and lock/audit behavior is retained. Actual clears retain confirmation, secret cleanup, and partial-application diagnostics. This only clears saved local privilege settings; remote sudoers and existing elevation flags are unchanged.
+
+Lock and config/profile-registry persistence failures show the reported path, operation stage, masked underlying cause, and a recovery step in human and JSON errors. Check the reported path/parent permissions, file type, filesystem, or active lock holder as indicated. Existing exit codes, JSON causes, timeouts, concurrency checks and atomic writes remain unchanged. A parent-directory sync failure after publication explicitly says the state was published: inspect it before retrying; the original publication marker and credential cleanup decisions are retained.
+
 ### JSON Error Contract
 
 Commands that support `--json` (`add`, `list`, `show`, `trust`, `run`, `put`, `get`, `remove`, `doctor`, `account add`, `account list`, `account show`, `account remove`, `profile list`, `profile show`, `privilege set`, `privilege show`, `privilege clear`) return a structured error envelope on runtime failures:
@@ -983,6 +987,10 @@ sshw doctor --json
 단일 object를 반환하는 `--json` 성공 응답(`add`, `show`, `trust`, `run`, `put`, `get`, `remove`, `doctor`, `account add`, `account show`, `account remove`, `profile show`, `privilege set`, `privilege show`, `privilege clear`)은 모두 `"ok":true`를 포함해 오류 envelope의 `"ok":false`와 대칭을 이루므로, 소비자가 `ok`로 분기할 수 있습니다. `list`, `account list`, `profile list`는 성공 시 JSON 배열을 반환하며(래핑 object 없음), 실패 시에는 동일한 `{"ok":false,...}` envelope를 출력합니다.
 
 `default`, `account default`, profile 상태 변경과 모든 policy 하위 명령도 `--json`을 지원합니다. 기존 list 명령의 성공 배열 형식은 유지합니다. 완료된 `run`의 `ok:true`는 호환성을 위해 유지하므로 원격 성공은 `command_succeeded` 또는 `exit_status == 0`으로 판단하세요. 정책 검사는 `allowed`, doctor는 `local_checks_passed`를 사용하며 실제 원격 연결을 검사한 것은 아닙니다.
+
+등록된 계정의 저장된 승격 설정이 이미 없으면 `privilege clear`는 확인 입력·설정 재저장 없이 성공합니다. JSON은 기존 `action:"cleared"`·server/account와 `changed:false`/`change:"unchanged"`를 표시하고, 실제 해제는 `true`/`"removed"`입니다. unknown target·잘못된 설정 오류와 lock/audit는 유지합니다. 실제 해제의 확인·비밀 삭제·부분 적용 안내는 그대로이며, 저장된 로컬 설정만 해제하므로 서버 sudoers와 기존 승격 옵션 정책은 바꾸지 않습니다.
+
+잠금·설정/프로필 registry 저장 오류는 실패한 경로·작업 단계·마스킹한 원인·복구 방법을 일반/JSON 메시지에 표시합니다. 안내된 파일/부모 권한·파일 종류·파일시스템·잠금 보유 작업을 확인하세요. 기존 exit·JSON causes·timeout·동시 변경 검사·atomic write는 유지합니다. 저장 후 부모 디렉터리 sync가 실패하면 이미 저장됐음을 표시하므로 재시도 전에 상태를 확인하세요. 원래 published marker와 자격 증명 정리 판단도 유지합니다.
 
 `default <이름>`·`account default <서버> <계정>`·`profile default <이름>`은 이미 선택된 기본값이면 설정/registry를 다시 쓰지 않습니다. 일반 출력은 변경 없음을 표시하고, JSON은 기존 action/대상 필드와 함께 `changed:false`/`change:"unchanged"`를 제공합니다. 실제 변경은 `true`/`"updated"`입니다. no-op은 원본 bytes·mtime·v1 형식을 보존하며 대상 검증·lock·감사 기록은 유지합니다. 이미 기본값인 프로필도 대상이 손상됐으면 거절하고, 조회 전용 `default` 응답은 그대로입니다.
 

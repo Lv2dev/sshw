@@ -1,4 +1,4 @@
-use crate::error::{ResultErrorKindExt, app_error, classified_error};
+use crate::error::{ResultErrorKindExt, app_error, classified_error, persistence_error};
 use crate::output::ErrorKind;
 use anyhow::Result;
 use std::fmt;
@@ -72,7 +72,8 @@ pub fn acquire_exclusive_lock_with_timeout(
     timeout: Duration,
 ) -> Result<ExclusiveFileLock> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        fs::create_dir_all(parent).map_err(|error| persistence_error(error.into(), "create lock parent directory", parent,
+            "check that the lock parent is a directory and allows creation; keep the same home/profile selection before retrying"))?;
     }
 
     let mut options = fs::OpenOptions::new();
@@ -80,8 +81,10 @@ pub fn acquire_exclusive_lock_with_timeout(
     #[cfg(unix)]
     options.mode(0o600);
 
-    let file = options.open(path)?;
-    set_owner_only(path)?;
+    let file = options.open(path).map_err(|error| persistence_error(error.into(), "open lock file", path,
+        "check that the lock path is a regular writable file and that its parent allows creation; keep the same home/profile selection before retrying"))?;
+    set_owner_only(path).map_err(|error| persistence_error(error, "set private lock permissions", path,
+        "check ownership and permission to update the reported lock file, then retry using the same home/profile selection"))?;
     let started = Instant::now();
     loop {
         match file.try_lock() {
@@ -89,14 +92,21 @@ pub fn acquire_exclusive_lock_with_timeout(
             Err(fs::TryLockError::WouldBlock) => {
                 if started.elapsed() >= timeout {
                     return Err(anyhow::anyhow!(
-                        "timed out waiting for lock at {} after {} milliseconds",
-                        path.display(),
+                        "timed out waiting for lock at {} after {} milliseconds\nnext: wait for the process using this home/profile to finish, then retry; inspect the reported lock path if timeouts continue",
+                        crate::error::diagnostic_path(path),
                         timeout.as_millis()
                     ));
                 }
                 std::thread::sleep(Duration::from_millis(5));
             }
-            Err(fs::TryLockError::Error(err)) => return Err(err.into()),
+            Err(fs::TryLockError::Error(err)) => {
+                return Err(persistence_error(
+                    err.into(),
+                    "acquire exclusive lock",
+                    path,
+                    "check filesystem locking support and access to the reported lock file, then retry using the same home/profile selection",
+                ));
+            }
         }
     }
     Ok(ExclusiveFileLock { file })
@@ -114,23 +124,34 @@ pub fn acquire_exclusive_lock_with_timeout(
 /// (NTFS ACLs already restrict the per-user config directory).
 pub fn write_owner_only_atomic(path: &Path, contents: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        fs::create_dir_all(parent).map_err(|error| persistence_error(error.into(), "create state parent directory", parent,
+            "check that the state parent is a directory and allows creation; repair the reported path before retrying"))?;
     }
 
     let temp_path = temp_sibling_path(path);
     write_temp(&temp_path, contents)?;
-    set_owner_only(&temp_path)?;
-    fs::OpenOptions::new()
+    set_owner_only(&temp_path).map_err(|error| persistence_error(error, "set private state staging permissions", &temp_path,
+        "check ownership and permission to update the staging file; inspect the saved state before retrying"))?;
+    let file = fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .open(&temp_path)?
-        .sync_all()?;
-    replace_atomic(&temp_path, path)?;
+        .open(&temp_path).map_err(|error| persistence_error(error.into(), "reopen state staging file for sync", &temp_path,
+            "check access to the staging file and its parent; inspect the saved state before retrying"))?;
+    file.sync_all().map_err(|error| persistence_error(error.into(), "sync state staging file", &temp_path,
+        "check filesystem errors and available storage; inspect the saved state before retrying"))?;
+    drop(file);
+    replace_atomic(&temp_path, path).map_err(|error| persistence_error(error, "replace state file atomically", path,
+        "check the destination type and parent write permissions, file locks, and filesystem errors; inspect the saved state before retrying"))?;
     if let Err(source) = sync_parent_directory(path) {
-        return Err(anyhow::Error::new(PublishedWriteError {
-            path: path.to_path_buf(),
-            source,
-        }));
+        return Err(persistence_error(
+            anyhow::Error::new(PublishedWriteError {
+                path: path.to_path_buf(),
+                source,
+            }),
+            "sync parent directory after publishing state",
+            path.parent().unwrap_or(path),
+            "the state was published; inspect it before retrying and check parent-directory durability/filesystem errors",
+        ));
     }
     Ok(())
 }
@@ -157,9 +178,12 @@ fn write_temp(path: &Path, contents: &str) -> Result<()> {
     #[cfg(unix)]
     options.mode(0o600);
 
-    let mut file = options.open(path)?;
-    file.write_all(contents.as_bytes())?;
-    file.sync_all()?;
+    let mut file = options.open(path).map_err(|error| persistence_error(error.into(), "create temporary state file", path,
+        "check parent directory creation/write permissions and available storage; inspect the saved state before retrying"))?;
+    file.write_all(contents.as_bytes()).map_err(|error| persistence_error(error.into(), "write temporary state file", path,
+        "check write permissions, available storage, and filesystem errors; inspect the saved state before retrying"))?;
+    file.sync_all().map_err(|error| persistence_error(error.into(), "sync temporary state file", path,
+        "check filesystem errors and available storage; inspect the saved state before retrying"))?;
     Ok(())
 }
 
@@ -454,6 +478,33 @@ mod stream_tests {
     };
     use std::fs;
     use std::io::{self, Read};
+
+    #[test]
+    fn clear_persistence_published_marker_survives_all_diagnostic_contexts() {
+        let path = std::path::Path::new("state.json");
+        let error = anyhow::Error::new(super::PublishedWriteError {
+            path: path.into(),
+            source: io::Error::new(io::ErrorKind::PermissionDenied, "parent sync refused").into(),
+        });
+        let error = crate::error::persistence_error(
+            error,
+            "sync parent directory after publishing state",
+            path,
+            "the state was published; inspect it before retrying",
+        );
+        let error = crate::error::persistence_context(error, "save config", path);
+        let error = crate::error::classified_error(crate::output::ErrorKind::Config, error);
+        assert!(super::write_was_published(&error));
+        assert!(
+            error.to_string().contains("published")
+                && error.to_string().contains("parent sync refused")
+        );
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.downcast_ref::<io::Error>().is_some())
+        );
+    }
 
     /// Reader that yields `remaining` bytes, then fails — simulates a download
     /// that dies partway (network drop, timeout, disk full).

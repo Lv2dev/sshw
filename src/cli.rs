@@ -7,7 +7,7 @@ use crate::config::{
 use crate::credentials::keyring_store::KeyringCredentialStore;
 use crate::credentials::session_store::SessionOnlyStore;
 use crate::credentials::{AuthMaterial, CredentialStore, CredentialStoreHealth};
-use crate::error::{ResultErrorKindExt, app_error};
+use crate::error::{ResultErrorKindExt, app_error, redacted_error_detail};
 use crate::home::{CredentialPurpose, ResolvedHome, builtin_default_home, sshw_base_dir};
 use crate::output::{
     ErrorKind, ErrorResponse, RunOutput, filter_startup_stderr_noise, redact_secrets,
@@ -1550,17 +1550,6 @@ where
         }
         AuthConfig::Agent => Ok(AuthMaterial::Agent),
     }
-}
-
-fn redacted_error_detail(error: &anyhow::Error) -> String {
-    let mut details = Vec::new();
-    for cause in error.chain() {
-        let detail = redact_secrets(&cause.to_string());
-        if details.last() != Some(&detail) {
-            details.push(detail);
-        }
-    }
-    details.join("\ncaused by: ")
 }
 
 /// Split a positional `target` into its optional leading server name and the

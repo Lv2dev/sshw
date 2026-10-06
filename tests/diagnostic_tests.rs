@@ -96,6 +96,163 @@ impl Prompter for NoPrompts {
 }
 
 #[test]
+fn clear_persistence_lock_errors_report_path_stage_recovery_and_io_source() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    config(&path, "example.test", 2222, "web", "deploy");
+    let lock = temp.path().join(".sshw.lock");
+    std::fs::create_dir(&lock).unwrap();
+    let before = std::fs::read(&path).unwrap();
+    let store = Store {
+        persistent: true,
+        error: Some("must not query"),
+        reads: Cell::new(0),
+    };
+    for json_output in [false, true] {
+        let mut args = vec!["sshw", "privilege", "clear", "web"];
+        if json_output {
+            args.push("--json");
+        }
+        let output = execute_for_runtime(
+            Cli::try_parse_from(args).unwrap(),
+            &path,
+            &store,
+            &NoNetwork,
+            &mut NoPrompts,
+        );
+        assert_eq!(output.exit_code, 3);
+        let message = if json_output {
+            serde_json::from_str::<serde_json::Value>(&output.stdout).unwrap()["error"]["message"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        } else {
+            output.stderr
+        };
+        assert!(
+            message.contains(".sshw.lock")
+                && message.contains("open lock file")
+                && message.contains("next:"),
+            "{message}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+    let error = sshw::storage::acquire_exclusive_lock(&lock).unwrap_err();
+    assert!(
+        error
+            .chain()
+            .any(|cause| cause.downcast_ref::<std::io::Error>().is_some())
+    );
+    assert_eq!(store.reads.get(), 0);
+}
+
+#[test]
+fn clear_persistence_config_registry_save_errors_report_atomic_stage_and_keep_source() {
+    for registry in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state-destination");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("keep"), "original").unwrap();
+        let error = if registry {
+            sshw::profile::save_registry(&path, &sshw::profile::ProfileRegistry::default())
+                .unwrap_err()
+        } else {
+            save_config(&path, &SshwConfig::default()).unwrap_err()
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("state-destination")
+                && message.contains("replace state file atomically")
+                && message.contains("next:"),
+            "{message}"
+        );
+        assert!(message.contains(if registry {
+            "save profile registry"
+        } else {
+            "save config"
+        }));
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.downcast_ref::<std::io::Error>().is_some())
+        );
+        assert_eq!(
+            std::fs::read_to_string(path.join("keep")).unwrap(),
+            "original"
+        );
+        assert_eq!(std::fs::read_dir(&path).unwrap().count(), 1);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn clear_persistence_readonly_save_has_the_os_cause_in_human_and_json_messages() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    std::fs::create_dir(&home).unwrap();
+    let path = home.join("servers.json");
+    config(&path, "example.test", 2222, "web", "deploy");
+    let mut file = load_config(&path).unwrap();
+    let mut server = file.servers["web"].clone();
+    server.accounts.get_mut("deploy").unwrap().auth = AuthConfig::Agent;
+    file.servers.insert("other".into(), server);
+    save_config(&path, &file).unwrap();
+    let lock = home.join(".sshw.lock");
+    std::fs::write(&lock, "").unwrap();
+    let before = std::fs::read(&path).unwrap();
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let result = std::panic::catch_unwind(|| {
+        for json_output in [false, true] {
+            let store = Store {
+                persistent: true,
+                error: Some("must not query"),
+                reads: Cell::new(0),
+            };
+            let mut args = vec!["sshw", "default", "other"];
+            if json_output {
+                args.push("--json");
+            }
+            let output = execute_for_runtime(
+                Cli::try_parse_from(args).unwrap(),
+                &path,
+                &store,
+                &NoNetwork,
+                &mut NoPrompts,
+            );
+            let denied = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(home.join("permission-control"));
+            if denied.is_ok() {
+                std::fs::remove_file(home.join("permission-control")).unwrap();
+                assert_eq!(output.exit_code, 0);
+                continue;
+            }
+            assert_eq!(output.exit_code, 3);
+            let message = if json_output {
+                serde_json::from_str::<serde_json::Value>(&output.stdout).unwrap()["error"]["message"].as_str().unwrap().to_string()
+            } else {
+                output.stderr
+            };
+            assert!(
+                message.contains("Permission denied")
+                    && message.contains("servers.json")
+                    && message.contains("temporary state file")
+                    && message.contains("next:"),
+                "{message}"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            assert_eq!(store.reads.get(), 0);
+        }
+    });
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+    if let Err(error) = result {
+        std::panic::resume_unwind(error);
+    }
+}
+
+#[test]
 fn default_audit_doctor_reports_path_causes_and_preserves_existing_metadata() {
     for kind in ["missing", "file", "directory"] {
         for json_output in [false, true] {

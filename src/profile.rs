@@ -1,3 +1,4 @@
+use crate::error::{persistence_context, persistence_error};
 use crate::home::{ResolvedHome, builtin_default_home, is_reserved_profile_id};
 use crate::storage::write_owner_only_atomic;
 use anyhow::Result;
@@ -136,8 +137,16 @@ pub fn save_registry(path: &Path, registry: &ProfileRegistry) -> Result<()> {
             path.display()
         )
     })?;
-    let contents = serde_json::to_string_pretty(registry)?;
+    let contents = serde_json::to_string_pretty(registry).map_err(|error| {
+        persistence_error(
+            error.into(),
+            "serialize profile registry",
+            path,
+            "check that registered profile paths contain supported values before retrying",
+        )
+    })?;
     write_owner_only_atomic(path, &contents)
+        .map_err(|error| persistence_context(error, "save profile registry", path))
 }
 
 pub fn save_registry_if_unchanged(

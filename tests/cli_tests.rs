@@ -774,6 +774,8 @@ fn privilege_clear_json_failure_uses_error_envelope() {
             "privilege",
             "clear",
             "server-alpha",
+            "--account",
+            "missing",
             "--yes",
             "--json",
         ])
@@ -784,7 +786,7 @@ fn privilege_clear_json_failure_uses_error_envelope() {
         &mut prompter,
     );
 
-    assert_json_error(output, 3, "config", "privilege configuration missing");
+    assert_json_error(output, 3, "config", "unknown account");
 }
 
 #[test]
@@ -1084,6 +1086,117 @@ fn privilege_clear_json_success_reports_state_change() {
     assert_eq!(json["ok"], true);
     assert_eq!(json["action"], "cleared");
     assert_eq!(json["server"], "server-alpha");
+}
+
+#[test]
+fn clear_persistence_absent_privilege_is_a_noop_without_prompts_or_secret_access() {
+    for version in [1, 2] {
+        for selected in [false, true] {
+            if version == 1 && selected {
+                continue;
+            }
+            for json_output in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let path = temp.path().join("servers.json");
+                if version == 1 {
+                    std::fs::write(&path,r#"{"version":1,"default":"web","servers":{"web":{"host":"example.test","port":22,"user":"deploy","auth":{"type":"agent"}}}}"#).unwrap();
+                } else {
+                    let mut config = agent_accounts_config(&path);
+                    let server = config.servers.remove("server-alpha").unwrap();
+                    config.servers.insert("web".into(), server);
+                    config.default = Some("web".into());
+                    save_config(&path, &config).unwrap();
+                }
+                let before = std::fs::read(&path).unwrap();
+                let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+                let store = FakeCredentialStore::default();
+                let ssh = FakeSshClient::default();
+                let mut prompts = NoPasswordPrompter { prompts: vec![] };
+                let home = ResolvedHome::from_config_path(&path);
+                let registry = temp.path().join("profiles.json");
+                let audit_path = temp.path().join("audit.jsonl");
+                let audit = FileAuditSink::new(audit_path.clone());
+                let ctx = ExecContext {
+                    home: &home,
+                    registry_path: &registry,
+                    policy_forced: false,
+                    audit: &audit,
+                };
+                for yes in [false, true] {
+                    let mut args = vec!["sshw", "privilege", "clear", "web"];
+                    if selected {
+                        args.extend(["--account", "ops"]);
+                    }
+                    if yes {
+                        args.push("--yes");
+                    }
+                    if json_output {
+                        args.push("--json");
+                    }
+                    let output = execute_with(
+                        Cli::try_parse_from(args).unwrap(),
+                        &ctx,
+                        &store,
+                        &ssh,
+                        &mut prompts,
+                    )
+                    .unwrap();
+                    assert_eq!(output.exit_code, 0);
+                    if json_output {
+                        let body: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+                        assert_eq!(body["action"], "cleared");
+                        assert_eq!(body["account"], if selected { "ops" } else { "deploy" });
+                        assert_eq!(body["changed"], false);
+                        assert_eq!(body["change"], "unchanged");
+                    } else {
+                        assert!(output.stdout.contains("unchanged"));
+                    }
+                    assert!(!output.stdout.contains("privilege set"));
+                    assert_eq!(std::fs::read(&path).unwrap(), before);
+                    assert_eq!(
+                        std::fs::metadata(&path).unwrap().modified().unwrap(),
+                        modified
+                    );
+                }
+                assert!(
+                    prompts.prompts.is_empty()
+                        && store.requested.borrow().is_empty()
+                        && store.deleted.borrow().is_empty()
+                        && store.values.borrow().is_empty()
+                );
+                assert!(ssh.selected_users.borrow().is_empty());
+                assert_eq!(
+                    std::fs::read_to_string(audit_path).unwrap().lines().count(),
+                    2
+                );
+            }
+        }
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &agent_accounts_config(&path)).unwrap();
+    for args in [
+        vec!["sshw", "privilege", "clear", "missing", "--json"],
+        vec![
+            "sshw",
+            "privilege",
+            "clear",
+            "server-alpha",
+            "--account",
+            "missing",
+            "--json",
+        ],
+    ] {
+        let output = execute_for_runtime(
+            Cli::try_parse_from(args).unwrap(),
+            &path,
+            &FakeCredentialStore::default(),
+            &FakeSshClient::default(),
+            &mut FakePrompter::default(),
+        );
+        assert_eq!(output.exit_code, 3);
+        assert!(output.stdout.contains("unknown"));
+    }
 }
 
 #[test]
