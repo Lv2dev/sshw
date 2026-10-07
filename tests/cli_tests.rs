@@ -17,6 +17,154 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 #[test]
+fn confirmation_prompts_mask_each_target_without_losing_action_or_yes_no_suffix() {
+    struct Decline {
+        prompts: Vec<String>,
+    }
+    impl Prompter for Decline {
+        fn confirm(&mut self, prompt: &str) -> anyhow::Result<bool> {
+            self.prompts.push(prompt.into());
+            Ok(false)
+        }
+        fn password(&mut self, _: &str) -> anyhow::Result<String> {
+            panic!("no password input on declined action")
+        }
+        fn password_stdin(&mut self) -> anyhow::Result<String> {
+            panic!("no stdin input on declined action")
+        }
+    }
+    for sensitive in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("servers.json");
+        let name = if sensitive {
+            "password=server-marker"
+        } else {
+            "web"
+        };
+        let user = if sensitive {
+            "token=account-marker"
+        } else {
+            "ops"
+        };
+        let old_target = if sensitive {
+            "password=target-marker"
+        } else {
+            "daemon"
+        };
+        let new_target = if sensitive {
+            "token=new-target-marker"
+        } else {
+            "service"
+        };
+        let mut server = ServerConfig::single_account("127.0.0.1", 22, "deploy", AuthConfig::Agent);
+        server.accounts.insert(
+            user.into(),
+            AccountConfig {
+                auth: AuthConfig::Agent,
+                privilege: Some(PrivilegeConfig {
+                    method: PrivilegeMethod::Sudo,
+                    user: old_target.into(),
+                    credential: None,
+                    no_password: true,
+                }),
+            },
+        );
+        let config = SshwConfig {
+            default: Some(name.into()),
+            servers: BTreeMap::from([(name.into(), server)]),
+            ..Default::default()
+        };
+        save_config(&path, &config).unwrap();
+        let before = (
+            std::fs::read(&path).unwrap(),
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+        );
+        let store = FakeCredentialStore::default();
+        let ssh = FakeSshClient {
+            host_key_fingerprint: "SHA256:expected".into(),
+            ..Default::default()
+        };
+        let operations = [
+            vec![
+                "sshw",
+                "add",
+                name,
+                "--host",
+                "127.0.0.1",
+                "--user",
+                "deploy",
+                "--auth",
+                "agent",
+            ],
+            vec!["sshw", "account", "add", name, user, "--auth", "agent"],
+            vec!["sshw", "account", "remove", name, user],
+            vec![
+                "sshw",
+                "privilege",
+                "set",
+                name,
+                "--account",
+                user,
+                "--no-password",
+                "--user",
+                new_target,
+            ],
+            vec!["sshw", "privilege", "clear", name, "--account", user],
+            vec!["sshw", "remove", name],
+            vec!["sshw", "trust", name],
+        ];
+        for args in operations {
+            let mut prompter = Decline {
+                prompts: Vec::new(),
+            };
+            let output = execute_for_runtime(
+                Cli::try_parse_from(args).unwrap(),
+                &path,
+                &store,
+                &ssh,
+                &mut prompter,
+            );
+            assert_eq!(output.exit_code, 3);
+            assert_eq!(prompter.prompts.len(), 1);
+            let prompt = &prompter.prompts[0];
+            assert!(prompt.ends_with("? [y/N] "), "{prompt}");
+            if sensitive {
+                for marker in [
+                    "server-marker",
+                    "account-marker",
+                    "target-marker",
+                    "new-target-marker",
+                ] {
+                    assert!(!prompt.contains(marker), "{prompt}");
+                }
+                assert!(prompt.contains("<redacted>"));
+            } else {
+                assert!(prompt.contains(name));
+            }
+            if prompt.starts_with("update account") && prompt.contains("preserved") {
+                assert!(prompt.contains("other accounts and privilege settings are preserved"));
+            }
+            if prompt.starts_with("update privilege") {
+                assert!(prompt.contains("sudo target:") && prompt.contains("authentication:"));
+            }
+            if prompt.starts_with("trust") {
+                assert!(prompt.contains("SHA256:expected"));
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), before.0);
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().modified().unwrap(),
+                before.1
+            );
+        }
+        assert!(
+            store.values.borrow().is_empty()
+                && store.requested.borrow().is_empty()
+                && store.deleted.borrow().is_empty()
+        );
+    }
+}
+
+#[test]
 fn unknown_profiles_share_recovery_without_config_secret_or_network_access() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("servers.json");

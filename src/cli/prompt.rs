@@ -33,8 +33,7 @@ impl Prompter for TerminalPrompter {
         // inherited stdin handle. std's buffered stdin read_line can hang under ConPTY
         // (Windows Terminal / PowerShell), whereas rprompt opens the console device
         // directly, the same way rpassword does for the password prompt.
-        let answer = rprompt::prompt_reply(prompt)?;
-        Ok(is_affirmative(&answer))
+        confirmation_from_reply(rprompt::prompt_reply(prompt), option)
     }
 
     fn password(&mut self, prompt: &str) -> anyhow::Result<String> {
@@ -68,6 +67,16 @@ fn is_affirmative(answer: &str) -> bool {
     matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
+fn confirmation_from_reply(reply: io::Result<String>, option: &str) -> anyhow::Result<bool> {
+    let answer = reply.map_err(|error| {
+        let detail = crate::output::redact_secrets(&error.to_string());
+        anyhow::Error::new(error).context(format!(
+            "cannot read confirmation from the terminal: {detail}; use an interactive terminal, or if you intend to confirm this action, rerun with {option}"
+        ))
+    })?;
+    Ok(is_affirmative(&answer))
+}
+
 /// Testable mirror of `TerminalPrompter::confirm`. Production reads the console device
 /// directly via `rprompt::prompt_reply`; this exercises the interactive gate and answer
 /// parsing against an injected reader/writer. An EOF reply (no trailing newline) is rejected.
@@ -84,8 +93,10 @@ where
 {
     check_confirmation_terminal(interactive, "--yes")?;
 
-    let answer = rprompt::prompt_reply_from_bufread(input, output, prompt)?;
-    Ok(is_affirmative(&answer))
+    confirmation_from_reply(
+        rprompt::prompt_reply_from_bufread(input, output, prompt),
+        "--yes",
+    )
 }
 
 fn password_from_reader<R>(input: &mut R) -> anyhow::Result<String>
@@ -124,6 +135,31 @@ fn read_redirected_password(
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
+
+    #[test]
+    fn confirmation_read_failure_keeps_io_source_and_the_action_specific_option() {
+        for option in ["--yes", "--force"] {
+            let source = std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "terminal reply ended; token=fixture-marker",
+            );
+            let error = super::confirmation_from_reply(Err(source), option).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("cannot read confirmation from the terminal")
+                    && error.to_string().contains(option)
+            );
+            assert!(!error.to_string().contains("fixture-marker"));
+            assert!(error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::UnexpectedEof)
+            }));
+        }
+        assert!(!super::confirmation_from_reply(Ok("no".into()), "--yes").unwrap());
+        assert!(super::confirmation_from_reply(Ok("YES\n".into()), "--force").unwrap());
+    }
 
     #[test]
     fn trust_readiness_uses_the_same_terminal_gate_without_prompting() {

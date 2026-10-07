@@ -36,7 +36,11 @@ where
         && !args.force
         && !prompter
             .confirm_with_option(
-                &format!("update account '{}/{}'? [y/N] ", args.name, args.user),
+                &format!(
+                    "update account '{}/{}'? [y/N] ",
+                    super::hints::redacted_argument(&args.name),
+                    super::hints::redacted_argument(&args.user)
+                ),
                 "--force",
             )
             .with_error_kind(ErrorKind::Config)?
@@ -276,7 +280,8 @@ where
         && !prompter
             .confirm(&format!(
                 "remove account '{}/{}'? [y/N] ",
-                args.name, args.user
+                super::hints::redacted_argument(&args.name),
+                super::hints::redacted_argument(&args.user)
             ))
             .with_error_kind(ErrorKind::Config)?
     {

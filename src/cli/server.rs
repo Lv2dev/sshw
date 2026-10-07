@@ -49,8 +49,8 @@ where
         .map(|change| {
             format!(
                 "; default login account will change: {} -> {}",
-                redact_secrets(change.previous.as_deref().unwrap_or("none")),
-                redact_secrets(change.current.as_deref().unwrap_or("none"))
+                super::hints::redacted_argument(change.previous.as_deref().unwrap_or("none")),
+                super::hints::redacted_argument(change.current.as_deref().unwrap_or("none"))
             )
         })
         .unwrap_or_default();
@@ -72,18 +72,19 @@ where
     let prompt = if args.replace {
         format!(
             "replace server '{}' and remove its existing accounts and privilege settings{account_notice}? [y/N] ",
-            args.name
+            super::hints::redacted_argument(&args.name)
         )
     } else {
         format!(
             "update account '{}/{}' (other accounts and privilege settings are preserved{account_notice})? [y/N] ",
-            args.name, args.user
+            super::hints::redacted_argument(&args.name),
+            super::hints::redacted_argument(&args.user)
         )
     };
     if previous_server.is_some()
         && !args.force
         && !prompter
-            .confirm_with_option(&redact_secrets(&prompt), "--force")
+            .confirm_with_option(&prompt, "--force")
             .with_error_kind(ErrorKind::Config)?
     {
         return Err(app_error(ErrorKind::Config, "add cancelled"));
@@ -339,7 +340,9 @@ where
     let host_key = ssh.host_key(server).with_error_kind(ErrorKind::Ssh)?;
     let prompt = format!(
         "trust {} {} {}? [y/N] ",
-        args.name, host_key.algorithm, host_key.fingerprint_sha256
+        super::hints::redacted_argument(&args.name),
+        host_key.algorithm,
+        host_key.fingerprint_sha256
     );
     if !args.yes
         && !prompter
@@ -383,7 +386,10 @@ where
     let server = get_server(config, &args.name)?.clone();
     if !args.yes
         && !prompter
-            .confirm(&format!("remove server '{}'? [y/N] ", args.name))
+            .confirm(&format!(
+                "remove server '{}'? [y/N] ",
+                super::hints::redacted_argument(&args.name)
+            ))
             .with_error_kind(ErrorKind::Config)?
     {
         return Err(app_error(ErrorKind::Config, "removal cancelled"));

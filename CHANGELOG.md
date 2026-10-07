@@ -8,6 +8,9 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 
 ## [Unreleased]
 
+### 확인창 대상 표시·입력 오류 안내
+- 서버·계정·승격 설정의 갱신/삭제와 host trust 확인창은 대상 값을 각각 마스킹해 작업 설명·승격 대상/방식·지문과 `[y/N]` 표시를 유지합니다. 확인 읽기 오류에는 마스킹한 원인과 해당 작업의 `--yes`/`--force` 안내를 추가하며 기존 terminal gate·승인/거절·원래 IO source를 유지합니다.
+
 ### 일반 SCP 전송 오류·프로필 복구 안내
 - 일반 `put/get` 오류에 실패 단계·로그인 사용자와 endpoint·local/remote 경로·개별 마스킹한 원인 및 점검 방법을 표시합니다. native SCP 오류만으로 파일 부재와 권한 거부를 단정하지 않으며 원래 source/code·ssh/IO 분류·deadline·완료 확인과 다운로드 staging을 유지합니다. 업로드 실패 시 목적지가 이미 변경됐을 수 있음을 안내하고 기존 atomic/MSYS/인증 진단을 보존합니다.
 - 미등록 프로필의 선택·show/default/remove 오류가 전역 목록 조회와 이름을 인용한 등록 안내를 공유합니다. 빈 human 목록은 선택적인 등록 방법과 내장 기본 home 사용 가능 여부를 설명하며 JSON `[]`는 유지합니다. 값별 마스킹·플랫폼 인용·`--` 경계·config/3·선택 우선순위·namespace·registry 저장/잠금/감사 계약을 유지합니다.

@@ -56,8 +56,9 @@ where
             .confirm_with_option(
                 &format!(
                     "update privilege configuration for '{}/{}' ({} target: {} -> {} target: {}; authentication: {} -> {})? [y/N] ",
-                    args.name, login_user, method_label(previous.method), previous.user,
-                    method_label(map_method(args.method)), args.user,
+                    super::hints::redacted_argument(&args.name), super::hints::redacted_argument(&login_user),
+                    method_label(previous.method), super::hints::redacted_argument(&previous.user),
+                    method_label(map_method(args.method)), super::hints::redacted_argument(&args.user),
                     authentication_label(previous.no_password), authentication_label(args.no_password)
                 ),
                 "--force",
@@ -271,7 +272,8 @@ where
         && !prompter
             .confirm(&format!(
                 "clear privilege configuration for '{}/{}' ({} target: {}; authentication: {})? [y/N] ",
-                args.name, login_user, method_label(privilege.method), privilege.user,
+                super::hints::redacted_argument(&args.name), super::hints::redacted_argument(&login_user),
+                method_label(privilege.method), super::hints::redacted_argument(&privilege.user),
                 authentication_label(privilege.no_password)
             ))
             .with_error_kind(ErrorKind::Config)?
