@@ -235,6 +235,10 @@ pub fn classify_error(err: &anyhow::Error) -> ErrorKind {
         return classified.kind();
     }
 
+    if let Some(kind) = crate::error::contextual_error_kind(err) {
+        return kind;
+    }
+
     let message = format!("{err:#}").to_ascii_lowercase();
 
     if message.contains(SAFETY_MARKER) {

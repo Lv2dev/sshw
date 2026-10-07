@@ -92,6 +92,40 @@ pub fn classified_error(kind: ErrorKind, source: anyhow::Error) -> anyhow::Error
     anyhow::Error::new(ClassifiedError { kind, source })
 }
 
+#[derive(Debug)]
+struct ClassifiedContext {
+    kind: ErrorKind,
+    message: String,
+}
+
+impl fmt::Display for ClassifiedContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.message.fmt(formatter)
+    }
+}
+
+/// An anyhow context preserves downcasting to the original native error.
+pub(crate) fn context_with_error_kind(
+    source: anyhow::Error,
+    kind: ErrorKind,
+    message: String,
+) -> anyhow::Error {
+    source.context(ClassifiedContext { kind, message })
+}
+
+pub(crate) fn contextual_error_kind(error: &anyhow::Error) -> Option<ErrorKind> {
+    error
+        .downcast_ref::<ClassifiedContext>()
+        .map(|context| context.kind)
+        .or_else(|| {
+            error.chain().find_map(|cause| {
+                cause
+                    .downcast_ref::<crate::ssh::PartialRunError>()
+                    .and_then(|partial| contextual_error_kind(&partial.source))
+            })
+        })
+}
+
 pub fn classified_io_error(
     kind: ErrorKind,
     io_kind: std::io::ErrorKind,
@@ -226,6 +260,7 @@ where
             if error
                 .chain()
                 .any(|cause| cause.downcast_ref::<ClassifiedError>().is_some())
+                || contextual_error_kind(&error).is_some()
             {
                 error
             } else {

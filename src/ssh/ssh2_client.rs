@@ -658,7 +658,13 @@ impl RunDiagnostic<'_> {
         stage: &str,
     ) -> anyhow::Result<T> {
         self.step(
-            result.map_err(Into::into).context("ssh session error"),
+            result.map_err(|error| {
+                crate::error::context_with_error_kind(
+                    error.into(),
+                    ErrorKind::Ssh,
+                    "ssh session error".into(),
+                )
+            }),
             stage,
         )
     }
@@ -1668,6 +1674,46 @@ mod tests {
     const KNOWN_HOSTS_LINE: &str = "\
 example.test ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB9zU1OEQ2tzYhrXq4/DEjvRNvKv6cU4Xar6gghj1p7D
 ";
+
+    #[test]
+    fn run_diagnostic_kind_ignores_marker_like_accounts_and_preserves_native_downcast() {
+        for marker in [
+            "authentication",
+            "unknown server",
+            "requires --yes",
+            "blocked by policy",
+        ] {
+            let server = ServerConfig::single_account(marker, 22, "deploy", AuthConfig::Agent);
+            let diagnostic = super::RunDiagnostic {
+                server: &server,
+                user: marker,
+            };
+            let error = diagnostic
+                .ssh_step(
+                    Err::<(), _>(ssh2::Error::from_errno(ssh2::ErrorCode::Session(-21))),
+                    "open SSH session",
+                )
+                .unwrap_err();
+            assert!(error.downcast_ref::<ssh2::Error>().is_some());
+            assert_eq!(crate::output::classify_error(&error), ErrorKind::Ssh);
+            let partial = crate::ssh::PartialRunError {
+                source: error,
+                stdout: "previous output".into(),
+                stderr: String::new(),
+            };
+            assert!(partial.source.downcast_ref::<ssh2::Error>().is_some());
+            let error = anyhow::Error::new(partial).context("caller context");
+            let error = Err::<(), _>(error)
+                .with_error_kind(ErrorKind::Io)
+                .unwrap_err();
+            let response = crate::output::ErrorResponse::from_error(&error);
+            assert_eq!(response.error.kind, ErrorKind::Ssh);
+            assert_eq!(response.error.exit_code, 5);
+            assert_eq!(response.partial_output.unwrap().stdout, "previous output");
+            let partial = error.downcast::<crate::ssh::PartialRunError>().unwrap();
+            assert!(partial.source.downcast::<ssh2::Error>().is_ok());
+        }
+    }
 
     #[test]
     fn run_diagnostic_preserves_native_codes_and_masks_account_endpoint_and_cause() {
