@@ -690,6 +690,8 @@ sshw --profile prod run web "uptime"
 
 ### profile 관리
 
+미등록 프로필을 `--profile`로 선택하거나 `profile show/default/remove`에 지정하면 config/3 오류가 `sshw profile list`와 이름을 인용한 등록 명령을 안내합니다. 복구 명령에서 실패한 `--profile`을 빼고, `sshw --home '<home>' profile add -- '<name>'`의 placeholder를 실제 값으로 바꾸세요. 등록한 namespace를 사용할 때는 `--home`을 빼고 `SSHW_HOME`을 해제한 뒤 `--profile=<name>`으로 선택합니다. 이름은 개별 마스킹하고 Windows PowerShell/POSIX 셸에 맞게 인용합니다. 등록 프로필이 없는 일반 목록도 등록 방법을 표시하며 JSON은 기존 `[]`를 유지합니다. 이름을 등록하는 것은 선택 사항이며 내장 기본 home을 포함한 기존 home 선택은 계속 사용할 수 있습니다. 오류 안내가 프로필을 등록·전환하거나 namespace를 재사용하지는 않습니다.
+
 ```bash
 sshw profile add prod --home /srv/prod    # home은 전역 --home 플래그에서 가져옵니다
 sshw profile list
@@ -900,6 +902,8 @@ sshw put server-alpha "$archive" 'remote:/tmp/sshw-src.tgz'
 실행 파일은 `sshw put web ./app /srv/app/app --mode 755`처럼 권한을 명시하세요. 새 파일의 기본 권한은 600이고 특수 권한 비트는 거부합니다. mode를 명시하면 기존 파일의 권한도 바꾸고 시각 정보는 전송 시각으로 설정합니다. 일반 업로드는 서버의 기존 권한 유지 동작을 따릅니다. 파일 전송 자체의 권한 상승은 제공하지 않습니다. 원격의 기존 파일은 업로드로 교체될 수 있고, 로컬의 기존 파일을 다운로드로 덮어쓰려면 `--yes`가 필요합니다.
 
 ### 업로드 보호·실시간 출력·전송 사전 검사
+
+일반 `put/get`의 SCP 실패는 원격 파일 열기·데이터 전송·응답/EOF·채널 종료·완료 확인 중 실제 실패 단계와 로그인 계정, endpoint, local/remote 경로, 마스킹한 native 원인을 표시합니다. 원격 경로와 로그인 계정의 읽기/쓰기 권한, 부모 디렉터리, 서버 SCP 지원 등을 확인하세요. SCP 라이브러리의 일반 오류만으로 파일 부재와 권한 거부를 구분할 수는 없습니다. 중간 업로드 실패는 원격 목적지가 변경됐을 수 있으므로 상태를 확인한 뒤 재시도하세요. 기존 오류 타입·코드와 JSON 원인, timeout 및 SCP 완료 확인을 유지하며 다운로드는 검증된 staging을 최종 반영하기 전까지 기존 로컬 파일을 보존합니다. 자동 권한 변경·승격·추가 접속·재시도는 수행하지 않습니다. `--atomic`의 단계별 상세 진단과 Git Bash/MSYS 경로 안내도 유지합니다.
 
 원자적 업로드 오류는 실패 단계·실제 원인·목적지와 임시 경로·정리 및 교체 상태를 함께 표시합니다. 생성 응답이 유실되면 원격 파일이 생겼더라도 생성 성공을 확인할 수 없으므로 해당 경로를 자동 삭제하지 않습니다. 경로와 소유권을 확인한 뒤 재시도하세요. 생성 성공이 확인된 임시 파일만 연결과 권한이 허용하는 범위에서 실패 시 정리합니다.
 

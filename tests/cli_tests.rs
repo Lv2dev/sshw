@@ -17,6 +17,164 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 #[test]
+fn unknown_profiles_share_recovery_without_config_secret_or_network_access() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    std::fs::write(&path, "{broken active configuration").unwrap();
+    let registry_path = temp.path().join("profiles.json");
+    let registry = ProfileRegistry::default();
+    save_registry(&registry_path, &registry).unwrap();
+    let before = (
+        std::fs::read(&registry_path).unwrap(),
+        std::fs::metadata(&registry_path)
+            .unwrap()
+            .modified()
+            .unwrap(),
+    );
+    let config_before = std::fs::read(&path).unwrap();
+    let store = FakeCredentialStore::default();
+    let ssh = FakeSshClient::default();
+    let mut prompts = NoPasswordPrompter {
+        prompts: Vec::new(),
+    };
+    for name in [
+        "missing",
+        "-profile's $literal",
+        "서버 작업",
+        "token=profile-marker",
+    ] {
+        let selected_error = sshw::profile::resolve_home_with_registry(
+            None,
+            None,
+            Some(name),
+            &registry,
+            temp.path(),
+        )
+        .unwrap_err();
+        let message = sshw::output::ErrorResponse::from_error(&selected_error)
+            .error
+            .message;
+        for command in ["show", "default", "remove"] {
+            for machine in [false, true] {
+                let mut args = vec!["sshw", "profile", command];
+                if machine {
+                    args.push("--json");
+                }
+                args.extend(["--", name]);
+                let output = execute_for_runtime(
+                    Cli::try_parse_from(args).unwrap(),
+                    &path,
+                    &store,
+                    &ssh,
+                    &mut prompts,
+                );
+                assert_eq!(output.exit_code, 3);
+                let actual = if machine {
+                    let body: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+                    assert_eq!(body["error"]["kind"], "config");
+                    body["error"]["message"].as_str().unwrap().to_string()
+                } else {
+                    output.stderr.trim_end().to_string()
+                };
+                assert_eq!(actual, message);
+                assert!(
+                    actual.contains("sshw profile list")
+                        && actual.contains("global profile registry")
+                        && actual.contains("omit the failing --profile")
+                        && actual.contains("separate namespace")
+                );
+                assert!(
+                    actual.contains("sshw --home '<home>' profile add -- ")
+                        && actual.contains("named profile is optional")
+                );
+                if name.starts_with("token=") {
+                    assert!(!actual.contains("profile-marker"));
+                    assert!(
+                        actual.contains("profile add -- '<redacted>'")
+                            && actual.contains("--profile='<redacted>'")
+                    );
+                } else if name.contains('\'') {
+                    let quoted = if cfg!(windows) {
+                        "'-profile''s $literal'"
+                    } else {
+                        "'-profile'\"'\"'s $literal'"
+                    };
+                    assert!(actual.contains(&format!("profile add -- {quoted}")));
+                }
+                assert_eq!(std::fs::read(&registry_path).unwrap(), before.0);
+                assert_eq!(
+                    std::fs::metadata(&registry_path)
+                        .unwrap()
+                        .modified()
+                        .unwrap(),
+                    before.1
+                );
+                assert_eq!(std::fs::read(&path).unwrap(), config_before);
+            }
+        }
+    }
+    assert!(
+        store.values.borrow().is_empty()
+            && store.requested.borrow().is_empty()
+            && store.deleted.borrow().is_empty()
+    );
+    assert!(ssh.selected_users.borrow().is_empty() && ssh.run_commands.borrow().is_empty());
+    assert!(prompts.prompts.is_empty());
+    assert!(!temp.path().join("known_hosts").exists());
+}
+
+#[test]
+fn empty_profile_list_explains_optional_registration_and_keeps_json_array() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    std::fs::write(&path, "{broken active configuration").unwrap();
+    let store = FakeCredentialStore::default();
+    let ssh = FakeSshClient::default();
+    let mut prompts = NoPasswordPrompter {
+        prompts: Vec::new(),
+    };
+    for machine in [false, true] {
+        let mut args = vec!["sshw", "profile", "list"];
+        if machine {
+            args.push("--json");
+        }
+        let output = execute_for_runtime(
+            Cli::try_parse_from(args).unwrap(),
+            &path,
+            &store,
+            &ssh,
+            &mut prompts,
+        );
+        assert_eq!(output.exit_code, 0);
+        assert!(output.stderr.is_empty());
+        if machine {
+            let body: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+            assert_eq!(body, serde_json::json!([]));
+        } else {
+            assert!(output.stdout.contains("no named profiles registered"));
+            assert!(
+                output
+                    .stdout
+                    .contains("sshw --home '<home>' profile add -- '<name>'")
+            );
+            assert!(
+                output.stdout.contains("Named profiles are optional")
+                    && output.stdout.contains("built-in default home")
+            );
+        }
+    }
+    assert!(
+        !temp.path().join("profiles.json").exists() && !temp.path().join(".profiles.lock").exists()
+    );
+    assert!(
+        store.values.borrow().is_empty()
+            && store.requested.borrow().is_empty()
+            && store.deleted.borrow().is_empty()
+    );
+    assert!(ssh.selected_users.borrow().is_empty() && prompts.prompts.is_empty());
+}
+
+#[test]
 fn transfer_help_documents_remote_absolute_literal() {
     for command in ["put", "get"] {
         let help = Cli::try_parse_from(["sshw", command, "--help"])
@@ -5237,7 +5395,10 @@ fn profile_add_list_show_default_remove_round_trip() {
         &mut FakePrompter::default(),
     )
     .unwrap();
-    assert_eq!(empty.stdout, "");
+    assert!(
+        empty.stdout.contains("no named profiles registered")
+            && empty.stdout.contains("Named profiles are optional")
+    );
 }
 
 #[test]

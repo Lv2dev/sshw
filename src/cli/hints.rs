@@ -2,28 +2,7 @@
 //! user-provided value is masked before platform-specific shell quoting.
 
 use crate::config::PrivilegeMethod;
-use crate::output::redact_secrets;
-
-pub(super) fn redacted_argument(value: &str) -> String {
-    let redacted = redact_secrets(value);
-    // Hide the whole argument when it contains a secret pattern. Keeping its
-    // assignment prefix would let later error redaction truncate the command.
-    if redacted.contains("<redacted>") || redacted.contains("[redacted private key]") {
-        "<redacted>".into()
-    } else {
-        redacted
-    }
-}
-
-pub(super) fn quote_local_argument(value: &str) -> String {
-    let value = redacted_argument(value);
-    if cfg!(windows) {
-        // PowerShell escapes an apostrophe in a literal by doubling it.
-        format!("'{}'", value.replace('\'', "''"))
-    } else {
-        super::shell_quote(&value)
-    }
-}
+pub(super) use crate::local_command::{quote_local_argument, redacted_argument};
 
 pub(super) fn trust(server: &str) -> String {
     format!("sshw trust -- {}", quote_local_argument(server))

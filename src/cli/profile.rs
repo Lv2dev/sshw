@@ -13,8 +13,8 @@ use crate::home::{ResolvedHome, generate_profile_id};
 use crate::output::{DefaultChange, ErrorKind, redact_secrets};
 use crate::profile::{
     ProfileEntry, ProfileRegistry, RegistryRevision, load_registry_for_removal_with_revision,
-    load_registry_with_revision, save_registry_if_unchanged, validate_home_directory,
-    validate_profile_name,
+    load_registry_with_revision, profile_registration_hint, save_registry_if_unchanged,
+    unknown_profile, validate_home_directory, validate_profile_name,
 };
 use serde_json::json;
 use std::fs;
@@ -202,6 +202,12 @@ fn profile_list(
         return Ok(ok(format!("{}\n", serde_json::to_string(&entries)?)));
     }
 
+    if registry.profiles.is_empty() {
+        return Ok(ok(format!(
+            "no named profiles registered\nnext: to register one, replace the home/name placeholders in `{}`; then select it with --profile=<name> (omit --home and unset SSHW_HOME). Named profiles are optional; normal home selection, including the built-in default home, remains available\n",
+            profile_registration_hint("<name>")
+        )));
+    }
     let mut stdout = String::new();
     for (name, entry) in &registry.profiles {
         let marker = if registry.default.as_deref() == Some(name) {
@@ -225,7 +231,7 @@ fn profile_show(
     let entry = registry
         .profiles
         .get(&args.name)
-        .ok_or_else(|| anyhow::anyhow!("unknown profile '{}'", args.name))?;
+        .ok_or_else(|| unknown_profile(&args.name))?;
     let is_default = registry.default.as_deref() == Some(args.name.as_str());
 
     if args.json {
@@ -257,7 +263,7 @@ fn profile_default(
     let entry = registry
         .profiles
         .get(&args.name)
-        .ok_or_else(|| anyhow::anyhow!("unknown profile '{}'", args.name))?;
+        .ok_or_else(|| unknown_profile(&args.name))?;
     validate_profile_target(&args.name, &entry.home, &entry.id)?;
 
     let changed = registry.default.as_deref() != Some(args.name.as_str());
@@ -287,7 +293,7 @@ fn profile_remove(
 ) -> anyhow::Result<CommandOutput> {
     let previous_default = registry.default.clone();
     if registry.profiles.remove(&args.name).is_none() {
-        return Err(anyhow::anyhow!("unknown profile '{}'", args.name));
+        return Err(unknown_profile(&args.name));
     }
     if registry.default.as_deref() == Some(args.name.as_str()) {
         registry.default = registry.profiles.keys().next().cloned();

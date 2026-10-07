@@ -2,6 +2,7 @@ use crate::error::{
     diagnostic_path, persistence_context, persistence_error, redacted_error_detail,
 };
 use crate::home::{ResolvedHome, builtin_default_home, is_reserved_profile_id};
+use crate::local_command::{quote_local_argument, redacted_argument};
 use crate::storage::write_owner_only_atomic;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -259,7 +260,7 @@ pub(crate) fn select_home_with_registry(
         let entry = registry
             .profiles
             .get(name)
-            .ok_or_else(|| anyhow::anyhow!("unknown profile '{name}'"))?;
+            .ok_or_else(|| unknown_profile(name))?;
         ensure_valid_profile_id(name, &entry.id)?;
         return Ok(ResolvedHome::profile(
             entry.home.clone(),
@@ -316,6 +317,26 @@ pub(crate) fn validate_home_directory(home: &Path) -> Result<()> {
             diagnostic_path(home)
         ))
     })
+}
+
+pub(crate) fn profile_registration_hint(name: &str) -> String {
+    format!(
+        "sshw --home {} profile add -- {}",
+        quote_local_argument("<home>"),
+        quote_local_argument(name)
+    )
+}
+
+pub(crate) fn unknown_profile(name: &str) -> anyhow::Error {
+    crate::error::app_error(
+        crate::output::ErrorKind::Config,
+        format!(
+            "unknown profile '{}'; only registered profiles can be selected\nnext: run `sshw profile list` to see the global profile registry; omit the failing --profile selection from recovery commands\nto register this name, replace the home placeholder in `{}`. Use --profile={} to select its registered credential namespace (omit --home and unset SSHW_HOME); --home uses a separate namespace. A named profile is optional; omit --profile to use normal home selection",
+            redacted_argument(name),
+            profile_registration_hint(name),
+            quote_local_argument(name)
+        ),
+    )
 }
 
 pub fn validate_profile_name(name: &str) -> Result<()> {

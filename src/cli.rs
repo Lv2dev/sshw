@@ -2218,6 +2218,48 @@ mod runtime_backend_tests {
     }
 
     #[test]
+    fn explicit_unknown_profile_reports_recovery_without_default_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut registry = crate::profile::ProfileRegistry {
+            default: Some("work".into()),
+            ..Default::default()
+        };
+        registry.profiles.insert(
+            "work".into(),
+            crate::profile::ProfileEntry {
+                id: "p_work".into(),
+                home: temp.path().join("work-home"),
+            },
+        );
+        let registry_path = temp.path().join("profiles.json");
+        crate::profile::save_registry(&registry_path, &registry).unwrap();
+        let before = std::fs::read(&registry_path).unwrap();
+        for command in ["list", "doctor"] {
+            let cli = Cli::try_parse_from(["sshw", "--profile=missing", command]).unwrap();
+            let error = resolve_runtime_with_base(&cli, temp.path(), None).unwrap_err();
+            for machine in [false, true] {
+                let output = error_output(&error, machine);
+                assert_eq!(output.exit_code, 3);
+                let text = if machine {
+                    output.stdout
+                } else {
+                    output.stderr
+                };
+                assert!(
+                    text.contains("unknown profile 'missing'")
+                        && text.contains("sshw profile list")
+                );
+                assert!(
+                    text.contains("profile add -- 'missing'")
+                        && text.contains("separate namespace")
+                );
+            }
+        }
+        assert_eq!(std::fs::read(&registry_path).unwrap(), before);
+        assert!(!temp.path().join("work-home").exists());
+    }
+
+    #[test]
     fn explicit_home_resolution_does_not_load_corrupt_registry() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join("profiles.json"), "{").unwrap();

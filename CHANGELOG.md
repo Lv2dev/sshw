@@ -8,6 +8,10 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 
 ## [Unreleased]
 
+### 일반 SCP 전송 오류·프로필 복구 안내
+- 일반 `put/get` 오류에 실패 단계·로그인 사용자와 endpoint·local/remote 경로·개별 마스킹한 원인 및 점검 방법을 표시합니다. native SCP 오류만으로 파일 부재와 권한 거부를 단정하지 않으며 원래 source/code·ssh/IO 분류·deadline·완료 확인과 다운로드 staging을 유지합니다. 업로드 실패 시 목적지가 이미 변경됐을 수 있음을 안내하고 기존 atomic/MSYS/인증 진단을 보존합니다.
+- 미등록 프로필의 선택·show/default/remove 오류가 전역 목록 조회와 이름을 인용한 등록 안내를 공유합니다. 빈 human 목록은 선택적인 등록 방법과 내장 기본 home 사용 가능 여부를 설명하며 JSON `[]`는 유지합니다. 값별 마스킹·플랫폼 인용·`--` 경계·config/3·선택 우선순위·namespace·registry 저장/잠금/감사 계약을 유지합니다.
+
 ### 무비밀번호 승격 재설정·미등록 서버 복구 안내
 - `privilege set --no-password`는 최종 전체 설정이 같으면 저장을 생략하고 human 변경 없음·JSON `changed:false`/`change:"unchanged"`를 표시합니다. 실제 신규·변경은 `true`와 `added/updated`이며 기존 metadata/credential 필드·확인/force·검증/lock/audit·원본 bytes/mtime를 유지합니다. Password 갱신·target 변경 및 실제 CAS/atomic/비밀 정리·부분 적용 오류는 보존하고 서버 sudoers를 검사하지 않습니다.
 - 공통 미등록 서버 오류에 등록된 서버 선택 의미와 같은 home/profile의 목록 조회·서버 등록 안내를 추가했습니다. 값별 마스킹·플랫폼 인용·`--` 경계를 공유하고 run/policy check의 기존 전체 명령 인용 안내를 유지합니다. config/3·JSON·기존 오류 순서를 보존하며 자동 등록/다른 home 조회·서버 전환·접속은 수행하지 않습니다.
