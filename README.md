@@ -27,7 +27,7 @@ For an existing home, start with `sshw doctor`: it lists local problems and next
 
 ### Security Boundary
 
-Version 0.13.0 improves usability but retains known native SSH security issues in the official dependency. Read the [native dependency limitations](SECURITY.md#native-ssh-의존성의-알려진-보안-제한-0130) before use.
+Version 0.15.0 improves usability but retains known native SSH security issues in the official dependency. Read the [native dependency limitations](SECURITY.md#native-ssh-의존성의-알려진-보안-제한-0130) before use.
 
 `sshw` reduces accidental secret exposure in chat, command lines, shell history, JSON config, and normal command output. It also provides:
 
@@ -88,6 +88,8 @@ done
 
 ### Storage Layout And Profiles
 
+Version 0.15.0 preserves existing CLI calls, exit codes and config read compatibility while adding diagnostic and change-status fields. Rust callers constructing `PrivilegeConfig` use `credential: Some(...)` with `no_password: false` for password-based settings, or `None` with `true` for passwordless sudo. Callers constructing `ErrorResponse` must include its new `mutation` field. The new `Prompter` confirmation-readiness hook has a default implementation, so existing implementations remain compatible. See [CHANGELOG.md](CHANGELOG.md) for the release and Rust API migration notes.
+
 All state lives under per-project **homes**. A home directory contains:
 
 ```text
@@ -115,7 +117,7 @@ sshw:v3:<encoded-namespace>:privilege:<encoded-server>:<encoded-user>:<generatio
 
 The namespace, server, and user components are base64url-encoded. Each credential update receives a new generation. Legacy v1 keys (`sshw:<namespace>:<server>` and `sshw:<namespace>:privilege:<server>`) and server-scoped v2 keys remain readable only when they match the active namespace, purpose, and server without colliding with another account; new writes use v3.
 
-`servers.json` schema v2 stores `default_user` plus a username-keyed `accounts` map under each server. Schema v1 remains readable: its single `user`/`auth` pair and optional server privilege entry are interpreted as the default account in memory. Read-only commands do not rewrite the file; the next successful config mutation persists schema v2 while retaining the legacy credential reference.
+`servers.json` schema v2 stores `default_user` plus a username-keyed `accounts` map under each server. Schema v1 remains readable: its single `user`/`auth` pair becomes the default account in memory, together with any matching server entry from the top-level `privileges` map. A v1 server object does not accept a nested `privilege` field. Read-only commands do not rewrite the file; the next successful config mutation persists schema v2 while retaining the legacy credential reference.
 
 ### Selecting A Home
 
@@ -545,7 +547,7 @@ cargo run --locked -- doctor
 
 On constrained local machines, limit Cargo parallelism per invocation instead of committing a repo-wide config, for example `CARGO_BUILD_JOBS=1 cargo test --locked`.
 
-See `CONTRIBUTING.md` for dependency-audit commands, integration-test expectations, and safe issue/PR data handling.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for dependency-audit commands, integration-test expectations, and safe issue/PR data handling.
 
 ### Security Reports
 
@@ -578,7 +580,7 @@ sshw run web "hostname" --json
 
 ### 보안 경계
 
-0.13.0은 사용성 개선 버전이며 공식 의존성의 알려진 native SSH 보안 문제가 남아 있습니다. 사용 전에 [의존성의 보안 제한](SECURITY.md#native-ssh-의존성의-알려진-보안-제한-0130)을 확인하세요.
+0.15.0은 사용성 개선 버전이며 공식 의존성의 알려진 native SSH 보안 문제가 남아 있습니다. 사용 전에 [의존성의 보안 제한](SECURITY.md#native-ssh-의존성의-알려진-보안-제한-0130)을 확인하세요.
 
 `sshw`는 채팅, 명령줄, 셸 히스토리, JSON 설정, 일반 출력에서 비밀이 실수로 노출되는 일을 줄이며, 추가로 다음을 제공합니다.
 
@@ -639,7 +641,7 @@ done
 
 ### 저장 구조와 profile
 
-`0.15.0`은 기존 CLI 호출·종료 코드·설정 읽기를 유지하며 진단과 변경 여부 필드를 추가합니다. Rust 라이브러리에서 `PrivilegeConfig`를 직접 구성한다면 `credential: Some(...)`과 `no_password: false`로 기존 비밀번호 설정을 표현하세요. 무비밀번호 sudo는 `credential: None`, `no_password: true`입니다. `ErrorResponse` 구조체를 직접 구성하는 호출자는 새 `mutation` 필드를 반영해야 합니다. `Prompter`의 새 확인 준비 hook은 기본 구현이 있어 기존 구현을 유지할 수 있습니다.
+`0.15.0`은 기존 CLI 호출·종료 코드·설정 읽기를 유지하며 진단과 변경 여부 필드를 추가합니다. Rust 라이브러리에서 `PrivilegeConfig`를 직접 구성한다면 `credential: Some(...)`과 `no_password: false`로 기존 비밀번호 설정을 표현하세요. 무비밀번호 sudo는 `credential: None`, `no_password: true`입니다. `ErrorResponse` 구조체를 직접 구성하는 호출자는 새 `mutation` 필드를 반영해야 합니다. `Prompter`의 새 확인 준비 hook은 기본 구현이 있어 기존 구현을 유지할 수 있습니다. 릴리스와 Rust API 이행 내역은 [CHANGELOG.md](CHANGELOG.md)에서 확인하세요.
 
 모든 상태는 프로젝트별 **home** 아래에 있습니다. home 디렉터리 구성:
 
@@ -668,7 +670,7 @@ sshw:v3:<encoded-namespace>:privilege:<encoded-server>:<encoded-user>:<generatio
 
 namespace, server, user는 base64url로 인코딩하며 credential을 갱신할 때마다 새 generation을 발급합니다. legacy v1 키(`sshw:<namespace>:<server>`, `sshw:<namespace>:privilege:<server>`)와 server 범위 v2 키는 active namespace, purpose, server가 일치하고 다른 account와 충돌하지 않을 때만 읽기 호환을 유지하며 신규 저장은 v3를 사용합니다.
 
-`servers.json` schema v2는 각 server 아래 `default_user`와 username-keyed `accounts` map을 저장합니다. schema v1도 계속 읽을 수 있으며 기존 단일 `user`/`auth`와 선택적 server privilege를 메모리에서 default account로 해석합니다. read-only 명령은 파일을 바꾸지 않고, 다음 config mutation이 성공하면 legacy credential 참조를 유지한 채 schema v2로 저장합니다.
+`servers.json` schema v2는 각 server 아래 `default_user`와 username-keyed `accounts` map을 저장합니다. schema v1도 계속 읽을 수 있으며 기존 단일 `user`/`auth`와 최상위 `privileges` map의 같은 server 항목을 메모리에서 default account로 해석합니다. v1 server 객체 안의 중첩 `privilege` 필드는 허용하지 않습니다. read-only 명령은 파일을 바꾸지 않고, 다음 config mutation이 성공하면 legacy credential 참조를 유지한 채 schema v2로 저장합니다.
 
 ### home 선택
 
@@ -1102,7 +1104,7 @@ cargo run --locked -- doctor
 
 로컬 머신 부담이 크면 저장소 전체 설정을 커밋하지 말고 호출별로 Cargo 병렬도를 제한하세요. 예: `CARGO_BUILD_JOBS=1 cargo test --locked`.
 
-dependency audit 명령, integration test 기대사항, 이슈/PR에서의 안전한 데이터 취급은 `CONTRIBUTING.md`를 참고하세요.
+dependency audit 명령, integration test 기대사항, 이슈/PR에서의 안전한 데이터 취급은 [CONTRIBUTING.md](CONTRIBUTING.md)를 참고하세요.
 
 ### 보안 제보
 
