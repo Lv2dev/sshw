@@ -1611,7 +1611,8 @@ fn resolve_run_target(
         return Err(app_error(
             ErrorKind::Config,
             format!(
-                "unknown server '{name}'; run 'sshw list' to see registered servers. Quote the whole remote command: sshw run <server> \"<command>\", or sshw run \"<command>\" for the default server"
+                "{}\nQuote the whole remote command: sshw run <server> \"<command>\", or sshw run \"<command>\" for the default server",
+                unknown_server_message(name)
             ),
         ));
     }
@@ -1654,7 +1655,15 @@ fn select_account<'a>(
 }
 
 fn unknown_server(name: &str) -> anyhow::Error {
-    app_error(ErrorKind::Config, format!("unknown server '{name}'"))
+    app_error(ErrorKind::Config, unknown_server_message(name))
+}
+
+fn unknown_server_message(name: &str) -> String {
+    format!(
+        "unknown server '{}'; only registered servers can be selected\nnext: using the same home/profile selection, run `sshw list` to see registered servers; to register this name, replace the host/login-user placeholders in `{}`. Registration uses hidden password input by default; insert --auth agent or --password-stdin before the suggested command's -- as appropriate",
+        hints::redacted_argument(name),
+        hints::server_add(name),
+    )
 }
 
 fn ok(stdout: String) -> CommandOutput {

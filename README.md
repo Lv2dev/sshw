@@ -201,6 +201,8 @@ Agent authentication failures in `run`, `put` and `get` show the selected login 
 
 ### Managing Server Accounts
 
+Unknown server errors (config/3) explain that selection requires a registered server and show `sshw list` plus a registration command with host/login-user placeholders. Keep the same home/profile and replace the placeholders before running it. The command quotes the requested name for PowerShell on Windows or POSIX shells elsewhere, masks sensitive values and puts the name after `--`. Registration defaults to hidden password input; put `--auth agent` or `--password-stdin` before `--` as needed. `run` and its policy check also keep the whole-command quoting hint. No server is registered, selected from another home or contacted by this diagnostic.
+
 Password SSH authentication failures in `run`, `put` and `get` show the selected login user, host/port and redacted native cause. Use the same home/profile with `sshw doctor` to inspect local credential readiness, check the login password (`SSHW_PASSWORD` for session-only homes), the account's login access and whether the server accepts password authentication. A generic authentication failure alone does not identify which condition failed. Errors retain the original native source/code, auth/4 and JSON causes. Host-key verification still comes first; these diagnostics do not change credentials, retry authentication or switch to agent auth.
 
 Each server endpoint can hold multiple explicitly registered SSH usernames. Omitting `--user` uses that server's `default_user`; `--user <name>` selects only an existing account and never acts as an ad-hoc username override.
@@ -256,6 +258,8 @@ Privilege metadata is scoped to the selected login account. `privilege set/show/
 For a server that already permits passwordless sudo, use `sshw run web "id -u" --as-root --no-password`. This runs `sudo -n` without reading a stored privilege password or prompting. It uses the configured sudo target user, or `root` when no privilege configuration exists; a configured `su` path is rejected. The server still enforces sudoers. `privilege set --account` also accepts `--login-user`, and its target `--user` accepts `--target-user`.
 
 `run --as-root` checks the required privilege settings and any su/`--no-password` conflict before looking up the login password. A missing login password therefore no longer hides a local privilege configuration error (config/3). Safety, policy, account selection and stream/su checks still run first. Ordinary login failures remain auth/4, and `--as-root --no-password` still allows an account without saved privilege settings.
+
+Repeating `privilege set --no-password` still requires confirmation or `--force`. An identical resulting configuration skips saving and reports human `(unchanged)` and JSON `changed:false`/`change:"unchanged"`, preserving the original bytes/mtime. New settings and changes report `true` with `added/updated`; existing target and credential fields remain. Password registration still rotates the credential. Validation, locking, auditing and actual-change concurrency/atomic-write/credential cleanup remain. This compares local metadata and does not check server sudoers.
 
 To save a passwordless sudo target for a specific login account:
 
@@ -746,6 +750,8 @@ agent auth는 비밀을 저장하지 않고 활성 SSH agent를 사용합니다.
 
 ### 서버 account 관리
 
+미등록 서버 오류(config/3)는 등록된 서버를 선택해야 한다는 설명과 `sshw list`·host/login-user placeholder가 있는 등록 명령을 제공합니다. 같은 home/profile을 유지하고 placeholder를 실제 값으로 바꿔 실행하세요. 이름은 민감 값을 마스킹한 뒤 Windows PowerShell/그 외 POSIX 셸에 맞게 인용하며 `--` 뒤에 둡니다. 등록은 기본적으로 비밀번호 숨김 입력이므로 필요한 `--auth agent` 또는 `--password-stdin`을 `--` 앞에 넣으세요. `run`과 대응 policy check는 전체 명령 인용 안내도 유지합니다. 이 진단이 서버를 등록하거나 다른 home에서 선택·접속하지 않습니다.
+
 `run`·`put`·`get`의 비밀번호 SSH 인증 실패도 로그인 사용자·host/port·마스킹한 native 원인을 표시합니다. 같은 home/profile의 `sshw doctor`로 로컬 credential 준비 상태를 검사하고 로그인 비밀번호(세션 전용은 `SSHW_PASSWORD`)·계정의 로그인 허용·서버의 password 인증 설정을 확인하세요. 일반 인증 실패만으로 어느 조건이 문제인지 단정하지 않습니다. 원래 native source/code·auth/4·JSON causes와 host key 확인 후 인증 순서를 유지하며 비밀번호 변경·추가 인증/재시도·agent 전환을 자동 실행하지 않습니다.
 
 미등록 계정 오류(config/3)는 등록된 로그인 계정을 선택해야 한다는 설명과 복사 가능한 `account list`·`account add` 명령을 제공합니다. 같은 home/profile을 사용하세요. 새 등록은 기본적으로 비밀번호 숨김 입력을 사용하며, agent 인증은 안내 명령의 `--` 앞에 `--auth agent`, 비밀번호 pipe/redirection은 `--password-stdin`을 넣습니다. 오류가 계정이나 자격 증명을 자동 변경하지 않으며 이름을 개별 마스킹하고 로컬 셸에 맞게 인용합니다.
@@ -799,6 +805,8 @@ privilege metadata는 선택된 login account별로 분리됩니다. `privilege 
 서버가 이미 무비밀번호 sudo를 허용한다면 `sshw run web "id -u" --as-root --no-password`를 사용하세요. 저장된 privilege 비밀번호를 읽거나 입력받지 않고 `sudo -n`을 실행합니다. 등록된 sudo 대상 계정을 사용하며 설정이 없으면 root입니다. su 설정이 있으면 거부하고 실제 권한은 원격 sudoers가 결정합니다. `privilege set --account`는 `--login-user`, 대상 `--user`는 `--target-user` 별칭도 지원합니다.
 
 `run --as-root`는 로그인 비밀번호 조회 전에 필요한 승격 설정과 su/`--no-password` 충돌을 검사합니다. 로그인 비밀번호가 없어도 로컬 승격 설정 오류(config/3)를 먼저 안내합니다. 기존 safety/policy/account 선택과 stream/su 검사는 더 먼저 실행합니다. 일반 로그인 오류는 auth/4이며, 저장된 승격 설정 없이 `--as-root --no-password`를 사용하는 의미도 유지합니다.
+
+같은 `privilege set --no-password` 설정을 재적용할 때도 확인 또는 `--force`가 필요합니다. 최종 전체 설정이 같으면 저장을 생략해 원본 bytes/mtime를 보존하고 일반 출력의 `(unchanged)`와 JSON `changed:false`/`change:"unchanged"`를 표시합니다. 신규·실제 변경은 `true`와 `added/updated`이며 기존 대상/credential 필드를 유지합니다. 비밀번호 등록은 계속 credential을 재발급합니다. 검증·잠금·감사 및 실제 변경의 동시 수정/atomic 저장·비밀 정리를 유지하며 비교 대상은 로컬 metadata로, 서버 sudoers를 검사하지 않습니다.
 
 로그인 계정별 무비밀번호 sudo 대상을 저장하려면 다음과 같이 실행합니다.
 

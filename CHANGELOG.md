@@ -8,6 +8,10 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 
 ## [Unreleased]
 
+### 무비밀번호 승격 재설정·미등록 서버 복구 안내
+- `privilege set --no-password`는 최종 전체 설정이 같으면 저장을 생략하고 human 변경 없음·JSON `changed:false`/`change:"unchanged"`를 표시합니다. 실제 신규·변경은 `true`와 `added/updated`이며 기존 metadata/credential 필드·확인/force·검증/lock/audit·원본 bytes/mtime를 유지합니다. Password 갱신·target 변경 및 실제 CAS/atomic/비밀 정리·부분 적용 오류는 보존하고 서버 sudoers를 검사하지 않습니다.
+- 공통 미등록 서버 오류에 등록된 서버 선택 의미와 같은 home/profile의 목록 조회·서버 등록 안내를 추가했습니다. 값별 마스킹·플랫폼 인용·`--` 경계를 공유하고 run/policy check의 기존 전체 명령 인용 안내를 유지합니다. config/3·JSON·기존 오류 순서를 보존하며 자동 등록/다른 home 조회·서버 전환·접속은 수행하지 않습니다.
+
 ### 동일 agent 재등록·비밀번호 SSH 인증 안내
 - `add/account add`의 agent 재등록은 최종 전체 설정이 같으면 저장을 생략하고 human 변경 없음과 JSON `changed:false`/`change:"unchanged"`를 표시합니다. 기존 action/대상 필드·확인/force·검증/lock/audit를 유지하며 원본 v1/형식/bytes/mtime를 보존합니다. 신규·endpoint/default/account/replace 변경과 비밀번호 재발급은 `changed:true`로 저장하고 기존 CAS/atomic/비밀 정리·부분 적용 오류를 유지합니다.
 - `run/put/get`의 비밀번호 SSH 인증 실패도 로그인 사용자·host/port·개별 마스킹한 native 원인과 같은 home/profile의 credential/로그인 비밀번호·서버 계정/password 인증 설정 점검을 안내합니다. 실패만으로 잘못된 비밀번호라고 단정하지 않으며 typed source/code·auth/4·JSON causes·host key 확인 후 인증·Agent/승격을 유지합니다. 자동 비밀번호 갱신·agent fallback·추가 접속/재시도는 수행하지 않습니다.

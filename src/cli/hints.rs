@@ -57,6 +57,15 @@ pub(super) fn account_add(server: &str, login_user: &str) -> String {
     )
 }
 
+pub(super) fn server_add(server: &str) -> String {
+    format!(
+        "sshw add --host {} --user {} -- {}",
+        quote_local_argument("<host>"),
+        quote_local_argument("<login-user>"),
+        quote_local_argument(server),
+    )
+}
+
 pub(super) fn privilege_set(
     server: &str,
     login_user: &str,

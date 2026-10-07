@@ -67,6 +67,7 @@ where
         return Err(app_error(ErrorKind::Config, "privilege update cancelled"));
     }
 
+    let before = config.clone();
     let privilege = PrivilegeConfig {
         method: map_method(args.method),
         user: args.user,
@@ -109,8 +110,17 @@ where
         .and_then(|server| server.accounts.get_mut(&login_user))
         .expect("validated default account")
         .privilege = Some(privilege);
-    if let Err(err) =
-        save_config_if_unchanged(config_path, config, revision).with_error_kind(ErrorKind::Config)
+    let changed = !args.no_password || *config != before;
+    let change = if !changed {
+        "unchanged"
+    } else if previous_privilege.is_some() {
+        "updated"
+    } else {
+        "added"
+    };
+    if changed
+        && let Err(err) = save_config_if_unchanged(config_path, config, revision)
+            .with_error_kind(ErrorKind::Config)
     {
         if !crate::storage::write_was_published(&err)
             && let Some((credential, user)) = &stored_credential
@@ -154,6 +164,8 @@ where
             "user": output_user,
             "credential": output_credential,
             "no_password": args.no_password,
+            "changed": changed,
+            "change": change,
         });
         if let (Some(map), Some(warning)) = (output.as_object_mut(), warning) {
             map.insert(
@@ -165,9 +177,10 @@ where
     }
 
     let mut message = format!(
-        "privilege set for {}/{}\n  login account: {}\n  method: {}\n  target user: {}\n  authentication: {}\n",
+        "privilege set for {}/{}{}\n  login account: {}\n  method: {}\n  target user: {}\n  authentication: {}\n",
         args.name,
         login_user,
+        if changed { "" } else { " (unchanged)" },
         login_user,
         method_label(output_method),
         output_user,

@@ -97,6 +97,103 @@ impl Prompter for NoPrompts {
 }
 
 #[test]
+fn server_selection_recovery_is_shared_quoted_and_masked_before_any_external_access() {
+    for missing in ["missing", "-stage's $literal", "password=server-marker"] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("servers.json");
+        config(&path, "example.test", 2222, "web", "deploy");
+        let before = std::fs::read(&path).unwrap();
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let store = Store {
+            persistent: true,
+            error: Some("must not query"),
+            reads: Cell::new(0),
+        };
+        let local = temp.path().join("upload");
+        std::fs::write(&local, "fixture").unwrap();
+        let local = local.to_str().unwrap();
+        let commands = [
+            (vec!["show"], vec![]),
+            (vec!["trust"], vec![]),
+            (vec!["default"], vec![]),
+            (vec!["remove", "--yes"], vec![]),
+            (vec!["account", "list"], vec![]),
+            (vec!["privilege", "show"], vec![]),
+            (vec!["run"], vec!["hostname"]),
+            (vec!["put"], vec![local, "/tmp/file"]),
+            (vec!["get"], vec!["/tmp/file", "unused-local"]),
+            (vec!["policy", "check"], vec!["hostname"]),
+            (vec!["policy", "check-put"], vec![local, "/tmp/file"]),
+            (
+                vec!["policy", "check-get"],
+                vec!["/tmp/file", "unused-local"],
+            ),
+        ];
+        for (prefix, target) in commands {
+            for machine in [false, true] {
+                let mut args = vec!["sshw"];
+                args.extend(prefix.iter().copied());
+                if machine {
+                    args.push("--json");
+                }
+                args.extend(["--", missing]);
+                args.extend(target.iter().copied());
+                let output = execute_for_runtime(
+                    Cli::try_parse_from(args).unwrap(),
+                    &path,
+                    &store,
+                    &NoNetwork,
+                    &mut NoPrompts,
+                );
+                assert_eq!(output.exit_code, 3, "{output:?}");
+                let text = format!("{}{}", output.stdout, output.stderr);
+                assert!(
+                    text.contains("only registered servers can be selected")
+                        && text.contains("same home/profile")
+                );
+                assert!(text.contains("sshw list") && text.contains("sshw add --host"));
+                assert!(
+                    text.contains("<host>")
+                        && text.contains("<login-user>")
+                        && text.contains("--auth agent")
+                        && text.contains("--password-stdin")
+                );
+                let message = if machine {
+                    let body: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+                    assert_eq!(body["error"]["kind"], "config");
+                    body["error"]["message"].as_str().unwrap().to_string()
+                } else {
+                    output.stderr
+                };
+                assert_eq!(
+                    message.contains("Quote the whole remote command"),
+                    prefix == ["run"] || prefix == ["policy", "check"]
+                );
+                if missing.starts_with("password=") {
+                    assert!(message.contains("<redacted>"));
+                    assert!(!text.contains("server-marker"));
+                    assert!(message.contains("-- '<redacted>'"));
+                } else if missing.starts_with('-') {
+                    let quoted = if cfg!(windows) {
+                        "-- '-stage''s $literal'"
+                    } else {
+                        "-- '-stage'\"'\"'s $literal'"
+                    };
+                    assert!(message.contains(quoted), "{message}");
+                }
+                assert_eq!(std::fs::read(&path).unwrap(), before);
+                assert_eq!(
+                    std::fs::metadata(&path).unwrap().modified().unwrap(),
+                    modified
+                );
+            }
+        }
+        assert_eq!(store.reads.get(), 0);
+        assert!(!temp.path().join("known_hosts").exists());
+    }
+}
+
+#[test]
 fn registration_validation_rejects_conflicting_auth_before_confirm_or_secret_input() {
     for account in [false, true] {
         for existing in [false, true] {
