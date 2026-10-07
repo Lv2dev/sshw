@@ -658,7 +658,7 @@ impl RunDiagnostic<'_> {
         stage: &str,
     ) -> anyhow::Result<T> {
         self.step(
-            result.map_err(Into::into).with_error_kind(ErrorKind::Ssh),
+            result.map_err(Into::into).context("ssh session error"),
             stage,
         )
     }
@@ -1743,6 +1743,25 @@ example.test ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB9zU1OEQ2tzYhrXq4/DEjvRNvKv6cU
                 .is_some_and(|io| io.kind() == std::io::ErrorKind::BrokenPipe)
         }));
         assert_eq!(response.partial_output.unwrap().stdout, "previous output");
+        // Completion callers expose this anyhow source directly, so preserve
+        // native anyhow downcasting as well as the standard source chain.
+        let source = diagnostic
+            .ssh_step(
+                Err::<(), _>(ssh2::Error::from_errno(ssh2::ErrorCode::Session(-9))),
+                "wait for command completion",
+            )
+            .unwrap_err();
+        assert!(source.downcast_ref::<ssh2::Error>().is_some());
+        let partial = crate::ssh::PartialRunError {
+            source,
+            stdout: "complete output".into(),
+            stderr: String::new(),
+        };
+        assert!(partial.source.downcast_ref::<ssh2::Error>().is_some());
+        assert_eq!(
+            crate::output::classify_error(&anyhow::Error::new(partial)),
+            ErrorKind::Ssh
+        );
     }
 
     #[test]
