@@ -8,6 +8,10 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 
 ## [Unreleased]
 
+### 동일 agent 재등록·비밀번호 SSH 인증 안내
+- `add/account add`의 agent 재등록은 최종 전체 설정이 같으면 저장을 생략하고 human 변경 없음과 JSON `changed:false`/`change:"unchanged"`를 표시합니다. 기존 action/대상 필드·확인/force·검증/lock/audit를 유지하며 원본 v1/형식/bytes/mtime를 보존합니다. 신규·endpoint/default/account/replace 변경과 비밀번호 재발급은 `changed:true`로 저장하고 기존 CAS/atomic/비밀 정리·부분 적용 오류를 유지합니다.
+- `run/put/get`의 비밀번호 SSH 인증 실패도 로그인 사용자·host/port·개별 마스킹한 native 원인과 같은 home/profile의 credential/로그인 비밀번호·서버 계정/password 인증 설정 점검을 안내합니다. 실패만으로 잘못된 비밀번호라고 단정하지 않으며 typed source/code·auth/4·JSON causes·host key 확인 후 인증·Agent/승격을 유지합니다. 자동 비밀번호 갱신·agent fallback·추가 접속/재시도는 수행하지 않습니다.
+
 ### home 경로 검사·trust 확인 준비
 - 선택한 home과 가장 가까운 기존 부모를 공통 검사해 파일·파일 아래 경로·경로 검사 실패를 설정/정책 로딩 전에 config/3으로 거절합니다. 경로·마스킹한 원인·폴더/권한 복구 안내와 원래 IO source를 보존하며, 없는 폴더를 만들거나 상대 경로·선택 우선순위·namespace를 변경하지 않습니다. `profile` 관리의 복구 경로와 add/default 대상 검사를 유지하고 doctor의 registry 복구가 잘못된 명시적 home을 숨기지 않게 합니다.
 - `trust`는 `--yes`가 없으면 서버 조회 뒤·SSH 접속 전에 확인 가능 여부를 검사합니다. 비대화형 입력에서는 접속 오류보다 config/3과 interactive/`--yes` 안내를 먼저 표시합니다. 지문 조회 후 확인·저장 직전 재검증과 `--yes` 흐름은 유지합니다. 공개 `Prompter`에 기본 구현이 있는 `ensure_confirmation_available` hook을 추가해 기존 구현의 호환성을 유지합니다.

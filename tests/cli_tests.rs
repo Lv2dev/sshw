@@ -4074,6 +4074,326 @@ fn default_command_prints_and_updates_default_server() {
 }
 
 #[test]
+fn agent_registration_noops_preserve_legacy_bytes_confirmation_secrets_and_audit() {
+    for version in [1, 2] {
+        for account in [false, true] {
+            for force in [false, true] {
+                for machine in [false, true] {
+                    let temp = tempfile::tempdir().unwrap();
+                    let path = temp.path().join("servers.json");
+                    let server = if version == 1 {
+                        serde_json::json!({"host":"example.test","port":2222,"user":"deploy","auth":{"type":"agent"}})
+                    } else {
+                        serde_json::json!({"host":"example.test","port":2222,"default_user":"deploy","accounts":{
+                            "deploy":{"auth":{"type":"agent"},"privilege":{"method":"sudo","user":"daemon","no_password":true}},
+                            "ops":{"auth":{"type":"agent"}}}})
+                    };
+                    std::fs::write(&path, serde_json::json!({"version":version,"default":"web","credential_backend":"session_only","servers":{"web":server}}).to_string()).unwrap();
+                    let before = std::fs::read(&path).unwrap();
+                    let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+                    let home = ResolvedHome::from_config_path(&path);
+                    let registry = temp.path().join("profiles.json");
+                    let audit_path = temp.path().join("audit.jsonl");
+                    let audit = FileAuditSink::new(audit_path.clone());
+                    let ctx = ExecContext {
+                        home: &home,
+                        registry_path: &registry,
+                        policy_forced: false,
+                        audit: &audit,
+                    };
+                    let mut args = if account {
+                        vec!["sshw", "account", "add", "web", "deploy", "--auth", "agent"]
+                    } else {
+                        vec![
+                            "sshw",
+                            "add",
+                            "web",
+                            "--host",
+                            "example.test",
+                            "--port",
+                            "2222",
+                            "--user",
+                            "deploy",
+                            "--auth",
+                            "agent",
+                        ]
+                    };
+                    if force {
+                        args.push("--force");
+                    }
+                    if machine {
+                        args.push("--json");
+                    }
+                    let store = FakeCredentialStore::default();
+                    let ssh = FakeSshClient::default();
+                    let mut prompts = NoPasswordPrompter { prompts: vec![] };
+                    for _ in 0..2 {
+                        let output = sshw::cli::execute_for_runtime_with(
+                            Cli::try_parse_from(args.clone()).unwrap(),
+                            &ctx,
+                            &store,
+                            &ssh,
+                            &mut prompts,
+                        );
+                        assert_eq!(output.exit_code, 0, "{output:?}");
+                        if machine {
+                            let body: serde_json::Value =
+                                serde_json::from_str(&output.stdout).unwrap();
+                            assert_eq!(body["action"], "updated");
+                            assert_eq!(body["changed"], false);
+                            assert_eq!(body["change"], "unchanged");
+                        } else {
+                            assert!(output.stdout.contains("(unchanged)"));
+                        }
+                        assert_eq!(std::fs::read(&path).unwrap(), before);
+                        assert_eq!(
+                            std::fs::metadata(&path).unwrap().modified().unwrap(),
+                            modified
+                        );
+                    }
+                    assert_eq!(prompts.prompts.len(), if force { 0 } else { 2 });
+                    assert!(
+                        store.requested.borrow().is_empty()
+                            && store.deleted.borrow().is_empty()
+                            && store.values.borrow().is_empty()
+                    );
+                    assert!(
+                        *ssh.host_key_calls.borrow() == 0 && ssh.selected_users.borrow().is_empty()
+                    );
+                    let audit = std::fs::read_to_string(audit_path).unwrap();
+                    let records: Vec<serde_json::Value> = audit
+                        .lines()
+                        .map(|line| serde_json::from_str(line).unwrap())
+                        .collect();
+                    assert_eq!(records.len(), 2);
+                    assert!(
+                        records
+                            .iter()
+                            .all(|record| record["status"] == "ok" && record["exit_code"] == 0)
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn agent_registration_real_metadata_changes_are_saved_before_repeat_becomes_a_noop() {
+    for scenario in [
+        "restore-default",
+        "login-default",
+        "replace",
+        "endpoint",
+        "new-server",
+        "new-account",
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("servers.json");
+        let mut config = agent_accounts_config(&path);
+        config.servers.get_mut("server-alpha").unwrap().host = "example.test".into();
+        config.servers.get_mut("server-alpha").unwrap().port = 2222;
+        if scenario == "restore-default" {
+            config.default = None;
+        }
+        set_default_privilege(
+            &mut config,
+            "server-alpha",
+            PrivilegeConfig {
+                method: PrivilegeMethod::Sudo,
+                user: "daemon".into(),
+                credential: None,
+                no_password: true,
+            },
+        );
+        save_config(&path, &config).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let mut args = if scenario == "new-account" {
+            vec!["sshw", "account", "add", "server-alpha", "new-user"]
+        } else {
+            vec![
+                "sshw",
+                "add",
+                if scenario == "new-server" {
+                    "new-server"
+                } else {
+                    "server-alpha"
+                },
+                "--host",
+                if scenario == "endpoint" {
+                    "changed.test"
+                } else {
+                    "example.test"
+                },
+                "--port",
+                "2222",
+                "--user",
+                if scenario == "login-default" {
+                    "ops"
+                } else {
+                    "deploy"
+                },
+            ]
+        };
+        args.extend(["--auth", "agent", "--force", "--json"]);
+        if matches!(scenario, "replace" | "endpoint") {
+            args.push("--replace");
+        }
+        let store = FakeCredentialStore::default();
+        let ssh = FakeSshClient::default();
+        let output = execute_for_runtime(
+            Cli::try_parse_from(args.clone()).unwrap(),
+            &path,
+            &store,
+            &ssh,
+            &mut NoPasswordPrompter { prompts: vec![] },
+        );
+        assert_eq!(output.exit_code, 0, "{scenario}: {output:?}");
+        let body: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+        assert_eq!(body["changed"], true);
+        assert_eq!(
+            body["change"],
+            if matches!(scenario, "new-server" | "new-account") {
+                "added"
+            } else {
+                "updated"
+            }
+        );
+        assert_ne!(std::fs::read(&path).unwrap(), before);
+        let updated = load_config(&path).unwrap();
+        match scenario {
+            "restore-default" => assert_eq!(updated.default.as_deref(), Some("server-alpha")),
+            "login-default" => assert_eq!(updated.servers["server-alpha"].default_user, "ops"),
+            "endpoint" => assert_eq!(updated.servers["server-alpha"].host, "changed.test"),
+            "new-server" => assert!(updated.servers.contains_key("new-server")),
+            "new-account" => assert!(
+                updated.servers["server-alpha"]
+                    .accounts
+                    .contains_key("new-user")
+            ),
+            _ => {
+                assert_eq!(updated.servers["server-alpha"].accounts.len(), 1);
+                assert!(default_privilege(&updated, "server-alpha").is_none());
+            }
+        }
+        let before = std::fs::read(&path).unwrap();
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let output = execute_for_runtime(
+            Cli::try_parse_from(args).unwrap(),
+            &path,
+            &store,
+            &ssh,
+            &mut NoPasswordPrompter { prompts: vec![] },
+        );
+        assert_eq!(output.exit_code, 0);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&output.stdout).unwrap()["changed"],
+            false
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            modified
+        );
+    }
+}
+
+#[test]
+fn agent_registration_password_rotation_and_switch_keep_real_secret_changes() {
+    for account in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("servers.json");
+        let mut config = sample_config(&path);
+        config.servers.get_mut("server-alpha").unwrap().host = "example.test".into();
+        config.servers.get_mut("server-alpha").unwrap().port = 2222;
+        save_config(&path, &config).unwrap();
+        let original = login_credential(&path, "server-alpha");
+        let store = FakeCredentialStore::default();
+        store
+            .set_password(&original, "deploy", "ORIGINAL_PASSWORD")
+            .unwrap();
+        let prefix = if account {
+            vec!["sshw", "account", "add", "server-alpha", "deploy"]
+        } else {
+            vec![
+                "sshw",
+                "add",
+                "server-alpha",
+                "--host",
+                "example.test",
+                "--port",
+                "2222",
+                "--user",
+                "deploy",
+            ]
+        };
+        let mut args = prefix.clone();
+        args.extend(["--force", "--password-stdin", "--json"]);
+        let output = execute_for_runtime(
+            Cli::try_parse_from(args).unwrap(),
+            &path,
+            &store,
+            &FakeSshClient::default(),
+            &mut FakePrompter::default(),
+        );
+        assert_eq!(output.exit_code, 0, "{output:?}");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&output.stdout).unwrap()["changed"],
+            true
+        );
+        let rotated = load_config(&path).unwrap();
+        let AuthConfig::Password { credential } = &rotated.servers["server-alpha"]
+            .account("deploy")
+            .unwrap()
+            .auth
+        else {
+            panic!("must keep password auth")
+        };
+        assert_ne!(credential, &original);
+        assert!(
+            store
+                .values
+                .borrow()
+                .contains_key(&(credential.clone(), "deploy".into()))
+        );
+        assert!(
+            store
+                .deleted
+                .borrow()
+                .contains(&(original, "deploy".into()))
+        );
+        let rotated_key = credential.clone();
+        let mut args = prefix;
+        args.extend(["--auth", "agent", "--force", "--json"]);
+        let output = execute_for_runtime(
+            Cli::try_parse_from(args).unwrap(),
+            &path,
+            &store,
+            &FakeSshClient::default(),
+            &mut NoPasswordPrompter { prompts: vec![] },
+        );
+        assert_eq!(output.exit_code, 0);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&output.stdout).unwrap()["changed"],
+            true
+        );
+        assert!(matches!(
+            load_config(&path).unwrap().servers["server-alpha"]
+                .account("deploy")
+                .unwrap()
+                .auth,
+            AuthConfig::Agent
+        ));
+        assert!(
+            store
+                .deleted
+                .borrow()
+                .contains(&(rotated_key, "deploy".into()))
+                && store.values.borrow().is_empty()
+        );
+    }
+}
+
+#[test]
 fn default_audit_server_account_noops_preserve_files_and_remain_audited() {
     for version in [1, 2] {
         for account in [false, true] {

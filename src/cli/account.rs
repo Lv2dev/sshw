@@ -44,6 +44,7 @@ where
         return Err(app_error(ErrorKind::Config, "account update cancelled"));
     }
 
+    let before = config.clone();
     let mut new_password_credential = None;
     let auth = match args.auth {
         AuthArg::Password => {
@@ -84,8 +85,10 @@ where
         .accounts
         .insert(args.user.clone(), account);
 
-    if let Err(err) =
-        save_config_if_unchanged(config_path, config, revision).with_error_kind(ErrorKind::Config)
+    let changed = matches!(args.auth, AuthArg::Password) || *config != before;
+    if changed
+        && let Err(err) = save_config_if_unchanged(config_path, config, revision)
+            .with_error_kind(ErrorKind::Config)
     {
         if !crate::storage::write_was_published(&err)
             && let Some(credential) = new_password_credential.as_ref()
@@ -126,6 +129,8 @@ where
             "action": action,
             "server": args.name,
             "user": args.user,
+            "changed": changed,
+            "change": if changed { action } else { "unchanged" },
         });
         if let (Some(map), Some(warning)) = (output.as_object_mut(), warning) {
             map.insert("warning".to_string(), Value::String(warning.to_string()));
@@ -133,7 +138,11 @@ where
         return Ok(ok(format!("{}\n", serde_json::to_string(&output)?)));
     }
 
-    let mut message = format!("account {action} {}/{}\n", args.name, args.user);
+    let mut message = if changed {
+        format!("account {action} {}/{}\n", args.name, args.user)
+    } else {
+        format!("account {}/{} (unchanged)\n", args.name, args.user)
+    };
     if let Some(warning) = warning {
         message.push_str(&format!("warning: {warning}\n"));
     }

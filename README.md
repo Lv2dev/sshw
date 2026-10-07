@@ -195,9 +195,13 @@ sshw add server-beta --host 192.0.2.11 --port 2222 --user deploy --auth agent
 
 Agent auth stores no secret; it uses the active SSH agent.
 
+Re-registering an agent server with `add` or an agent account with `account add` still requires confirmation or `--force`. If the resulting configuration is identical, it skips saving, preserves the original format/bytes/mtime, and reports human `(unchanged)` and JSON `changed:false`/`change:"unchanged"`. Actual changes use `changed:true` with `change:"added"` or `"updated"`; existing action and target fields remain. Endpoint/default/account changes and replacement are compared as part of the whole configuration. Password registration always renews the credential and remains a real change. Validation, locking, auditing and actual-change concurrency/atomic-write/credential-cleanup checks remain.
+
 Agent authentication failures in `run`, `put` and `get` show the selected login user, endpoint, redacted native cause and recovery steps. Run `sshw doctor` with the same home/profile and execution environment, check the agent connection and loaded identities, then verify that the server allows that account/key. An unavailable agent and an agent with no identities can have different causes. These errors retain auth/4 and JSON `causes`; they do not automatically start an agent, load keys, or fall back to password auth. Host-key verification still happens before authentication.
 
 ### Managing Server Accounts
+
+Password SSH authentication failures in `run`, `put` and `get` show the selected login user, host/port and redacted native cause. Use the same home/profile with `sshw doctor` to inspect local credential readiness, check the login password (`SSHW_PASSWORD` for session-only homes), the account's login access and whether the server accepts password authentication. A generic authentication failure alone does not identify which condition failed. Errors retain the original native source/code, auth/4 and JSON causes. Host-key verification still comes first; these diagnostics do not change credentials, retry authentication or switch to agent auth.
 
 Each server endpoint can hold multiple explicitly registered SSH usernames. Omitting `--user` uses that server's `default_user`; `--user <name>` selects only an existing account and never acts as an ad-hoc username override.
 
@@ -736,9 +740,13 @@ sshw add server-beta --host 192.0.2.11 --port 2222 --user deploy --auth agent
 
 agent auth는 비밀을 저장하지 않고 활성 SSH agent를 사용합니다.
 
+`add/account add`로 agent 서버·계정을 재등록할 때도 확인 또는 `--force`가 필요합니다. 최종 전체 설정이 같으면 저장을 생략해 원본 형식·bytes/mtime를 유지하고 일반 출력의 `(unchanged)`와 JSON `changed:false`/`change:"unchanged"`를 표시합니다. 실제 변경은 `true`와 `added/updated`이며 기존 action/대상 필드는 유지합니다. endpoint·기본값·계정·교체 결과도 전체 설정에 포함해 비교합니다. 비밀번호 등록은 credential을 재발급하므로 계속 실제 변경으로 처리합니다. 검증·잠금·감사 및 실제 변경의 동시 수정/atomic 저장·비밀 정리를 유지합니다.
+
 `run`·`put`·`get`의 agent 인증 실패는 선택한 로그인 사용자·host/port·마스킹한 native 원인과 점검 방법을 표시합니다. 같은 home/profile과 실행 환경에서 `sshw doctor`를 실행하고 agent 연결·로드된 키 및 서버의 해당 계정/키 허용을 확인하세요. agent 연결 불가와 키 부재는 원인이 다를 수 있습니다. auth/4·JSON causes와 host key 확인 후 인증 순서를 유지하며 agent 시작·키 로드·비밀번호 fallback을 자동 실행하지 않습니다.
 
 ### 서버 account 관리
+
+`run`·`put`·`get`의 비밀번호 SSH 인증 실패도 로그인 사용자·host/port·마스킹한 native 원인을 표시합니다. 같은 home/profile의 `sshw doctor`로 로컬 credential 준비 상태를 검사하고 로그인 비밀번호(세션 전용은 `SSHW_PASSWORD`)·계정의 로그인 허용·서버의 password 인증 설정을 확인하세요. 일반 인증 실패만으로 어느 조건이 문제인지 단정하지 않습니다. 원래 native source/code·auth/4·JSON causes와 host key 확인 후 인증 순서를 유지하며 비밀번호 변경·추가 인증/재시도·agent 전환을 자동 실행하지 않습니다.
 
 미등록 계정 오류(config/3)는 등록된 로그인 계정을 선택해야 한다는 설명과 복사 가능한 `account list`·`account add` 명령을 제공합니다. 같은 home/profile을 사용하세요. 새 등록은 기본적으로 비밀번호 숨김 입력을 사용하며, agent 인증은 안내 명령의 `--` 앞에 `--auth agent`, 비밀번호 pipe/redirection은 `--password-stdin`을 넣습니다. 오류가 계정이나 자격 증명을 자동 변경하지 않으며 이름을 개별 마스킹하고 로컬 셸에 맞게 인용합니다.
 

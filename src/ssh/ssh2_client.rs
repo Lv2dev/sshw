@@ -1458,6 +1458,18 @@ fn agent_auth_diagnostic(
     ))
 }
 
+fn password_auth_diagnostic(
+    source: anyhow::Error,
+    server: &ServerConfig,
+    user: &str,
+) -> anyhow::Error {
+    let detail = redacted_error_detail(&source);
+    source.context(format!(
+        "SSH password authentication failed for login account '{}' at {}:{}\ncaused by: {detail}\nnext: using the same home/profile selection, run `sshw doctor` to inspect local credential readiness; check the selected login password (SSHW_PASSWORD for session-only homes), the server's password authentication settings and whether this account is allowed to log in. Never put passwords in arguments",
+        diagnostic_value(user), diagnostic_value(&server.host), server.port,
+    ))
+}
+
 fn authenticate(
     session: &Session,
     server: &ServerConfig,
@@ -1468,7 +1480,7 @@ fn authenticate(
         AuthMaterial::Password(password) => {
             session
                 .userauth_password(user, password)
-                .context("SSH authentication failed")?;
+                .map_err(|error| password_auth_diagnostic(error.into(), server, user))?;
         }
         AuthMaterial::Agent => {
             session
@@ -1478,6 +1490,13 @@ fn authenticate(
     }
 
     if !session.authenticated() {
+        if matches!(auth, AuthMaterial::Password(_)) {
+            return Err(password_auth_diagnostic(
+                anyhow::anyhow!("SSH authentication did not complete"),
+                server,
+                user,
+            ));
+        }
         return Err(anyhow::anyhow!("SSH authentication failed"));
     }
 
@@ -1567,6 +1586,91 @@ example.test ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB9zU1OEQ2tzYhrXq4/DEjvRNvKv6cU
             super::Ssh2Client::default().connect_timeout(),
             std::time::Duration::from_secs(15)
         );
+    }
+
+    #[test]
+    fn password_auth_diagnostics_preserve_native_errors_and_mask_each_field_and_cause() {
+        for sensitive in [false, true] {
+            let server = ServerConfig::single_account(
+                if sensitive {
+                    "token=host-marker"
+                } else {
+                    "example.test"
+                },
+                2222,
+                "deploy",
+                AuthConfig::Agent,
+            );
+            let user = if sensitive {
+                "password=user-marker"
+            } else {
+                "deploy"
+            };
+            let native = ssh2::Error::from_errno(ssh2::ErrorCode::Session(
+                libssh2_sys::LIBSSH2_ERROR_AUTHENTICATION_FAILED,
+            ));
+            let native_message = native.to_string();
+            let source = if sensitive {
+                anyhow::Error::new(native).context("password=cause-marker\n-----BEGIN PRIVATE KEY-----\nkey-material\n-----END PRIVATE KEY-----")
+            } else {
+                anyhow::Error::new(native)
+            };
+            let error = Err::<(), _>(super::password_auth_diagnostic(source, &server, user))
+                .with_error_kind(ErrorKind::Auth)
+                .unwrap_err();
+            let response = crate::output::ErrorResponse::from_error(&error);
+            let rendered = serde_json::to_string(&response).unwrap();
+            assert_eq!(response.error.kind, ErrorKind::Auth);
+            assert_eq!(response.error.exit_code, 4);
+            assert!(
+                response
+                    .error
+                    .message
+                    .contains("SSH password authentication failed for login account")
+            );
+            assert!(
+                response.error.message.contains("caused by:")
+                    && response.error.message.contains("same home/profile")
+                    && response.error.message.contains("sshw doctor")
+            );
+            assert!(
+                response.error.message.contains("SSHW_PASSWORD")
+                    && response
+                        .error
+                        .message
+                        .contains("server's password authentication settings")
+            );
+            assert!(
+                response
+                    .error
+                    .causes
+                    .iter()
+                    .any(|cause| cause == &native_message)
+            );
+            assert!(
+                error
+                    .chain()
+                    .any(|cause| cause
+                        .downcast_ref::<ssh2::Error>()
+                        .is_some_and(|native| native.code()
+                            == ssh2::ErrorCode::Session(
+                                libssh2_sys::LIBSSH2_ERROR_AUTHENTICATION_FAILED
+                            )))
+            );
+            if sensitive {
+                for marker in ["host-marker", "user-marker", "cause-marker", "key-material"] {
+                    assert!(!rendered.contains(marker));
+                }
+                assert!(response.error.message.contains("<redacted>"));
+            } else {
+                assert!(
+                    response
+                        .error
+                        .message
+                        .contains("'deploy' at example.test:2222")
+                );
+            }
+        }
     }
 
     #[test]

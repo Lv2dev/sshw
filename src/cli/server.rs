@@ -89,6 +89,7 @@ where
         return Err(app_error(ErrorKind::Config, "add cancelled"));
     }
 
+    let before = config.clone();
     let mut new_password_credential = None;
     let auth = match args.auth {
         AuthArg::Password => {
@@ -144,8 +145,10 @@ where
         config.default = Some(args.name.clone());
     }
 
-    if let Err(err) =
-        save_config_if_unchanged(config_path, config, revision).with_error_kind(ErrorKind::Config)
+    let changed = matches!(args.auth, AuthArg::Password) || *config != before;
+    if changed
+        && let Err(err) = save_config_if_unchanged(config_path, config, revision)
+            .with_error_kind(ErrorKind::Config)
     {
         if !crate::storage::write_was_published(&err)
             && let Some((credential, user)) = new_password_credential.as_ref()
@@ -182,6 +185,8 @@ where
             "action": action,
             "server": args.name,
             "user": redact_secrets(&config.servers[&args.name].default_user),
+            "changed": changed,
+            "change": if changed { action } else { "unchanged" },
         });
         if let Some(change) = default_change {
             output["default_change"] = serde_json::to_value(change.redacted())?;
@@ -195,7 +200,11 @@ where
         return Ok(ok(format!("{}\n", serde_json::to_string(&output)?)));
     }
 
-    let mut message = format!("{action} {}\n", args.name);
+    let mut message = if changed {
+        format!("{action} {}\n", args.name)
+    } else {
+        format!("server {} (unchanged)\n", args.name)
+    };
     if let Some(change) = default_change {
         message.push_str(&change.human_message());
     }
