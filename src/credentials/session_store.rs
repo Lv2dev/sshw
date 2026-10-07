@@ -1,5 +1,5 @@
 use super::{CredentialStore, CredentialStoreHealth};
-use crate::error::app_error;
+use crate::error::classified_error;
 use crate::home::CredentialPurpose;
 use crate::output::ErrorKind;
 use std::cell::RefCell;
@@ -119,12 +119,9 @@ impl CredentialStore for SessionOnlyStore {
             .as_ref()
             .map(|password| password.as_str().to_string())
             .ok_or_else(|| {
-                app_error(
-                    ErrorKind::Auth,
-                    format!(
+                classified_error(ErrorKind::Auth, anyhow::Error::new(keyring_core::Error::NoEntry).context(format!(
                         "session-only credential backend has no password for {credential}; set {environment} or use the native backend"
-                    ),
-                )
+                    )))
             })
     }
 

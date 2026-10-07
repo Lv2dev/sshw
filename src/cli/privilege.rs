@@ -6,11 +6,13 @@ use super::{
 };
 use crate::config::{
     ConfigRevision, PrivilegeConfig, PrivilegeMethod, SshwConfig, save_config_if_unchanged,
+    validate_account_user,
 };
 use crate::credentials::CredentialStore;
-use crate::error::{ResultErrorKindExt, app_error};
+use crate::error::{ResultErrorKindExt, app_error, credential_cleanup_error};
 use crate::home::{CredentialNamespace, CredentialPurpose, validate_server_name};
 use crate::output::ErrorKind;
+use anyhow::Context;
 use serde_json::json;
 use std::path::Path;
 
@@ -27,7 +29,16 @@ where
     C: CredentialStore,
     P: Prompter,
 {
+    if args.no_password && (args.password_stdin || matches!(args.method, PrivilegeMethodArg::Su)) {
+        return Err(app_error(
+            ErrorKind::Usage,
+            "--no-password requires sudo and cannot be combined with --password-stdin",
+        ));
+    }
     validate_server_name(&args.name).with_error_kind(ErrorKind::Config)?;
+    validate_account_user(&args.user)
+        .context("invalid privilege target user")
+        .with_error_kind(ErrorKind::Config)?;
     let server = get_server(config, &args.name)?;
     let login_user = args
         .account
@@ -39,11 +50,17 @@ where
     let previous_privilege = get_server(config, &args.name)?
         .account(&login_user)
         .and_then(|account| account.privilege.clone());
-    if previous_privilege.is_some()
+    if let Some(previous) = &previous_privilege
         && !args.force
         && !prompter
             .confirm_with_option(
-                &format!("update privilege configuration for '{}'? [y/N] ", args.name),
+                &format!(
+                    "update privilege configuration for '{}/{}' ({} target: {} -> {} target: {}; authentication: {} -> {})? [y/N] ",
+                    super::hints::redacted_argument(&args.name), super::hints::redacted_argument(&login_user),
+                    method_label(previous.method), super::hints::redacted_argument(&previous.user),
+                    method_label(map_method(args.method)), super::hints::redacted_argument(&args.user),
+                    authentication_label(previous.no_password), authentication_label(args.no_password)
+                ),
                 "--force",
             )
             .with_error_kind(ErrorKind::Config)?
@@ -51,51 +68,65 @@ where
         return Err(app_error(ErrorKind::Config, "privilege update cancelled"));
     }
 
-    let password = if args.password_stdin {
-        prompter.password_stdin().with_error_kind(ErrorKind::Auth)?
-    } else {
-        prompter
-            .password("Privilege password: ")
-            .with_error_kind(ErrorKind::Auth)?
-    };
-    validate_privilege_password(&password)?;
-
+    let before = config.clone();
     let privilege = PrivilegeConfig {
         method: map_method(args.method),
         user: args.user,
-        credential: namespace.new_account_credential_key(
-            CredentialPurpose::Privilege,
-            &args.name,
-            &login_user,
-        ),
+        credential: (!args.no_password).then(|| {
+            namespace.new_account_credential_key(
+                CredentialPurpose::Privilege,
+                &args.name,
+                &login_user,
+            )
+        }),
+        no_password: args.no_password,
     };
     let output_method = privilege.method;
     let output_user = privilege.user.clone();
     let output_credential = privilege.credential.clone();
-    credentials
-        .set_password_for(
-            CredentialPurpose::Privilege,
-            &privilege.credential,
-            &privilege.user,
-            &password,
-        )
-        .with_error_kind(ErrorKind::Auth)?;
-    let stored_credential = (privilege.credential.clone(), privilege.user.clone());
+    let stored_credential = if let Some(credential) = &privilege.credential {
+        let password = zeroize::Zeroizing::new(if args.password_stdin {
+            prompter.password_stdin().with_error_kind(ErrorKind::Auth)?
+        } else {
+            prompter
+                .password("Privilege password: ")
+                .with_error_kind(ErrorKind::Auth)?
+        });
+        validate_privilege_password(&password)?;
+        credentials
+            .set_password_for(
+                CredentialPurpose::Privilege,
+                credential,
+                &privilege.user,
+                &password,
+            )
+            .with_error_kind(ErrorKind::Auth)?;
+        Some((credential.clone(), privilege.user.clone()))
+    } else {
+        None
+    };
     config
         .servers
         .get_mut(&args.name)
         .and_then(|server| server.accounts.get_mut(&login_user))
         .expect("validated default account")
         .privilege = Some(privilege);
-    if let Err(err) =
-        save_config_if_unchanged(config_path, config, revision).with_error_kind(ErrorKind::Config)
+    let changed = !args.no_password || *config != before;
+    let change = if !changed {
+        "unchanged"
+    } else if previous_privilege.is_some() {
+        "updated"
+    } else {
+        "added"
+    };
+    if changed
+        && let Err(err) = save_config_if_unchanged(config_path, config, revision)
+            .with_error_kind(ErrorKind::Config)
     {
-        if !crate::storage::write_was_published(&err) {
-            let _ = credentials.delete_password_for(
-                CredentialPurpose::Privilege,
-                &stored_credential.0,
-                &stored_credential.1,
-            );
+        if !crate::storage::write_was_published(&err)
+            && let Some((credential, user)) = &stored_credential
+        {
+            let _ = credentials.delete_password_for(CredentialPurpose::Privilege, credential, user);
         }
         return Err(err);
     }
@@ -106,18 +137,18 @@ where
             .and_then(|server| server.account(&login_user))
             .and_then(|account| account.privilege.as_ref())
             .expect("privilege just set");
-        if previous.credential != current.credential || previous.user != current.user {
+        if (previous.credential != current.credential || previous.user != current.user)
+            && let Some(credential) = &previous.credential
+        {
             credentials
-                .delete_password_for(
-                    CredentialPurpose::Privilege,
-                    &previous.credential,
-                    &previous.user,
-                )
-                .with_error_kind(ErrorKind::Auth)?;
+                .delete_password_for(CredentialPurpose::Privilege, credential, &previous.user)
+                .map_err(|err| {
+                    credential_cleanup_error(err, "set", &args.name, Some(&login_user), None)
+                })?;
         }
     }
 
-    let warning = if !credentials.is_persistent() {
+    let warning = if !args.no_password && !credentials.is_persistent() {
         Some(
             "this credential backend does not persist privilege passwords; supply SSHW_PRIVILEGE_PASSWORD at run time",
         )
@@ -133,6 +164,9 @@ where
             "method": output_method,
             "user": output_user,
             "credential": output_credential,
+            "no_password": args.no_password,
+            "changed": changed,
+            "change": change,
         });
         if let (Some(map), Some(warning)) = (output.as_object_mut(), warning) {
             map.insert(
@@ -143,7 +177,16 @@ where
         return Ok(ok(format!("{}\n", serde_json::to_string(&output)?)));
     }
 
-    let mut message = format!("privilege set for {}\n", args.name);
+    let mut message = format!(
+        "privilege set for {}/{}{}\n  login account: {}\n  method: {}\n  target user: {}\n  authentication: {}\n",
+        args.name,
+        login_user,
+        if changed { "" } else { " (unchanged)" },
+        login_user,
+        method_label(output_method),
+        output_user,
+        authentication_label(args.no_password)
+    );
     if let Some(warning) = warning {
         message.push_str(&format!("warning: {warning}\n"));
     }
@@ -172,16 +215,20 @@ pub(super) fn show_privilege(
             "method": privilege.method,
             "user": privilege.user,
             "credential": privilege.credential,
+            "no_password": privilege.no_password,
         });
         return Ok(ok(format!("{}\n", serde_json::to_string(&output)?)));
     }
 
     Ok(ok(format!(
-        "{}\n  method: {}\n  user: {}\n  credential: {}\n",
+        "{}/{}\n  login account: {}\n  method: {}\n  target user: {}\n  authentication: {}\n  credential: {}\n",
         args.name,
+        login_user,
+        login_user,
         method_label(privilege.method),
         privilege.user,
-        privilege.credential
+        authentication_label(privilege.no_password),
+        privilege.credential.as_deref().unwrap_or("none")
     )))
 }
 
@@ -207,16 +254,27 @@ where
     let account = config.servers[&args.name]
         .account(&login_user)
         .ok_or_else(|| super::account::unknown_account(&args.name, &login_user))?;
-    let privilege = account
-        .privilege
-        .clone()
-        .ok_or_else(|| missing_privilege(&args.name, &login_user))?;
+    let Some(privilege) = account.privilege.clone() else {
+        if args.json {
+            return Ok(ok(format!(
+                "{}\n",
+                json!({"ok":true,"action":"cleared","server":args.name,"account":login_user,
+                "changed":false,"change":"unchanged"})
+            )));
+        }
+        return Ok(ok(format!(
+            "privilege already cleared for {}/{} (unchanged)\n",
+            args.name, login_user
+        )));
+    };
 
     if !args.yes
         && !prompter
             .confirm(&format!(
-                "clear privilege configuration for '{}'? [y/N] ",
-                args.name
+                "clear privilege configuration for '{}/{}' ({} target: {}; authentication: {})? [y/N] ",
+                super::hints::redacted_argument(&args.name), super::hints::redacted_argument(&login_user),
+                method_label(privilege.method), super::hints::redacted_argument(&privilege.user),
+                authentication_label(privilege.no_password)
             ))
             .with_error_kind(ErrorKind::Config)?
     {
@@ -230,31 +288,48 @@ where
         .expect("validated default account")
         .privilege = None;
     save_config_if_unchanged(config_path, config, revision).with_error_kind(ErrorKind::Config)?;
-    credentials
-        .delete_password_for(
-            CredentialPurpose::Privilege,
-            &privilege.credential,
-            &privilege.user,
-        )
-        .with_error_kind(ErrorKind::Auth)?;
+    if let Some(credential) = &privilege.credential {
+        credentials
+            .delete_password_for(CredentialPurpose::Privilege, credential, &privilege.user)
+            .map_err(|err| {
+                credential_cleanup_error(err, "cleared", &args.name, Some(&login_user), None)
+            })?;
+    }
     if args.json {
         let output = json!({
             "ok": true,
             "action": "cleared",
             "server": args.name,
             "account": login_user,
+            "changed": true,
+            "change": "removed",
         });
         return Ok(ok(format!("{}\n", serde_json::to_string(&output)?)));
     }
 
-    Ok(ok(format!("privilege cleared for {}\n", args.name)))
+    Ok(ok(format!(
+        "privilege cleared for {}/{} ({} target: {})\n",
+        args.name,
+        login_user,
+        method_label(privilege.method),
+        privilege.user
+    )))
+}
+
+fn authentication_label(no_password: bool) -> &'static str {
+    if no_password {
+        "no password (sudo -n)"
+    } else {
+        "password"
+    }
 }
 
 pub(super) fn missing_privilege(server: &str, login_user: &str) -> anyhow::Error {
+    let command = super::hints::privilege_set(server, login_user, PrivilegeMethod::Sudo, None);
     app_error(
         ErrorKind::Config,
         format!(
-            "privilege configuration missing for account '{server}/{login_user}'; run 'sshw privilege set {server} --account {login_user} --method sudo' first"
+            "privilege configuration missing for account '{server}/{login_user}'\nusing the same home/profile selection, run `{command}` first"
         ),
     )
 }
@@ -264,6 +339,27 @@ pub(super) fn method_label(method: PrivilegeMethod) -> &'static str {
         PrivilegeMethod::Sudo => "sudo",
         PrivilegeMethod::Su => "su",
     }
+}
+
+pub(super) fn recovery_step(
+    server: &str,
+    login_user: &str,
+    privilege: &PrivilegeConfig,
+    persistent: bool,
+) -> String {
+    let method = method_label(privilege.method);
+    if !persistent {
+        return format!(
+            "supply SSHW_PRIVILEGE_PASSWORD at run time for login account {} ({method} target {}); session-only passwords are not persisted. Keep the same home/profile selection and never put the password in arguments",
+            super::hints::quote_local_argument(login_user),
+            super::hints::quote_local_argument(&privilege.user)
+        );
+    }
+    let command =
+        super::hints::privilege_set(server, login_user, privilege.method, Some(&privilege.user));
+    format!(
+        "using the same home/profile selection, run `{command}` to register the privilege password again; confirm the update, or insert --force and --password-stdin before -- for non-interactive secret-manager input"
+    )
 }
 
 pub(super) fn validate_privilege_password(password: &str) -> anyhow::Result<()> {
@@ -379,7 +475,8 @@ mod tests {
             .privilege = Some(PrivilegeConfig {
             method: PrivilegeMethod::Sudo,
             user: "root".to_string(),
-            credential: "sshw:default:privilege:web".to_string(),
+            credential: Some("sshw:default:privilege:web".to_string()),
+            no_password: false,
         });
         config
     }
@@ -442,6 +539,7 @@ mod tests {
                 method: PrivilegeMethodArg::Sudo,
                 user: "root".to_string(),
                 password_stdin: false,
+                no_password: false,
                 force: false,
                 json: false,
             },
@@ -497,6 +595,7 @@ mod tests {
                 method: PrivilegeMethodArg::Su,
                 user: "root".to_string(),
                 password_stdin: false,
+                no_password: false,
                 force: true,
                 json: false,
             },
@@ -554,6 +653,7 @@ mod tests {
                 method: PrivilegeMethodArg::Sudo,
                 user: "root".to_string(),
                 password_stdin: false,
+                no_password: false,
                 force: false,
                 json: false,
             },
@@ -576,12 +676,75 @@ mod tests {
             .as_ref()
             .unwrap();
         assert!(
-            store
-                .values
-                .borrow()
-                .contains_key(&(privilege.credential.clone(), "root".to_string())),
+            store.values.borrow().contains_key(&(
+                privilege.credential.as_ref().unwrap().clone(),
+                "root".to_string()
+            )),
             "a published privilege config must retain its credential"
         );
         assert!(store.deleted.borrow().is_empty());
+    }
+
+    #[test]
+    fn passwordless_transition_keeps_previous_secret_on_save_errors() {
+        for published in [false, true] {
+            let mut config = sample_config();
+            let store = RecordingStore::default();
+            let old = config.servers["web"].accounts["deploy"]
+                .privilege
+                .as_ref()
+                .unwrap()
+                .credential
+                .clone()
+                .unwrap();
+            store
+                .set_password(&old, "root", "OLD_FIXTURE_PASSWORD")
+                .unwrap();
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("servers.json");
+            crate::config::save_config(&path, &config).unwrap();
+            let (_, revision) = crate::config::load_config_with_revision(&path).unwrap();
+            let revision = if published {
+                crate::storage::fail_next_parent_sync();
+                revision
+            } else {
+                ConfigRevision::missing() // stale revision: no write may occur
+            };
+            let error = set_privilege(
+                PrivilegeSetArgs {
+                    name: "web".into(),
+                    account: None,
+                    method: PrivilegeMethodArg::Sudo,
+                    user: "service".into(),
+                    password_stdin: false,
+                    no_password: true,
+                    force: true,
+                    json: false,
+                },
+                &path,
+                &revision,
+                &CredentialNamespace::profile("default"),
+                &store,
+                &mut TestPrompter,
+                &mut config,
+            )
+            .unwrap_err();
+            assert_eq!(crate::storage::write_was_published(&error), published);
+            let persisted = crate::config::load_config(&path).unwrap();
+            assert_eq!(
+                persisted.servers["web"].accounts["deploy"]
+                    .privilege
+                    .as_ref()
+                    .unwrap()
+                    .no_password,
+                published
+            );
+            assert_eq!(store.values.borrow().len(), 1);
+            assert!(store.values.borrow().contains_key(&(old, "root".into())));
+            assert!(
+                store.deleted.borrow().is_empty(),
+                "cleanup requires a successful config save"
+            );
+        }
     }
 }

@@ -1,6 +1,6 @@
+use crate::error::{persistence_context, persistence_error, settings_error};
 use crate::home::{CredentialNamespace, CredentialPurpose, validate_server_name};
 use crate::storage::write_owner_only_atomic;
-use anyhow::Context;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -77,27 +77,34 @@ impl<'de> Deserialize<'de> for SshwConfig {
         let version = u32::try_from(version)
             .map_err(|_| serde::de::Error::custom("config version is out of range"))?;
 
-        match version {
+        let config = match version {
             CONFIG_VERSION => {
                 let wire: ConfigV2Wire =
                     serde_json::from_value(value).map_err(serde::de::Error::custom)?;
                 debug_assert_eq!(wire.version, CONFIG_VERSION);
-                Ok(Self {
+                Self {
                     version: CONFIG_VERSION,
                     default: wire.default,
                     servers: wire.servers,
                     credential_backend: wire.credential_backend,
-                })
+                }
             }
             LEGACY_CONFIG_VERSION => {
                 let wire: ConfigV1Wire =
                     serde_json::from_value(value).map_err(serde::de::Error::custom)?;
-                migrate_v1(wire).map_err(serde::de::Error::custom)
+                migrate_v1(wire).map_err(serde::de::Error::custom)?
             }
-            unsupported => Err(serde::de::Error::custom(format!(
-                "unsupported config version {unsupported}; supported versions are {LEGACY_CONFIG_VERSION} and {CONFIG_VERSION}"
-            ))),
+            unsupported => {
+                return Err(serde::de::Error::custom(format!(
+                    "unsupported config version {unsupported}; supported versions are {LEGACY_CONFIG_VERSION} and {CONFIG_VERSION}"
+                )));
+            }
+        };
+        for (name, server) in &config.servers {
+            validate_server_endpoint(name, &server.host, server.port)
+                .map_err(serde::de::Error::custom)?;
         }
+        Ok(config)
     }
 }
 
@@ -246,13 +253,58 @@ impl<'de> Deserialize<'de> for AuthConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct PrivilegeConfig {
     pub method: PrivilegeMethod,
-    #[serde(default = "default_privilege_user")]
     pub user: String,
-    pub credential: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential: Option<String>,
+    #[serde(skip_serializing_if = "is_false")]
+    pub no_password: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PrivilegeConfigWire {
+    method: PrivilegeMethod,
+    #[serde(default = "default_privilege_user")]
+    user: String,
+    credential: Option<String>,
+    #[serde(default)]
+    no_password: bool,
+}
+
+impl<'de> Deserialize<'de> for PrivilegeConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = PrivilegeConfigWire::deserialize(deserializer)?;
+        let config = Self {
+            method: wire.method,
+            user: wire.user,
+            credential: wire.credential,
+            no_password: wire.no_password,
+        };
+        config.validate().map_err(serde::de::Error::custom)?;
+        Ok(config)
+    }
+}
+
+impl PrivilegeConfig {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        validate_user_value(&self.user)?;
+        match (self.no_password, self.method, &self.credential) {
+            (true, PrivilegeMethod::Sudo, None) | (false, _, Some(_)) => Ok(()),
+            (true, PrivilegeMethod::Su, _) => Err("no_password requires method sudo"),
+            (true, _, Some(_)) => Err("no_password cannot include a credential"),
+            (false, _, None) => Err("missing field `credential` for password privilege"),
+        }
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -284,7 +336,8 @@ pub fn load_config_with_revision(path: &Path) -> anyhow::Result<(SshwConfig, Con
         return Ok((SshwConfig::default(), ConfigRevision::missing()));
     };
     let config: SshwConfig = serde_json::from_str(&contents)
-        .map_err(|err| anyhow::anyhow!("failed to load config at {}: {err}", path.display()))?;
+        .map_err(|err| settings_error(err.into(), "failed to load config", path,
+            "repair JSON syntax and supported config fields at the reported servers.json; rerun using the same home/profile selection"))?;
     let revision = ConfigRevision(Some(contents.into_bytes()));
     Ok((config, revision))
 }
@@ -298,33 +351,40 @@ fn read_config_contents(path: &Path) -> anyhow::Result<Option<String>> {
                     return Ok(None);
                 }
                 Err(metadata_err) => {
-                    return Err(anyhow::anyhow!(
-                        "failed to load config at {}: {metadata_err}",
-                        path.display()
-                    ));
+                    return Err(config_read_error(metadata_err, path));
                 }
                 Ok(_) => {
-                    return Err(anyhow::anyhow!(
-                        "failed to load config at {}: {err}",
-                        path.display()
-                    ));
+                    return Err(config_read_error(err, path));
                 }
             }
         }
         Err(err) => {
-            return Err(anyhow::anyhow!(
-                "failed to load config at {}: {err}",
-                path.display()
-            ));
+            return Err(config_read_error(err, path));
         }
     };
     Ok(Some(contents))
 }
 
+fn config_read_error(error: std::io::Error, path: &Path) -> anyhow::Error {
+    settings_error(
+        error.into(),
+        "failed to load config",
+        path,
+        "check that the reported servers.json is a readable UTF-8 file and its parent path is accessible; rerun using the same home/profile selection",
+    )
+}
+
 pub fn save_config(path: &Path, config: &SshwConfig) -> anyhow::Result<()> {
-    let contents = serde_json::to_string_pretty(config)?;
+    let contents = serde_json::to_string_pretty(config).map_err(|error| {
+        persistence_error(
+            error.into(),
+            "serialize config",
+            path,
+            "check that the config contains supported values before retrying",
+        )
+    })?;
     write_owner_only_atomic(path, &contents)
-        .with_context(|| format!("failed to save config at {}", path.display()))
+        .map_err(|error| persistence_context(error, "save config", path))
 }
 
 pub fn save_config_if_unchanged(
@@ -333,12 +393,7 @@ pub fn save_config_if_unchanged(
     revision: &ConfigRevision,
 ) -> anyhow::Result<()> {
     let current = read_config_contents(path)
-        .map_err(|err| {
-            anyhow::anyhow!(
-                "failed to save config at {} while checking its revision: {err}",
-                path.display()
-            )
-        })?
+        .map_err(|err| persistence_context(err, "save config while checking its revision", path))?
         .map(String::into_bytes);
     if current != revision.0 {
         return Err(anyhow::anyhow!(
@@ -368,6 +423,7 @@ pub fn validate_config_credential_references(
     for (name, server) in &config.servers {
         validate_server_name(name)
             .map_err(|err| anyhow::anyhow!("invalid server name '{name}': {err}"))?;
+        validate_server_endpoint(name, &server.host, server.port)?;
         if !server.accounts.contains_key(&server.default_user) {
             return Err(anyhow::anyhow!(
                 "default user '{}' is not registered for server '{name}'",
@@ -389,14 +445,17 @@ pub fn validate_config_credential_references(
                 )?;
             }
             if let Some(privilege) = &account.privilege {
-                validate_credential_owner(
-                    namespace,
-                    CredentialPurpose::Privilege,
-                    name,
-                    user,
-                    &privilege.credential,
-                    &mut owners,
-                )?;
+                privilege.validate().map_err(anyhow::Error::msg)?;
+                if let Some(credential) = &privilege.credential {
+                    validate_credential_owner(
+                        namespace,
+                        CredentialPurpose::Privilege,
+                        name,
+                        user,
+                        credential,
+                        &mut owners,
+                    )?;
+                }
             }
         }
     }
@@ -434,11 +493,33 @@ fn validate_credential_owner<'a>(
 }
 
 pub fn validate_account_user(user: &str) -> anyhow::Result<()> {
+    validate_user_value(user).map_err(anyhow::Error::msg)
+}
+
+pub(crate) fn validate_server_endpoint(name: &str, host: &str, port: u16) -> anyhow::Result<()> {
+    let reason = if host.trim().is_empty() {
+        Some("host must not be empty or whitespace")
+    } else if host.chars().any(char::is_control) {
+        Some("host must not contain control characters")
+    } else if port == 0 {
+        Some("port must be between 1 and 65535")
+    } else {
+        None
+    };
+    if let Some(reason) = reason {
+        return Err(anyhow::anyhow!(
+            "invalid endpoint for server '{name}': {reason}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_user_value(user: &str) -> Result<(), &'static str> {
     if user.trim().is_empty() {
-        return Err(anyhow::anyhow!("user cannot be empty"));
+        return Err("user cannot be empty");
     }
     if user.chars().any(char::is_control) {
-        return Err(anyhow::anyhow!("user must not contain control characters"));
+        return Err("user must not contain control characters");
     }
     Ok(())
 }

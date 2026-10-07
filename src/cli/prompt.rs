@@ -3,6 +3,10 @@ use std::io::{self, IsTerminal, Read};
 use std::io::{BufRead, Write};
 
 pub trait Prompter {
+    /// Check readiness without prompting. Existing programmatic prompters remain available.
+    fn ensure_confirmation_available(&mut self, _option: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
     fn confirm(&mut self, prompt: &str) -> anyhow::Result<bool>;
     fn confirm_with_option(&mut self, prompt: &str, _option: &str) -> anyhow::Result<bool> {
         self.confirm(prompt)
@@ -14,38 +18,63 @@ pub trait Prompter {
 pub(crate) struct TerminalPrompter;
 
 impl Prompter for TerminalPrompter {
+    fn ensure_confirmation_available(&mut self, option: &str) -> anyhow::Result<()> {
+        check_confirmation_terminal(io::stdin().is_terminal(), option)
+    }
+
     fn confirm(&mut self, prompt: &str) -> anyhow::Result<bool> {
         self.confirm_with_option(prompt, "--yes")
     }
 
     fn confirm_with_option(&mut self, prompt: &str, option: &str) -> anyhow::Result<bool> {
-        if !io::stdin().is_terminal() {
-            return Err(anyhow::anyhow!(
-                "confirmation requires an interactive terminal; rerun with {option} to confirm"
-            ));
-        }
+        self.ensure_confirmation_available(option)?;
 
         // Read the reply from the controlling terminal (CONIN$ on Windows) instead of the
         // inherited stdin handle. std's buffered stdin read_line can hang under ConPTY
         // (Windows Terminal / PowerShell), whereas rprompt opens the console device
         // directly, the same way rpassword does for the password prompt.
-        let answer = rprompt::prompt_reply(prompt)?;
-        Ok(is_affirmative(&answer))
+        confirmation_from_reply(rprompt::prompt_reply(prompt), option)
     }
 
     fn password(&mut self, prompt: &str) -> anyhow::Result<String> {
-        Ok(rpassword::prompt_password(prompt)?)
+        rpassword::prompt_password(prompt).map_err(|error| {
+            let detail = crate::output::redact_secrets(&error.to_string());
+            anyhow::Error::new(error).context(format!(
+                "cannot read password from the terminal: {detail}; run in an interactive terminal, or pipe the password from a secret manager and pass --password-stdin"
+            ))
+        })
     }
 
     fn password_stdin(&mut self) -> anyhow::Result<String> {
         let stdin = io::stdin();
-        let mut input = stdin.lock();
-        password_from_reader(&mut input)
+        read_redirected_password(stdin.is_terminal(), || {
+            let mut input = stdin.lock();
+            password_from_reader(&mut input)
+        })
     }
+}
+
+fn check_confirmation_terminal(interactive: bool, option: &str) -> anyhow::Result<()> {
+    if !interactive {
+        return Err(anyhow::anyhow!(
+            "confirmation requires an interactive terminal; rerun with {option} to confirm"
+        ));
+    }
+    Ok(())
 }
 
 fn is_affirmative(answer: &str) -> bool {
     matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+fn confirmation_from_reply(reply: io::Result<String>, option: &str) -> anyhow::Result<bool> {
+    let answer = reply.map_err(|error| {
+        let detail = crate::output::redact_secrets(&error.to_string());
+        anyhow::Error::new(error).context(format!(
+            "cannot read confirmation from the terminal: {detail}; use an interactive terminal, or if you intend to confirm this action, rerun with {option}"
+        ))
+    })?;
+    Ok(is_affirmative(&answer))
 }
 
 /// Testable mirror of `TerminalPrompter::confirm`. Production reads the console device
@@ -62,14 +91,12 @@ where
     R: BufRead,
     W: Write,
 {
-    if !interactive {
-        return Err(anyhow::anyhow!(
-            "confirmation requires an interactive terminal; rerun with --yes to confirm"
-        ));
-    }
+    check_confirmation_terminal(interactive, "--yes")?;
 
-    let answer = rprompt::prompt_reply_from_bufread(input, output, prompt)?;
-    Ok(is_affirmative(&answer))
+    confirmation_from_reply(
+        rprompt::prompt_reply_from_bufread(input, output, prompt),
+        "--yes",
+    )
 }
 
 fn password_from_reader<R>(input: &mut R) -> anyhow::Result<String>
@@ -93,9 +120,77 @@ where
     Ok(password)
 }
 
+fn read_redirected_password(
+    interactive: bool,
+    read: impl FnOnce() -> anyhow::Result<String>,
+) -> anyhow::Result<String> {
+    if interactive {
+        return Err(anyhow::anyhow!(
+            "--password-stdin requires redirected input; stdin is a terminal. Omit --password-stdin for hidden terminal input, or pipe/redirect the password from a secret manager. Never put passwords in arguments"
+        ));
+    }
+    read()
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
+
+    #[test]
+    fn confirmation_read_failure_keeps_io_source_and_the_action_specific_option() {
+        for option in ["--yes", "--force"] {
+            let source = std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "terminal reply ended; token=fixture-marker",
+            );
+            let error = super::confirmation_from_reply(Err(source), option).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("cannot read confirmation from the terminal")
+                    && error.to_string().contains(option)
+            );
+            assert!(!error.to_string().contains("fixture-marker"));
+            assert!(error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::UnexpectedEof)
+            }));
+        }
+        assert!(!super::confirmation_from_reply(Ok("no".into()), "--yes").unwrap());
+        assert!(super::confirmation_from_reply(Ok("YES\n".into()), "--force").unwrap());
+    }
+
+    #[test]
+    fn trust_readiness_uses_the_same_terminal_gate_without_prompting() {
+        for option in ["--yes", "--force"] {
+            assert!(super::check_confirmation_terminal(true, option).is_ok());
+            let error = super::check_confirmation_terminal(false, option).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "confirmation requires an interactive terminal; rerun with {option} to confirm"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn local_stdin_terminal_gate_rejects_before_reading_and_keeps_redirected_data() {
+        let error =
+            super::read_redirected_password(true, || panic!("terminal input must not be read"))
+                .unwrap_err();
+        assert!(
+            error.to_string().contains("stdin is a terminal")
+                && error.to_string().contains("hidden terminal input")
+                && error.to_string().contains("pipe/redirect")
+        );
+        let mut source = Cursor::new(b"line-one\nline-two\r\n");
+        let password =
+            super::read_redirected_password(false, || super::password_from_reader(&mut source))
+                .unwrap();
+        assert_eq!(password, "line-one\nline-two");
+    }
 
     #[test]
     fn confirm_from_reader_rejects_non_interactive_stdin() {

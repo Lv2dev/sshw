@@ -113,3 +113,163 @@ fn is_writable_requires_existing_parent() {
         &temp.path().join("missing").join("audit.jsonl")
     ));
 }
+
+#[test]
+fn default_audit_readiness_preserves_logs_and_does_not_create_missing_parents() {
+    let temp = tempfile::tempdir().unwrap();
+    let blocker = temp.path().join("blocker");
+    std::fs::write(&blocker, "file").unwrap();
+    assert!(!is_writable(&blocker.join("audit.jsonl")));
+    assert!(!is_writable(&temp.path().join("missing/audit.jsonl")));
+    assert!(!temp.path().join("missing").exists());
+    let path = temp.path().join("audit.jsonl");
+    let before: Vec<_> = std::fs::read_dir(temp.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert!(is_writable(&path));
+    assert!(!path.exists());
+    let after: Vec<_> = std::fs::read_dir(temp.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(before, after);
+    std::fs::write(&path, "existing audit data\n").unwrap();
+    let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+    assert!(is_writable(&path));
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "existing audit data\n"
+    );
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().modified().unwrap(),
+        modified
+    );
+    #[cfg(unix)]
+    {
+        let link = temp.path().join("dangling");
+        std::os::unix::fs::symlink(temp.path().join("nonexistent"), &link).unwrap();
+        assert!(!is_writable(&link));
+        assert!(!temp.path().join("nonexistent").exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn default_audit_readiness_checks_creation_permission_in_a_readonly_parent() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().unwrap();
+    let parent = temp.path().join("parent");
+    std::fs::create_dir(&parent).unwrap();
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let result = std::panic::catch_unwind(|| {
+        let marker = parent.join("direct-creation-control");
+        let writable = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&marker)
+        {
+            Ok(file) => {
+                drop(file);
+                std::fs::remove_file(&marker).unwrap();
+                true
+            }
+            Err(error) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+                false
+            }
+        };
+        assert_eq!(is_writable(&parent.join("audit.jsonl")), writable);
+        assert!(std::fs::read_dir(&parent).unwrap().next().is_none());
+    });
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+    if let Err(error) = result {
+        std::panic::resume_unwind(error);
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn default_audit_readiness_checks_windows_directory_acl_and_keeps_append_access() {
+    let temp = tempfile::tempdir().unwrap();
+    let parent = temp.path().join("audit-home");
+    std::fs::create_dir(&parent).unwrap();
+    let saved_acl = temp.path().join("audit-acl.txt");
+    let invoke = |args: &[&std::ffi::OsStr]| {
+        let mut command = std::process::Command::new("icacls.exe");
+        command.args(args);
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    // Use a normal inherited DACL on this new empty fixture. Otherwise an
+    // icacls edit can convert the initial descriptor and add inherited ACEs.
+    invoke(&[
+        parent.as_os_str(),
+        std::ffi::OsStr::new("/reset"),
+        std::ffi::OsStr::new("/q"),
+    ]);
+    let existing = parent.join("existing.jsonl");
+    std::fs::write(&existing, "existing audit data\n").unwrap();
+    let identity = std::process::Command::new("whoami.exe")
+        .args(["/user", "/fo", "csv", "/nh"])
+        .output()
+        .unwrap();
+    assert!(identity.status.success());
+    let identity = String::from_utf8_lossy(&identity.stdout);
+    let sid = identity
+        .trim()
+        .rsplit(',')
+        .next()
+        .unwrap()
+        .trim_matches('"');
+    assert!(sid.starts_with("S-1-"));
+    let deny = format!("*{sid}:(WD)");
+    invoke(&[
+        parent.as_os_str(),
+        std::ffi::OsStr::new("/save"),
+        saved_acl.as_os_str(),
+        std::ffi::OsStr::new("/q"),
+    ]);
+    invoke(&[
+        parent.as_os_str(),
+        std::ffi::OsStr::new("/deny"),
+        std::ffi::OsStr::new(&deny),
+        std::ffi::OsStr::new("/q"),
+    ]);
+    let result = std::panic::catch_unwind(|| {
+        assert!(!is_writable(&parent.join("audit.jsonl")));
+        assert!(is_writable(&existing));
+        assert_eq!(
+            std::fs::read_to_string(&existing).unwrap(),
+            "existing audit data\n"
+        );
+        assert!(!parent.join("audit.jsonl").exists());
+        assert_eq!(std::fs::read_dir(&parent).unwrap().count(), 1);
+    });
+    let remove = format!("*{sid}");
+    invoke(&[
+        parent.as_os_str(),
+        std::ffi::OsStr::new("/remove:d"),
+        std::ffi::OsStr::new(&remove),
+        std::ffi::OsStr::new("/q"),
+    ]);
+    let restored_acl = temp.path().join("restored-acl.txt");
+    invoke(&[
+        parent.as_os_str(),
+        std::ffi::OsStr::new("/save"),
+        restored_acl.as_os_str(),
+        std::ffi::OsStr::new("/q"),
+    ]);
+    assert_eq!(
+        std::fs::read(saved_acl).unwrap(),
+        std::fs::read(restored_acl).unwrap()
+    );
+    if let Err(error) = result {
+        std::panic::resume_unwind(error);
+    }
+}

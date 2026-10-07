@@ -1,4 +1,8 @@
+use crate::error::{
+    diagnostic_path, persistence_context, persistence_error, redacted_error_detail, settings_error,
+};
 use crate::home::{ResolvedHome, builtin_default_home, is_reserved_profile_id};
+use crate::local_command::{quote_local_argument, redacted_argument};
 use crate::storage::write_owner_only_atomic;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -48,12 +52,7 @@ pub fn load_registry_with_revision(path: &Path) -> Result<(ProfileRegistry, Regi
         return Ok((ProfileRegistry::default(), RegistryRevision(None)));
     };
     let registry = parse_registry(path, &contents)?;
-    validate_registry(&registry).map_err(|err| {
-        anyhow::anyhow!(
-            "failed to load profile registry at {}: {err}",
-            path.display()
-        )
-    })?;
+    validate_registry(&registry).map_err(|err| registry_load_error(err, path))?;
     let revision = RegistryRevision(Some(contents.into_bytes()));
     Ok((registry, revision))
 }
@@ -68,33 +67,30 @@ pub fn load_registry_for_removal_with_revision(
     let registry = parse_registry(path, &contents)?;
     let mut remainder = registry.clone();
     if remainder.profiles.remove(target_name).is_none() {
-        validate_registry(&registry).map_err(|err| {
-            anyhow::anyhow!(
-                "failed to load profile registry at {}: {err}",
-                path.display()
-            )
-        })?;
+        validate_registry(&registry).map_err(|err| registry_load_error(err, path))?;
     }
     if remainder.default.as_deref() == Some(target_name) {
         remainder.default = remainder.profiles.keys().next().cloned();
     }
     validate_registry(&remainder).map_err(|err| {
-        anyhow::anyhow!(
-            "failed to load profile registry at {} after removing profile '{target_name}': {err}",
-            path.display()
-        )
+        settings_error(err, &format!("failed to load profile registry after removing profile '{}'", redacted_argument(target_name)), path,
+            "repair the remaining profile registry entries at the reported profiles.json before retrying")
     })?;
     let revision = RegistryRevision(Some(contents.into_bytes()));
     Ok((registry, revision))
 }
 
 fn parse_registry(path: &Path, contents: &str) -> Result<ProfileRegistry> {
-    serde_json::from_str(contents).map_err(|err| {
-        anyhow::anyhow!(
-            "failed to load profile registry at {}: {err}",
-            path.display()
-        )
-    })
+    serde_json::from_str(contents).map_err(|err| registry_load_error(err.into(), path))
+}
+
+fn registry_load_error(error: anyhow::Error, path: &Path) -> anyhow::Error {
+    settings_error(
+        error,
+        "failed to load profile registry",
+        path,
+        "check read access, UTF-8 JSON syntax and supported profile entries at the reported profiles.json; repair the registry and retry the profile command",
+    )
 }
 
 fn read_registry_contents(path: &Path) -> Result<Option<String>> {
@@ -106,24 +102,15 @@ fn read_registry_contents(path: &Path) -> Result<Option<String>> {
                     return Ok(None);
                 }
                 Err(metadata_err) => {
-                    return Err(anyhow::anyhow!(
-                        "failed to load profile registry at {}: {metadata_err}",
-                        path.display()
-                    ));
+                    return Err(registry_load_error(metadata_err.into(), path));
                 }
                 Ok(_) => {
-                    return Err(anyhow::anyhow!(
-                        "failed to load profile registry at {}: {err}",
-                        path.display()
-                    ));
+                    return Err(registry_load_error(err.into(), path));
                 }
             }
         }
         Err(err) => {
-            return Err(anyhow::anyhow!(
-                "failed to load profile registry at {}: {err}",
-                path.display()
-            ));
+            return Err(registry_load_error(err.into(), path));
         }
     };
     Ok(Some(contents))
@@ -136,8 +123,16 @@ pub fn save_registry(path: &Path, registry: &ProfileRegistry) -> Result<()> {
             path.display()
         )
     })?;
-    let contents = serde_json::to_string_pretty(registry)?;
+    let contents = serde_json::to_string_pretty(registry).map_err(|error| {
+        persistence_error(
+            error.into(),
+            "serialize profile registry",
+            path,
+            "check that registered profile paths contain supported values before retrying",
+        )
+    })?;
     write_owner_only_atomic(path, &contents)
+        .map_err(|error| persistence_context(error, "save profile registry", path))
 }
 
 pub fn save_registry_if_unchanged(
@@ -205,6 +200,20 @@ pub fn resolve_home_with_registry(
     registry: &ProfileRegistry,
     sshw_base: &Path,
 ) -> Result<ResolvedHome> {
+    let home = select_home_with_registry(home_flag, env_home, profile_flag, registry, sshw_base)?;
+    validate_home_directory(&home.root)?;
+    Ok(home)
+}
+
+/// Registry management must remain reachable when the selected home needs repair.
+/// Its add/default handlers validate the target home before changing the registry.
+pub(crate) fn select_home_with_registry(
+    home_flag: Option<&Path>,
+    env_home: Option<&OsStr>,
+    profile_flag: Option<&str>,
+    registry: &ProfileRegistry,
+    sshw_base: &Path,
+) -> Result<ResolvedHome> {
     if home_flag.is_some() && profile_flag.is_some() {
         return Err(anyhow::anyhow!("cannot use --home and --profile together"));
     }
@@ -234,7 +243,7 @@ pub fn resolve_home_with_registry(
         let entry = registry
             .profiles
             .get(name)
-            .ok_or_else(|| anyhow::anyhow!("unknown profile '{name}'"))?;
+            .ok_or_else(|| unknown_profile(name))?;
         ensure_valid_profile_id(name, &entry.id)?;
         return Ok(ResolvedHome::profile(
             entry.home.clone(),
@@ -256,6 +265,61 @@ pub fn resolve_home_with_registry(
     }
 
     Ok(builtin_default_home(sshw_base))
+}
+
+pub(crate) fn validate_home_directory(home: &Path) -> Result<()> {
+    let inspect = || -> Result<()> {
+        // Inspect an absolute path without changing the selected path or namespace.
+        // Missing directories are valid; Windows can also report NotFound beneath a file.
+        let absolute = std::path::absolute(home)?;
+        let mut ancestor = absolute.as_path();
+        loop {
+            match fs::metadata(ancestor) {
+                Ok(metadata) if metadata.is_dir() => return Ok(()),
+                Ok(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::NotADirectory,
+                        format!("'{}' is not a directory", diagnostic_path(ancestor)),
+                    )
+                    .into());
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    let Some(parent) = ancestor.parent() else {
+                        return Err(error.into());
+                    };
+                    ancestor = parent;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    };
+    inspect().map_err(|error| {
+        let detail = redacted_error_detail(&error);
+        error.context(format!(
+            "sshw home '{}' requires a directory: {detail}; choose a directory for --home/SSHW_HOME, or repair the selected profile home/path permissions before retrying",
+            diagnostic_path(home)
+        ))
+    })
+}
+
+pub(crate) fn profile_registration_hint(name: &str) -> String {
+    format!(
+        "sshw --home {} profile add -- {}",
+        quote_local_argument("<home>"),
+        quote_local_argument(name)
+    )
+}
+
+pub(crate) fn unknown_profile(name: &str) -> anyhow::Error {
+    crate::error::app_error(
+        crate::output::ErrorKind::Config,
+        format!(
+            "unknown profile '{}'; only registered profiles can be selected\nnext: run `sshw profile list` to see the global profile registry; omit the failing --profile selection from recovery commands\nto register this name, replace the home placeholder in `{}`. Use --profile={} to select its registered credential namespace (omit --home and unset SSHW_HOME); --home uses a separate namespace. A named profile is optional; omit --profile to use normal home selection",
+            redacted_argument(name),
+            profile_registration_hint(name),
+            quote_local_argument(name)
+        ),
+    )
 }
 
 pub fn validate_profile_name(name: &str) -> Result<()> {

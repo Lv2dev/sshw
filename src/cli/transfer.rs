@@ -53,7 +53,8 @@ where
         sandbox,
         config,
     )?;
-    let auth = resolve_auth(account, login_user, credentials)?;
+    check_put_source(&local)?;
+    let auth = resolve_auth(&server_name, account, login_user, credentials)?;
     let ssh_target = SshTarget::new(server, login_user);
     let result = with_msys_remote_path_hint(
         if atomic {
@@ -114,7 +115,7 @@ where
         sandbox,
         config,
     )?;
-    let auth = resolve_auth(account, login_user, credentials)?;
+    let auth = resolve_auth(&server_name, account, login_user, credentials)?;
     let ssh_target = SshTarget::new(server, login_user);
     let result = with_msys_remote_path_hint(
         ssh.get(&ssh_target, &auth, &remote.value, &local, yes)
@@ -155,6 +156,12 @@ pub(super) fn check_put_access<'a>(
     checked_account(name, user, get_server(config, name)?, sandbox)
 }
 
+pub(super) fn check_put_source(local: &std::path::Path) -> anyhow::Result<()> {
+    // This checks readiness now. The transfer still opens, validates and keeps
+    // its own handle so later path replacements cannot change what it sends.
+    crate::ssh::ssh2_client::open_regular_local_file(local).map(|_| ())
+}
+
 pub(super) fn check_get_access<'a>(
     name: &str,
     user: Option<&str>,
@@ -166,7 +173,7 @@ pub(super) fn check_get_access<'a>(
 ) -> anyhow::Result<(&'a ServerConfig, &'a str, &'a AccountConfig)> {
     let server = get_server(config, name)?;
     check_get_path(remote, sandbox)?;
-    check_local_overwrite(local, yes)?;
+    crate::storage::check_download_destination(local, yes)?;
     checked_account(name, user, server, sandbox)
 }
 
@@ -218,20 +225,6 @@ fn check_get_path(remote: &str, sandbox: &dyn Sandbox) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn check_local_overwrite(local: &std::path::Path, yes: bool) -> anyhow::Result<()> {
-    if local.try_exists().with_error_kind(ErrorKind::Io)? && !yes {
-        return Err(app_error(
-            ErrorKind::Io,
-            format!(
-                "local file already exists: {}; pass --yes to overwrite",
-                local.display()
-            ),
-        ));
-    }
-
-    Ok(())
-}
-
 pub(super) fn resolve_put_target(
     target: Vec<String>,
     config: &SshwConfig,
@@ -240,11 +233,9 @@ pub(super) fn resolve_put_target(
     let (name, rest) = split_target(&target, 2)
         .ok_or_else(|| app_error(ErrorKind::Config, "put expects [name] <local> <remote>"))?;
     let server = resolve_target_server(name, config)?;
-    Ok((
-        server,
-        PathBuf::from(&rest[0]),
-        decode_remote_path(&rest[1])?,
-    ))
+    let remote = decode_transfer_remote_path(&rest[1], "put")?;
+    let local = decode_transfer_local_path(&rest[0], "put")?;
+    Ok((server, local, remote))
 }
 
 pub(super) fn resolve_get_target(
@@ -255,15 +246,47 @@ pub(super) fn resolve_get_target(
     let (name, rest) = split_target(&target, 2)
         .ok_or_else(|| app_error(ErrorKind::Config, "get expects [name] <remote> <local>"))?;
     let server = resolve_target_server(name, config)?;
-    Ok((
-        server,
-        decode_remote_path(&rest[0])?,
-        PathBuf::from(&rest[1]),
-    ))
+    let remote = decode_transfer_remote_path(&rest[0], "get")?;
+    let local = decode_transfer_local_path(&rest[1], "get")?;
+    Ok((server, remote, local))
 }
 
 pub(super) fn policy_remote_path(path: &str) -> anyhow::Result<String> {
     decode_remote_path(path).map(|remote| remote.value)
+}
+
+fn decode_transfer_local_path(path: &str, operation: &str) -> anyhow::Result<PathBuf> {
+    if path.is_empty() {
+        let (label, target) = if operation == "put" {
+            ("source", "<local> <remote>")
+        } else {
+            ("destination", "<remote> <local>")
+        };
+        return Err(app_error(
+            ErrorKind::Usage,
+            format!(
+                "local {label} path cannot be empty; check the local path variable, for example sshw {operation} <server> {target}"
+            ),
+        ));
+    }
+    Ok(PathBuf::from(path))
+}
+
+fn decode_transfer_remote_path(path: &str, operation: &str) -> anyhow::Result<RemotePath> {
+    if path.is_empty() {
+        let target = if operation == "put" {
+            "<local> <remote>"
+        } else {
+            "<remote> <local>"
+        };
+        return Err(app_error(
+            ErrorKind::Usage,
+            format!(
+                "remote path cannot be empty; check the remote path variable, for example sshw {operation} <server> {target}"
+            ),
+        ));
+    }
+    decode_remote_path(path)
 }
 
 fn decode_remote_path(path: &str) -> anyhow::Result<RemotePath> {

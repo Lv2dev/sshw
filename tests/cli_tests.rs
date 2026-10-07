@@ -10,10 +10,317 @@ use sshw::config::{
 use sshw::credentials::session_store::SessionOnlyStore;
 use sshw::credentials::{AuthMaterial, CredentialStore, CredentialStoreHealth};
 use sshw::home::{CredentialNamespace, CredentialPurpose, ResolvedHome};
+use sshw::profile::{ProfileEntry, ProfileRegistry, load_registry, save_registry};
 use sshw::ssh::{HostKeyInfo, RunResult, SshClient, SshTarget, TransferResult};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::Path;
+
+#[test]
+fn confirmation_prompts_mask_each_target_without_losing_action_or_yes_no_suffix() {
+    struct Decline {
+        prompts: Vec<String>,
+    }
+    impl Prompter for Decline {
+        fn confirm(&mut self, prompt: &str) -> anyhow::Result<bool> {
+            self.prompts.push(prompt.into());
+            Ok(false)
+        }
+        fn password(&mut self, _: &str) -> anyhow::Result<String> {
+            panic!("no password input on declined action")
+        }
+        fn password_stdin(&mut self) -> anyhow::Result<String> {
+            panic!("no stdin input on declined action")
+        }
+    }
+    for sensitive in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("servers.json");
+        let name = if sensitive {
+            "password=server-marker"
+        } else {
+            "web"
+        };
+        let user = if sensitive {
+            "token=account-marker"
+        } else {
+            "ops"
+        };
+        let old_target = if sensitive {
+            "password=target-marker"
+        } else {
+            "daemon"
+        };
+        let new_target = if sensitive {
+            "token=new-target-marker"
+        } else {
+            "service"
+        };
+        let mut server = ServerConfig::single_account("127.0.0.1", 22, "deploy", AuthConfig::Agent);
+        server.accounts.insert(
+            user.into(),
+            AccountConfig {
+                auth: AuthConfig::Agent,
+                privilege: Some(PrivilegeConfig {
+                    method: PrivilegeMethod::Sudo,
+                    user: old_target.into(),
+                    credential: None,
+                    no_password: true,
+                }),
+            },
+        );
+        let config = SshwConfig {
+            default: Some(name.into()),
+            servers: BTreeMap::from([(name.into(), server)]),
+            ..Default::default()
+        };
+        save_config(&path, &config).unwrap();
+        let before = (
+            std::fs::read(&path).unwrap(),
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+        );
+        let store = FakeCredentialStore::default();
+        let ssh = FakeSshClient {
+            host_key_fingerprint: "SHA256:expected".into(),
+            ..Default::default()
+        };
+        let operations = [
+            vec![
+                "sshw",
+                "add",
+                name,
+                "--host",
+                "127.0.0.1",
+                "--user",
+                "deploy",
+                "--auth",
+                "agent",
+            ],
+            vec!["sshw", "account", "add", name, user, "--auth", "agent"],
+            vec!["sshw", "account", "remove", name, user],
+            vec![
+                "sshw",
+                "privilege",
+                "set",
+                name,
+                "--account",
+                user,
+                "--no-password",
+                "--user",
+                new_target,
+            ],
+            vec!["sshw", "privilege", "clear", name, "--account", user],
+            vec!["sshw", "remove", name],
+            vec!["sshw", "trust", name],
+        ];
+        for args in operations {
+            let mut prompter = Decline {
+                prompts: Vec::new(),
+            };
+            let output = execute_for_runtime(
+                Cli::try_parse_from(args).unwrap(),
+                &path,
+                &store,
+                &ssh,
+                &mut prompter,
+            );
+            assert_eq!(output.exit_code, 3);
+            assert_eq!(prompter.prompts.len(), 1);
+            let prompt = &prompter.prompts[0];
+            assert!(prompt.ends_with("? [y/N] "), "{prompt}");
+            if sensitive {
+                for marker in [
+                    "server-marker",
+                    "account-marker",
+                    "target-marker",
+                    "new-target-marker",
+                ] {
+                    assert!(!prompt.contains(marker), "{prompt}");
+                }
+                assert!(prompt.contains("<redacted>"));
+            } else {
+                assert!(prompt.contains(name));
+            }
+            if prompt.starts_with("update account") && prompt.contains("preserved") {
+                assert!(prompt.contains("other accounts and privilege settings are preserved"));
+            }
+            if prompt.starts_with("update privilege") {
+                assert!(prompt.contains("sudo target:") && prompt.contains("authentication:"));
+            }
+            if prompt.starts_with("trust") {
+                assert!(prompt.contains("SHA256:expected"));
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), before.0);
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().modified().unwrap(),
+                before.1
+            );
+        }
+        assert!(
+            store.values.borrow().is_empty()
+                && store.requested.borrow().is_empty()
+                && store.deleted.borrow().is_empty()
+        );
+    }
+}
+
+#[test]
+fn unknown_profiles_share_recovery_without_config_secret_or_network_access() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    std::fs::write(&path, "{broken active configuration").unwrap();
+    let registry_path = temp.path().join("profiles.json");
+    let registry = ProfileRegistry::default();
+    save_registry(&registry_path, &registry).unwrap();
+    let before = (
+        std::fs::read(&registry_path).unwrap(),
+        std::fs::metadata(&registry_path)
+            .unwrap()
+            .modified()
+            .unwrap(),
+    );
+    let config_before = std::fs::read(&path).unwrap();
+    let store = FakeCredentialStore::default();
+    let ssh = FakeSshClient::default();
+    let mut prompts = NoPasswordPrompter {
+        prompts: Vec::new(),
+    };
+    for name in [
+        "missing",
+        "-profile's $literal",
+        "서버 작업",
+        "token=profile-marker",
+    ] {
+        let selected_error = sshw::profile::resolve_home_with_registry(
+            None,
+            None,
+            Some(name),
+            &registry,
+            temp.path(),
+        )
+        .unwrap_err();
+        let message = sshw::output::ErrorResponse::from_error(&selected_error)
+            .error
+            .message;
+        for command in ["show", "default", "remove"] {
+            for machine in [false, true] {
+                let mut args = vec!["sshw", "profile", command];
+                if machine {
+                    args.push("--json");
+                }
+                args.extend(["--", name]);
+                let output = execute_for_runtime(
+                    Cli::try_parse_from(args).unwrap(),
+                    &path,
+                    &store,
+                    &ssh,
+                    &mut prompts,
+                );
+                assert_eq!(output.exit_code, 3);
+                let actual = if machine {
+                    let body: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+                    assert_eq!(body["error"]["kind"], "config");
+                    body["error"]["message"].as_str().unwrap().to_string()
+                } else {
+                    output.stderr.trim_end().to_string()
+                };
+                assert_eq!(actual, message);
+                assert!(
+                    actual.contains("sshw profile list")
+                        && actual.contains("global profile registry")
+                        && actual.contains("omit the failing --profile")
+                        && actual.contains("separate namespace")
+                );
+                assert!(
+                    actual.contains("sshw --home '<home>' profile add -- ")
+                        && actual.contains("named profile is optional")
+                );
+                if name.starts_with("token=") {
+                    assert!(!actual.contains("profile-marker"));
+                    assert!(
+                        actual.contains("profile add -- '<redacted>'")
+                            && actual.contains("--profile='<redacted>'")
+                    );
+                } else if name.contains('\'') {
+                    let quoted = if cfg!(windows) {
+                        "'-profile''s $literal'"
+                    } else {
+                        "'-profile'\"'\"'s $literal'"
+                    };
+                    assert!(actual.contains(&format!("profile add -- {quoted}")));
+                }
+                assert_eq!(std::fs::read(&registry_path).unwrap(), before.0);
+                assert_eq!(
+                    std::fs::metadata(&registry_path)
+                        .unwrap()
+                        .modified()
+                        .unwrap(),
+                    before.1
+                );
+                assert_eq!(std::fs::read(&path).unwrap(), config_before);
+            }
+        }
+    }
+    assert!(
+        store.values.borrow().is_empty()
+            && store.requested.borrow().is_empty()
+            && store.deleted.borrow().is_empty()
+    );
+    assert!(ssh.selected_users.borrow().is_empty() && ssh.run_commands.borrow().is_empty());
+    assert!(prompts.prompts.is_empty());
+    assert!(!temp.path().join("known_hosts").exists());
+}
+
+#[test]
+fn empty_profile_list_explains_optional_registration_and_keeps_json_array() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    std::fs::write(&path, "{broken active configuration").unwrap();
+    let store = FakeCredentialStore::default();
+    let ssh = FakeSshClient::default();
+    let mut prompts = NoPasswordPrompter {
+        prompts: Vec::new(),
+    };
+    for machine in [false, true] {
+        let mut args = vec!["sshw", "profile", "list"];
+        if machine {
+            args.push("--json");
+        }
+        let output = execute_for_runtime(
+            Cli::try_parse_from(args).unwrap(),
+            &path,
+            &store,
+            &ssh,
+            &mut prompts,
+        );
+        assert_eq!(output.exit_code, 0);
+        assert!(output.stderr.is_empty());
+        if machine {
+            let body: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+            assert_eq!(body, serde_json::json!([]));
+        } else {
+            assert!(output.stdout.contains("no named profiles registered"));
+            assert!(
+                output
+                    .stdout
+                    .contains("sshw --home '<home>' profile add -- '<name>'")
+            );
+            assert!(
+                output.stdout.contains("Named profiles are optional")
+                    && output.stdout.contains("built-in default home")
+            );
+        }
+    }
+    assert!(
+        !temp.path().join("profiles.json").exists() && !temp.path().join(".profiles.lock").exists()
+    );
+    assert!(
+        store.values.borrow().is_empty()
+            && store.requested.borrow().is_empty()
+            && store.deleted.borrow().is_empty()
+    );
+    assert!(ssh.selected_users.borrow().is_empty() && prompts.prompts.is_empty());
+}
 
 #[test]
 fn transfer_help_documents_remote_absolute_literal() {
@@ -52,6 +359,248 @@ fn parses_add_with_default_password_auth() {
     assert_eq!(args.port, 2222);
     assert_eq!(args.user, "deploy");
     assert_eq!(args.auth, AuthArg::Password);
+}
+
+#[test]
+fn endpoint_account_registration_rejects_bad_addresses_before_prompts_and_secrets() {
+    for (host, port) in [
+        ("", "22"),
+        ("   ", "22"),
+        ("bad\nhost", "22"),
+        ("bad\rhost", "22"),
+        ("bad\0host", "22"),
+        ("bad\thost", "22"),
+        ("localhost", "0"),
+    ] {
+        for name in ["server-alpha", "new-server"] {
+            for auth in ["agent", "password", "password-stdin"] {
+                for json in [false, true] {
+                    let temp = tempfile::tempdir().unwrap();
+                    let path = temp.path().join("servers.json");
+                    save_config(&path, &agent_accounts_config(&path)).unwrap();
+                    let before = std::fs::read(&path).unwrap();
+                    let store = FakeCredentialStore::default();
+                    let ssh = FakeSshClient::default();
+                    let mut prompts = NoPasswordPrompter { prompts: vec![] };
+                    let mut args = vec![
+                        "sshw",
+                        "add",
+                        name,
+                        "--host",
+                        host,
+                        "--port",
+                        port,
+                        "--user",
+                        "deploy",
+                        "--replace",
+                        "--auth",
+                        if auth == "agent" { "agent" } else { "password" },
+                    ];
+                    if auth == "password-stdin" {
+                        args.push("--password-stdin");
+                    }
+                    if json {
+                        args.push("--json");
+                    }
+                    let output = execute_for_runtime(
+                        Cli::try_parse_from(args).unwrap(),
+                        &path,
+                        &store,
+                        &ssh,
+                        &mut prompts,
+                    );
+                    assert_eq!(output.exit_code, 3, "{}{}", output.stdout, output.stderr);
+                    assert!(
+                        format!("{}{}", output.stdout, output.stderr)
+                            .contains("invalid endpoint for server")
+                    );
+                    assert!(prompts.prompts.is_empty());
+                    assert_eq!(std::fs::read(&path).unwrap(), before);
+                    assert!(
+                        store.values.borrow().is_empty()
+                            && store.requested.borrow().is_empty()
+                            && store.deleted.borrow().is_empty()
+                    );
+                    assert!(ssh.selected_users.borrow().is_empty());
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn endpoint_account_invalid_stored_addresses_fail_closed_and_remain_diagnosable() {
+    for version in [1, 2] {
+        for (host, port) in [("", 22), ("  ", 22), ("bad\nhost", 22), ("localhost", 0)] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("servers.json");
+            let server = if version == 1 {
+                serde_json::json!({"host":host,"port":port,"user":"deploy","auth":{"type":"agent"}})
+            } else {
+                serde_json::json!({"host":host,"port":port,"default_user":"deploy","accounts":{"deploy":{"auth":{"type":"agent"}}}})
+            };
+            let before = serde_json::json!({"version":version,"default":"web","credential_backend":"session_only","servers":{"web":server}}).to_string();
+            std::fs::write(&path, &before).unwrap();
+            assert!(
+                load_config(&path)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("invalid endpoint for server 'web'")
+            );
+            let store = FakeCredentialStore::default();
+            let ssh = FakeSshClient::default();
+            for args in [
+                vec!["sshw", "show", "web", "--json"],
+                vec!["sshw", "policy", "check", "web", "hostname", "--json"],
+                vec!["sshw", "run", "web", "hostname", "--json"],
+                vec!["sshw", "put", "web", "missing", "/tmp/file", "--json"],
+                vec!["sshw", "get", "web", "/tmp/file", "missing", "--json"],
+            ] {
+                let output = execute_for_runtime(
+                    Cli::try_parse_from(args).unwrap(),
+                    &path,
+                    &store,
+                    &ssh,
+                    &mut NoPasswordPrompter { prompts: vec![] },
+                );
+                assert_eq!(output.exit_code, 3, "{}{}", output.stdout, output.stderr);
+                let value: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+                assert_eq!(value["error"]["kind"], "config");
+                assert!(
+                    value["error"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("invalid endpoint for server 'web'")
+                );
+            }
+            let output = execute_for_runtime(
+                Cli::try_parse_from(["sshw", "doctor", "--json"]).unwrap(),
+                &path,
+                &store,
+                &ssh,
+                &mut NoPasswordPrompter { prompts: vec![] },
+            );
+            assert_eq!(output.exit_code, 0);
+            let value: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+            assert_eq!(value["config_valid"], false);
+            assert!(
+                value["config_message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("invalid endpoint for server 'web'")
+            );
+            assert!(
+                value["issues"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|issue| issue["kind"] == "config")
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+            assert!(
+                store.values.borrow().is_empty()
+                    && store.requested.borrow().is_empty()
+                    && store.deleted.borrow().is_empty()
+            );
+            assert!(ssh.selected_users.borrow().is_empty());
+        }
+    }
+}
+
+#[test]
+fn endpoint_account_human_privilege_summaries_show_target_and_authentication() {
+    for (method, target, no_password, expected) in [
+        (
+            PrivilegeMethod::Sudo,
+            "root",
+            true,
+            "sudo -> root (no password)",
+        ),
+        (
+            PrivilegeMethod::Sudo,
+            "service",
+            true,
+            "sudo -> service (no password)",
+        ),
+        (
+            PrivilegeMethod::Sudo,
+            "service",
+            false,
+            "sudo -> service (password)",
+        ),
+        (
+            PrivilegeMethod::Su,
+            "service",
+            false,
+            "su -> service (password)",
+        ),
+        (
+            PrivilegeMethod::Sudo,
+            "password=fixture-value",
+            true,
+            "sudo -> <redacted> (no password)",
+        ),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("servers.json");
+        let mut config = agent_accounts_config(&path);
+        set_default_privilege(
+            &mut config,
+            "server-alpha",
+            PrivilegeConfig {
+                method,
+                user: target.into(),
+                credential: (!no_password).then(|| privilege_credential(&path, "server-alpha")),
+                no_password,
+            },
+        );
+        save_config(&path, &config).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let store = FakeCredentialStore::default();
+        let ssh = FakeSshClient::default();
+        for args in [
+            vec!["sshw", "account", "list", "server-alpha"],
+            vec!["sshw", "account", "show", "server-alpha", "deploy"],
+        ] {
+            let output = execute(
+                Cli::try_parse_from(args).unwrap(),
+                &path,
+                &store,
+                &ssh,
+                &mut NoPasswordPrompter { prompts: vec![] },
+            )
+            .unwrap();
+            assert!(output.stdout.contains(expected), "{}", output.stdout);
+            assert!(!output.stdout.contains("fixture-value"));
+            assert!(output.stdout.contains("deploy"));
+        }
+        if !target.starts_with("password=") {
+            let output = execute(
+                Cli::try_parse_from([
+                    "sshw",
+                    "account",
+                    "show",
+                    "server-alpha",
+                    "deploy",
+                    "--json",
+                ])
+                .unwrap(),
+                &path,
+                &store,
+                &ssh,
+                &mut NoPasswordPrompter { prompts: vec![] },
+            )
+            .unwrap();
+            let value: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+            assert_eq!(
+                value["privilege"],
+                serde_json::json!({"method":method,"user":target,"no_password":no_password,"credential":if no_password { None } else { Some(privilege_credential(&path, "server-alpha")) }})
+            );
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(store.requested.borrow().is_empty() && store.deleted.borrow().is_empty());
+        assert!(ssh.selected_users.borrow().is_empty());
+    }
 }
 
 #[test]
@@ -531,6 +1080,8 @@ fn privilege_clear_json_failure_uses_error_envelope() {
             "privilege",
             "clear",
             "server-alpha",
+            "--account",
+            "missing",
             "--yes",
             "--json",
         ])
@@ -541,7 +1092,7 @@ fn privilege_clear_json_failure_uses_error_envelope() {
         &mut prompter,
     );
 
-    assert_json_error(output, 3, "config", "privilege configuration missing");
+    assert_json_error(output, 3, "config", "unknown account");
 }
 
 #[test]
@@ -811,7 +1362,8 @@ fn privilege_clear_json_success_reports_state_change() {
         PrivilegeConfig {
             method: PrivilegeMethod::Sudo,
             user: "root".to_string(),
-            credential: privilege_credential(&path, "server-alpha"),
+            credential: Some(privilege_credential(&path, "server-alpha")),
+            no_password: false,
         },
     );
     save_config(&path, &config).unwrap();
@@ -840,6 +1392,117 @@ fn privilege_clear_json_success_reports_state_change() {
     assert_eq!(json["ok"], true);
     assert_eq!(json["action"], "cleared");
     assert_eq!(json["server"], "server-alpha");
+}
+
+#[test]
+fn clear_persistence_absent_privilege_is_a_noop_without_prompts_or_secret_access() {
+    for version in [1, 2] {
+        for selected in [false, true] {
+            if version == 1 && selected {
+                continue;
+            }
+            for json_output in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let path = temp.path().join("servers.json");
+                if version == 1 {
+                    std::fs::write(&path,r#"{"version":1,"default":"web","servers":{"web":{"host":"example.test","port":22,"user":"deploy","auth":{"type":"agent"}}}}"#).unwrap();
+                } else {
+                    let mut config = agent_accounts_config(&path);
+                    let server = config.servers.remove("server-alpha").unwrap();
+                    config.servers.insert("web".into(), server);
+                    config.default = Some("web".into());
+                    save_config(&path, &config).unwrap();
+                }
+                let before = std::fs::read(&path).unwrap();
+                let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+                let store = FakeCredentialStore::default();
+                let ssh = FakeSshClient::default();
+                let mut prompts = NoPasswordPrompter { prompts: vec![] };
+                let home = ResolvedHome::from_config_path(&path);
+                let registry = temp.path().join("profiles.json");
+                let audit_path = temp.path().join("audit.jsonl");
+                let audit = FileAuditSink::new(audit_path.clone());
+                let ctx = ExecContext {
+                    home: &home,
+                    registry_path: &registry,
+                    policy_forced: false,
+                    audit: &audit,
+                };
+                for yes in [false, true] {
+                    let mut args = vec!["sshw", "privilege", "clear", "web"];
+                    if selected {
+                        args.extend(["--account", "ops"]);
+                    }
+                    if yes {
+                        args.push("--yes");
+                    }
+                    if json_output {
+                        args.push("--json");
+                    }
+                    let output = execute_with(
+                        Cli::try_parse_from(args).unwrap(),
+                        &ctx,
+                        &store,
+                        &ssh,
+                        &mut prompts,
+                    )
+                    .unwrap();
+                    assert_eq!(output.exit_code, 0);
+                    if json_output {
+                        let body: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+                        assert_eq!(body["action"], "cleared");
+                        assert_eq!(body["account"], if selected { "ops" } else { "deploy" });
+                        assert_eq!(body["changed"], false);
+                        assert_eq!(body["change"], "unchanged");
+                    } else {
+                        assert!(output.stdout.contains("unchanged"));
+                    }
+                    assert!(!output.stdout.contains("privilege set"));
+                    assert_eq!(std::fs::read(&path).unwrap(), before);
+                    assert_eq!(
+                        std::fs::metadata(&path).unwrap().modified().unwrap(),
+                        modified
+                    );
+                }
+                assert!(
+                    prompts.prompts.is_empty()
+                        && store.requested.borrow().is_empty()
+                        && store.deleted.borrow().is_empty()
+                        && store.values.borrow().is_empty()
+                );
+                assert!(ssh.selected_users.borrow().is_empty());
+                assert_eq!(
+                    std::fs::read_to_string(audit_path).unwrap().lines().count(),
+                    2
+                );
+            }
+        }
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &agent_accounts_config(&path)).unwrap();
+    for args in [
+        vec!["sshw", "privilege", "clear", "missing", "--json"],
+        vec![
+            "sshw",
+            "privilege",
+            "clear",
+            "server-alpha",
+            "--account",
+            "missing",
+            "--json",
+        ],
+    ] {
+        let output = execute_for_runtime(
+            Cli::try_parse_from(args).unwrap(),
+            &path,
+            &FakeCredentialStore::default(),
+            &FakeSshClient::default(),
+            &mut FakePrompter::default(),
+        );
+        assert_eq!(output.exit_code, 3);
+        assert!(output.stdout.contains("unknown"));
+    }
 }
 
 #[test]
@@ -928,7 +1591,20 @@ fn json_run_missing_credential_returns_auth_error() {
         json["error"]["message"]
             .as_str()
             .unwrap()
-            .contains("missing credential entry")
+            .contains("failed to load login credential")
+    );
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("caused by: missing credential")
+    );
+    assert!(
+        json["error"]["causes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|cause| cause == "missing credential")
     );
     assert!(ssh.run_commands.borrow().is_empty());
 }
@@ -1016,7 +1692,8 @@ fn remove_deletes_privilege_metadata_and_password() {
         PrivilegeConfig {
             method: PrivilegeMethod::Sudo,
             user: "root".to_string(),
-            credential: privilege_credential(&path, "server-alpha"),
+            credential: Some(privilege_credential(&path, "server-alpha")),
+            no_password: false,
         },
     );
     config
@@ -1033,7 +1710,8 @@ fn remove_deletes_privilege_metadata_and_password() {
                 privilege: Some(PrivilegeConfig {
                     method: PrivilegeMethod::Sudo,
                     user: "admin".to_string(),
-                    credential: ops_privilege.clone(),
+                    credential: Some(ops_privilege.clone()),
+                    no_password: false,
                 }),
             },
         );
@@ -1095,6 +1773,150 @@ fn confirmation_failure_is_reported_as_config_error() {
     assert_eq!(output.exit_code, 3);
     assert_eq!(output.stdout, "");
     assert!(output.stderr.contains("interactive terminal"));
+}
+
+#[test]
+fn trust_readiness_checks_before_ssh_but_yes_bypasses_the_gate() {
+    struct Unavailable;
+    impl Prompter for Unavailable {
+        fn ensure_confirmation_available(&mut self, option: &str) -> anyhow::Result<()> {
+            assert_eq!(option, "--yes");
+            Err(anyhow::Error::new(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "fixture terminal access denied",
+            ))
+            .context("fixture confirmation unavailable"))
+        }
+        fn confirm(&mut self, _: &str) -> anyhow::Result<bool> {
+            panic!("must not prompt")
+        }
+        fn password(&mut self, _: &str) -> anyhow::Result<String> {
+            panic!("must not read a password")
+        }
+        fn password_stdin(&mut self) -> anyhow::Result<String> {
+            panic!("must not read stdin")
+        }
+    }
+    for yes in [false, true] {
+        for json in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("servers.json");
+            save_config(&path, &sample_config(&path)).unwrap();
+            let before = std::fs::read(&path).unwrap();
+            let store = FakeCredentialStore::default();
+            let ssh = FakeSshClient::default();
+            let mut argv = vec!["sshw", "trust", "server-alpha"];
+            if yes {
+                argv.push("--yes");
+            }
+            if json {
+                argv.push("--json");
+            }
+            let output = execute_for_runtime(
+                Cli::try_parse_from(argv).unwrap(),
+                &path,
+                &store,
+                &ssh,
+                &mut Unavailable,
+            );
+            assert_eq!(output.exit_code, if yes { 0 } else { 3 });
+            assert_eq!(*ssh.host_key_calls.borrow(), if yes { 2 } else { 0 });
+            assert_eq!(
+                ssh.trusted_expected_fingerprints.borrow().len(),
+                usize::from(yes)
+            );
+            if !yes {
+                assert!(
+                    format!("{}{}", output.stdout, output.stderr)
+                        .contains("fixture confirmation unavailable")
+                );
+                if json {
+                    let body: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+                    assert_eq!(body["error"]["kind"], "config");
+                    assert!(
+                        body["error"]["causes"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|cause| cause == "fixture terminal access denied")
+                    );
+                }
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            assert!(
+                store.requested.borrow().is_empty()
+                    && store.values.borrow().is_empty()
+                    && store.deleted.borrow().is_empty()
+            );
+        }
+    }
+}
+
+#[test]
+fn trust_readiness_keeps_lookup_priority_and_confirms_the_fetched_fingerprint() {
+    struct Recording {
+        available: usize,
+        prompts: Vec<String>,
+        approve: bool,
+    }
+    impl Prompter for Recording {
+        fn ensure_confirmation_available(&mut self, _: &str) -> anyhow::Result<()> {
+            self.available += 1;
+            Ok(())
+        }
+        fn confirm(&mut self, prompt: &str) -> anyhow::Result<bool> {
+            self.prompts.push(prompt.into());
+            Ok(self.approve)
+        }
+        fn password(&mut self, _: &str) -> anyhow::Result<String> {
+            panic!("must not read a password")
+        }
+        fn password_stdin(&mut self) -> anyhow::Result<String> {
+            panic!("must not read stdin")
+        }
+    }
+    for target in ["missing", "server-alpha"] {
+        for approve in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("servers.json");
+            save_config(&path, &sample_config(&path)).unwrap();
+            let store = FakeCredentialStore::default();
+            let ssh = FakeSshClient {
+                host_key_fingerprint: "SHA256:displayed".into(),
+                ..Default::default()
+            };
+            let mut prompts = Recording {
+                available: 0,
+                prompts: vec![],
+                approve,
+            };
+            let output = execute_for_runtime(
+                Cli::try_parse_from(["sshw", "trust", target, "--json"]).unwrap(),
+                &path,
+                &store,
+                &ssh,
+                &mut prompts,
+            );
+            if target == "missing" {
+                assert_eq!(output.exit_code, 3);
+                assert!(output.stdout.contains("unknown server"));
+                assert_eq!(prompts.available, 0);
+                assert!(prompts.prompts.is_empty());
+                assert_eq!(*ssh.host_key_calls.borrow(), 0);
+            } else {
+                assert_eq!(output.exit_code, if approve { 0 } else { 3 });
+                assert_eq!(prompts.available, 1);
+                assert_eq!(prompts.prompts.len(), 1);
+                assert!(prompts.prompts[0].contains("ssh-ed25519 SHA256:displayed"));
+                assert_eq!(*ssh.host_key_calls.borrow(), if approve { 2 } else { 1 });
+                let trusted = ssh.trusted_expected_fingerprints.borrow();
+                assert_eq!(trusted.len(), usize::from(approve));
+                if approve {
+                    assert_eq!(trusted[0], "SHA256:displayed");
+                }
+            }
+        }
+    }
 }
 
 #[test]
@@ -1347,7 +2169,8 @@ fn add_update_removes_stale_privilege_metadata_and_password() {
         PrivilegeConfig {
             method: PrivilegeMethod::Sudo,
             user: "root".to_string(),
-            credential: privilege_credential(&path, "server-alpha"),
+            credential: Some(privilege_credential(&path, "server-alpha")),
+            no_password: false,
         },
     );
     config
@@ -1364,7 +2187,8 @@ fn add_update_removes_stale_privilege_metadata_and_password() {
                 privilege: Some(PrivilegeConfig {
                     method: PrivilegeMethod::Sudo,
                     user: "admin".to_string(),
-                    credential: ops_privilege.clone(),
+                    credential: Some(ops_privilege.clone()),
+                    no_password: false,
                 }),
             },
         );
@@ -1604,17 +2428,20 @@ fn privilege_set_stores_root_password_outside_config() {
         CredentialPurpose::Privilege,
         "server-alpha",
         "deploy",
-        &privilege.credential
+        privilege.credential.as_deref().unwrap()
     ));
     assert_ne!(
         privilege.credential,
-        namespace.legacy_privilege_credential_key("server-alpha")
+        Some(namespace.legacy_privilege_credential_key("server-alpha"))
     );
 
     let stored = store
         .values
         .borrow()
-        .get(&(privilege.credential.clone(), "root".to_string()))
+        .get(&(
+            privilege.credential.as_ref().unwrap().clone(),
+            "root".to_string(),
+        ))
         .cloned()
         .unwrap();
     assert_eq!(stored, "ROOT_PASSWORD");
@@ -1673,7 +2500,8 @@ fn privilege_show_redacts_secret_material() {
         PrivilegeConfig {
             method: PrivilegeMethod::Sudo,
             user: "root".to_string(),
-            credential: privilege_credential(&path, "server-alpha"),
+            credential: Some(privilege_credential(&path, "server-alpha")),
+            no_password: false,
         },
     );
     save_config(&path, &config).unwrap();
@@ -1717,7 +2545,8 @@ fn privilege_show_json_success_includes_ok_true() {
         PrivilegeConfig {
             method: PrivilegeMethod::Sudo,
             user: "root".to_string(),
-            credential: privilege_credential(&path, "server-alpha"),
+            credential: Some(privilege_credential(&path, "server-alpha")),
+            no_password: false,
         },
     );
     save_config(&path, &config).unwrap();
@@ -1752,7 +2581,8 @@ fn privilege_clear_removes_metadata_and_stored_password() {
         PrivilegeConfig {
             method: PrivilegeMethod::Sudo,
             user: "root".to_string(),
-            credential: privilege_credential(&path, "server-alpha"),
+            credential: Some(privilege_credential(&path, "server-alpha")),
+            no_password: false,
         },
     );
     save_config(&path, &config).unwrap();
@@ -1792,7 +2622,8 @@ fn privilege_clear_removes_metadata_when_password_delete_fails() {
         PrivilegeConfig {
             method: PrivilegeMethod::Sudo,
             user: "root".to_string(),
-            credential: privilege_credential(&path, "server-alpha"),
+            credential: Some(privilege_credential(&path, "server-alpha")),
+            no_password: false,
         },
     );
     save_config(&path, &config).unwrap();
@@ -1827,7 +2658,8 @@ fn privilege_set_update_deletes_previous_user_credential() {
         PrivilegeConfig {
             method: PrivilegeMethod::Sudo,
             user: "root".to_string(),
-            credential: privilege_credential(&path, "server-alpha"),
+            credential: Some(privilege_credential(&path, "server-alpha")),
+            no_password: false,
         },
     );
     save_config(&path, &config).unwrap();
@@ -1879,12 +2711,10 @@ fn privilege_set_update_deletes_previous_user_credential() {
             "root".to_string()
         )]
     );
-    assert!(
-        store
-            .values
-            .borrow()
-            .contains_key(&(privilege.credential.clone(), "admin".to_string()))
-    );
+    assert!(store.values.borrow().contains_key(&(
+        privilege.credential.as_ref().unwrap().clone(),
+        "admin".to_string()
+    )));
 }
 
 #[test]
@@ -1903,7 +2733,8 @@ fn privilege_set_update_surfaces_previous_credential_delete_failure() {
         PrivilegeConfig {
             method: PrivilegeMethod::Sudo,
             user: "root".to_string(),
-            credential: privilege_credential(&path, "server-alpha"),
+            credential: Some(privilege_credential(&path, "server-alpha")),
+            no_password: false,
         },
     );
     save_config(&path, &config).unwrap();
@@ -1953,12 +2784,10 @@ fn privilege_set_update_surfaces_previous_credential_delete_failure() {
     let config = load_config(&path).unwrap();
     let privilege = default_privilege(&config, "server-alpha").unwrap();
     assert_eq!(privilege.user, "admin");
-    assert!(
-        store
-            .values
-            .borrow()
-            .contains_key(&(privilege.credential.clone(), "admin".to_string()))
-    );
+    assert!(store.values.borrow().contains_key(&(
+        privilege.credential.as_ref().unwrap().clone(),
+        "admin".to_string()
+    )));
     // The previous user's credential remains an orphan because delete failed.
     assert!(store.values.borrow().contains_key(&(
         privilege_credential(&path, "server-alpha"),
@@ -2242,7 +3071,8 @@ fn run_as_root_uses_sudo_stdin_and_redacts_privilege_secret() {
         PrivilegeConfig {
             method: PrivilegeMethod::Sudo,
             user: "root".to_string(),
-            credential: privilege_credential(&path, "server-alpha"),
+            credential: Some(privilege_credential(&path, "server-alpha")),
+            no_password: false,
         },
     );
     save_config(&path, &config).unwrap();
@@ -2336,6 +3166,435 @@ fn passwordless_sudo_needs_no_privilege_secret_and_reports_remote_failure() {
     assert_eq!(ssh.run_stdin.borrow().as_slice(), &[None]);
 }
 
+fn agent_accounts_config(path: &Path) -> SshwConfig {
+    let mut config = sample_config(path);
+    let server = config.servers.get_mut("server-alpha").unwrap();
+    server.account_mut("deploy").unwrap().auth = AuthConfig::Agent;
+    server.accounts.insert(
+        "ops".into(),
+        AccountConfig {
+            auth: AuthConfig::Agent,
+            privilege: None,
+        },
+    );
+    config
+}
+
+struct NoPasswordPrompter {
+    prompts: Vec<String>,
+}
+
+impl Prompter for NoPasswordPrompter {
+    fn confirm(&mut self, prompt: &str) -> anyhow::Result<bool> {
+        self.prompts.push(prompt.to_string());
+        Ok(true)
+    }
+    fn password(&mut self, _: &str) -> anyhow::Result<String> {
+        panic!("unexpected password prompt")
+    }
+    fn password_stdin(&mut self) -> anyhow::Result<String> {
+        panic!("unexpected password stdin")
+    }
+}
+
+#[test]
+fn saved_passwordless_sudo_uses_selected_target_without_secret_access() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &agent_accounts_config(&path)).unwrap();
+    let store = FakeCredentialStore::default();
+    let ssh = FakeSshClient::default();
+    let mut prompter = NoPasswordPrompter {
+        prompts: Vec::new(),
+    };
+    let result = execute(
+        Cli::try_parse_from([
+            "sshw",
+            "privilege",
+            "set",
+            "server-alpha",
+            "--account",
+            "ops",
+            "--user",
+            "service",
+            "--no-password",
+            "--json",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    )
+    .unwrap();
+    let output: serde_json::Value = serde_json::from_str(&result.stdout).unwrap();
+    assert_eq!(output["account"], "ops");
+    assert_eq!(output["user"], "service");
+    assert_eq!(output["no_password"], true);
+    assert!(output["credential"].is_null());
+    let saved = load_config(&path).unwrap();
+    assert!(
+        saved.servers["server-alpha"].accounts["deploy"]
+            .privilege
+            .is_none()
+    );
+    let privilege = saved.servers["server-alpha"].accounts["ops"]
+        .privilege
+        .as_ref()
+        .unwrap();
+    assert!(privilege.no_password);
+    assert_eq!(privilege.credential, None);
+    let saved_json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert!(
+        saved_json["servers"]["server-alpha"]["accounts"]["ops"]["privilege"]
+            .get("credential")
+            .is_none()
+    );
+
+    for extra in [None, Some("--no-password")] {
+        let mut args = vec![
+            "sshw",
+            "run",
+            "server-alpha",
+            "whoami",
+            "--user",
+            "ops",
+            "--as-root",
+        ];
+        args.extend(extra);
+        execute(
+            Cli::try_parse_from(args).unwrap(),
+            &path,
+            &store,
+            &ssh,
+            &mut prompter,
+        )
+        .unwrap();
+    }
+    assert!(
+        ssh.run_commands
+            .borrow()
+            .iter()
+            .all(|command| command.starts_with("sudo -n -u 'service' -- sh -c "))
+    );
+    assert_eq!(*ssh.run_stdin.borrow(), vec![None, None]);
+    assert_eq!(*ssh.selected_users.borrow(), vec!["ops", "ops"]);
+    execute(
+        Cli::try_parse_from(["sshw", "run", "server-alpha", "whoami", "--user", "ops"]).unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    )
+    .unwrap();
+    assert_eq!(
+        ssh.run_commands.borrow().last().unwrap(),
+        "whoami",
+        "a saved setting must not elevate ordinary runs"
+    );
+
+    let denied = execute(
+        Cli::try_parse_from([
+            "sshw",
+            "run",
+            "server-alpha",
+            "whoami",
+            "--user",
+            "ops",
+            "--as-root",
+            "--json",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &FakeSshClient::with_exit_status(1),
+        &mut prompter,
+    )
+    .unwrap();
+    assert_eq!(denied.exit_code, 8);
+    let value: serde_json::Value = serde_json::from_str(&denied.stdout).unwrap();
+    assert_eq!(value["exit_status"], 1);
+    assert_eq!(value["command_succeeded"], false);
+
+    let doctor = execute(
+        Cli::try_parse_from(["sshw", "doctor", "--json"]).unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    )
+    .unwrap();
+    assert!(!doctor.stdout.contains("privilege_credential"));
+    let account = execute(
+        Cli::try_parse_from(["sshw", "account", "show", "server-alpha", "ops", "--json"]).unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    )
+    .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&account.stdout).unwrap();
+    assert_eq!(value["privilege"]["no_password"], true);
+    let calls = ssh.run_commands.borrow().len();
+    let dangerous = execute_for_runtime(
+        Cli::try_parse_from([
+            "sshw",
+            "run",
+            "server-alpha",
+            "rm -rf /",
+            "--user",
+            "ops",
+            "--as-root",
+            "--json",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    );
+    assert_eq!(dangerous.exit_code, 2);
+    write_policy(
+        temp.path(),
+        r#"{"version":1,"enabled":true,"allow_commands":["uptime"]}"#,
+    );
+    let blocked = execute_for_runtime(
+        Cli::try_parse_from([
+            "sshw",
+            "run",
+            "server-alpha",
+            "whoami",
+            "--user",
+            "ops",
+            "--as-root",
+            "--json",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut prompter,
+    );
+    assert_eq!(blocked.exit_code, 7);
+    assert_eq!(ssh.run_commands.borrow().len(), calls);
+    assert!(store.values.borrow().is_empty());
+    assert!(store.requested.borrow().is_empty());
+    assert!(store.deleted.borrow().is_empty());
+}
+
+#[test]
+fn passwordless_privilege_transitions_and_prompts_identify_both_accounts() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &agent_accounts_config(&path)).unwrap();
+    let store = FakeCredentialStore::default();
+    let ssh = FakeSshClient::default();
+    let mut no_password_prompter = NoPasswordPrompter {
+        prompts: Vec::new(),
+    };
+    execute(
+        Cli::try_parse_from([
+            "sshw",
+            "privilege",
+            "set",
+            "server-alpha",
+            "--account",
+            "ops",
+            "--user",
+            "root",
+            "--password-stdin",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut FakePrompter::default(),
+    )
+    .unwrap();
+    let old = load_config(&path).unwrap().servers["server-alpha"].accounts["ops"]
+        .privilege
+        .as_ref()
+        .unwrap()
+        .credential
+        .clone()
+        .unwrap();
+    let set = execute(
+        Cli::try_parse_from([
+            "sshw",
+            "privilege",
+            "set",
+            "server-alpha",
+            "--account",
+            "ops",
+            "--user",
+            "service",
+            "--no-password",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut no_password_prompter,
+    )
+    .unwrap();
+    assert!(set.stdout.contains("server-alpha/ops"));
+    assert!(set.stdout.contains("login account: ops"));
+    assert!(set.stdout.contains("target user: service"));
+    assert_eq!(*store.deleted.borrow(), vec![(old, "root".into())]);
+    assert!(store.values.borrow().is_empty());
+    let prompt = &no_password_prompter.prompts[0];
+    assert!(prompt.contains("server-alpha/ops"));
+    assert!(prompt.contains("sudo target: root -> sudo target: service"));
+    assert!(prompt.contains("password -> no password"));
+    let show = execute(
+        Cli::try_parse_from([
+            "sshw",
+            "privilege",
+            "show",
+            "server-alpha",
+            "--account",
+            "ops",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut no_password_prompter,
+    )
+    .unwrap();
+    assert!(show.stdout.contains("login account: ops"));
+    assert!(show.stdout.contains("target user: service"));
+    assert!(show.stdout.contains("credential: none"));
+    execute(
+        Cli::try_parse_from([
+            "sshw",
+            "privilege",
+            "set",
+            "server-alpha",
+            "--account",
+            "ops",
+            "--user",
+            "service2",
+            "--no-password",
+            "--force",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut no_password_prompter,
+    )
+    .unwrap();
+    assert_eq!(
+        store.deleted.borrow().len(),
+        1,
+        "no nonexistent credential cleanup"
+    );
+    let clear = execute(
+        Cli::try_parse_from([
+            "sshw",
+            "privilege",
+            "clear",
+            "server-alpha",
+            "--account",
+            "ops",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut no_password_prompter,
+    )
+    .unwrap();
+    assert!(
+        clear
+            .stdout
+            .contains("server-alpha/ops (sudo target: service2)")
+    );
+    let prompt = no_password_prompter.prompts.last().unwrap();
+    assert!(prompt.contains("server-alpha/ops"));
+    assert!(prompt.contains("sudo target: service2"));
+    assert_eq!(store.deleted.borrow().len(), 1);
+
+    execute(
+        Cli::try_parse_from(["sshw", "privilege", "set", "server-alpha", "--no-password"]).unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut no_password_prompter,
+    )
+    .unwrap();
+    execute(
+        Cli::try_parse_from([
+            "sshw",
+            "privilege",
+            "set",
+            "server-alpha",
+            "--password-stdin",
+            "--force",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut FakePrompter::default(),
+    )
+    .unwrap();
+    let saved = load_config(&path).unwrap();
+    let privilege = saved.servers["server-alpha"].accounts["deploy"]
+        .privilege
+        .as_ref()
+        .unwrap();
+    assert!(!privilege.no_password);
+    assert!(
+        store
+            .values
+            .borrow()
+            .contains_key(&(privilege.credential.clone().unwrap(), "root".into()))
+    );
+}
+
+#[test]
+fn passwordless_account_and_server_removal_skip_nonexistent_credentials() {
+    for remove in [
+        vec!["account", "remove", "server-alpha", "ops", "--yes"],
+        vec!["remove", "server-alpha", "--yes"],
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("servers.json");
+        let mut config = agent_accounts_config(&path);
+        config
+            .servers
+            .get_mut("server-alpha")
+            .unwrap()
+            .accounts
+            .get_mut("ops")
+            .unwrap()
+            .privilege = Some(PrivilegeConfig {
+            method: PrivilegeMethod::Sudo,
+            user: "service".into(),
+            credential: None,
+            no_password: true,
+        });
+        save_config(&path, &config).unwrap();
+        let store = FakeCredentialStore {
+            delete_error: Some("credential deletion must not be attempted".into()),
+            ..Default::default()
+        };
+        let mut args = vec!["sshw"];
+        args.extend(remove);
+        execute(
+            Cli::try_parse_from(args).unwrap(),
+            &path,
+            &store,
+            &FakeSshClient::default(),
+            &mut NoPasswordPrompter { prompts: vec![] },
+        )
+        .unwrap();
+    }
+}
+
 #[test]
 fn profile_mutations_have_json_without_changing_namespace_contract() {
     let temp = tempfile::tempdir().unwrap();
@@ -2383,7 +3642,8 @@ fn session_passwords_are_selected_by_typed_login_and_privilege_purpose() {
         PrivilegeConfig {
             method: PrivilegeMethod::Sudo,
             user: "root".to_string(),
-            credential: privilege_credential(&path, "server-alpha"),
+            credential: Some(privilege_credential(&path, "server-alpha")),
+            no_password: false,
         },
     );
     save_config(&path, &config).unwrap();
@@ -2420,7 +3680,8 @@ fn run_as_root_rejects_stored_multiline_privilege_password_before_ssh() {
         PrivilegeConfig {
             method: PrivilegeMethod::Sudo,
             user: "root".to_string(),
-            credential: privilege_credential(&path, "server-alpha"),
+            credential: Some(privilege_credential(&path, "server-alpha")),
+            no_password: false,
         },
     );
     save_config(&path, &config).unwrap();
@@ -2467,7 +3728,8 @@ fn run_as_root_su_injects_password_over_pty_without_leaking_it() {
         PrivilegeConfig {
             method: PrivilegeMethod::Su,
             user: "root".to_string(),
-            credential: privilege_credential(&path, "server-alpha"),
+            credential: Some(privilege_credential(&path, "server-alpha")),
+            no_password: false,
         },
     );
     save_config(&path, &config).unwrap();
@@ -3118,6 +4380,806 @@ fn default_command_prints_and_updates_default_server() {
 }
 
 #[test]
+fn passwordless_privilege_noops_preserve_original_files_confirmation_and_audit() {
+    for pretty in [false, true] {
+        for explicit_account in [false, true] {
+            for force in [false, true] {
+                for machine in [false, true] {
+                    let temp = tempfile::tempdir().unwrap();
+                    let path = temp.path().join("servers.json");
+                    let privilege =
+                        serde_json::json!({"method":"sudo","user":"daemon","no_password":true});
+                    let server = serde_json::json!({"host":"example.test","port":2222,"default_user":"deploy","accounts":{
+                            "deploy":{"auth":{"type":"agent"},"privilege":privilege},
+                            "ops":{"auth":{"type":"agent"},"privilege":privilege}}});
+                    let contents = serde_json::json!({"version":2,"default":"web","credential_backend":"session_only","servers":{"web":server}});
+                    std::fs::write(
+                        &path,
+                        if pretty {
+                            serde_json::to_string_pretty(&contents).unwrap()
+                        } else {
+                            contents.to_string()
+                        },
+                    )
+                    .unwrap();
+                    let before = std::fs::read(&path).unwrap();
+                    let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+                    let home = ResolvedHome::from_config_path(&path);
+                    let registry = temp.path().join("profiles.json");
+                    let audit_path = temp.path().join("audit.jsonl");
+                    let audit = FileAuditSink::new(audit_path.clone());
+                    let ctx = ExecContext {
+                        home: &home,
+                        registry_path: &registry,
+                        policy_forced: false,
+                        audit: &audit,
+                    };
+                    let mut args = vec![
+                        "sshw",
+                        "privilege",
+                        "set",
+                        "web",
+                        "--method",
+                        "sudo",
+                        "--user",
+                        "daemon",
+                        "--no-password",
+                    ];
+                    if explicit_account {
+                        args.extend(["--account", "ops"]);
+                    }
+                    if force {
+                        args.push("--force");
+                    }
+                    if machine {
+                        args.push("--json");
+                    }
+                    let store = FakeCredentialStore::default();
+                    let ssh = FakeSshClient::default();
+                    let mut prompts = NoPasswordPrompter { prompts: vec![] };
+                    for _ in 0..2 {
+                        let output = sshw::cli::execute_for_runtime_with(
+                            Cli::try_parse_from(args.clone()).unwrap(),
+                            &ctx,
+                            &store,
+                            &ssh,
+                            &mut prompts,
+                        );
+                        assert_eq!(output.exit_code, 0, "{output:?}");
+                        if machine {
+                            let body: serde_json::Value =
+                                serde_json::from_str(&output.stdout).unwrap();
+                            assert_eq!(body["changed"], false);
+                            assert_eq!(body["change"], "unchanged");
+                            assert_eq!(body["method"], "sudo");
+                            assert_eq!(body["user"], "daemon");
+                            assert_eq!(body["no_password"], true);
+                            assert!(body["credential"].is_null());
+                        } else {
+                            assert!(
+                                output.stdout.contains("(unchanged)")
+                                    && output.stdout.contains("target user: daemon")
+                            );
+                        }
+                        assert_eq!(std::fs::read(&path).unwrap(), before);
+                        assert_eq!(
+                            std::fs::metadata(&path).unwrap().modified().unwrap(),
+                            modified
+                        );
+                    }
+                    assert_eq!(prompts.prompts.len(), if force { 0 } else { 2 });
+                    assert!(
+                        store.values.borrow().is_empty()
+                            && store.requested.borrow().is_empty()
+                            && store.deleted.borrow().is_empty()
+                    );
+                    assert!(
+                        *ssh.host_key_calls.borrow() == 0 && ssh.selected_users.borrow().is_empty()
+                    );
+                    let audit = std::fs::read_to_string(audit_path).unwrap();
+                    let records: Vec<serde_json::Value> = audit
+                        .lines()
+                        .map(|line| serde_json::from_str(line).unwrap())
+                        .collect();
+                    assert_eq!(records.len(), 2);
+                    assert!(
+                        records
+                            .iter()
+                            .all(|record| record["status"] == "ok" && record["exit_code"] == 0)
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn passwordless_privilege_legacy_registration_upgrades_then_skips_identical_saves() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    std::fs::write(&path,r#"{"version":1,"default":"web","credential_backend":"session_only","servers":{"web":{"host":"example.test","port":2222,"user":"deploy","auth":{"type":"agent"}}}}"#).unwrap();
+    let store = FakeCredentialStore::default();
+    let ssh = FakeSshClient::default();
+    let args = [
+        "sshw",
+        "privilege",
+        "set",
+        "web",
+        "--user",
+        "daemon",
+        "--no-password",
+        "--force",
+        "--json",
+    ];
+    let output = execute_for_runtime(
+        Cli::try_parse_from(args).unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut NoPasswordPrompter { prompts: vec![] },
+    );
+    assert_eq!(output.exit_code, 0, "{output:?}");
+    let body: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+    assert_eq!(body["changed"], true);
+    assert_eq!(body["change"], "added");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&std::fs::read(&path).unwrap()).unwrap()["version"],
+        2
+    );
+    let before = std::fs::read(&path).unwrap();
+    let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+    let output = execute_for_runtime(
+        Cli::try_parse_from(args).unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut NoPasswordPrompter { prompts: vec![] },
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&output.stdout).unwrap()["changed"],
+        false
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().modified().unwrap(),
+        modified
+    );
+    assert!(
+        store.values.borrow().is_empty()
+            && store.requested.borrow().is_empty()
+            && store.deleted.borrow().is_empty()
+    );
+}
+
+#[test]
+fn passwordless_privilege_real_changes_and_password_rotation_keep_storage_and_cleanup() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &agent_accounts_config(&path)).unwrap();
+    let store = FakeCredentialStore::default();
+    let ssh = FakeSshClient::default();
+    let mut prompts = FakePrompter::default();
+    let mut apply = |account: &str, user: &str, passwordless: bool| {
+        let mut args = vec![
+            "sshw",
+            "privilege",
+            "set",
+            "server-alpha",
+            "--account",
+            account,
+            "--user",
+            user,
+            "--force",
+            "--json",
+        ];
+        args.push(if passwordless {
+            "--no-password"
+        } else {
+            "--password-stdin"
+        });
+        let output = execute_for_runtime(
+            Cli::try_parse_from(args).unwrap(),
+            &path,
+            &store,
+            &ssh,
+            &mut prompts,
+        );
+        assert_eq!(output.exit_code, 0, "{output:?}");
+        serde_json::from_str::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    for (account, user, expected) in [
+        ("deploy", "daemon", "added"),
+        ("deploy", "root", "updated"),
+        ("ops", "daemon", "added"),
+    ] {
+        let before = std::fs::read(&path).unwrap();
+        let body = apply(account, user, true);
+        assert_eq!(body["changed"], true);
+        assert_eq!(body["change"], expected);
+        assert_ne!(std::fs::read(&path).unwrap(), before);
+        let before = std::fs::read(&path).unwrap();
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(apply(account, user, true)["changed"], false);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            modified
+        );
+    }
+    let body = apply("ops", "daemon", false);
+    assert_eq!(body["changed"], true);
+    let first = body["credential"].as_str().unwrap().to_string();
+    assert!(
+        store
+            .values
+            .borrow()
+            .contains_key(&(first.clone(), "daemon".into()))
+    );
+    let body = apply("ops", "daemon", false);
+    assert_eq!(body["changed"], true);
+    let second = body["credential"].as_str().unwrap().to_string();
+    assert_ne!(first, second);
+    assert!(store.deleted.borrow().contains(&(first, "daemon".into())));
+    let body = apply("ops", "daemon", true);
+    assert_eq!(body["changed"], true);
+    assert!(
+        store.deleted.borrow().contains(&(second, "daemon".into()))
+            && store.values.borrow().is_empty()
+    );
+    assert_eq!(apply("ops", "daemon", true)["changed"], false);
+    assert!(store.requested.borrow().is_empty());
+    assert!(*ssh.host_key_calls.borrow() == 0 && ssh.selected_users.borrow().is_empty());
+}
+
+#[test]
+fn agent_registration_noops_preserve_legacy_bytes_confirmation_secrets_and_audit() {
+    for version in [1, 2] {
+        for account in [false, true] {
+            for force in [false, true] {
+                for machine in [false, true] {
+                    let temp = tempfile::tempdir().unwrap();
+                    let path = temp.path().join("servers.json");
+                    let server = if version == 1 {
+                        serde_json::json!({"host":"example.test","port":2222,"user":"deploy","auth":{"type":"agent"}})
+                    } else {
+                        serde_json::json!({"host":"example.test","port":2222,"default_user":"deploy","accounts":{
+                            "deploy":{"auth":{"type":"agent"},"privilege":{"method":"sudo","user":"daemon","no_password":true}},
+                            "ops":{"auth":{"type":"agent"}}}})
+                    };
+                    std::fs::write(&path, serde_json::json!({"version":version,"default":"web","credential_backend":"session_only","servers":{"web":server}}).to_string()).unwrap();
+                    let before = std::fs::read(&path).unwrap();
+                    let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+                    let home = ResolvedHome::from_config_path(&path);
+                    let registry = temp.path().join("profiles.json");
+                    let audit_path = temp.path().join("audit.jsonl");
+                    let audit = FileAuditSink::new(audit_path.clone());
+                    let ctx = ExecContext {
+                        home: &home,
+                        registry_path: &registry,
+                        policy_forced: false,
+                        audit: &audit,
+                    };
+                    let mut args = if account {
+                        vec!["sshw", "account", "add", "web", "deploy", "--auth", "agent"]
+                    } else {
+                        vec![
+                            "sshw",
+                            "add",
+                            "web",
+                            "--host",
+                            "example.test",
+                            "--port",
+                            "2222",
+                            "--user",
+                            "deploy",
+                            "--auth",
+                            "agent",
+                        ]
+                    };
+                    if force {
+                        args.push("--force");
+                    }
+                    if machine {
+                        args.push("--json");
+                    }
+                    let store = FakeCredentialStore::default();
+                    let ssh = FakeSshClient::default();
+                    let mut prompts = NoPasswordPrompter { prompts: vec![] };
+                    for _ in 0..2 {
+                        let output = sshw::cli::execute_for_runtime_with(
+                            Cli::try_parse_from(args.clone()).unwrap(),
+                            &ctx,
+                            &store,
+                            &ssh,
+                            &mut prompts,
+                        );
+                        assert_eq!(output.exit_code, 0, "{output:?}");
+                        if machine {
+                            let body: serde_json::Value =
+                                serde_json::from_str(&output.stdout).unwrap();
+                            assert_eq!(body["action"], "updated");
+                            assert_eq!(body["changed"], false);
+                            assert_eq!(body["change"], "unchanged");
+                        } else {
+                            assert!(output.stdout.contains("(unchanged)"));
+                        }
+                        assert_eq!(std::fs::read(&path).unwrap(), before);
+                        assert_eq!(
+                            std::fs::metadata(&path).unwrap().modified().unwrap(),
+                            modified
+                        );
+                    }
+                    assert_eq!(prompts.prompts.len(), if force { 0 } else { 2 });
+                    assert!(
+                        store.requested.borrow().is_empty()
+                            && store.deleted.borrow().is_empty()
+                            && store.values.borrow().is_empty()
+                    );
+                    assert!(
+                        *ssh.host_key_calls.borrow() == 0 && ssh.selected_users.borrow().is_empty()
+                    );
+                    let audit = std::fs::read_to_string(audit_path).unwrap();
+                    let records: Vec<serde_json::Value> = audit
+                        .lines()
+                        .map(|line| serde_json::from_str(line).unwrap())
+                        .collect();
+                    assert_eq!(records.len(), 2);
+                    assert!(
+                        records
+                            .iter()
+                            .all(|record| record["status"] == "ok" && record["exit_code"] == 0)
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn agent_registration_real_metadata_changes_are_saved_before_repeat_becomes_a_noop() {
+    for scenario in [
+        "restore-default",
+        "login-default",
+        "replace",
+        "endpoint",
+        "new-server",
+        "new-account",
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("servers.json");
+        let mut config = agent_accounts_config(&path);
+        config.servers.get_mut("server-alpha").unwrap().host = "example.test".into();
+        config.servers.get_mut("server-alpha").unwrap().port = 2222;
+        if scenario == "restore-default" {
+            config.default = None;
+        }
+        set_default_privilege(
+            &mut config,
+            "server-alpha",
+            PrivilegeConfig {
+                method: PrivilegeMethod::Sudo,
+                user: "daemon".into(),
+                credential: None,
+                no_password: true,
+            },
+        );
+        save_config(&path, &config).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let mut args = if scenario == "new-account" {
+            vec!["sshw", "account", "add", "server-alpha", "new-user"]
+        } else {
+            vec![
+                "sshw",
+                "add",
+                if scenario == "new-server" {
+                    "new-server"
+                } else {
+                    "server-alpha"
+                },
+                "--host",
+                if scenario == "endpoint" {
+                    "changed.test"
+                } else {
+                    "example.test"
+                },
+                "--port",
+                "2222",
+                "--user",
+                if scenario == "login-default" {
+                    "ops"
+                } else {
+                    "deploy"
+                },
+            ]
+        };
+        args.extend(["--auth", "agent", "--force", "--json"]);
+        if matches!(scenario, "replace" | "endpoint") {
+            args.push("--replace");
+        }
+        let store = FakeCredentialStore::default();
+        let ssh = FakeSshClient::default();
+        let output = execute_for_runtime(
+            Cli::try_parse_from(args.clone()).unwrap(),
+            &path,
+            &store,
+            &ssh,
+            &mut NoPasswordPrompter { prompts: vec![] },
+        );
+        assert_eq!(output.exit_code, 0, "{scenario}: {output:?}");
+        let body: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+        assert_eq!(body["changed"], true);
+        assert_eq!(
+            body["change"],
+            if matches!(scenario, "new-server" | "new-account") {
+                "added"
+            } else {
+                "updated"
+            }
+        );
+        assert_ne!(std::fs::read(&path).unwrap(), before);
+        let updated = load_config(&path).unwrap();
+        match scenario {
+            "restore-default" => assert_eq!(updated.default.as_deref(), Some("server-alpha")),
+            "login-default" => assert_eq!(updated.servers["server-alpha"].default_user, "ops"),
+            "endpoint" => assert_eq!(updated.servers["server-alpha"].host, "changed.test"),
+            "new-server" => assert!(updated.servers.contains_key("new-server")),
+            "new-account" => assert!(
+                updated.servers["server-alpha"]
+                    .accounts
+                    .contains_key("new-user")
+            ),
+            _ => {
+                assert_eq!(updated.servers["server-alpha"].accounts.len(), 1);
+                assert!(default_privilege(&updated, "server-alpha").is_none());
+            }
+        }
+        let before = std::fs::read(&path).unwrap();
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let output = execute_for_runtime(
+            Cli::try_parse_from(args).unwrap(),
+            &path,
+            &store,
+            &ssh,
+            &mut NoPasswordPrompter { prompts: vec![] },
+        );
+        assert_eq!(output.exit_code, 0);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&output.stdout).unwrap()["changed"],
+            false
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            modified
+        );
+    }
+}
+
+#[test]
+fn agent_registration_password_rotation_and_switch_keep_real_secret_changes() {
+    for account in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("servers.json");
+        let mut config = sample_config(&path);
+        config.servers.get_mut("server-alpha").unwrap().host = "example.test".into();
+        config.servers.get_mut("server-alpha").unwrap().port = 2222;
+        save_config(&path, &config).unwrap();
+        let original = login_credential(&path, "server-alpha");
+        let store = FakeCredentialStore::default();
+        store
+            .set_password(&original, "deploy", "ORIGINAL_PASSWORD")
+            .unwrap();
+        let prefix = if account {
+            vec!["sshw", "account", "add", "server-alpha", "deploy"]
+        } else {
+            vec![
+                "sshw",
+                "add",
+                "server-alpha",
+                "--host",
+                "example.test",
+                "--port",
+                "2222",
+                "--user",
+                "deploy",
+            ]
+        };
+        let mut args = prefix.clone();
+        args.extend(["--force", "--password-stdin", "--json"]);
+        let output = execute_for_runtime(
+            Cli::try_parse_from(args).unwrap(),
+            &path,
+            &store,
+            &FakeSshClient::default(),
+            &mut FakePrompter::default(),
+        );
+        assert_eq!(output.exit_code, 0, "{output:?}");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&output.stdout).unwrap()["changed"],
+            true
+        );
+        let rotated = load_config(&path).unwrap();
+        let AuthConfig::Password { credential } = &rotated.servers["server-alpha"]
+            .account("deploy")
+            .unwrap()
+            .auth
+        else {
+            panic!("must keep password auth")
+        };
+        assert_ne!(credential, &original);
+        assert!(
+            store
+                .values
+                .borrow()
+                .contains_key(&(credential.clone(), "deploy".into()))
+        );
+        assert!(
+            store
+                .deleted
+                .borrow()
+                .contains(&(original, "deploy".into()))
+        );
+        let rotated_key = credential.clone();
+        let mut args = prefix;
+        args.extend(["--auth", "agent", "--force", "--json"]);
+        let output = execute_for_runtime(
+            Cli::try_parse_from(args).unwrap(),
+            &path,
+            &store,
+            &FakeSshClient::default(),
+            &mut NoPasswordPrompter { prompts: vec![] },
+        );
+        assert_eq!(output.exit_code, 0);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&output.stdout).unwrap()["changed"],
+            true
+        );
+        assert!(matches!(
+            load_config(&path).unwrap().servers["server-alpha"]
+                .account("deploy")
+                .unwrap()
+                .auth,
+            AuthConfig::Agent
+        ));
+        assert!(
+            store
+                .deleted
+                .borrow()
+                .contains(&(rotated_key, "deploy".into()))
+                && store.values.borrow().is_empty()
+        );
+    }
+}
+
+#[test]
+fn default_audit_server_account_noops_preserve_files_and_remain_audited() {
+    for version in [1, 2] {
+        for account in [false, true] {
+            for json_output in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let path = temp.path().join("servers.json");
+                let server = if version == 1 {
+                    serde_json::json!({"host":"example.test","port":22,"user":"deploy","auth":{"type":"agent"}})
+                } else {
+                    serde_json::json!({"host":"example.test","port":22,"default_user":"deploy","accounts":{
+                        "deploy":{"auth":{"type":"agent"}},"ops":{"auth":{"type":"agent"}}}})
+                };
+                std::fs::write(&path, serde_json::json!({"version":version,"default":"web","servers":{"web":server},"credential_backend":"session_only"}).to_string()).unwrap();
+                let before = std::fs::read(&path).unwrap();
+                let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+                let home = ResolvedHome::from_config_path(&path);
+                let registry = temp.path().join("profiles.json");
+                let audit_path = temp.path().join("audit.jsonl");
+                let audit = FileAuditSink::new(audit_path.clone());
+                let ctx = ExecContext {
+                    home: &home,
+                    registry_path: &registry,
+                    policy_forced: false,
+                    audit: &audit,
+                };
+                let store = FakeCredentialStore::default();
+                let ssh = FakeSshClient::default();
+                for _ in 0..2 {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    let mut args = if account {
+                        vec!["sshw", "account", "default", "web", "deploy"]
+                    } else {
+                        vec!["sshw", "default", "web"]
+                    };
+                    if json_output {
+                        args.push("--json");
+                    }
+                    let output = execute_with(
+                        Cli::try_parse_from(args).unwrap(),
+                        &ctx,
+                        &store,
+                        &ssh,
+                        &mut FakePrompter::default(),
+                    )
+                    .unwrap();
+                    assert_eq!(output.exit_code, 0);
+                    assert_eq!(std::fs::read(&path).unwrap(), before);
+                    assert_eq!(
+                        std::fs::metadata(&path).unwrap().modified().unwrap(),
+                        modified
+                    );
+                    if json_output {
+                        let body: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+                        assert_eq!(body["action"], "default");
+                        assert_eq!(body["changed"], false);
+                        assert_eq!(body["change"], "unchanged");
+                    } else {
+                        assert!(output.stdout.contains("unchanged"));
+                    }
+                }
+                let records: Vec<serde_json::Value> = std::fs::read_to_string(&audit_path)
+                    .unwrap()
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+                assert_eq!(records.len(), 2);
+                assert!(
+                    records
+                        .iter()
+                        .all(|record| record["status"] == "ok" && record["exit_code"] == 0)
+                );
+                assert!(
+                    store.requested.borrow().is_empty()
+                        && store.deleted.borrow().is_empty()
+                        && store.values.borrow().is_empty()
+                );
+                assert!(ssh.selected_users.borrow().is_empty());
+            }
+        }
+    }
+    for args in [
+        vec!["sshw", "default", "server-beta", "--json"],
+        vec![
+            "sshw",
+            "account",
+            "default",
+            "server-alpha",
+            "ops",
+            "--json",
+        ],
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("servers.json");
+        let mut config = agent_accounts_config(&path);
+        config.servers.insert(
+            "server-beta".into(),
+            ServerConfig::single_account("example.test", 22, "deploy", AuthConfig::Agent),
+        );
+        save_config(&path, &config).unwrap();
+        let output = execute_for_runtime(
+            Cli::try_parse_from(args.clone()).unwrap(),
+            &path,
+            &FakeCredentialStore::default(),
+            &FakeSshClient::default(),
+            &mut FakePrompter::default(),
+        );
+        assert_eq!(output.exit_code, 0);
+        let body: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+        assert_eq!(body["changed"], true);
+        assert_eq!(body["change"], "updated");
+        let before = std::fs::read(&path).unwrap();
+        let output = execute_for_runtime(
+            Cli::try_parse_from(args).unwrap(),
+            &path,
+            &FakeCredentialStore::default(),
+            &FakeSshClient::default(),
+            &mut FakePrompter::default(),
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&output.stdout).unwrap()["changed"],
+            false
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+}
+
+#[test]
+fn default_audit_profile_noop_preserves_registry_and_still_validates_target() {
+    for json_output in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("servers.json");
+        let registry_path = temp.path().join("profiles.json");
+        let target = temp.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        let registry = ProfileRegistry {
+            default: Some("primary".into()),
+            profiles: BTreeMap::from([
+                (
+                    "primary".into(),
+                    ProfileEntry {
+                        id: "p_primary".into(),
+                        home: target.clone(),
+                    },
+                ),
+                (
+                    "other".into(),
+                    ProfileEntry {
+                        id: "p_other".into(),
+                        home: temp.path().join("other"),
+                    },
+                ),
+            ]),
+            ..ProfileRegistry::default()
+        };
+        std::fs::write(&registry_path, serde_json::to_string(&registry).unwrap()).unwrap();
+        let before = std::fs::read(&registry_path).unwrap();
+        let modified = std::fs::metadata(&registry_path)
+            .unwrap()
+            .modified()
+            .unwrap();
+        let store = FakeCredentialStore::default();
+        let ssh = FakeSshClient::default();
+        for _ in 0..2 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            let mut args = vec!["sshw", "profile", "default", "primary"];
+            if json_output {
+                args.push("--json");
+            }
+            let output = execute_for_runtime(
+                Cli::try_parse_from(args).unwrap(),
+                &path,
+                &store,
+                &ssh,
+                &mut FakePrompter::default(),
+            );
+            assert_eq!(output.exit_code, 0);
+            assert_eq!(std::fs::read(&registry_path).unwrap(), before);
+            assert_eq!(
+                std::fs::metadata(&registry_path)
+                    .unwrap()
+                    .modified()
+                    .unwrap(),
+                modified
+            );
+            if json_output {
+                let body: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+                assert_eq!(body["changed"], false);
+                assert_eq!(body["change"], "unchanged");
+            } else {
+                assert!(output.stdout.contains("unchanged"));
+            }
+        }
+        std::fs::write(target.join("servers.json"), "{broken").unwrap();
+        let output = execute_for_runtime(
+            Cli::try_parse_from(["sshw", "profile", "default", "primary", "--json"]).unwrap(),
+            &path,
+            &store,
+            &ssh,
+            &mut FakePrompter::default(),
+        );
+        assert_eq!(output.exit_code, 3);
+        assert_eq!(std::fs::read(&registry_path).unwrap(), before);
+        let output = execute_for_runtime(
+            Cli::try_parse_from(["sshw", "profile", "default", "other", "--json"]).unwrap(),
+            &path,
+            &store,
+            &ssh,
+            &mut FakePrompter::default(),
+        );
+        assert_eq!(output.exit_code, 0);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&output.stdout).unwrap()["changed"],
+            true
+        );
+        assert_eq!(
+            load_registry(&registry_path).unwrap().default.as_deref(),
+            Some("other")
+        );
+        assert!(
+            store.requested.borrow().is_empty()
+                && store.deleted.borrow().is_empty()
+                && store.values.borrow().is_empty()
+        );
+        assert!(ssh.selected_users.borrow().is_empty());
+    }
+}
+
+#[test]
 fn doctor_json_reports_missing_credentials_without_secrets() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("servers.json");
@@ -3481,7 +5543,10 @@ fn profile_add_list_show_default_remove_round_trip() {
         &mut FakePrompter::default(),
     )
     .unwrap();
-    assert_eq!(empty.stdout, "");
+    assert!(
+        empty.stdout.contains("no named profiles registered")
+            && empty.stdout.contains("Named profiles are optional")
+    );
 }
 
 #[test]
@@ -3791,7 +5856,8 @@ fn run_redacts_overlapping_login_and_privilege_secrets_longest_first() {
         PrivilegeConfig {
             method: PrivilegeMethod::Sudo,
             user: "root".to_string(),
-            credential: privilege_credential(&path, "server-alpha"),
+            credential: Some(privilege_credential(&path, "server-alpha")),
+            no_password: false,
         },
     );
     save_config(&path, &config).unwrap();
@@ -4084,7 +6150,8 @@ fn run_as_root_audit_records_privilege_marker_without_secret() {
         PrivilegeConfig {
             method: PrivilegeMethod::Sudo,
             user: "root".to_string(),
-            credential: privilege_credential(&path, "server-alpha"),
+            credential: Some(privilege_credential(&path, "server-alpha")),
+            no_password: false,
         },
     );
     save_config(&path, &config).unwrap();
@@ -4359,13 +6426,15 @@ fn transfer_boundaries_type_backend_errors_as_ssh() {
         )
         .unwrap();
     let ssh = FakeSshClient::with_transfer_error("blocked by policy and requires --yes");
+    let local = temp.path().join("fixture.txt");
+    std::fs::write(&local, "fixture").unwrap();
 
     for cli in [
         Cli::try_parse_from([
             "sshw",
             "put",
             "server-alpha",
-            "fixture.txt",
+            local.to_str().unwrap(),
             "/srv/app/fixture.txt",
             "--json",
         ])
@@ -4765,6 +6834,2304 @@ fn policy_disabled_in_file_allows_everything_without_flag() {
     )
     .unwrap();
     assert_eq!(out.stdout, "ok\n");
+}
+
+#[test]
+fn cleanup_failures_report_saved_mutations() {
+    let commands = [
+        (
+            vec![
+                "add",
+                "server-alpha",
+                "--host",
+                "192.0.2.10",
+                "--port",
+                "2222",
+                "--user",
+                "deploy",
+                "--auth",
+                "agent",
+                "--force",
+            ],
+            "updated",
+            None,
+        ),
+        (vec!["remove", "server-alpha", "--yes"], "removed", None),
+        (
+            vec![
+                "account",
+                "add",
+                "server-alpha",
+                "ops",
+                "--auth",
+                "agent",
+                "--force",
+            ],
+            "updated",
+            Some("ops"),
+        ),
+        (
+            vec!["account", "remove", "server-alpha", "ops", "--yes"],
+            "removed",
+            Some("ops"),
+        ),
+        (
+            vec![
+                "privilege",
+                "set",
+                "server-alpha",
+                "--no-password",
+                "--force",
+            ],
+            "set",
+            Some("deploy"),
+        ),
+        (
+            vec!["privilege", "clear", "server-alpha", "--yes"],
+            "cleared",
+            Some("deploy"),
+        ),
+    ];
+    for (command, action, account) in commands {
+        for json in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("servers.json");
+            let namespace = ResolvedHome::from_config_path(&path).namespace;
+            let mut config = sample_config(&path);
+            config.servers.insert(
+                "server-beta".into(),
+                ServerConfig::single_account("192.0.2.11", 22, "deploy", AuthConfig::Agent),
+            );
+            config
+                .servers
+                .get_mut("server-alpha")
+                .unwrap()
+                .accounts
+                .insert(
+                    "ops".into(),
+                    AccountConfig {
+                        auth: AuthConfig::Password {
+                            credential: namespace.new_account_credential_key(
+                                CredentialPurpose::Login,
+                                "server-alpha",
+                                "ops",
+                            ),
+                        },
+                        privilege: None,
+                    },
+                );
+            set_default_privilege(
+                &mut config,
+                "server-alpha",
+                PrivilegeConfig {
+                    method: PrivilegeMethod::Sudo,
+                    user: "root".into(),
+                    credential: Some(privilege_credential(&path, "server-alpha")),
+                    no_password: false,
+                },
+            );
+            save_config(&path, &config).unwrap();
+            let store = FakeCredentialStore {
+                delete_error: Some("keyring delete failed\npassword=fixture-cleanup-secret\n-----BEGIN OPENSSH PRIVATE KEY-----\nfixture-private-key\n-----END OPENSSH PRIVATE KEY-----".into()),
+                ..FakeCredentialStore::default()
+            };
+            let ssh = FakeSshClient::default();
+            let mut args = vec!["sshw"];
+            args.extend(command.iter().copied());
+            if json {
+                args.push("--json");
+            }
+            let output = execute_for_runtime(
+                Cli::try_parse_from(args).unwrap(),
+                &path,
+                &store,
+                &ssh,
+                &mut FakePrompter::default(),
+            );
+            assert_eq!(output.exit_code, 4, "{command:?}");
+            let rendered = format!("{}{}", output.stdout, output.stderr);
+            assert!(
+                rendered.contains("configuration changes saved"),
+                "{rendered}"
+            );
+            assert!(rendered.contains("keyring delete failed"), "{rendered}");
+            assert!(!rendered.contains("fixture-cleanup-secret"), "{rendered}");
+            assert!(!rendered.contains("fixture-private-key"), "{rendered}");
+            if json {
+                assert!(output.stderr.is_empty());
+                let body: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+                assert_eq!(body["ok"], false);
+                assert_eq!(body["error"]["kind"], "auth");
+                assert_eq!(body["error"]["exit_code"], 4);
+                assert_eq!(body["mutation"]["config_applied"], true);
+                assert_eq!(body["mutation"]["failed_stage"], "credential_cleanup");
+                assert_eq!(body["mutation"]["action"], action);
+                assert_eq!(body["mutation"]["server"], "server-alpha");
+                assert_eq!(body["mutation"]["account"].as_str(), account);
+                if command[0] == "remove" {
+                    assert_eq!(
+                        body["mutation"]["default_change"],
+                        serde_json::json!({"resource":"server", "previous":"server-alpha", "current":"server-beta"})
+                    );
+                } else {
+                    assert!(body["mutation"].get("default_change").is_none());
+                }
+            } else {
+                assert!(output.stdout.is_empty());
+                if command[0] == "remove" {
+                    assert!(
+                        output
+                            .stderr
+                            .contains("default server changed: server-alpha -> server-beta")
+                    );
+                }
+            }
+            let saved = load_config(&path).unwrap();
+            match command.as_slice() {
+                ["add", ..] => assert!(matches!(
+                    saved.servers["server-alpha"].accounts["deploy"].auth,
+                    AuthConfig::Agent
+                )),
+                ["remove", ..] => {
+                    assert!(!saved.servers.contains_key("server-alpha"));
+                    assert_eq!(saved.default.as_deref(), Some("server-beta"));
+                }
+                ["account", "add", ..] => assert!(matches!(
+                    saved.servers["server-alpha"].accounts["ops"].auth,
+                    AuthConfig::Agent
+                )),
+                ["account", "remove", ..] => {
+                    assert!(!saved.servers["server-alpha"].accounts.contains_key("ops"))
+                }
+                ["privilege", "set", ..] => assert!(
+                    default_privilege(&saved, "server-alpha")
+                        .unwrap()
+                        .no_password
+                ),
+                ["privilege", "clear", ..] => {
+                    assert!(default_privilege(&saved, "server-alpha").is_none())
+                }
+                _ => unreachable!(),
+            }
+            assert!(store.requested.borrow().is_empty());
+            assert!(ssh.run_commands.borrow().is_empty());
+        }
+    }
+}
+
+#[test]
+fn server_removal_reports_only_effective_default_changes() {
+    for (default, remove, last) in [
+        (Some("server-alpha"), "server-alpha", false),
+        (Some("server-alpha"), "server-beta", false),
+        (Some("server-alpha"), "server-alpha", true),
+        (None, "server-beta", false),
+    ] {
+        for json in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("servers.json");
+            let mut config = sample_config(&path);
+            config
+                .servers
+                .get_mut("server-alpha")
+                .unwrap()
+                .accounts
+                .get_mut("deploy")
+                .unwrap()
+                .auth = AuthConfig::Agent;
+            if !last {
+                config.servers.insert(
+                    "server-beta".into(),
+                    ServerConfig::single_account("192.0.2.11", 22, "deploy", AuthConfig::Agent),
+                );
+            }
+            config.default = default.map(str::to_owned);
+            save_config(&path, &config).unwrap();
+            let mut args = vec!["sshw", "remove", remove, "--yes"];
+            if json {
+                args.push("--json");
+            }
+            let output = execute_for_runtime(
+                Cli::try_parse_from(args).unwrap(),
+                &path,
+                &FakeCredentialStore::default(),
+                &FakeSshClient::default(),
+                &mut FakePrompter::default(),
+            );
+            assert_eq!(output.exit_code, 0);
+            let saved = load_config(&path).unwrap();
+            let changed = default == Some(remove);
+            let expected = if changed {
+                if last { None } else { Some("server-beta") }
+            } else {
+                default
+            };
+            assert_eq!(saved.default.as_deref(), expected);
+            if json {
+                let body: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+                assert_eq!(body["server"], remove);
+                if changed {
+                    assert_eq!(
+                        body["default_change"],
+                        serde_json::json!({"resource":"server", "previous":default, "current":expected})
+                    );
+                } else {
+                    assert!(body.get("default_change").is_none());
+                }
+            } else {
+                assert!(output.stdout.starts_with(&format!("removed {remove}\n")));
+                assert_eq!(output.stdout.contains("default server changed:"), changed);
+                if changed {
+                    assert!(
+                        output
+                            .stdout
+                            .contains(&format!("{remove} -> {}", expected.unwrap_or("none")))
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn save_conflicts_do_not_report_applied_mutations() {
+    struct ConcurrentEdit<'a>(&'a Path);
+    impl Prompter for ConcurrentEdit<'_> {
+        fn confirm(&mut self, _: &str) -> anyhow::Result<bool> {
+            let mut bytes = std::fs::read(self.0)?;
+            bytes.push(b'\n');
+            std::fs::write(self.0, bytes)?;
+            Ok(true)
+        }
+        fn password(&mut self, _: &str) -> anyhow::Result<String> {
+            panic!("no password required")
+        }
+        fn password_stdin(&mut self) -> anyhow::Result<String> {
+            panic!("no password required")
+        }
+    }
+    for command in [
+        vec!["remove", "server-alpha"],
+        vec!["privilege", "clear", "server-alpha"],
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("servers.json");
+        let mut config = sample_config(&path);
+        set_default_privilege(
+            &mut config,
+            "server-alpha",
+            PrivilegeConfig {
+                method: PrivilegeMethod::Sudo,
+                user: "root".into(),
+                credential: Some(privilege_credential(&path, "server-alpha")),
+                no_password: false,
+            },
+        );
+        save_config(&path, &config).unwrap();
+        let store = FakeCredentialStore::default();
+        let mut args = vec!["sshw"];
+        args.extend(command);
+        args.push("--json");
+        let output = execute_for_runtime(
+            Cli::try_parse_from(args).unwrap(),
+            &path,
+            &store,
+            &FakeSshClient::default(),
+            &mut ConcurrentEdit(&path),
+        );
+        assert_eq!(output.exit_code, 3);
+        let body: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+        assert!(body.get("mutation").is_none());
+        assert!(body.get("default_change").is_none());
+        assert!(!output.stdout.contains("configuration changes saved"));
+        assert_eq!(load_config(&path).unwrap(), config);
+        assert!(
+            store.deleted.borrow().is_empty(),
+            "save conflict must precede credential cleanup"
+        );
+    }
+}
+
+#[test]
+fn profile_removal_reports_only_effective_default_changes() {
+    for (remove, last) in [("zeta", false), ("alpha", false), ("zeta", true)] {
+        for json in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("servers.json");
+            let store = FakeCredentialStore::default();
+            let ssh = FakeSshClient::default();
+            for name in if last {
+                vec!["zeta"]
+            } else {
+                vec!["zeta", "alpha"]
+            } {
+                let home = temp.path().join(name);
+                execute(
+                    Cli::try_parse_from([
+                        "sshw",
+                        "profile",
+                        "add",
+                        name,
+                        "--home",
+                        home.to_str().unwrap(),
+                    ])
+                    .unwrap(),
+                    &path,
+                    &store,
+                    &ssh,
+                    &mut FakePrompter::default(),
+                )
+                .unwrap();
+            }
+            let mut args = vec!["sshw", "profile", "remove", remove];
+            if json {
+                args.push("--json");
+            }
+            let output = execute_for_runtime(
+                Cli::try_parse_from(args).unwrap(),
+                &path,
+                &store,
+                &ssh,
+                &mut FakePrompter::default(),
+            );
+            assert_eq!(output.exit_code, 0);
+            let saved = sshw::profile::load_registry(&temp.path().join("profiles.json")).unwrap();
+            let expected = if remove == "alpha" {
+                Some("zeta")
+            } else if last {
+                None
+            } else {
+                Some("alpha")
+            };
+            assert_eq!(saved.default.as_deref(), expected);
+            if json {
+                let body: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+                assert_eq!(body["name"], remove);
+                assert!(
+                    body["warning"]
+                        .as_str()
+                        .unwrap()
+                        .contains("home and keyring entries left intact")
+                );
+                if remove == "zeta" {
+                    assert_eq!(
+                        body["default_change"],
+                        serde_json::json!({"resource":"profile", "previous":"zeta", "current":expected})
+                    );
+                } else {
+                    assert!(body.get("default_change").is_none());
+                }
+            } else {
+                assert_eq!(
+                    output.stdout.contains("default profile changed:"),
+                    remove == "zeta"
+                );
+                if last {
+                    assert!(output.stdout.contains("built-in default home"));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn path_rules_root_only_registration_fails_without_saving_and_legacy_removal_works() {
+    for operation in ["put", "get"] {
+        for entry in ["/", "///", " / ", "remote:/", "remote:///", "", "*"] {
+            for json in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let path = temp.path().join("servers.json");
+                let policy = temp.path().join("policy.json");
+                let before = r#"{"version":1,"enabled":true}"#;
+                std::fs::write(&policy, before).unwrap();
+                let store = FakeCredentialStore::default();
+                let ssh = FakeSshClient::default();
+                let mut prompts = NoPasswordPrompter { prompts: vec![] };
+                let mut args = vec!["sshw", "policy", "allow", operation, entry];
+                if json {
+                    args.push("--json");
+                }
+                let output = execute_for_runtime(
+                    Cli::try_parse_from(args).unwrap(),
+                    &path,
+                    &store,
+                    &ssh,
+                    &mut prompts,
+                );
+                assert_eq!(output.exit_code, 7, "{}{}", output.stdout, output.stderr);
+                if entry
+                    .trim()
+                    .trim_start_matches("remote:")
+                    .trim_end_matches('/')
+                    .is_empty()
+                    && !entry.is_empty()
+                {
+                    assert!(format!("{}{}", output.stdout, output.stderr).contains("root-only"));
+                    assert!(format!("{}{}", output.stdout, output.stderr).contains("/srv/app"));
+                }
+                assert_eq!(std::fs::read_to_string(&policy).unwrap(), before);
+                assert!(!path.exists());
+                assert!(
+                    store.values.borrow().is_empty()
+                        && store.requested.borrow().is_empty()
+                        && store.deleted.borrow().is_empty()
+                );
+                assert!(ssh.selected_users.borrow().is_empty() && prompts.prompts.is_empty());
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("servers.json");
+        let policy = temp.path().join("policy.json");
+        std::fs::write(
+            &policy,
+            serde_json::json!({"version":1,"enabled":true,
+            "allow_put_paths":["/","///"],"allow_get_paths":["/","///"]})
+            .to_string(),
+        )
+        .unwrap();
+        let sshw::policy::Policy::Enabled(rules) =
+            sshw::policy::resolve_policy(&policy, false).unwrap()
+        else {
+            panic!("expected enabled policy");
+        };
+        assert!(!rules.allows_put("/tmp/file") && !rules.allows_get("/tmp/file"));
+        let output = execute_for_runtime(
+            Cli::try_parse_from(["sshw", "policy", "remove", operation, "/", "--json"]).unwrap(),
+            &path,
+            &FakeCredentialStore::default(),
+            &FakeSshClient::default(),
+            &mut FakePrompter::default(),
+        );
+        assert_eq!(output.exit_code, 0);
+        let body: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+        assert_eq!(body["change"], "removed");
+    }
+}
+
+#[test]
+fn path_rules_windows_preflight_and_transfers_agree_and_atomic_keeps_forward_slash_requirement() {
+    for (entry, remote) in [
+        (r"C:\Data\", r"remote:C:\Data\file"),
+        (r"\\server\share\", r"remote:\\server\share\file"),
+        (r"C:\Data", "remote:C:/Data/file"),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("servers.json");
+        let policy = temp.path().join("policy.json");
+        save_config(&path, &agent_accounts_config(&path)).unwrap();
+        std::fs::write(
+            &policy,
+            serde_json::json!({"version":2,"enabled":true,
+            "allow_put_paths":[entry],"allow_get_paths":[entry]})
+            .to_string(),
+        )
+        .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let policy_before = std::fs::read(&policy).unwrap();
+        let local = temp.path().join("source");
+        std::fs::write(&local, "payload").unwrap();
+        let store = FakeCredentialStore::default();
+        let ssh = FakeSshClient::default();
+        for (command, upload) in [
+            ("check-put", true),
+            ("check-get", false),
+            ("put", true),
+            ("get", false),
+        ] {
+            let target = if upload {
+                vec![local.to_str().unwrap(), remote]
+            } else {
+                vec![remote, local.to_str().unwrap()]
+            };
+            let mut args = vec!["sshw"];
+            if command.starts_with("check-") {
+                args.push("policy");
+            }
+            args.extend([command, "server-alpha"]);
+            args.extend(target);
+            args.extend(["--yes", "--json"]);
+            let output = execute_for_runtime(
+                Cli::try_parse_from(args).unwrap(),
+                &path,
+                &store,
+                &ssh,
+                &mut FakePrompter::default(),
+            );
+            assert_eq!(output.exit_code, 0, "{}{}", output.stdout, output.stderr);
+            if command.starts_with("check-") {
+                let body: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+                assert_eq!(body["allowed"], true);
+                assert_eq!(
+                    body["policy"]["checks"][if upload { "put" } else { "get" }]["reason"],
+                    "matched_rule"
+                );
+            }
+        }
+        if remote.contains('\\') {
+            for args in [
+                vec![
+                    "sshw",
+                    "policy",
+                    "check-put",
+                    "server-alpha",
+                    local.to_str().unwrap(),
+                    remote,
+                    "--atomic",
+                    "--json",
+                ],
+                vec![
+                    "sshw",
+                    "put",
+                    "server-alpha",
+                    local.to_str().unwrap(),
+                    remote,
+                    "--atomic",
+                    "--json",
+                ],
+            ] {
+                let output = execute_for_runtime(
+                    Cli::try_parse_from(args).unwrap(),
+                    &path,
+                    &store,
+                    &ssh,
+                    &mut FakePrompter::default(),
+                );
+                assert_eq!(output.exit_code, 3);
+                assert!(output.stdout.contains("forward slashes"));
+            }
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(std::fs::read(&policy).unwrap(), policy_before);
+        assert!(store.requested.borrow().is_empty());
+        assert_eq!(ssh.put_calls.borrow().len(), 1);
+        assert_eq!(ssh.get_calls.borrow().len(), 1);
+    }
+}
+
+#[test]
+fn path_rules_profile_removal_warns_only_for_an_invalid_automatic_default() {
+    for kind in ["json", "namespace", "file", "healthy", "empty"] {
+        for json in [false, true] {
+            for remove in ["z-active", "a-fallback"] {
+                let temp = tempfile::tempdir().unwrap();
+                let path = temp.path().join("servers.json");
+                let registry_path = temp.path().join("profiles.json");
+                let target = temp.path().join("fallback");
+                let registry = ProfileRegistry {
+                    default: Some("z-active".into()),
+                    profiles: BTreeMap::from([
+                        (
+                            "z-active".into(),
+                            ProfileEntry {
+                                id: "p_active".into(),
+                                home: temp.path().join("active"),
+                            },
+                        ),
+                        (
+                            "a-fallback".into(),
+                            ProfileEntry {
+                                id: "p_fallback".into(),
+                                home: target.clone(),
+                            },
+                        ),
+                    ]),
+                    ..ProfileRegistry::default()
+                };
+                save_registry(&registry_path, &registry).unwrap();
+                if kind == "file" {
+                    std::fs::write(&target, "file").unwrap();
+                } else if kind != "empty" {
+                    std::fs::create_dir(&target).unwrap();
+                    let config_path = target.join("servers.json");
+                    if kind == "json" {
+                        std::fs::write(&config_path, "{broken").unwrap();
+                    } else {
+                        let mut config = agent_accounts_config(&config_path);
+                        if kind == "namespace" {
+                            config
+                                .servers
+                                .get_mut("server-alpha")
+                                .unwrap()
+                                .accounts
+                                .get_mut("deploy")
+                                .unwrap()
+                                .auth = AuthConfig::Password {
+                                credential: CredentialNamespace::profile("foreign")
+                                    .new_account_credential_key(
+                                        CredentialPurpose::Login,
+                                        "server-alpha",
+                                        "deploy",
+                                    ),
+                            };
+                        }
+                        save_config(&config_path, &config).unwrap();
+                    }
+                }
+                let before = if kind == "file" {
+                    Some(std::fs::read(&target).unwrap())
+                } else {
+                    std::fs::read(target.join("servers.json")).ok()
+                };
+                let store = FakeCredentialStore::default();
+                let ssh = FakeSshClient::default();
+                let mut prompts = NoPasswordPrompter { prompts: vec![] };
+                let mut args = vec!["sshw", "profile", "remove", remove];
+                if json {
+                    args.push("--json");
+                }
+                let output = execute_for_runtime(
+                    Cli::try_parse_from(args).unwrap(),
+                    &path,
+                    &store,
+                    &ssh,
+                    &mut prompts,
+                );
+                assert_eq!(output.exit_code, 0, "{}{}", output.stdout, output.stderr);
+                let saved = load_registry(&registry_path).unwrap();
+                let switched = remove == "z-active";
+                let expected = if switched { "a-fallback" } else { "z-active" };
+                assert_eq!(saved.default.as_deref(), Some(expected));
+                assert_eq!(saved.profiles[expected], registry.profiles[expected]);
+                assert!(!saved.profiles.contains_key(remove));
+                let warns = switched && !matches!(kind, "healthy" | "empty");
+                if json {
+                    let body: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+                    assert_eq!(body.get("default_target_warning").is_some(), warns);
+                    if warns {
+                        assert_eq!(body["default_target_warning"]["name"], "a-fallback");
+                        assert!(
+                            body["default_target_warning"]["message"]
+                                .as_str()
+                                .unwrap()
+                                .contains("removal was completed")
+                        );
+                        assert!(
+                            body["default_target_warning"]["next_step"]
+                                .as_str()
+                                .unwrap()
+                                .contains("sshw profile default --")
+                        );
+                    }
+                } else {
+                    assert_eq!(
+                        output
+                            .stdout
+                            .contains("cannot validate automatically selected default profile"),
+                        warns
+                    );
+                    if warns {
+                        assert!(output.stdout.contains("sshw profile default --"));
+                    }
+                }
+                let after = if kind == "file" {
+                    Some(std::fs::read(&target).unwrap())
+                } else {
+                    std::fs::read(target.join("servers.json")).ok()
+                };
+                assert_eq!(after, before);
+                assert!(
+                    store.values.borrow().is_empty()
+                        && store.requested.borrow().is_empty()
+                        && store.deleted.borrow().is_empty()
+                );
+                assert!(ssh.selected_users.borrow().is_empty() && prompts.prompts.is_empty());
+                if kind == "empty" {
+                    assert!(!target.exists());
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn path_rules_profile_warning_redacts_causes_and_quotes_recovery_selection() {
+    for json in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("servers.json");
+        let target = temp.path().join("fallback");
+        let name = "-broken's $literal";
+        let registry = ProfileRegistry {
+            default: Some("active".into()),
+            profiles: BTreeMap::from([
+                (
+                    "active".into(),
+                    ProfileEntry {
+                        id: "p_active".into(),
+                        home: temp.path().join("active"),
+                    },
+                ),
+                (
+                    name.into(),
+                    ProfileEntry {
+                        id: "p_target".into(),
+                        home: target.clone(),
+                    },
+                ),
+            ]),
+            ..ProfileRegistry::default()
+        };
+        save_registry(&temp.path().join("profiles.json"), &registry).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(
+            target.join("servers.json"),
+            r#"{"version":2,"token=profile-warning-secret":true}"#,
+        )
+        .unwrap();
+        let mut args = vec!["sshw", "profile", "remove", "active"];
+        if json {
+            args.push("--json");
+        }
+        let output = execute_for_runtime(
+            Cli::try_parse_from(args).unwrap(),
+            &path,
+            &FakeCredentialStore::default(),
+            &FakeSshClient::default(),
+            &mut FakePrompter::default(),
+        );
+        assert_eq!(output.exit_code, 0);
+        assert!(!output.stdout.contains("profile-warning-secret"));
+        assert!(!output.stdout.contains("registry was not changed"));
+        let hint = if json {
+            serde_json::from_str::<serde_json::Value>(&output.stdout).unwrap()["default_target_warning"]["next_step"].as_str().unwrap().to_string()
+        } else {
+            output.stdout
+        };
+        let quoted = if cfg!(windows) {
+            "'-broken''s $literal'"
+        } else {
+            r#"'-broken'"'"'s $literal'"#
+        };
+        assert!(
+            hint.contains(&format!("--profile={quoted} doctor")),
+            "{hint}"
+        );
+        assert!(hint.contains("SSHW_HOME"));
+    }
+}
+
+#[test]
+fn server_update_reports_default_login_account_change() {
+    for user in ["deploy", "ops"] {
+        for json in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("servers.json");
+            let mut config = agent_accounts_config(&path);
+            set_default_privilege(
+                &mut config,
+                "server-alpha",
+                PrivilegeConfig {
+                    method: PrivilegeMethod::Sudo,
+                    user: "root".into(),
+                    credential: None,
+                    no_password: true,
+                },
+            );
+            save_config(&path, &config).unwrap();
+            let original_accounts = config.servers["server-alpha"].accounts.clone();
+            let mut args = vec![
+                "sshw",
+                "add",
+                "server-alpha",
+                "--host",
+                "192.0.2.10",
+                "--port",
+                "2222",
+                "--user",
+                user,
+                "--auth",
+                "agent",
+            ];
+            if json {
+                args.push("--json");
+            }
+            let mut prompts = NoPasswordPrompter { prompts: vec![] };
+            let output = execute_for_runtime(
+                Cli::try_parse_from(args).unwrap(),
+                &path,
+                &FakeCredentialStore::default(),
+                &FakeSshClient::default(),
+                &mut prompts,
+            );
+            assert_eq!(output.exit_code, 0, "{}{}", output.stdout, output.stderr);
+            assert_eq!(prompts.prompts.len(), 1);
+            assert_eq!(
+                prompts.prompts[0].contains("default login account will change: deploy -> ops"),
+                user == "ops"
+            );
+            let saved = load_config(&path).unwrap();
+            assert_eq!(saved.servers["server-alpha"].default_user, user);
+            assert_eq!(saved.servers["server-alpha"].accounts, original_accounts);
+            if json {
+                let value: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+                assert_eq!(value["user"], user);
+                if user == "ops" {
+                    assert_eq!(
+                        value["default_change"],
+                        serde_json::json!({"resource":"account","previous":"deploy","current":"ops"})
+                    );
+                } else {
+                    assert!(value.get("default_change").is_none());
+                }
+            } else {
+                assert_eq!(
+                    output
+                        .stdout
+                        .contains("default account changed: deploy -> ops"),
+                    user == "ops"
+                );
+            }
+        }
+    }
+    let help = Cli::try_parse_from(["sshw", "add", "--help"])
+        .unwrap_err()
+        .to_string();
+    assert!(help.contains("default login account") && help.contains("account add"));
+}
+
+#[test]
+fn server_update_cleanup_failure_retains_account_change() {
+    for json in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("servers.json");
+        let namespace = ResolvedHome::from_config_path(&path).namespace;
+        let mut config = agent_accounts_config(&path);
+        config
+            .servers
+            .get_mut("server-alpha")
+            .unwrap()
+            .accounts
+            .get_mut("ops")
+            .unwrap()
+            .auth = AuthConfig::Password {
+            credential: namespace.new_account_credential_key(
+                CredentialPurpose::Login,
+                "server-alpha",
+                "ops",
+            ),
+        };
+        save_config(&path, &config).unwrap();
+        let store = FakeCredentialStore {
+            delete_error: Some("keyring delete failed".into()),
+            ..Default::default()
+        };
+        let mut args = vec![
+            "sshw",
+            "add",
+            "server-alpha",
+            "--host",
+            "192.0.2.10",
+            "--port",
+            "2222",
+            "--user",
+            "ops",
+            "--auth",
+            "agent",
+            "--force",
+        ];
+        if json {
+            args.push("--json");
+        }
+        let output = execute_for_runtime(
+            Cli::try_parse_from(args).unwrap(),
+            &path,
+            &store,
+            &FakeSshClient::default(),
+            &mut FakePrompter::default(),
+        );
+        assert_eq!(output.exit_code, 4);
+        assert_eq!(
+            load_config(&path).unwrap().servers["server-alpha"].default_user,
+            "ops"
+        );
+        if json {
+            let value: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+            assert_eq!(value["mutation"]["config_applied"], true);
+            assert_eq!(
+                value["mutation"]["default_change"],
+                serde_json::json!({"resource":"account","previous":"deploy","current":"ops"})
+            );
+        } else {
+            assert!(
+                output
+                    .stderr
+                    .contains("default account changed: deploy -> ops")
+            );
+        }
+        assert!(store.requested.borrow().is_empty());
+    }
+}
+
+#[test]
+fn profile_default_rejects_invalid_targets_without_changing_registry_or_secrets() {
+    for kind in ["json", "endpoint", "default", "login", "privilege"] {
+        for json in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let active = temp.path().join("active/servers.json");
+            let registry_path = temp.path().join("active/profiles.json");
+            let target = temp.path().join("target");
+            let path = target.join("servers.json");
+            let registry = ProfileRegistry {
+                default: Some("current".into()),
+                profiles: BTreeMap::from([
+                    (
+                        "current".into(),
+                        ProfileEntry {
+                            id: "p_1111111111111111".into(),
+                            home: temp.path().join("current"),
+                        },
+                    ),
+                    (
+                        "target".into(),
+                        ProfileEntry {
+                            id: "p_2222222222222222".into(),
+                            home: target.clone(),
+                        },
+                    ),
+                ]),
+                ..ProfileRegistry::default()
+            };
+            save_registry(&registry_path, &registry).unwrap();
+            let mut config = agent_accounts_config(&path);
+            let foreign = CredentialNamespace::profile("foreign-id");
+            match kind {
+                "endpoint" => config.servers.get_mut("server-alpha").unwrap().port = 0,
+                "default" => config.default = Some("missing".into()),
+                "login" => {
+                    config
+                        .servers
+                        .get_mut("server-alpha")
+                        .unwrap()
+                        .accounts
+                        .get_mut("deploy")
+                        .unwrap()
+                        .auth = AuthConfig::Password {
+                        credential: foreign.new_account_credential_key(
+                            CredentialPurpose::Login,
+                            "server-alpha",
+                            "deploy",
+                        ),
+                    }
+                }
+                "privilege" => set_default_privilege(
+                    &mut config,
+                    "server-alpha",
+                    PrivilegeConfig {
+                        method: PrivilegeMethod::Sudo,
+                        user: "service".into(),
+                        no_password: false,
+                        credential: Some(foreign.new_account_credential_key(
+                            CredentialPurpose::Privilege,
+                            "server-alpha",
+                            "deploy",
+                        )),
+                    },
+                ),
+                _ => (),
+            }
+            std::fs::create_dir_all(&target).unwrap();
+            let bytes = if kind == "json" {
+                b"{ broken".to_vec()
+            } else {
+                serde_json::to_vec(&config).unwrap()
+            };
+            std::fs::write(&path, &bytes).unwrap();
+            let before = std::fs::read(&registry_path).unwrap();
+            let store = FakeCredentialStore::default();
+            let ssh = FakeSshClient::default();
+            let mut prompts = NoPasswordPrompter { prompts: vec![] };
+            let mut args = vec!["sshw", "profile", "default", "target"];
+            if json {
+                args.push("--json");
+            }
+            let output = execute_for_runtime(
+                Cli::try_parse_from(args).unwrap(),
+                &active,
+                &store,
+                &ssh,
+                &mut prompts,
+            );
+            assert_eq!(
+                output.exit_code, 3,
+                "{kind}: {}{}",
+                output.stdout, output.stderr
+            );
+            let rendered = format!("{}{}", output.stdout, output.stderr);
+            assert!(
+                rendered.contains("servers.json")
+                    && rendered.contains("profile registry was not changed"),
+                "{rendered}"
+            );
+            if json {
+                let value: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+                assert_eq!(value["error"]["kind"], "config");
+            }
+            assert_eq!(std::fs::read(&registry_path).unwrap(), before);
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            assert_eq!(load_registry(&registry_path).unwrap(), registry);
+            assert!(!target.join(".sshw.lock").exists() && !target.join("audit.jsonl").exists());
+            assert!(prompts.prompts.is_empty());
+            assert!(
+                store.values.borrow().is_empty()
+                    && store.requested.borrow().is_empty()
+                    && store.deleted.borrow().is_empty()
+            );
+            assert!(ssh.selected_users.borrow().is_empty());
+        }
+    }
+}
+
+#[test]
+fn profile_default_recovers_to_compatible_targets_and_preserves_namespace() {
+    for kind in ["missing", "legacy", "password", "agent", "no-password"] {
+        for json in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let current = temp.path().join("current");
+            std::fs::create_dir_all(&current).unwrap();
+            let active = current.join("servers.json");
+            std::fs::write(&active, "{ damaged current default").unwrap();
+            let registry_path = current.join("profiles.json");
+            let target = temp.path().join("target");
+            let path = target.join("servers.json");
+            let mut registry = ProfileRegistry {
+                default: Some("current".into()),
+                profiles: BTreeMap::from([
+                    (
+                        "current".into(),
+                        ProfileEntry {
+                            id: "p_1111111111111111".into(),
+                            home: current,
+                        },
+                    ),
+                    (
+                        "target".into(),
+                        ProfileEntry {
+                            id: "p_2222222222222222".into(),
+                            home: target.clone(),
+                        },
+                    ),
+                ]),
+                ..ProfileRegistry::default()
+            };
+            save_registry(&registry_path, &registry).unwrap();
+            let namespace = CredentialNamespace::profile("p_2222222222222222");
+            let bytes = if kind == "missing" {
+                None
+            } else {
+                std::fs::create_dir_all(&target).unwrap();
+                let bytes = if kind == "legacy" {
+                    serde_json::to_vec(&serde_json::json!({"version":1,"default":"web","servers":{"web":{"host":"192.0.2.10","port":22,"user":"deploy","auth":{"type":"password","credential":namespace.legacy_credential_key("web")}}}})).unwrap()
+                } else {
+                    let mut config = agent_accounts_config(&path);
+                    if kind == "password" {
+                        config
+                            .servers
+                            .get_mut("server-alpha")
+                            .unwrap()
+                            .accounts
+                            .get_mut("deploy")
+                            .unwrap()
+                            .auth = AuthConfig::Password {
+                            credential: namespace.new_account_credential_key(
+                                CredentialPurpose::Login,
+                                "server-alpha",
+                                "deploy",
+                            ),
+                        };
+                        set_default_privilege(
+                            &mut config,
+                            "server-alpha",
+                            PrivilegeConfig {
+                                method: PrivilegeMethod::Su,
+                                user: "service".into(),
+                                no_password: false,
+                                credential: Some(namespace.new_account_credential_key(
+                                    CredentialPurpose::Privilege,
+                                    "server-alpha",
+                                    "deploy",
+                                )),
+                            },
+                        );
+                    } else if kind == "no-password" {
+                        set_default_privilege(
+                            &mut config,
+                            "server-alpha",
+                            PrivilegeConfig {
+                                method: PrivilegeMethod::Sudo,
+                                user: "service".into(),
+                                no_password: true,
+                                credential: None,
+                            },
+                        );
+                    }
+                    serde_json::to_vec(&config).unwrap()
+                };
+                std::fs::write(&path, &bytes).unwrap();
+                Some(bytes)
+            };
+            let store = FakeCredentialStore::default();
+            let ssh = FakeSshClient::default();
+            let mut prompts = NoPasswordPrompter { prompts: vec![] };
+            let mut args = vec!["sshw", "profile", "default", "target"];
+            if json {
+                args.push("--json");
+            }
+            let output = execute_for_runtime(
+                Cli::try_parse_from(args).unwrap(),
+                &active,
+                &store,
+                &ssh,
+                &mut prompts,
+            );
+            assert_eq!(
+                output.exit_code, 0,
+                "{kind}: {}{}",
+                output.stdout, output.stderr
+            );
+            if json {
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&output.stdout).unwrap(),
+                    serde_json::json!({"ok":true,"action":"default","name":"target","changed":true,"change":"updated"})
+                );
+            }
+            registry.default = Some("target".into());
+            assert_eq!(load_registry(&registry_path).unwrap(), registry);
+            assert_eq!(std::fs::read(&path).ok(), bytes);
+            assert_eq!(
+                std::fs::read_to_string(&active).unwrap(),
+                "{ damaged current default"
+            );
+            assert!(!target.join(".sshw.lock").exists() && !target.join("audit.jsonl").exists());
+            if kind == "missing" {
+                assert!(!target.exists());
+            }
+            assert!(prompts.prompts.is_empty());
+            assert!(
+                store.values.borrow().is_empty()
+                    && store.requested.borrow().is_empty()
+                    && store.deleted.borrow().is_empty()
+            );
+            assert!(ssh.selected_users.borrow().is_empty());
+        }
+    }
+}
+
+#[test]
+fn profile_default_rejects_home_replaced_with_file_and_file_parent() {
+    for child in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let active = temp.path().join("active/servers.json");
+        let registry_path = temp.path().join("active/profiles.json");
+        let parent = temp.path().join("target");
+        let home = if child {
+            parent.join("missing/home")
+        } else {
+            parent.clone()
+        };
+        let registry = ProfileRegistry {
+            default: Some("current".into()),
+            profiles: BTreeMap::from([
+                (
+                    "current".into(),
+                    ProfileEntry {
+                        id: "p_1111111111111111".into(),
+                        home: temp.path().join("current"),
+                    },
+                ),
+                (
+                    "target".into(),
+                    ProfileEntry {
+                        id: "p_2222222222222222".into(),
+                        home,
+                    },
+                ),
+            ]),
+            ..ProfileRegistry::default()
+        };
+        save_registry(&registry_path, &registry).unwrap();
+        let before = std::fs::read(&registry_path).unwrap();
+        std::fs::write(&parent, "preserve file").unwrap();
+        for json in [false, true] {
+            let mut args = vec!["sshw", "profile", "default", "target"];
+            if json {
+                args.push("--json");
+            }
+            let output = execute_for_runtime(
+                Cli::try_parse_from(args).unwrap(),
+                &active,
+                &FakeCredentialStore::default(),
+                &FakeSshClient::default(),
+                &mut NoPasswordPrompter { prompts: vec![] },
+            );
+            assert_eq!(output.exit_code, 3, "{}{}", output.stdout, output.stderr);
+            assert_eq!(std::fs::read(&registry_path).unwrap(), before);
+            assert_eq!(std::fs::read_to_string(&parent).unwrap(), "preserve file");
+        }
+    }
+}
+
+#[test]
+fn profile_rejects_incompatible_target_before_registry_write() {
+    for existing in [false, true] {
+        for kind in ["login", "privilege", "malformed"] {
+            for json in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let active = temp.path().join("active/servers.json");
+                let registry_path = temp.path().join("active/profiles.json");
+                let store = FakeCredentialStore::default();
+                let ssh = FakeSshClient::default();
+                if existing {
+                    let previous = temp.path().join("previous");
+                    execute(
+                        Cli::try_parse_from([
+                            "sshw",
+                            "profile",
+                            "add",
+                            "prod",
+                            "--home",
+                            previous.to_str().unwrap(),
+                        ])
+                        .unwrap(),
+                        &active,
+                        &store,
+                        &ssh,
+                        &mut FakePrompter::default(),
+                    )
+                    .unwrap();
+                }
+                let registry_before = std::fs::read(&registry_path).ok();
+                let target = temp.path().join("target");
+                std::fs::create_dir_all(&target).unwrap();
+                let target_config = target.join("servers.json");
+                let foreign = CredentialNamespace::profile("foreign-profile");
+                let mut config = agent_accounts_config(&target_config);
+                if kind == "login" {
+                    config
+                        .servers
+                        .get_mut("server-alpha")
+                        .unwrap()
+                        .accounts
+                        .get_mut("deploy")
+                        .unwrap()
+                        .auth = AuthConfig::Password {
+                        credential: foreign.new_account_credential_key(
+                            CredentialPurpose::Login,
+                            "server-alpha",
+                            "deploy",
+                        ),
+                    };
+                } else if kind == "privilege" {
+                    set_default_privilege(
+                        &mut config,
+                        "server-alpha",
+                        PrivilegeConfig {
+                            method: PrivilegeMethod::Sudo,
+                            user: "root".into(),
+                            no_password: false,
+                            credential: Some(foreign.new_account_credential_key(
+                                CredentialPurpose::Privilege,
+                                "server-alpha",
+                                "deploy",
+                            )),
+                        },
+                    );
+                }
+                if kind == "malformed" {
+                    std::fs::write(&target_config, "{\"version\":99}").unwrap();
+                } else {
+                    save_config(&target_config, &config).unwrap();
+                }
+                let target_before = std::fs::read(&target_config).unwrap();
+                let mut args = vec![
+                    "sshw",
+                    "profile",
+                    "add",
+                    "prod",
+                    "--home",
+                    target.to_str().unwrap(),
+                ];
+                if existing {
+                    args.push("--force");
+                }
+                if json {
+                    args.push("--json");
+                }
+                let output = execute_for_runtime(
+                    Cli::try_parse_from(args).unwrap(),
+                    &active,
+                    &store,
+                    &ssh,
+                    &mut FakePrompter::default(),
+                );
+                assert_eq!(output.exit_code, 3, "{}{}", output.stdout, output.stderr);
+                let rendered = format!("{}{}", output.stdout, output.stderr);
+                assert!(rendered.contains("profile registry was not changed"));
+                assert!(rendered.contains("servers.json"));
+                assert_eq!(std::fs::read(&registry_path).ok(), registry_before);
+                assert_eq!(std::fs::read(&target_config).unwrap(), target_before);
+                assert!(!target.join(".sshw.lock").exists());
+                assert!(!target.join("audit.jsonl").exists());
+                assert!(store.requested.borrow().is_empty() && store.deleted.borrow().is_empty());
+                assert!(ssh.run_commands.borrow().is_empty());
+                if json {
+                    let value: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+                    assert_eq!(value["ok"], false);
+                    assert_eq!(value["error"]["kind"], "config");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn profile_updates_preserve_compatible_legacy_namespace_and_report_moves() {
+    for json in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let active = temp.path().join("active/servers.json");
+        let registry_path = temp.path().join("active/profiles.json");
+        let original = temp.path().join("original");
+        let store = FakeCredentialStore::default();
+        let ssh = FakeSshClient::default();
+        execute(
+            Cli::try_parse_from([
+                "sshw",
+                "profile",
+                "add",
+                "prod",
+                "--home",
+                original.to_str().unwrap(),
+            ])
+            .unwrap(),
+            &active,
+            &store,
+            &ssh,
+            &mut FakePrompter::default(),
+        )
+        .unwrap();
+        assert!(
+            !original.exists(),
+            "registration should not create an empty target home"
+        );
+        let first = sshw::profile::load_registry(&registry_path)
+            .unwrap()
+            .profiles["prod"]
+            .clone();
+        std::fs::create_dir_all(&original).unwrap();
+        let legacy = serde_json::json!({"version":1,"default":"web","servers":{"web":{"host":"192.0.2.10","port":22,"user":"deploy","auth":{"type":"password","credential":CredentialNamespace::profile(&first.id).legacy_credential_key("web")}}}}).to_string();
+        std::fs::write(original.join("servers.json"), &legacy).unwrap();
+        let mut args = vec![
+            "sshw",
+            "profile",
+            "add",
+            "prod",
+            "--home",
+            original.to_str().unwrap(),
+            "--force",
+        ];
+        if json {
+            args.push("--json");
+        }
+        let same = execute_for_runtime(
+            Cli::try_parse_from(args).unwrap(),
+            &active,
+            &store,
+            &ssh,
+            &mut FakePrompter::default(),
+        );
+        assert_eq!(same.exit_code, 0, "{}{}", same.stdout, same.stderr);
+        let same_entry = sshw::profile::load_registry(&registry_path)
+            .unwrap()
+            .profiles["prod"]
+            .clone();
+        let changed = same_entry != first;
+        if json {
+            let value: serde_json::Value = serde_json::from_str(&same.stdout).unwrap();
+            assert_eq!(value["action"], "updated");
+            assert_eq!(value["id"], first.id);
+            assert_eq!(value["namespace_changed"], false);
+            assert_eq!(value["changed"], changed);
+            assert_eq!(
+                value["change"],
+                if changed { "updated" } else { "unchanged" }
+            );
+            assert!(value.get("warning").is_none());
+        } else {
+            assert!(
+                same.stdout.contains(if changed {
+                    "updated profile prod"
+                } else {
+                    "(unchanged)"
+                }) && same.stdout.contains("credential namespace unchanged")
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(original.join("servers.json")).unwrap(),
+            legacy
+        );
+        assert_eq!(same_entry.id, first.id);
+        let vacant = temp.path().join("vacant");
+        let mut args = vec![
+            "sshw",
+            "profile",
+            "add",
+            "prod",
+            "--home",
+            vacant.to_str().unwrap(),
+            "--force",
+        ];
+        if json {
+            args.push("--json");
+        }
+        let moved = execute_for_runtime(
+            Cli::try_parse_from(args).unwrap(),
+            &active,
+            &store,
+            &ssh,
+            &mut FakePrompter::default(),
+        );
+        assert_eq!(moved.exit_code, 0);
+        let registry = sshw::profile::load_registry(&registry_path).unwrap();
+        assert_ne!(registry.profiles["prod"].id, first.id);
+        assert_eq!(registry.default.as_deref(), Some("prod"));
+        assert!(!vacant.exists());
+        if json {
+            let value: serde_json::Value = serde_json::from_str(&moved.stdout).unwrap();
+            assert_eq!(value["action"], "updated");
+            assert_eq!(value["namespace_changed"], true);
+            assert_eq!(
+                value["previous_home"],
+                serde_json::to_value(&same_entry.home).unwrap()
+            );
+            assert!(
+                value["warning"]
+                    .as_str()
+                    .unwrap()
+                    .contains("password credentials")
+            );
+        } else {
+            assert!(
+                moved.stdout.contains("fresh credential namespace")
+                    && moved.stdout.contains("home changed:")
+            );
+        }
+        assert!(store.requested.borrow().is_empty() && store.deleted.borrow().is_empty());
+    }
+}
+
+#[test]
+fn profile_registration_accepts_agent_target_without_rewriting_or_secret_access() {
+    for existing in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let active = temp.path().join("active/servers.json");
+        let store = FakeCredentialStore::default();
+        let ssh = FakeSshClient::default();
+        if existing {
+            let old = temp.path().join("old");
+            execute(
+                Cli::try_parse_from([
+                    "sshw",
+                    "profile",
+                    "add",
+                    "prod",
+                    "--home",
+                    old.to_str().unwrap(),
+                ])
+                .unwrap(),
+                &active,
+                &store,
+                &ssh,
+                &mut FakePrompter::default(),
+            )
+            .unwrap();
+        }
+        let target = temp.path().join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        let path = target.join("servers.json");
+        let mut config = agent_accounts_config(&path);
+        set_default_privilege(
+            &mut config,
+            "server-alpha",
+            PrivilegeConfig {
+                method: PrivilegeMethod::Sudo,
+                user: "root".into(),
+                credential: None,
+                no_password: true,
+            },
+        );
+        let before = serde_json::to_vec(&config).unwrap();
+        std::fs::write(&path, &before).unwrap();
+        let output = execute_for_runtime(
+            Cli::try_parse_from([
+                "sshw",
+                "profile",
+                "add",
+                "prod",
+                "--home",
+                target.to_str().unwrap(),
+                "--force",
+                "--json",
+            ])
+            .unwrap(),
+            &active,
+            &store,
+            &ssh,
+            &mut FakePrompter::default(),
+        );
+        assert_eq!(output.exit_code, 0, "{}{}", output.stdout, output.stderr);
+        let value: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+        assert_eq!(value["namespace_changed"], existing);
+        assert_eq!(value["action"], if existing { "updated" } else { "added" });
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(!target.join(".sshw.lock").exists() && !target.join("audit.jsonl").exists());
+        assert!(store.requested.borrow().is_empty() && store.deleted.borrow().is_empty());
+        assert!(ssh.run_commands.borrow().is_empty());
+    }
+}
+
+#[test]
+fn profile_registration_rejects_file_home_and_file_parent() {
+    for child in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let active = temp.path().join("active/servers.json");
+        let registry_path = temp.path().join("active/profiles.json");
+        let original = temp.path().join("original");
+        let store = FakeCredentialStore::default();
+        let ssh = FakeSshClient::default();
+        execute(
+            Cli::try_parse_from([
+                "sshw",
+                "profile",
+                "add",
+                "prod",
+                "--home",
+                original.to_str().unwrap(),
+            ])
+            .unwrap(),
+            &active,
+            &store,
+            &ssh,
+            &mut FakePrompter::default(),
+        )
+        .unwrap();
+        let before = std::fs::read(&registry_path).unwrap();
+        let file = temp.path().join("file-parent");
+        std::fs::write(&file, "keep this file").unwrap();
+        let target = if child {
+            file.join("missing/home")
+        } else {
+            file.clone()
+        };
+        let output = execute_for_runtime(
+            Cli::try_parse_from([
+                "sshw",
+                "profile",
+                "add",
+                "prod",
+                "--home",
+                target.to_str().unwrap(),
+                "--force",
+                "--json",
+            ])
+            .unwrap(),
+            &active,
+            &store,
+            &ssh,
+            &mut FakePrompter::default(),
+        );
+        assert_eq!(output.exit_code, 3, "{}{}", output.stdout, output.stderr);
+        assert_eq!(std::fs::read(&registry_path).unwrap(), before);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "keep this file");
+        assert!(store.requested.borrow().is_empty() && store.deleted.borrow().is_empty());
+    }
+}
+
+#[test]
+fn privilege_target_rejection_precedes_confirmation_and_secret_access() {
+    for target in ["", "  ", "service\nextra", "service\r", "service\0"] {
+        for (method, no_password) in [("sudo", false), ("su", false), ("sudo", true)] {
+            for json in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let path = temp.path().join("servers.json");
+                let mut config = agent_accounts_config(&path);
+                set_default_privilege(
+                    &mut config,
+                    "server-alpha",
+                    PrivilegeConfig {
+                        method: PrivilegeMethod::Sudo,
+                        user: "service".into(),
+                        credential: None,
+                        no_password: true,
+                    },
+                );
+                save_config(&path, &config).unwrap();
+                let before = std::fs::read(&path).unwrap();
+                let store = FakeCredentialStore::default();
+                let ssh = FakeSshClient::default();
+                let mut prompts = NoPasswordPrompter { prompts: vec![] };
+                let mut args = vec![
+                    "sshw",
+                    "privilege",
+                    "set",
+                    "server-alpha",
+                    "--method",
+                    method,
+                    "--user",
+                    target,
+                ];
+                if no_password {
+                    args.push("--no-password");
+                }
+                if json {
+                    args.push("--json");
+                }
+                let output = execute_for_runtime(
+                    Cli::try_parse_from(args).unwrap(),
+                    &path,
+                    &store,
+                    &ssh,
+                    &mut prompts,
+                );
+                assert_eq!(output.exit_code, 3, "{}{}", output.stdout, output.stderr);
+                assert!(
+                    format!("{}{}", output.stdout, output.stderr)
+                        .contains("invalid privilege target user")
+                );
+                assert_eq!(std::fs::read(&path).unwrap(), before);
+                assert!(prompts.prompts.is_empty());
+                assert!(
+                    store.values.borrow().is_empty()
+                        && store.requested.borrow().is_empty()
+                        && store.deleted.borrow().is_empty()
+                );
+                assert!(ssh.run_commands.borrow().is_empty());
+            }
+        }
+    }
+}
+
+#[test]
+fn invalid_stored_privilege_targets_fail_before_run_or_preflight_and_remain_diagnosable() {
+    for target in ["", "   ", "service\nextra"] {
+        for version in [1, 2] {
+            for (method, no_password) in [("sudo", false), ("su", false), ("sudo", true)] {
+                let temp = tempfile::tempdir().unwrap();
+                let path = temp.path().join("servers.json");
+                let mut privilege = serde_json::json!({"method":method,"user":target});
+                if no_password {
+                    privilege["no_password"] = serde_json::json!(true);
+                } else {
+                    privilege["credential"] = serde_json::json!(privilege_credential(&path, "web"));
+                }
+                let config = if version == 1 {
+                    serde_json::json!({"version":1,"default":"web","servers":{"web":{"host":"localhost","port":22,"user":"deploy","auth":{"type":"agent"}}},"privileges":{"web":privilege}})
+                } else {
+                    serde_json::json!({"version":2,"default":"web","servers":{"web":{"host":"localhost","port":22,"default_user":"deploy","accounts":{"deploy":{"auth":{"type":"agent"},"privilege":privilege}}}}})
+                };
+                let before = config.to_string();
+                std::fs::write(&path, &before).unwrap();
+                let store = FakeCredentialStore::default();
+                let ssh = FakeSshClient::default();
+                for args in [
+                    vec!["sshw", "privilege", "show", "web", "--json"],
+                    vec![
+                        "sshw",
+                        "policy",
+                        "check",
+                        "web",
+                        "id -u",
+                        "--as-root",
+                        "--json",
+                    ],
+                    vec!["sshw", "run", "web", "id -u", "--as-root", "--json"],
+                ] {
+                    let output = execute_for_runtime(
+                        Cli::try_parse_from(args).unwrap(),
+                        &path,
+                        &store,
+                        &ssh,
+                        &mut NoPasswordPrompter { prompts: vec![] },
+                    );
+                    assert_eq!(output.exit_code, 3, "{}{}", output.stdout, output.stderr);
+                }
+                let output = execute_for_runtime(
+                    Cli::try_parse_from(["sshw", "doctor", "--json"]).unwrap(),
+                    &path,
+                    &store,
+                    &ssh,
+                    &mut NoPasswordPrompter { prompts: vec![] },
+                );
+                assert_eq!(output.exit_code, 0);
+                let value: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+                assert_eq!(value["config_valid"], false);
+                assert!(
+                    value["issues"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|issue| issue["kind"] == "config")
+                );
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+                assert!(
+                    store.requested.borrow().is_empty()
+                        && store.values.borrow().is_empty()
+                        && store.deleted.borrow().is_empty()
+                );
+                assert!(ssh.run_commands.borrow().is_empty());
+            }
+        }
+    }
+}
+
+#[test]
+fn doctor_privilege_recovery_preserves_method_account_and_target() {
+    for method in [PrivilegeMethod::Sudo, PrivilegeMethod::Su] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("servers.json");
+        let mut config = agent_accounts_config(&path);
+        set_default_privilege(
+            &mut config,
+            "server-alpha",
+            PrivilegeConfig {
+                method,
+                user: "service's $literal".into(),
+                credential: Some(privilege_credential(&path, "server-alpha")),
+                no_password: false,
+            },
+        );
+        save_config(&path, &config).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let store = FakeCredentialStore::default();
+        let output = execute_for_runtime(
+            Cli::try_parse_from(["sshw", "doctor", "--json"]).unwrap(),
+            &path,
+            &store,
+            &FakeSshClient::default(),
+            &mut FakePrompter::default(),
+        );
+        let value: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+        let issue = value["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|issue| issue["kind"] == "privilege_credential")
+            .unwrap();
+        let step = issue["next_step"].as_str().unwrap();
+        let label = if method == PrivilegeMethod::Su {
+            "su"
+        } else {
+            "sudo"
+        };
+        assert!(
+            step.contains(&format!("--method {label}"))
+                && step.contains("--account='deploy'")
+                && step.contains("-- 'server-alpha'"),
+            "{step}"
+        );
+        let quoted_target = if cfg!(windows) {
+            "'service''s $literal'"
+        } else {
+            "'service'\"'\"'s $literal'"
+        };
+        assert!(step.contains(&format!("--user={quoted_target}")), "{step}");
+        assert!(step.contains("--force") && step.contains("same home/profile"));
+        let human = execute_for_runtime(
+            Cli::try_parse_from(["sshw", "doctor"]).unwrap(),
+            &path,
+            &store,
+            &FakeSshClient::default(),
+            &mut FakePrompter::default(),
+        );
+        assert!(human.stdout.contains(step));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(store.values.borrow().is_empty() && store.deleted.borrow().is_empty());
+
+        // Exercise the emitted command through the user's local shell, while
+        // using session-only storage to keep the real OS keyring untouched.
+        config.credential_backend = sshw::config::CredentialBackend::SessionOnly;
+        save_config(&path, &config).unwrap();
+        let command = step
+            .split('`')
+            .nth(1)
+            .unwrap()
+            .strip_prefix("sshw ")
+            .unwrap();
+        let (options, server) = command.rsplit_once(" -- ").unwrap();
+        let quote_path = |value: &str| {
+            if cfg!(windows) {
+                format!("'{}'", value.replace('\'', "''"))
+            } else {
+                format!("'{}'", value.replace('\'', "'\"'\"'"))
+            }
+        };
+        let script = format!(
+            "{}{} --home {} {options} --force --password-stdin --json -- {server}",
+            if cfg!(windows) { "& " } else { "" },
+            quote_path(env!("CARGO_BIN_EXE_sshw")),
+            quote_path(temp.path().to_str().unwrap()),
+        );
+        let mut shell = if cfg!(windows) {
+            let mut command = std::process::Command::new("pwsh");
+            command.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
+            command
+        } else {
+            let mut command = std::process::Command::new("sh");
+            command.args(["-c", &script]);
+            command
+        };
+        let mut child = shell
+            .env_remove("SSHW_HOME")
+            .env_remove("SSHW_PASSWORD")
+            .env_remove("SSHW_PRIVILEGE_PASSWORD")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        std::io::Write::write_all(&mut child.stdin.take().unwrap(), b"fixture-only\n").unwrap();
+        let repaired = child.wait_with_output().unwrap();
+        assert!(
+            repaired.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&repaired.stdout),
+            String::from_utf8_lossy(&repaired.stderr)
+        );
+        let saved = load_config(&path).unwrap();
+        let privilege = default_privilege(&saved, "server-alpha").unwrap();
+        assert_eq!(privilege.method, method);
+        assert_eq!(privilege.user, "service's $literal");
+        assert_eq!(saved.servers["server-alpha"].default_user, "deploy");
+    }
+}
+
+#[test]
+fn doctor_session_only_privilege_recovery_uses_environment_without_resetting_metadata() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    let mut config = agent_accounts_config(&path);
+    set_default_privilege(
+        &mut config,
+        "server-alpha",
+        PrivilegeConfig {
+            method: PrivilegeMethod::Su,
+            user: "service".into(),
+            credential: Some(privilege_credential(&path, "server-alpha")),
+            no_password: false,
+        },
+    );
+    save_config(&path, &config).unwrap();
+    let before = std::fs::read(&path).unwrap();
+    let store = SessionOnlyStore::default();
+    let output = execute_for_runtime(
+        Cli::try_parse_from(["sshw", "doctor", "--json"]).unwrap(),
+        &path,
+        &store,
+        &FakeSshClient::default(),
+        &mut FakePrompter::default(),
+    );
+    let value: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+    let step = value["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|issue| issue["kind"] == "privilege_credential")
+        .unwrap()["next_step"]
+        .as_str()
+        .unwrap();
+    assert!(
+        step.contains("SSHW_PRIVILEGE_PASSWORD")
+            && step.contains("su target 'service'")
+            && step.contains("login account 'deploy'"),
+        "{step}"
+    );
+    assert!(!step.contains("privilege set") && step.contains("not persisted"));
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn doctor_privilege_recovery_masks_sensitive_target_metadata() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    let mut config = agent_accounts_config(&path);
+    set_default_privilege(
+        &mut config,
+        "server-alpha",
+        PrivilegeConfig {
+            method: PrivilegeMethod::Su,
+            user: "password=fixture-only".into(),
+            credential: Some(privilege_credential(&path, "server-alpha")),
+            no_password: false,
+        },
+    );
+    save_config(&path, &config).unwrap();
+    for json in [false, true] {
+        let mut args = vec!["sshw", "doctor"];
+        if json {
+            args.push("--json");
+        }
+        let output = execute_for_runtime(
+            Cli::try_parse_from(args).unwrap(),
+            &path,
+            &FakeCredentialStore::default(),
+            &FakeSshClient::default(),
+            &mut FakePrompter::default(),
+        );
+        assert_eq!(output.exit_code, 0);
+        assert!(!output.stdout.contains("fixture-only"));
+        assert!(output.stdout.contains("--method su") && output.stdout.contains("<redacted>"));
+        assert!(output.stdout.contains("-- 'server-alpha'"));
+    }
+}
+
+#[test]
+fn transfer_hint_invalid_upload_source_stops_before_credentials() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    let directory = temp.path().join("directory");
+    std::fs::create_dir(&directory).unwrap();
+    for config in [sample_config(&path), agent_accounts_config(&path)] {
+        save_config(&path, &config).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        for source in [temp.path().join("missing"), directory.clone()] {
+            for atomic in [false, true] {
+                for json in [false, true] {
+                    let mut args = vec!["sshw", "put", source.to_str().unwrap(), "/tmp/app"];
+                    if atomic {
+                        args.push("--atomic");
+                    }
+                    if json {
+                        args.push("--json");
+                    }
+                    let store = FakeCredentialStore::default();
+                    let ssh = FakeSshClient::default();
+                    let output = execute_for_runtime(
+                        Cli::try_parse_from(args).unwrap(),
+                        &path,
+                        &store,
+                        &ssh,
+                        &mut FakePrompter::default(),
+                    );
+                    assert_eq!(output.exit_code, 6, "{}{}", output.stdout, output.stderr);
+                    let diagnostic = format!("{}{}", output.stdout, output.stderr);
+                    assert!(
+                        diagnostic.contains(
+                            source
+                                .to_str()
+                                .unwrap()
+                                .rsplit(std::path::MAIN_SEPARATOR)
+                                .next()
+                                .unwrap()
+                        )
+                    );
+                    assert!(store.requested.borrow().is_empty());
+                    assert!(ssh.put_calls.borrow().is_empty());
+                    assert_eq!(std::fs::read(&path).unwrap(), before);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn transfer_hint_readable_upload_reaches_auth_and_safety_stays_first() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    save_config(&path, &sample_config(&path)).unwrap();
+    let source = temp.path().join("app");
+    std::fs::write(&source, "fixture").unwrap();
+    let store = FakeCredentialStore::default();
+    let ssh = FakeSshClient::default();
+    for atomic in [false, true] {
+        let mut args = vec![
+            "sshw",
+            "put",
+            source.to_str().unwrap(),
+            "/tmp/app",
+            "--json",
+        ];
+        if atomic {
+            args.push("--atomic");
+        }
+        assert_json_error(
+            execute_for_runtime(
+                Cli::try_parse_from(args).unwrap(),
+                &path,
+                &store,
+                &ssh,
+                &mut FakePrompter::default(),
+            ),
+            4,
+            "auth",
+            "missing credential",
+        );
+    }
+    assert_eq!(store.requested.borrow().len(), 2);
+    store.requested.borrow_mut().clear();
+    let missing = temp.path().join("missing");
+    let output = execute_for_runtime(
+        Cli::try_parse_from([
+            "sshw",
+            "put",
+            missing.to_str().unwrap(),
+            "/etc/app",
+            "--json",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut FakePrompter::default(),
+    );
+    assert_json_error(output, 2, "safety", "requires --yes");
+    assert!(store.requested.borrow().is_empty() && ssh.put_calls.borrow().is_empty());
+    store
+        .set_password(
+            &login_credential(&path, "server-alpha"),
+            "deploy",
+            "fixture-only",
+        )
+        .unwrap();
+    execute(
+        Cli::try_parse_from(["sshw", "put", source.to_str().unwrap(), "/tmp/app"]).unwrap(),
+        &path,
+        &store,
+        &ssh,
+        &mut FakePrompter::default(),
+    )
+    .unwrap();
+    assert_eq!(ssh.put_calls.borrow().as_slice(), ["/tmp/app"]);
+}
+
+fn run_local_hint(command: &str, home: &Path) -> std::process::Output {
+    let quote = |value: &str| {
+        if cfg!(windows) {
+            format!("'{}'", value.replace('\'', "''"))
+        } else {
+            format!("'{}'", value.replace('\'', "'\"'\"'"))
+        }
+    };
+    let script = format!(
+        "{}{} --home {} {}{}",
+        if cfg!(windows) { "& " } else { "" },
+        quote(env!("CARGO_BIN_EXE_sshw")),
+        quote(home.to_str().unwrap()),
+        command.strip_prefix("sshw ").unwrap(),
+        if cfg!(windows) {
+            "; exit $LASTEXITCODE"
+        } else {
+            ""
+        }
+    );
+    let mut shell = if cfg!(windows) {
+        let mut shell = std::process::Command::new("pwsh");
+        shell.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
+        shell
+    } else {
+        let mut shell = std::process::Command::new("sh");
+        shell.args(["-c", &script]);
+        shell
+    };
+    shell
+        .env_remove("SSHW_HOME")
+        .env_remove("SSHW_PROFILE")
+        .env_remove("SSHW_PASSWORD")
+        .env_remove("SSHW_PRIVILEGE_PASSWORD")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn transfer_hint_first_use_commands_preserve_server_names_in_local_shell() {
+    for name in ["web", "stage west", "-staging", "O'Brien $literal"] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("servers.json");
+        let output = execute(
+            Cli::try_parse_from([
+                "sshw",
+                "add",
+                "--host",
+                "localhost",
+                "--user",
+                "deploy",
+                "--auth",
+                "agent",
+                "--",
+                name,
+            ])
+            .unwrap(),
+            &path,
+            &FakeCredentialStore::default(),
+            &FakeSshClient::default(),
+            &mut FakePrompter::default(),
+        )
+        .unwrap();
+        let empty = tempfile::tempdir().unwrap();
+        let hints: Vec<_> = output
+            .stdout
+            .lines()
+            .filter_map(|line| {
+                line.strip_prefix("next: ")
+                    .or_else(|| line.strip_prefix("then: "))
+            })
+            .collect();
+        assert_eq!(hints.len(), 2);
+        for hint in hints {
+            // An empty home ensures valid trust/run arguments stop at server
+            // lookup before SSH. This exercises the actual native CLI parser.
+            let result = run_local_hint(hint, empty.path());
+            let message = String::from_utf8_lossy(&result.stderr);
+            assert_eq!(result.status.code(), Some(3), "{hint}: {message}");
+            assert!(
+                message.contains(&format!("unknown server '{name}'")),
+                "{message}"
+            );
+        }
+    }
+}
+
+#[test]
+fn transfer_hint_doctor_host_trust_preserves_server_names() {
+    for name in ["stage west", "-staging", "O'Brien $literal"] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("servers.json");
+        execute(
+            Cli::try_parse_from([
+                "sshw",
+                "add",
+                "--host",
+                "localhost",
+                "--user",
+                "deploy",
+                "--auth",
+                "agent",
+                "--",
+                name,
+            ])
+            .unwrap(),
+            &path,
+            &FakeCredentialStore::default(),
+            &FakeSshClient::default(),
+            &mut FakePrompter::default(),
+        )
+        .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let output = execute_for_runtime(
+            Cli::try_parse_from(["sshw", "doctor", "--json"]).unwrap(),
+            &path,
+            &FakeCredentialStore::default(),
+            &FakeSshClient::default(),
+            &mut FakePrompter::default(),
+        );
+        let value: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+        let step = value["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|issue| issue["kind"] == "host_trust")
+            .unwrap()["next_step"]
+            .as_str()
+            .unwrap();
+        let human = execute_for_runtime(
+            Cli::try_parse_from(["sshw", "doctor"]).unwrap(),
+            &path,
+            &FakeCredentialStore::default(),
+            &FakeSshClient::default(),
+            &mut FakePrompter::default(),
+        );
+        assert!(human.stdout.contains(step));
+        let empty = tempfile::tempdir().unwrap();
+        let result = run_local_hint(step, empty.path());
+        assert_eq!(result.status.code(), Some(3));
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains(&format!("unknown server '{name}'"))
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+}
+
+#[test]
+fn transfer_hint_missing_privilege_command_preserves_login_account() {
+    for name in ["stage west", "-staging", "O'Brien $literal"] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("servers.json");
+        let login = "operator's $literal";
+        let mut config = SshwConfig {
+            credential_backend: sshw::config::CredentialBackend::SessionOnly,
+            default: Some(name.into()),
+            ..SshwConfig::default()
+        };
+        config.servers.insert(
+            name.into(),
+            ServerConfig::single_account("localhost", 22, login, AuthConfig::Agent),
+        );
+        save_config(&path, &config).unwrap();
+        let output = execute_for_runtime(
+            Cli::try_parse_from(["sshw", "run", "--as-root", "--json", "--", name, "hostname"])
+                .unwrap(),
+            &path,
+            &FakeCredentialStore::default(),
+            &FakeSshClient::default(),
+            &mut FakePrompter::default(),
+        );
+        let value: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+        let message = value["error"]["message"].as_str().unwrap();
+        let command = message
+            .split('`')
+            .nth(1)
+            .expect("copyable privilege command");
+        let (options, positional) = command.rsplit_once(" -- ").unwrap();
+        let result = run_local_hint(
+            &format!("{options} --no-password -- {positional}"),
+            temp.path(),
+        );
+        assert!(
+            result.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let saved = load_config(&path).unwrap();
+        let server = &saved.servers[name];
+        assert_eq!(server.default_user, login);
+        let privilege = server.accounts[login].privilege.as_ref().unwrap();
+        assert_eq!(privilege.method, PrivilegeMethod::Sudo);
+        assert_eq!(privilege.user, "root");
+        assert!(privilege.no_password && privilege.credential.is_none());
+    }
+}
+
+#[test]
+fn transfer_hint_sensitive_account_does_not_remove_recovery_command() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    let mut config = SshwConfig {
+        default: Some("web".into()),
+        ..SshwConfig::default()
+    };
+    config.servers.insert(
+        "web".into(),
+        ServerConfig::single_account("localhost", 22, "password=fixture-only", AuthConfig::Agent),
+    );
+    save_config(&path, &config).unwrap();
+    for json in [false, true] {
+        let mut args = vec!["sshw", "run", "web", "hostname", "--as-root"];
+        if json {
+            args.push("--json");
+        }
+        let output = execute_for_runtime(
+            Cli::try_parse_from(args).unwrap(),
+            &path,
+            &FakeCredentialStore::default(),
+            &FakeSshClient::default(),
+            &mut FakePrompter::default(),
+        );
+        let diagnostic = format!("{}{}", output.stdout, output.stderr);
+        assert_eq!(output.exit_code, 3);
+        assert!(!diagnostic.contains("fixture-only"));
+        assert!(
+            diagnostic.contains("<redacted>") && diagnostic.contains("-- 'web'"),
+            "{diagnostic}"
+        );
+    }
 }
 
 fn assert_json_error(
@@ -5234,7 +9601,7 @@ fn privilege_configuration_is_scoped_to_the_selected_login_account() {
                 CredentialPurpose::Privilege,
                 "server-alpha",
                 "ops",
-                &privilege.credential,
+                privilege.credential.as_deref().unwrap(),
             )
     );
     assert!(
@@ -5689,7 +10056,8 @@ fn account_auth_update_preserves_privilege_and_deletes_only_stale_login_secret()
                 privilege: Some(PrivilegeConfig {
                     method: PrivilegeMethod::Sudo,
                     user: "root".to_string(),
-                    credential: privilege.clone(),
+                    credential: Some(privilege.clone()),
+                    no_password: false,
                 }),
             },
         );
@@ -5722,7 +10090,10 @@ fn account_auth_update_preserves_privilege_and_deletes_only_stale_login_secret()
     let config = load_config(&path).unwrap();
     let account = &config.servers["server-alpha"].accounts["ops"];
     assert!(matches!(account.auth, AuthConfig::Agent));
-    assert_eq!(account.privilege.as_ref().unwrap().credential, privilege);
+    assert_eq!(
+        account.privilege.as_ref().unwrap().credential.as_ref(),
+        Some(&privilege)
+    );
     assert_eq!(
         store.deleted.borrow().as_slice(),
         [(login, "ops".to_string())]
@@ -5781,7 +10152,9 @@ impl CredentialStore for FakeCredentialStore {
             .borrow()
             .get(&(credential.to_string(), user.to_string()))
             .cloned()
-            .ok_or_else(|| anyhow::anyhow!("missing credential"))
+            .ok_or_else(|| {
+                anyhow::Error::new(keyring_core::Error::NoEntry).context("missing credential")
+            })
     }
 
     fn delete_password(&self, credential: &str, user: &str) -> anyhow::Result<()> {
@@ -5808,6 +10181,7 @@ impl CredentialStore for FakeCredentialStore {
 
 #[derive(Default)]
 struct FakeSshClient {
+    host_key_calls: RefCell<usize>,
     selected_users: RefCell<Vec<String>>,
     run_commands: RefCell<Vec<String>>,
     run_stdin: RefCell<Vec<Option<String>>>,
@@ -5864,6 +10238,7 @@ impl FakeSshClient {
 
 impl SshClient for FakeSshClient {
     fn host_key(&self, _server: &ServerConfig) -> anyhow::Result<HostKeyInfo> {
+        *self.host_key_calls.borrow_mut() += 1;
         Ok(HostKeyInfo {
             algorithm: "ssh-ed25519".to_string(),
             fingerprint_sha256: if self.host_key_fingerprint.is_empty() {

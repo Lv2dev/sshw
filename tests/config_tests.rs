@@ -7,12 +7,116 @@ use sshw::home::{CredentialNamespace, CredentialPurpose};
 use std::fs;
 
 #[test]
+fn settings_load_errors_preserve_causes_types_and_files_when_paths_are_masked() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("token=path-marker");
+    fs::create_dir(&home).unwrap();
+    for document in ["servers.json", "profiles.json", "policy.json"] {
+        let path = home.join(document);
+        let load = || match document {
+            "servers.json" => load_config(&path).map(|_| ()),
+            "profiles.json" => sshw::profile::load_registry(&path).map(|_| ()),
+            _ => sshw::policy::resolve_policy(&path, false).map(|_| ()),
+        };
+        assert!(load().is_ok());
+        assert!(!path.exists());
+        fs::write(&path, "{").unwrap();
+        let before = (
+            fs::read(&path).unwrap(),
+            fs::metadata(&path).unwrap().modified().unwrap(),
+        );
+        let error = load().unwrap_err();
+        let response = sshw::output::ErrorResponse::from_error(&error);
+        assert!(
+            response.error.message.contains("EOF while parsing")
+                && response.error.message.contains("next:")
+        );
+        assert!(!response.error.message.contains("path-marker"));
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.downcast_ref::<serde_json::Error>().is_some())
+        );
+        assert_eq!(fs::read(&path).unwrap(), before.0);
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), before.1);
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        let error = load().unwrap_err();
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.downcast_ref::<std::io::Error>().is_some())
+        );
+        let response = sshw::output::ErrorResponse::from_error(&error);
+        assert!(
+            response.error.message.contains("caused by:")
+                && response.error.message.contains("next:")
+        );
+        assert!(!response.error.message.contains("path-marker"));
+        assert!(path.is_dir());
+        fs::remove_dir(&path).unwrap();
+    }
+}
+
+#[test]
 fn new_config_starts_empty() {
     let config = SshwConfig::default();
 
     assert_eq!(config.version, 2);
     assert!(config.default.is_none());
     assert!(config.servers.is_empty());
+}
+
+#[test]
+fn endpoint_account_programmatic_config_rejects_invalid_addresses() {
+    let namespace = CredentialNamespace::profile("default");
+    for (host, port) in [
+        ("", 22),
+        (" \t ", 22),
+        ("bad\nhost", 22),
+        ("bad\u{7f}host", 22),
+        ("localhost", 0),
+    ] {
+        let mut config = SshwConfig::default();
+        config.servers.insert(
+            "web".into(),
+            ServerConfig::single_account(host, port, "deploy", AuthConfig::Agent),
+        );
+        let error = validate_config_credential_references(&config, &namespace).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("invalid endpoint for server 'web'")
+        );
+    }
+}
+
+#[test]
+fn endpoint_account_valid_addresses_preserve_values_for_v1_and_v2() {
+    for version in [1, 2] {
+        for host in [
+            "localhost",
+            "server.internal",
+            "192.0.2.10",
+            "::1",
+            "[::1]",
+            "fe80::1%eth0",
+        ] {
+            for port in [1, 22, 65535] {
+                let server = if version == 1 {
+                    serde_json::json!({"host":host,"port":port,"user":"deploy","auth":{"type":"agent"}})
+                } else {
+                    serde_json::json!({"host":host,"port":port,"default_user":"deploy","accounts":{"deploy":{"auth":{"type":"agent"}}}})
+                };
+                let config: SshwConfig = serde_json::from_value(
+                    serde_json::json!({"version":version,"servers":{"web":server}}),
+                )
+                .unwrap();
+                assert_eq!(config.servers["web"].host, host);
+                assert_eq!(config.servers["web"].port, port);
+            }
+        }
+    }
 }
 
 #[test]
@@ -42,7 +146,8 @@ fn config_serializes_password_and_agent_auth_without_secrets() {
         .privilege = Some(PrivilegeConfig {
         method: PrivilegeMethod::Sudo,
         user: "root".to_string(),
-        credential: "sshw:default:privilege:server-alpha".to_string(),
+        credential: Some("sshw:default:privilege:server-alpha".to_string()),
+        no_password: false,
     });
 
     let json = serde_json::to_string_pretty(&config).unwrap();
@@ -345,14 +450,89 @@ fn credential_references_accept_expected_legacy_and_v2_keys() {
         .privilege = Some(PrivilegeConfig {
         method: PrivilegeMethod::Sudo,
         user: "root".to_string(),
-        credential: namespace.credential_key_v2(
+        credential: Some(namespace.credential_key_v2(
             CredentialPurpose::Privilege,
             "modern",
             "0000000000000002",
-        ),
+        )),
+        no_password: false,
     });
 
     validate_config_credential_references(&config, &namespace).unwrap();
+}
+
+#[test]
+fn privilege_modes_preserve_legacy_shape_and_roundtrip_passwordless_settings() {
+    let legacy = serde_json::json!({"method":"sudo","user":"root","credential":"existing-key"});
+    let parsed: PrivilegeConfig = serde_json::from_value(legacy.clone()).unwrap();
+    assert!(!parsed.no_password);
+    assert_eq!(parsed.credential.as_deref(), Some("existing-key"));
+    assert_eq!(serde_json::to_value(parsed).unwrap(), legacy);
+
+    let passwordless = serde_json::json!({"method":"sudo","user":"service","no_password":true});
+    let parsed: PrivilegeConfig = serde_json::from_value(passwordless.clone()).unwrap();
+    assert!(parsed.no_password);
+    assert_eq!(parsed.credential, None);
+    assert_eq!(serde_json::to_value(&parsed).unwrap(), passwordless);
+    let mut config = SshwConfig::default();
+    let mut server = ServerConfig::single_account("localhost", 22, "ops", AuthConfig::Agent);
+    server.account_mut("ops").unwrap().privilege = Some(parsed);
+    config.servers.insert("web".into(), server);
+    validate_config_credential_references(&config, &CredentialNamespace::profile("default"))
+        .unwrap();
+    let serialized = serde_json::to_string(&config).unwrap();
+    assert_eq!(
+        serde_json::from_str::<SshwConfig>(&serialized).unwrap(),
+        config
+    );
+}
+
+#[test]
+fn privilege_modes_reject_ambiguous_or_unsupported_authentication() {
+    for value in [
+        serde_json::json!({"method":"sudo"}),
+        serde_json::json!({"method":"su","no_password":true}),
+        serde_json::json!({"method":"sudo","credential":"key","no_password":true}),
+        serde_json::json!({"method":"sudo","credential":"","no_password":true}),
+        serde_json::json!({"method":"sudo","no_password":false}),
+        serde_json::json!({"method":"sudo","no_password":"true"}),
+        serde_json::json!({"method":"sudo","no_password":true,"future_auth":true}),
+    ] {
+        assert!(
+            serde_json::from_value::<PrivilegeConfig>(value.clone()).is_err(),
+            "{value}"
+        );
+    }
+}
+
+#[test]
+fn privilege_target_validation_rejects_empty_and_control_users_in_all_formats() {
+    for user in ["", "   ", "service\nextra", "service\r", "service\0"] {
+        for (method, no_password) in [("sudo", false), ("su", false), ("sudo", true)] {
+            let mut value = serde_json::json!({"method":method,"user":user});
+            if no_password {
+                value["no_password"] = serde_json::json!(true);
+            } else {
+                value["credential"] = serde_json::json!("existing-key");
+            }
+            assert!(serde_json::from_value::<PrivilegeConfig>(value.clone()).is_err());
+            for config in [
+                serde_json::json!({"version":1,"default":"web","servers":{"web":{"host":"localhost","port":22,"user":"deploy","auth":{"type":"agent"}}},"privileges":{"web":value}}),
+                serde_json::json!({"version":2,"default":"web","servers":{"web":{"host":"localhost","port":22,"default_user":"deploy","accounts":{"deploy":{"auth":{"type":"agent"},"privilege":value}}}}}),
+            ] {
+                assert!(serde_json::from_value::<SshwConfig>(config).is_err());
+            }
+            let mut privilege = PrivilegeConfig {
+                method: PrivilegeMethod::Sudo,
+                user: user.into(),
+                credential: None,
+                no_password: true,
+            };
+            assert!(privilege.validate().is_err());
+            privilege.user = "service's $literal".into();
+            privilege.validate().unwrap();
+        }
+    }
 }
 
 #[test]
@@ -528,12 +708,13 @@ fn v2_config_round_trip_preserves_multiple_accounts() {
             privilege: Some(PrivilegeConfig {
                 method: PrivilegeMethod::Sudo,
                 user: "root".to_string(),
-                credential: namespace.credential_key_v3(
+                credential: Some(namespace.credential_key_v3(
                     CredentialPurpose::Privilege,
                     "web",
                     "ops",
                     "0000000000000002",
-                ),
+                )),
+                no_password: false,
             }),
         },
     );

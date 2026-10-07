@@ -8,12 +8,12 @@ use super::{
 };
 use crate::config::{
     AccountConfig, AuthConfig, ConfigRevision, ServerConfig, SshwConfig, save_config_if_unchanged,
-    validate_account_user,
+    validate_account_user, validate_server_endpoint,
 };
 use crate::credentials::CredentialStore;
-use crate::error::{ResultErrorKindExt, app_error};
+use crate::error::{ResultErrorKindExt, app_error, credential_cleanup_error};
 use crate::home::{CredentialNamespace, CredentialPurpose, validate_server_name};
-use crate::output::{ErrorKind, ServerOutput};
+use crate::output::{DefaultChange, ErrorKind, ServerOutput, redact_secrets};
 use crate::ssh::SshClient;
 use serde_json::json;
 use std::path::Path;
@@ -33,8 +33,32 @@ where
 {
     validate_server_name(&args.name).with_error_kind(ErrorKind::Config)?;
     validate_account_user(&args.user).with_error_kind(ErrorKind::Config)?;
+    validate_server_endpoint(&args.name, &args.host, args.port)
+        .with_error_kind(ErrorKind::Config)?;
 
     let previous_server = config.servers.get(&args.name).cloned();
+    let default_change = previous_server.as_ref().and_then(|previous| {
+        DefaultChange::between(
+            "account",
+            Some(previous.default_user.clone()),
+            Some(args.user.clone()),
+        )
+    });
+    let account_notice = default_change
+        .as_ref()
+        .map(|change| {
+            format!(
+                "; default login account will change: {} -> {}",
+                super::hints::redacted_argument(change.previous.as_deref().unwrap_or("none")),
+                super::hints::redacted_argument(change.current.as_deref().unwrap_or("none"))
+            )
+        })
+        .unwrap_or_default();
+    let action = if previous_server.is_some() {
+        "updated"
+    } else {
+        "added"
+    };
     if let Some(previous) = &previous_server
         && (previous.host != args.host || previous.port != args.port)
         && !args.replace
@@ -44,15 +68,17 @@ where
             "changing a server's host or port requires --replace (removes its accounts and privilege settings); use a new server name to keep the existing configuration",
         ));
     }
+    super::check_registration_auth(args.auth, args.password_stdin)?;
     let prompt = if args.replace {
         format!(
-            "replace server '{}' and remove its existing accounts and privilege settings? [y/N] ",
-            args.name
+            "replace server '{}' and remove its existing accounts and privilege settings{account_notice}? [y/N] ",
+            super::hints::redacted_argument(&args.name)
         )
     } else {
         format!(
-            "update account '{}/{}' (other accounts and privilege settings are preserved)? [y/N] ",
-            args.name, args.user
+            "update account '{}/{}' (other accounts and privilege settings are preserved{account_notice})? [y/N] ",
+            super::hints::redacted_argument(&args.name),
+            super::hints::redacted_argument(&args.user)
         )
     };
     if previous_server.is_some()
@@ -64,6 +90,7 @@ where
         return Err(app_error(ErrorKind::Config, "add cancelled"));
     }
 
+    let before = config.clone();
     let mut new_password_credential = None;
     let auth = match args.auth {
         AuthArg::Password => {
@@ -88,15 +115,7 @@ where
             new_password_credential = Some((credential.clone(), args.user.clone()));
             AuthConfig::Password { credential }
         }
-        AuthArg::Agent => {
-            if args.password_stdin {
-                return Err(app_error(
-                    ErrorKind::Config,
-                    "--password-stdin cannot be used with --auth agent",
-                ));
-            }
-            AuthConfig::Agent
-        }
+        AuthArg::Agent => AuthConfig::Agent,
     };
 
     let mut accounts = previous_server
@@ -127,8 +146,10 @@ where
         config.default = Some(args.name.clone());
     }
 
-    if let Err(err) =
-        save_config_if_unchanged(config_path, config, revision).with_error_kind(ErrorKind::Config)
+    let changed = matches!(args.auth, AuthArg::Password) || *config != before;
+    if changed
+        && let Err(err) = save_config_if_unchanged(config_path, config, revision)
+            .with_error_kind(ErrorKind::Config)
     {
         if !crate::storage::write_was_published(&err)
             && let Some((credential, user)) = new_password_credential.as_ref()
@@ -144,14 +165,15 @@ where
         }
     }
     if let Some(err) = cleanup_error {
-        return Err(crate::error::classified_error(ErrorKind::Auth, err));
+        return Err(credential_cleanup_error(
+            err,
+            action,
+            &args.name,
+            None,
+            default_change,
+        ));
     }
 
-    let action = if previous_server.is_some() {
-        "updated"
-    } else {
-        "added"
-    };
     let warning = if matches!(args.auth, AuthArg::Password) && !credentials.is_persistent() {
         Some("this credential backend does not persist passwords; supply SSHW_PASSWORD at run time")
     } else {
@@ -163,7 +185,13 @@ where
             "ok": true,
             "action": action,
             "server": args.name,
+            "user": redact_secrets(&config.servers[&args.name].default_user),
+            "changed": changed,
+            "change": if changed { action } else { "unchanged" },
         });
+        if let Some(change) = default_change {
+            output["default_change"] = serde_json::to_value(change.redacted())?;
+        }
         if let (Some(map), Some(warning)) = (output.as_object_mut(), warning) {
             map.insert(
                 "warning".to_string(),
@@ -173,11 +201,19 @@ where
         return Ok(ok(format!("{}\n", serde_json::to_string(&output)?)));
     }
 
-    let mut message = format!("{action} {}\n", args.name);
+    let mut message = if changed {
+        format!("{action} {}\n", args.name)
+    } else {
+        format!("server {} (unchanged)\n", args.name)
+    };
+    if let Some(change) = default_change {
+        message.push_str(&change.human_message());
+    }
     if previous_server.is_none() || args.replace {
         message.push_str(&format!(
-            "next: sshw trust {}\nthen: sshw run {} \"hostname\"\n",
-            args.name, args.name
+            "next: {}\nthen: {}\n",
+            super::hints::trust(&args.name),
+            super::hints::run(&args.name, "hostname")
         ));
     }
     if let Some(warning) = warning {
@@ -265,15 +301,24 @@ pub(super) fn default_server(
         return Err(unknown_server(&name));
     }
 
-    config.default = Some(name.clone());
-    save_config_if_unchanged(config_path, config, revision).with_error_kind(ErrorKind::Config)?;
+    let changed = config.default.as_deref() != Some(name.as_str());
+    if changed {
+        config.default = Some(name.clone());
+        save_config_if_unchanged(config_path, config, revision)
+            .with_error_kind(ErrorKind::Config)?;
+    }
     if args.json {
         return Ok(ok(format!(
             "{}\n",
-            json!({"ok":true,"action":"default","server":name})
+            json!({"ok":true,"action":"default","server":name,"changed":changed,
+                "change":if changed { "updated" } else { "unchanged" }})
         )));
     }
-    Ok(ok(format!("default set to {name}\n")))
+    Ok(ok(if changed {
+        format!("default set to {name}\n")
+    } else {
+        format!("default already set to {name} (unchanged)\n")
+    }))
 }
 
 pub(super) fn trust_server<S, P>(
@@ -287,10 +332,17 @@ where
     P: Prompter,
 {
     let server = get_server(config, &args.name)?;
+    if !args.yes {
+        prompter
+            .ensure_confirmation_available("--yes")
+            .with_error_kind(ErrorKind::Config)?;
+    }
     let host_key = ssh.host_key(server).with_error_kind(ErrorKind::Ssh)?;
     let prompt = format!(
         "trust {} {} {}? [y/N] ",
-        args.name, host_key.algorithm, host_key.fingerprint_sha256
+        super::hints::redacted_argument(&args.name),
+        host_key.algorithm,
+        host_key.fingerprint_sha256
     );
     if !args.yes
         && !prompter
@@ -334,18 +386,23 @@ where
     let server = get_server(config, &args.name)?.clone();
     if !args.yes
         && !prompter
-            .confirm(&format!("remove server '{}'? [y/N] ", args.name))
+            .confirm(&format!(
+                "remove server '{}'? [y/N] ",
+                super::hints::redacted_argument(&args.name)
+            ))
             .with_error_kind(ErrorKind::Config)?
     {
         return Err(app_error(ErrorKind::Config, "removal cancelled"));
     }
 
+    let previous_default = config.default.clone();
     config.servers.remove(&args.name);
     if config.default.as_deref() == Some(args.name.as_str()) {
         config.default = config.servers.keys().next().cloned();
     }
 
     save_config_if_unchanged(config_path, config, revision).with_error_kind(ErrorKind::Config)?;
+    let default_change = DefaultChange::between("server", previous_default, config.default.clone());
     let mut cleanup_error = None;
     for (purpose, credential, user) in stored_credentials(&server) {
         if let Err(err) = credentials.delete_password_for(purpose, &credential, &user) {
@@ -353,19 +410,32 @@ where
         }
     }
     if let Some(err) = cleanup_error {
-        return Err(crate::error::classified_error(ErrorKind::Auth, err));
+        return Err(credential_cleanup_error(
+            err,
+            "removed",
+            &args.name,
+            None,
+            default_change,
+        ));
     }
 
     if args.json {
-        let output = json!({
+        let mut output = json!({
             "ok": true,
             "action": "removed",
             "server": args.name,
         });
+        if let Some(change) = default_change {
+            output["default_change"] = serde_json::to_value(change.redacted())?;
+        }
         return Ok(ok(format!("{}\n", serde_json::to_string(&output)?)));
     }
 
-    Ok(ok(format!("removed {}\n", args.name)))
+    let mut message = format!("removed {}\n", args.name);
+    if let Some(change) = default_change {
+        message.push_str(&change.human_message());
+    }
+    Ok(ok(message))
 }
 
 fn server_outputs(config: &SshwConfig) -> Vec<ServerOutput> {
@@ -384,10 +454,12 @@ fn stored_credentials(server: &ServerConfig) -> Vec<(CredentialPurpose, String, 
         if let AuthConfig::Password { credential } = &account.auth {
             stored.push((CredentialPurpose::Login, credential.clone(), user.clone()));
         }
-        if let Some(privilege) = &account.privilege {
+        if let Some(privilege) = &account.privilege
+            && let Some(credential) = &privilege.credential
+        {
             stored.push((
                 CredentialPurpose::Privilege,
-                privilege.credential.clone(),
+                credential.clone(),
                 privilege.user.clone(),
             ));
         }
@@ -495,7 +567,8 @@ mod tests {
             .privilege = Some(PrivilegeConfig {
             method: PrivilegeMethod::Sudo,
             user: "root".to_string(),
-            credential: "sshw:default:privilege:web".to_string(),
+            credential: Some("sshw:default:privilege:web".to_string()),
+            no_password: false,
         });
         config
     }

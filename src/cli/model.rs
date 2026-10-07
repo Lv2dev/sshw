@@ -285,7 +285,7 @@ pub struct PrivilegeArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum PrivilegeCommand {
-    /// Store privilege escalation metadata and password for a server.
+    /// Store privilege settings; use --no-password for non-interactive sudo.
     Set(PrivilegeSetArgs),
     /// Show privilege metadata without revealing the password.
     Show(PrivilegeShowArgs),
@@ -310,6 +310,10 @@ pub struct PrivilegeSetArgs {
     /// Read the privilege password from stdin instead of a hidden prompt.
     #[arg(long)]
     pub password_stdin: bool,
+    /// Store a sudo target without a password. run --as-root will use sudo -n.
+    /// Cannot be used with --method su or --password-stdin.
+    #[arg(long, conflicts_with = "password_stdin")]
+    pub no_password: bool,
     /// Overwrite an existing privilege configuration without prompting.
     #[arg(long)]
     pub force: bool,
@@ -425,13 +429,15 @@ pub struct ProfileRemoveArgs {
 pub struct AddArgs {
     /// Server name (the alias used by run/put/get/trust).
     pub name: String,
-    /// Hostname or IP address to connect to.
+    /// Hostname or IP address (nonblank, no control characters). Registration
+    /// does not resolve the address or test the connection.
     #[arg(long)]
     pub host: String,
-    /// TCP port of the SSH server (default: 22).
+    /// TCP port of the SSH server, from 1 to 65535 (default: 22).
     #[arg(long, default_value_t = 22)]
     pub port: u16,
-    /// Remote username to log in as.
+    /// Remote username to register and make the default login account. Use
+    /// `account add` to add an account while keeping the current default.
     #[arg(long)]
     pub user: String,
     /// Authentication method (default: password).
@@ -505,7 +511,7 @@ pub struct RunArgs {
     /// Grammar: `[server] <command>`. With one value it is the command and the
     /// default server is used; with two, the first is the server name. Quote
     /// the command so it stays one argument.
-    #[arg(value_name = "TARGET", num_args = 1..=2)]
+    #[arg(value_name = "TARGET", num_args = 1..=2, required = true)]
     pub target: Vec<String>,
     /// Use this registered login account instead of the server default.
     #[arg(long, value_name = "USER")]
@@ -541,7 +547,7 @@ pub struct PutArgs {
     /// Grammar: `[server] <local> <remote>`. With two values the default server
     /// is used; with three, the first is the server name. In Git Bash/MSYS,
     /// write an absolute remote path as `remote:/path` to prevent conversion.
-    #[arg(value_name = "TARGET", num_args = 2..=3)]
+    #[arg(value_name = "TARGET", num_args = 2..=3, required = true)]
     pub target: Vec<String>,
     /// Use this registered login account instead of the server default.
     #[arg(long, value_name = "USER")]
@@ -578,7 +584,7 @@ pub struct GetArgs {
     /// Grammar: `[server] <remote> <local>`. With two values the default server
     /// is used; with three, the first is the server name. In Git Bash/MSYS,
     /// write an absolute remote path as `remote:/path` to prevent conversion.
-    #[arg(value_name = "TARGET", num_args = 2..=3)]
+    #[arg(value_name = "TARGET", num_args = 2..=3, required = true)]
     pub target: Vec<String>,
     /// Use this registered login account instead of the server default.
     #[arg(long, value_name = "USER")]

@@ -5,13 +5,13 @@ use super::{
     AuthArg, CommandOutput, Prompter, get_server, ok,
 };
 use crate::config::{
-    AccountConfig, AuthConfig, ConfigRevision, PrivilegeMethod, SshwConfig,
-    save_config_if_unchanged, validate_account_user,
+    AccountConfig, AuthConfig, ConfigRevision, SshwConfig, save_config_if_unchanged,
+    validate_account_user,
 };
 use crate::credentials::CredentialStore;
-use crate::error::{ResultErrorKindExt, app_error, classified_error};
+use crate::error::{ResultErrorKindExt, app_error, credential_cleanup_error};
 use crate::home::{CredentialNamespace, CredentialPurpose, validate_server_name};
-use crate::output::ErrorKind;
+use crate::output::{ErrorKind, redact_secrets};
 use serde_json::{Value, json};
 use std::path::Path;
 
@@ -31,11 +31,16 @@ where
     validate_server_name(&args.name).with_error_kind(ErrorKind::Config)?;
     validate_account_user(&args.user).with_error_kind(ErrorKind::Config)?;
     let previous = get_server(config, &args.name)?.account(&args.user).cloned();
+    super::check_registration_auth(args.auth, args.password_stdin)?;
     if previous.is_some()
         && !args.force
         && !prompter
             .confirm_with_option(
-                &format!("update account '{}/{}'? [y/N] ", args.name, args.user),
+                &format!(
+                    "update account '{}/{}'? [y/N] ",
+                    super::hints::redacted_argument(&args.name),
+                    super::hints::redacted_argument(&args.user)
+                ),
                 "--force",
             )
             .with_error_kind(ErrorKind::Config)?
@@ -43,6 +48,7 @@ where
         return Err(app_error(ErrorKind::Config, "account update cancelled"));
     }
 
+    let before = config.clone();
     let mut new_password_credential = None;
     let auth = match args.auth {
         AuthArg::Password => {
@@ -67,15 +73,7 @@ where
             new_password_credential = Some(credential.clone());
             AuthConfig::Password { credential }
         }
-        AuthArg::Agent => {
-            if args.password_stdin {
-                return Err(app_error(
-                    ErrorKind::Config,
-                    "--password-stdin cannot be used with --auth agent",
-                ));
-            }
-            AuthConfig::Agent
-        }
+        AuthArg::Agent => AuthConfig::Agent,
     };
 
     let account = AccountConfig {
@@ -91,8 +89,10 @@ where
         .accounts
         .insert(args.user.clone(), account);
 
-    if let Err(err) =
-        save_config_if_unchanged(config_path, config, revision).with_error_kind(ErrorKind::Config)
+    let changed = matches!(args.auth, AuthArg::Password) || *config != before;
+    if changed
+        && let Err(err) = save_config_if_unchanged(config_path, config, revision)
+            .with_error_kind(ErrorKind::Config)
     {
         if !crate::storage::write_was_published(&err)
             && let Some(credential) = new_password_credential.as_ref()
@@ -111,7 +111,9 @@ where
         {
             credentials
                 .delete_password_for(CredentialPurpose::Login, credential, &args.user)
-                .with_error_kind(ErrorKind::Auth)?;
+                .map_err(|err| {
+                    credential_cleanup_error(err, "updated", &args.name, Some(&args.user), None)
+                })?;
         }
     }
 
@@ -131,6 +133,8 @@ where
             "action": action,
             "server": args.name,
             "user": args.user,
+            "changed": changed,
+            "change": if changed { action } else { "unchanged" },
         });
         if let (Some(map), Some(warning)) = (output.as_object_mut(), warning) {
             map.insert("warning".to_string(), Value::String(warning.to_string()));
@@ -138,7 +142,11 @@ where
         return Ok(ok(format!("{}\n", serde_json::to_string(&output)?)));
     }
 
-    let mut message = format!("account {action} {}/{}\n", args.name, args.user);
+    let mut message = if changed {
+        format!("account {action} {}/{}\n", args.name, args.user)
+    } else {
+        format!("account {}/{} (unchanged)\n", args.name, args.user)
+    };
     if let Some(warning) = warning {
         message.push_str(&format!("warning: {warning}\n"));
     }
@@ -219,18 +227,27 @@ pub(super) fn default_account(
     if !server.accounts.contains_key(&args.user) {
         return Err(unknown_account(&args.name, &args.user));
     }
-    server.default_user = args.user.clone();
-    save_config_if_unchanged(config_path, config, revision).with_error_kind(ErrorKind::Config)?;
+    let changed = server.default_user != args.user;
+    if changed {
+        server.default_user = args.user.clone();
+        save_config_if_unchanged(config_path, config, revision)
+            .with_error_kind(ErrorKind::Config)?;
+    }
     if args.json {
         return Ok(ok(format!(
             "{}\n",
-            json!({"ok":true,"action":"default","server":args.name,"user":args.user})
+            json!({"ok":true,"action":"default","server":args.name,"user":args.user,"changed":changed,
+                "change":if changed { "updated" } else { "unchanged" }})
         )));
     }
-    Ok(ok(format!(
-        "default account for {} set to {}\n",
-        args.name, args.user
-    )))
+    Ok(ok(if changed {
+        format!("default account for {} set to {}\n", args.name, args.user)
+    } else {
+        format!(
+            "default account for {} already set to {} (unchanged)\n",
+            args.name, args.user
+        )
+    }))
 }
 
 pub(super) fn remove_account<C, P>(
@@ -263,7 +280,8 @@ where
         && !prompter
             .confirm(&format!(
                 "remove account '{}/{}'? [y/N] ",
-                args.name, args.user
+                super::hints::redacted_argument(&args.name),
+                super::hints::redacted_argument(&args.user)
             ))
             .with_error_kind(ErrorKind::Config)?
     {
@@ -286,16 +304,23 @@ where
         cleanup_error = Some(err);
     }
     if let Some(privilege) = &account.privilege
+        && let Some(credential) = &privilege.credential
         && let Err(err) = credentials.delete_password_for(
             CredentialPurpose::Privilege,
-            &privilege.credential,
+            credential,
             &privilege.user,
         )
     {
         cleanup_error.get_or_insert(err);
     }
     if let Some(err) = cleanup_error {
-        return Err(classified_error(ErrorKind::Auth, err));
+        return Err(credential_cleanup_error(
+            err,
+            "removed",
+            &args.name,
+            Some(&args.user),
+            None,
+        ));
     }
 
     if args.json {
@@ -323,6 +348,7 @@ fn account_json(user: &str, account: &AccountConfig, is_default: bool) -> Value 
             "method": privilege.method,
             "user": privilege.user,
             "credential": privilege.credential,
+            "no_password": privilege.no_password,
         })
     });
     json!({
@@ -340,18 +366,42 @@ fn auth_label(auth: &AuthConfig) -> &'static str {
     }
 }
 
-fn privilege_label(account: &AccountConfig) -> &'static str {
-    match account.privilege.as_ref().map(|privilege| privilege.method) {
-        Some(PrivilegeMethod::Sudo) => "sudo",
-        Some(PrivilegeMethod::Su) => "su",
-        None => "none",
-    }
+fn privilege_label(account: &AccountConfig) -> String {
+    let Some(privilege) = &account.privilege else {
+        return "none".into();
+    };
+    let redacted = redact_secrets(&privilege.user);
+    // Hide the assignment too, so final output redaction preserves the
+    // authentication label after a target containing a secret pattern.
+    let target = if redacted != privilege.user {
+        "<redacted>"
+    } else {
+        &redacted
+    };
+    let authentication = if privilege.no_password {
+        "no password"
+    } else {
+        "password"
+    };
+    format!(
+        "{} -> {target} ({authentication})",
+        super::privilege::method_label(privilege.method)
+    )
 }
 
 pub(super) fn unknown_account(server: &str, user: &str) -> anyhow::Error {
+    let target = format!(
+        "{}/{}",
+        super::hints::redacted_argument(server),
+        super::hints::redacted_argument(user)
+    );
+    let list = super::hints::account_list(server);
+    let add = super::hints::account_add(server, user);
     app_error(
         ErrorKind::Config,
-        format!("unknown account '{server}/{user}'"),
+        format!(
+            "unknown account '{target}'\nnext: using the same home/profile selection, run `{list}` to see registered login accounts. Account selection requires a registered login account; it does not override the SSH username\nif a new login is needed, register it first with `{add}`. Password auth is the default; insert --auth agent before -- to use SSH-agent auth, or --password-stdin before -- for redirected password input. Never put passwords in arguments"
+        ),
     )
 }
 

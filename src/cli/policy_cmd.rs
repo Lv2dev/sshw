@@ -1,14 +1,17 @@
 //! Policy management and local execution checks; never connects to SSH.
 use super::{
-    CommandOutput, ExecContext, build_sandbox, get_server, load_active_config, ok, select_account,
+    CommandOutput, ExecContext, get_server, load_active_config, ok, sandbox_from_policy,
+    select_account,
 };
 use crate::error::{ResultErrorKindExt, app_error};
 use crate::output::{ErrorKind, redact_secrets};
-use crate::policy::{AccountRule, PolicyFile, load_policy_with_revision, save_policy_if_unchanged};
-use crate::safety::{SafetyDecision, classify_command};
-use crate::sandbox::SandboxDecision;
+use crate::policy::{
+    AccountRule, Policy, PolicyExplanation, PolicyFile, load_policy_with_revision, resolve_policy,
+    save_policy_if_unchanged,
+};
 use clap::{Args, Subcommand};
 use serde_json::json;
+use std::collections::BTreeMap;
 
 #[derive(Debug, Args)]
 pub struct PolicyArgs {
@@ -25,9 +28,10 @@ pub enum PolicyCommand {
     Init,
     /// Show the active home's policy and how command rules are interpreted.
     Show,
-    /// Enable the configured allowlist. Empty lists deny operations.
+    /// Enable the saved allowlist. Empty lists deny operations.
     Enable,
-    /// Disable allowlist enforcement (safety checks still apply).
+    /// Disable the saved allowlist; --policy still forces enforcement.
+    /// Safety checks still apply.
     Disable,
     /// Add an allowlist entry. This does not enable the policy automatically.
     Allow(PolicyRuleArgs),
@@ -44,7 +48,7 @@ pub enum PolicyCommand {
 #[derive(Debug, Args)]
 pub struct PolicyTransferCheckArgs {
     /// Same target order as put/get: [server] <source> <destination>.
-    #[arg(value_name = "TARGET", num_args = 2..=3)]
+    #[arg(value_name = "TARGET", num_args = 2..=3, required = true)]
     pub target: Vec<String>,
     /// Registered login account (default: server default).
     #[arg(long)]
@@ -77,10 +81,10 @@ pub enum PolicyRule {
 
 #[derive(Debug, Args)]
 pub struct PolicyCheckArgs {
-    /// Registered server name.
-    pub name: String,
-    /// Entire remote command, quoted as one argument.
-    pub command: String,
+    /// Same target order as run: [server] <command>. With one value, use the
+    /// default server. Quote the entire remote command as one argument.
+    #[arg(value_name = "TARGET", num_args = 1..=2, required = true)]
+    pub target: Vec<String>,
     /// Registered login account (default: server default).
     #[arg(long)]
     pub user: Option<String>,
@@ -143,6 +147,7 @@ pub(super) fn run_policy(args: PolicyArgs, ctx: &ExecContext<'_>) -> anyhow::Res
         }
         let present = existing.is_some();
         let mut file = existing.unwrap_or_default();
+        let before = file.clone();
         match &args.command {
             PolicyCommand::Enable => file.enabled = true,
             PolicyCommand::Disable => file.enabled = false,
@@ -152,18 +157,68 @@ pub(super) fn run_policy(args: PolicyArgs, ctx: &ExecContext<'_>) -> anyhow::Res
             }
             _ => {}
         }
-        if mutating {
+        let changed = action == "init" || file != before;
+        let change = match &args.command {
+            PolicyCommand::Init => "created",
+            PolicyCommand::Allow(_) if changed => "added",
+            PolicyCommand::Allow(_) => "already_present",
+            PolicyCommand::Remove(_) if changed => "removed",
+            PolicyCommand::Remove(_) => "not_found",
+            _ if changed => "updated",
+            _ => "unchanged",
+        };
+        if mutating && changed {
             save_policy_if_unchanged(&ctx.home.policy_path, &file, &revision)
                 .with_error_kind(ErrorKind::Policy)?;
         }
+        let file_present = present || mutating;
+        let enforced = file.enabled || ctx.policy_forced;
         let mut value = json!({"ok":true,"action":action,"path":ctx.home.policy_path,
-            "present":present || mutating,"policy":file,"enforced":file.enabled || ctx.policy_forced});
+            "present":file_present,"policy":file,"enforced":enforced,"forced":ctx.policy_forced});
+        if mutating {
+            value["changed"] = json!(changed);
+            value["change"] = json!(change);
+        }
         if args.json {
             redact_json(&mut value);
             return Ok(ok(format!("{value}\n")));
         }
+        let outcome = if mutating {
+            format!("result: {}\n", change.replace('_', " "))
+        } else {
+            String::new()
+        };
+        let saved_enabled = if file_present {
+            file.enabled.to_string()
+        } else {
+            "not configured".to_string()
+        };
+        let reason = if ctx.policy_forced {
+            "forced by --policy"
+        } else if !file_present {
+            "policy file missing"
+        } else if file.enabled {
+            "enabled in policy file"
+        } else {
+            "disabled in policy file"
+        };
+        let mut status = format!(
+            "policy file: {}\nsaved enabled: {saved_enabled}\npolicy enforcement: {} ({reason})\n",
+            if file_present { "present" } else { "missing" },
+            if enforced { "on" } else { "off" }
+        );
+        if !file_present {
+            status.push_str("next: using the same home/profile selection, run `sshw policy init` to create the policy file\n");
+            if ctx.policy_forced {
+                status.push_str(
+                    "--policy requires a policy file; operations fail closed until it exists\n",
+                );
+            }
+        } else if ctx.policy_forced && !file.enabled {
+            status.push_str("next: remove --policy from the invocation to use the saved disabled setting; keep the same home/profile selection\n");
+        }
         Ok(ok(format!(
-            "policy {action}: {}\n{}\nBare program rules allow that program's arguments and subprocesses. Shell metacharacters require an exact full-command rule. Default accounts are implicitly allowed.\nCheck a command: sshw policy check <server> \"<command>\"\n",
+            "policy {action}: {}\n{outcome}{status}{}\nBare program rules allow that program's arguments and subprocesses. Shell metacharacters require an exact full-command rule. Default accounts are implicitly allowed.\nCheck a command: sshw policy check <server> \"<command>\"\n",
             ctx.home.policy_path.display(),
             redact_secrets(&serde_json::to_string_pretty(&file)?)
         )))
@@ -222,6 +277,15 @@ fn change_rule(
     }
     if adding
         && !matches!(rule, PolicyRule::Command { .. })
+        && value.trim().trim_end_matches('/').is_empty()
+    {
+        return Err(app_error(
+            ErrorKind::Policy,
+            "root-only policy paths ('/' or repeated slashes) do not grant access; specify a directory such as '/srv/app' or '/var/log'",
+        ));
+    }
+    if adding
+        && !matches!(rule, PolicyRule::Command { .. })
         && value.split(['/', '\\']).any(|part| part == "..")
     {
         return Err(app_error(
@@ -243,67 +307,77 @@ fn check_run(
     ctx: &ExecContext<'_>,
 ) -> anyhow::Result<CommandOutput> {
     let config = load_active_config(ctx.home)?;
-    let server = get_server(&config, &args.name)?;
-    let (user, account) = select_account(&args.name, server, args.user.as_deref())?;
-    let sandbox = build_sandbox(&ctx.home.policy_path, ctx.policy_forced)?;
-    let mut reasons = Vec::new();
-    let mut exit_code = 0;
-    if let SafetyDecision::Block { reason } = classify_command(&args.command, args.yes) {
-        reasons.push(reason);
-        exit_code = ErrorKind::Safety.exit_code();
-    }
-    for decision in [
-        sandbox.check_command(&args.command),
-        sandbox.check_account(&args.name, user, user == server.default_user),
-    ] {
-        if let SandboxDecision::Deny { reason } = decision {
-            reasons.push(reason);
-            if exit_code == 0 {
-                exit_code = ErrorKind::Policy.exit_code();
+    // Match run's loading and target-resolution order before evaluating checks.
+    let policy = resolve_policy(&ctx.home.policy_path, ctx.policy_forced)
+        .with_error_kind(ErrorKind::Policy)?;
+    let sandbox = sandbox_from_policy(policy.clone());
+    let (name, command) = super::resolve_run_target(args.target, &config)?;
+    let mut errors = Vec::new();
+    let checked = super::check_run_access(
+        &name,
+        &command,
+        args.user.as_deref(),
+        args.yes,
+        sandbox.as_ref(),
+        &config,
+        |error| {
+            errors.push(error);
+            Ok(())
+        },
+    );
+    match checked {
+        Ok((_, user, account)) => {
+            if let Err(error) =
+                super::check_run_privilege(&name, user, account, args.as_root, args.no_password)
+            {
+                errors.push(error);
             }
         }
+        // Preserve the error envelope when account resolution is the first
+        // failure; an earlier safety/policy denial remains the primary result.
+        Err(error) if errors.is_empty() => return Err(error),
+        Err(error) => errors.push(error),
     }
-    if args.as_root && !args.no_password && account.privilege.is_none() {
-        reasons.push(format!(
-            "privilege is not configured; run 'sshw privilege set {} --account {}'",
-            args.name, user
-        ));
-        if exit_code == 0 {
-            exit_code = ErrorKind::Config.exit_code();
-        }
-    }
-    if args.no_password
-        && account
-            .privilege
-            .as_ref()
-            .is_some_and(|p| p.method != crate::config::PrivilegeMethod::Sudo)
-    {
-        reasons.push(
-            "--no-password requires a sudo privilege path; this account is configured for su"
-                .to_string(),
-        );
-        if exit_code == 0 {
-            exit_code = ErrorKind::Config.exit_code();
-        }
-    }
+    let exit_code = errors
+        .first()
+        .map(|error| crate::output::classify_error(error).exit_code())
+        .unwrap_or(0);
+    let reasons: Vec<_> = errors
+        .iter()
+        .map(|error| redact_secrets(&error.to_string()))
+        .collect();
+    let user = args
+        .user
+        .as_deref()
+        .or_else(|| {
+            config
+                .servers
+                .get(&name)
+                .map(|server| server.default_user.as_str())
+        })
+        .unwrap_or("unresolved");
     let mut value = json!({"ok":true,"allowed":reasons.is_empty(),"home":ctx.home.root,
-        "home_source":ctx.home.description,"server":args.name,"user":user,"reasons":reasons,
+        "home_source":ctx.home.description,"server":name,"user":user,"reasons":reasons,
         "connection_tested":false,"credentials_checked":false});
+    let mut checks = BTreeMap::from([("command", policy.explain_command(&command))]);
+    add_account_explanation(&mut checks, &policy, &config, &name, Some(user));
+    value["policy"] = policy_report(ctx, &policy, checks);
     redact_json(&mut value);
     let stdout = if json_output {
         format!("{value}\n")
     } else {
         format!(
-            "home: {}\nserver/account: {}/{}\nlocal checks: {}\n{}\nSSH and credentials were not tested.\n",
+            "home: {}\nserver/account: {}/{}\nlocal checks: {}\n{}\n{}SSH and credentials were not tested.\n",
             ctx.home.root.display(),
-            args.name,
+            name,
             user,
             if reasons.is_empty() {
                 "allowed"
             } else {
                 "blocked"
             },
-            redact_secrets(&reasons.join("\n"))
+            redact_secrets(&reasons.join("\n")),
+            human_policy_report(&value["policy"])
         )
     };
     Ok(CommandOutput {
@@ -327,7 +401,9 @@ fn check_transfer(
         ));
     }
     let config = load_active_config(ctx.home)?;
-    let sandbox = build_sandbox(&ctx.home.policy_path, ctx.policy_forced)?;
+    let policy = resolve_policy(&ctx.home.policy_path, ctx.policy_forced)
+        .with_error_kind(ErrorKind::Policy)?;
+    let sandbox = sandbox_from_policy(policy.clone());
     let (name, local, remote) = if upload {
         transfer::resolve_put_target(args.target, &config)?
     } else {
@@ -372,7 +448,7 @@ fn check_transfer(
         if upload {
             // Readability at this instant, without reading contents. Actual
             // transfer still opens and checks its own retained file handle.
-            crate::ssh::ssh2_client::open_regular_local_file(&local)?;
+            transfer::check_put_source(&local)?;
         }
         Ok(())
     });
@@ -385,19 +461,38 @@ fn check_transfer(
             return Err(error);
         }
         exit_code = kind.exit_code();
-        reasons.push(redact_secrets(&format!("{error:#}")));
+        let diagnostic = crate::output::ErrorResponse::from_error(&error);
+        let mut reason = diagnostic.error.message;
+        // Each cause is already redacted and consecutive wrapper duplicates
+        // are removed. A path diagnostic may also include its OS cause inline.
+        for cause in diagnostic.error.causes {
+            if !reason.ends_with(&format!(": {cause}")) {
+                reason.push_str(": ");
+                reason.push_str(&cause);
+            }
+        }
+        reasons.push(reason);
     }
     let operation = if upload { "put" } else { "get" };
     let mut value = json!({"ok":true,"allowed":reasons.is_empty(),"operation":operation,
         "server":name,"user":user,"local":local,"remote":remote.value,"reasons":reasons,
         "access_allowed":access_allowed,"local_file_checked":local_file_checked,"local_file_ready":local_file_ready,
         "connection_tested":false,"credentials_checked":false,"remote_permissions_checked":false});
+    let mut checks = BTreeMap::from([(operation, policy.explain_path(&remote.value, upload))]);
+    if upload
+        && args.atomic
+        && let Ok(parent) = crate::ssh::atomic_upload::parent_path(&remote.value)
+    {
+        checks.insert("atomic_parent", policy.explain_path(parent, true));
+    }
+    add_account_explanation(&mut checks, &policy, &config, &name, user);
+    value["policy"] = policy_report(ctx, &policy, checks);
     redact_json(&mut value);
     let stdout = if json_output {
         format!("{value}\n")
     } else {
         redact_secrets(&format!(
-            "operation: {operation}\nserver/account: {name}/{}\nlocal: {}\nremote: {}\nlocal checks: {}\n{}\nSSH, credentials and remote filesystem permissions were not tested. Local readiness is a point-in-time check. --yes confirms a local guardrail; it does not grant remote write permission.\n",
+            "operation: {operation}\nserver/account: {name}/{}\nlocal: {}\nremote: {}\nlocal checks: {}\n{}\n{}SSH, credentials and remote filesystem permissions were not tested. Local readiness is a point-in-time check. --yes confirms a local guardrail; it does not grant remote write permission.\n",
             user.unwrap_or("unresolved"),
             local.display(),
             remote.value,
@@ -406,7 +501,8 @@ fn check_transfer(
             } else {
                 "blocked"
             },
-            reasons.join("\n")
+            reasons.join("\n"),
+            human_policy_report(&value["policy"])
         ))
     };
     Ok(CommandOutput {
@@ -414,6 +510,72 @@ fn check_transfer(
         stderr: String::new(),
         exit_code,
     })
+}
+
+fn add_account_explanation(
+    checks: &mut BTreeMap<&'static str, PolicyExplanation>,
+    policy: &Policy,
+    config: &super::SshwConfig,
+    name: &str,
+    user: Option<&str>,
+) {
+    if let Some(server) = config.servers.get(name)
+        && let Some(user) = user
+        && server.accounts.contains_key(user)
+    {
+        checks.insert(
+            "account",
+            policy.explain_account(name, user, user == server.default_user),
+        );
+    }
+}
+
+fn policy_report(
+    ctx: &ExecContext<'_>,
+    policy: &Policy,
+    checks: BTreeMap<&'static str, PolicyExplanation>,
+) -> serde_json::Value {
+    json!({"path":ctx.home.policy_path,"enforced":matches!(policy, Policy::Enabled(_)),
+        "forced":ctx.policy_forced,"checks":checks})
+}
+
+fn human_policy_report(value: &serde_json::Value) -> String {
+    let state = if value["forced"] == true {
+        "enforced by --policy"
+    } else if value["enforced"] == true {
+        "enabled"
+    } else {
+        "disabled"
+    };
+    let mut text = format!(
+        "policy: {state}\npolicy path: {}\n",
+        value["path"].as_str().unwrap_or("")
+    );
+    if let Some(checks) = value["checks"].as_object() {
+        for (name, decision) in checks {
+            let detail = match decision["reason"].as_str().unwrap_or("") {
+                "matched_rule" => format!(
+                    "allowed by {} rule '{}'",
+                    decision["match_type"].as_str().unwrap_or(""),
+                    decision["matched_rule"].as_str().unwrap_or("")
+                ),
+                "policy_disabled" => "allowed because policy disabled".to_string(),
+                "default_account" => "allowed as the default account".to_string(),
+                "exact_command_required" => {
+                    "blocked: shell syntax requires an exact full-command rule".to_string()
+                }
+                "parent_traversal" => {
+                    "blocked: parent traversal ('..') cannot match a path rule".to_string()
+                }
+                _ => "blocked: no matching rule".to_string(),
+            };
+            text.push_str(&format!("policy {name}: {detail}\n"));
+        }
+    }
+    text.push_str(
+        "Policy decisions are separate from safety, account existence and local file checks.\n",
+    );
+    redact_secrets(&text)
 }
 
 fn redact_json(value: &mut serde_json::Value) {

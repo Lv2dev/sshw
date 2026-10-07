@@ -65,6 +65,182 @@ fn add(home: &Path) {
 }
 
 #[test]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn password_prompt_without_terminal_explains_recovery_and_preserves_os_cause() {
+    let home = home();
+    add(home.path());
+    let path = home.path().join("servers.json");
+    let before = std::fs::read(&path).unwrap();
+    for args in [
+        vec!["add", "new", "--host", "192.0.2.11", "--user", "deploy"],
+        vec!["account", "add", "web", "operator"],
+        vec![
+            "privilege",
+            "set",
+            "web",
+            "--method",
+            "sudo",
+            "--user",
+            "service",
+        ],
+    ] {
+        for json in [false, true] {
+            #[cfg(target_os = "windows")]
+            let mut command = {
+                use std::os::windows::process::CommandExt;
+                let mut command = Command::new(env!("CARGO_BIN_EXE_sshw"));
+                command.creation_flags(0x00000008); // DETACHED_PROCESS: no controlling console.
+                command
+            };
+            #[cfg(target_os = "linux")]
+            let mut command = {
+                let mut command = Command::new("setsid");
+                command.arg("--wait").arg(env!("CARGO_BIN_EXE_sshw"));
+                command
+            };
+            command
+                .env("SSHW_HOME", home.path())
+                .env_remove("SSHW_PASSWORD")
+                .env_remove("SSHW_PRIVILEGE_PASSWORD")
+                .args(&args)
+                .stdin(Stdio::null());
+            if json {
+                command.arg("--json");
+            }
+            let output = command.output().unwrap();
+            assert_eq!(output.status.code(), Some(4), "{args:?}: {output:?}");
+            let rendered = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                rendered.contains("interactive terminal")
+                    && rendered.contains("--password-stdin")
+                    && rendered.contains("secret manager"),
+                "{rendered}"
+            );
+            assert!(
+                rendered.contains("os error"),
+                "original I/O cause was lost: {rendered}"
+            );
+            if json {
+                assert!(output.stderr.is_empty());
+                let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(value["error"]["kind"], "auth");
+            } else {
+                assert!(output.stdout.is_empty());
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+    }
+}
+
+#[test]
+fn missing_operation_targets_fail_during_parsing_without_state_writes() {
+    let home = home();
+    let untouched_home = home.path().join("not-created");
+    // Parsing must take precedence even over broken runtime state.
+    std::fs::write(home.path().join("servers.json"), "{").unwrap();
+    std::fs::write(home.path().join("policy.json"), "{").unwrap();
+    for command in [
+        vec!["run"],
+        vec!["put"],
+        vec!["get"],
+        vec!["policy", "check"],
+        vec!["policy", "check-put"],
+        vec!["policy", "check-get"],
+    ] {
+        for json in [false, true] {
+            let mut args = command.clone();
+            if json {
+                args.push("--json");
+            }
+            let fresh = run(&untouched_home, &args, "");
+            assert_eq!(fresh.status.code(), Some(9), "{args:?}: {fresh:?}");
+            assert!(
+                !untouched_home.exists(),
+                "invalid arguments must not create a home"
+            );
+            let output = run(home.path(), &args, "");
+            assert_eq!(output.status.code(), Some(9), "{args:?}: {output:?}");
+            if json {
+                assert!(output.stderr.is_empty());
+                let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(value["error"]["kind"], "usage");
+                assert!(
+                    value["error"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("TARGET")
+                );
+            } else {
+                assert!(output.stdout.is_empty());
+                assert!(String::from_utf8(output.stderr).unwrap().contains("TARGET"));
+            }
+        }
+    }
+    assert!(!home.path().join("audit.jsonl").exists());
+    assert!(!home.path().join(".sshw.lock").exists());
+    assert_eq!(
+        std::fs::read_to_string(home.path().join("servers.json")).unwrap(),
+        "{"
+    );
+}
+
+#[test]
+fn json_usage_preserves_required_arguments_suggestions_and_value_guidance() {
+    let home = home();
+    for (args, expected) in [
+        (
+            vec!["add", "web", "--json"],
+            vec!["--host <HOST>", "--user <USER>"],
+        ),
+        (
+            vec!["put", "web", "local", "remote", "--atmoic", "--json"],
+            vec!["--atmoic", "--atomic"],
+        ),
+        (
+            vec![
+                "add",
+                "web",
+                "--host",
+                "localhost",
+                "--user",
+                "deploy",
+                "--auth",
+                "agnet",
+                "--json",
+            ],
+            vec!["agnet", "agent", "password"],
+        ),
+        (
+            vec!["put", "local", "remote", "--mode", "999", "--json"],
+            vec!["999", "use octal permissions"],
+        ),
+        (
+            vec!["run", "uptime", "--stream", "--json"],
+            vec!["--stream", "--json"],
+        ),
+    ] {
+        let output = run(home.path(), &args, "");
+        assert_eq!(output.status.code(), Some(9));
+        assert!(output.stderr.is_empty());
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["ok"], false);
+        assert_eq!(value["error"]["kind"], "usage");
+        assert_eq!(value["error"]["exit_code"], 9);
+        let message = value["error"]["message"].as_str().unwrap();
+        for expected in expected {
+            assert!(message.contains(expected), "{args:?}: {message}");
+        }
+        assert!(!message.contains("Usage:"), "{message}");
+        assert!(!message.contains("For more information"), "{message}");
+    }
+    assert!(!home.path().join("audit.jsonl").exists());
+}
+
+#[test]
 fn upload_diagnostics_reject_missing_files_and_directories_locally() {
     let home = home();
     add(home.path());
@@ -137,6 +313,139 @@ fn transfer_preflight_and_execution_choose_the_same_first_failure() {
             );
         }
     }
+}
+
+#[test]
+fn download_directory_is_rejected_with_a_file_path_hint_before_ssh() {
+    let home = home();
+    add(home.path());
+    let directory = home.path().join("destination");
+    std::fs::create_dir(&directory).unwrap();
+    for yes in [false, true] {
+        for check in [false, true] {
+            for json in [false, true] {
+                let mut args = if check {
+                    vec!["policy", "check-get"]
+                } else {
+                    vec!["get"]
+                };
+                args.extend(["web", "/tmp/source", directory.to_str().unwrap()]);
+                if yes {
+                    args.push("--yes");
+                }
+                if json {
+                    args.push("--json");
+                }
+                let output = run(home.path(), &args, "");
+                assert_eq!(output.status.code(), Some(6), "{args:?}: {output:?}");
+                let message = if json {
+                    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+                    if check {
+                        assert_eq!(value["allowed"], false);
+                        assert_eq!(value["connection_tested"], false);
+                        value["reasons"][0].as_str().unwrap().to_string()
+                    } else {
+                        assert_eq!(value["error"]["kind"], "io");
+                        value["error"]["message"].as_str().unwrap().to_string()
+                    }
+                } else {
+                    String::from_utf8(if check { output.stdout } else { output.stderr }).unwrap()
+                };
+                assert!(message.contains("is a directory"), "{message}");
+                assert!(message.contains("specify a file path"), "{message}");
+                assert!(message.contains(directory.to_str().unwrap()), "{message}");
+                assert!(!message.contains("pass --yes to overwrite"), "{message}");
+            }
+        }
+    }
+    assert!(directory.is_dir());
+    assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
+}
+
+#[test]
+fn download_invalid_parent_reports_local_path_and_one_copy_of_each_cause() {
+    let home = home();
+    add(home.path());
+    let parent = home.path().join("parent-file");
+    std::fs::write(&parent, "original").unwrap();
+    let destination = parent.join("file.txt");
+    let mut messages = Vec::new();
+    for check in [true, false] {
+        let mut args = if check {
+            vec!["policy", "check-get"]
+        } else {
+            vec!["get"]
+        };
+        args.extend([
+            "web",
+            "/tmp/source",
+            destination.to_str().unwrap(),
+            "--yes",
+            "--json",
+        ]);
+        let output = run(home.path(), &args, "");
+        assert_eq!(output.status.code(), Some(6), "{args:?}: {output:?}");
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let message = if check {
+            &value["reasons"][0]
+        } else {
+            &value["error"]["message"]
+        };
+        let message = message.as_str().unwrap();
+        assert!(message.contains("local download"), "{message}");
+        assert!(message.contains(destination.to_str().unwrap()), "{message}");
+        assert_eq!(
+            message.matches("(os error").count(),
+            usize::from(message.contains("(os error")),
+            "{message}"
+        );
+        messages.push(message.to_string());
+    }
+    assert_eq!(messages[0], messages[1]);
+    let human = run(
+        home.path(),
+        &[
+            "get",
+            "web",
+            "/tmp/source",
+            destination.to_str().unwrap(),
+            "--yes",
+        ],
+        "",
+    );
+    assert_eq!(human.status.code(), Some(6));
+    assert!(
+        String::from_utf8(human.stderr)
+            .unwrap()
+            .contains(&messages[0])
+    );
+    assert_eq!(std::fs::read_to_string(parent).unwrap(), "original");
+}
+
+#[test]
+fn download_preflight_accepts_missing_relative_parents_without_creating_them() {
+    let home = home();
+    add(home.path());
+    let output = Command::new(env!("CARGO_BIN_EXE_sshw"))
+        .current_dir(home.path())
+        .env("SSHW_HOME", home.path())
+        .env_remove("SSHW_PASSWORD")
+        .env_remove("SSHW_PRIVILEGE_PASSWORD")
+        .args([
+            "policy",
+            "check-get",
+            "web",
+            "/tmp/source",
+            "missing/nested/file",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["allowed"], true);
+    assert_eq!(value["local_file_ready"], Value::Null);
+    assert!(!home.path().join("missing").exists());
 }
 
 #[test]
@@ -385,6 +694,48 @@ fn same_endpoint_update_preserves_other_accounts_and_privilege() {
 }
 
 #[test]
+fn passwordless_privilege_cli_needs_no_stdin_and_rejects_conflicting_options() {
+    let home = home();
+    add(home.path());
+    let path = home.path().join("servers.json");
+    let initial = std::fs::read(&path).unwrap();
+    for flags in [vec!["--method", "su"], vec!["--password-stdin"]] {
+        let mut args = vec!["privilege", "set", "web", "--no-password", "--json"];
+        args.extend(flags);
+        let output = run(home.path(), &args, "");
+        assert_eq!(output.status.code(), Some(9));
+        assert_eq!(std::fs::read(&path).unwrap(), initial);
+    }
+    let output = successful(
+        home.path(),
+        &[
+            "privilege",
+            "set",
+            "web",
+            "--user",
+            "service",
+            "--no-password",
+            "--json",
+        ],
+        "",
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["no_password"], true);
+    assert!(
+        value.get("warning").is_none(),
+        "passwordless settings need no password environment variable"
+    );
+    assert!(value["credential"].is_null());
+    let stored: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert!(
+        stored["servers"]["web"]["accounts"]["deploy"]["privilege"]
+            .get("credential")
+            .is_none()
+    );
+    successful(home.path(), &["privilege", "clear", "web", "--yes"], "");
+}
+
+#[test]
 fn endpoint_change_requires_explicit_replacement_before_mutation() {
     let home = home();
     add(home.path());
@@ -578,6 +929,311 @@ fn policy_mutation_rejects_corruption_and_preserves_existing_file() {
 }
 
 #[test]
+fn policy_checks_explain_matching_rules_disabled_state_and_shell_syntax() {
+    let home = home();
+    add(home.path());
+    successful(home.path(), &["policy", "init"], "");
+    successful(home.path(), &["policy", "allow", "command", "whoami"], "");
+    successful(home.path(), &["policy", "allow", "command", "who*"], "");
+    successful(home.path(), &["policy", "enable"], "");
+    let check = |command: &str, forced: bool| {
+        let mut args = vec!["policy", "check", "web", command, "--json"];
+        if forced {
+            args.push("--policy");
+        }
+        let output = run(home.path(), &args, "");
+        (
+            output.status.code(),
+            serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+        )
+    };
+    let (_, value) = check("whoami", false);
+    assert_eq!(
+        value["policy"]["checks"]["command"]["match_type"],
+        "program"
+    );
+    assert_eq!(
+        value["policy"]["checks"]["account"]["reason"],
+        "default_account"
+    );
+    successful(home.path(), &["policy", "remove", "command", "whoami"], "");
+    let (_, value) = check("whoami", false);
+    assert_eq!(value["allowed"], true);
+    assert_eq!(value["reasons"], json!([]));
+    assert_eq!(value["policy"]["checks"]["command"]["matched_rule"], "who*");
+    assert_eq!(value["policy"]["checks"]["command"]["match_type"], "prefix");
+    let (status, value) = check("whoami; echo done", false);
+    assert_eq!(status, Some(7));
+    assert_eq!(
+        value["policy"]["checks"]["command"]["reason"],
+        "exact_command_required"
+    );
+    successful(
+        home.path(),
+        &["policy", "allow", "command", "whoami; echo done"],
+        "",
+    );
+    let (_, value) = check("whoami; echo done", false);
+    assert_eq!(value["policy"]["checks"]["command"]["match_type"], "exact");
+    successful(home.path(), &["policy", "disable"], "");
+    let (_, value) = check("date", false);
+    assert_eq!(value["policy"]["enforced"], false);
+    assert_eq!(
+        value["policy"]["checks"]["command"]["reason"],
+        "policy_disabled"
+    );
+    let (status, value) = check("date", true);
+    assert_eq!(status, Some(7));
+    assert_eq!(value["policy"]["enforced"], true);
+    assert_eq!(value["policy"]["forced"], true);
+    assert_eq!(
+        value["policy"]["checks"]["command"]["reason"],
+        "no_matching_rule"
+    );
+    let human = successful(home.path(), &["policy", "check", "web", "date"], "");
+    assert!(
+        String::from_utf8(human.stdout)
+            .unwrap()
+            .contains("policy disabled")
+    );
+}
+
+#[test]
+fn policy_transfer_checks_explain_paths_accounts_and_atomic_parent() {
+    let home = home();
+    add(home.path());
+    successful(
+        home.path(),
+        &["account", "add", "web", "ops", "--auth", "agent"],
+        "",
+    );
+    successful(home.path(), &["policy", "init"], "");
+    successful(
+        home.path(),
+        &["policy", "allow", "account", "web", "ops"],
+        "",
+    );
+    successful(
+        home.path(),
+        &["policy", "allow", "put", "/srv/app/release"],
+        "",
+    );
+    successful(home.path(), &["policy", "allow", "get", "/var/log"], "");
+    successful(home.path(), &["policy", "enable"], "");
+    let local = home.path().join("upload");
+    std::fs::write(&local, "fixture").unwrap();
+    let output = run(
+        home.path(),
+        &[
+            "policy",
+            "check-put",
+            "web",
+            local.to_str().unwrap(),
+            "remote:/srv/app/release",
+            "--atomic",
+            "--yes",
+            "--user",
+            "ops",
+            "--json",
+        ],
+        "",
+    );
+    assert_eq!(output.status.code(), Some(7));
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        value["policy"]["checks"]["put"]["matched_rule"],
+        "/srv/app/release"
+    );
+    assert_eq!(value["policy"]["checks"]["atomic_parent"]["allowed"], false);
+    assert_eq!(
+        value["policy"]["checks"]["account"]["match_type"],
+        "account"
+    );
+    assert_eq!(value["local_file_checked"], false);
+    let destination = home.path().join("download");
+    let output = successful(
+        home.path(),
+        &[
+            "policy",
+            "check-get",
+            "web",
+            "remote:/var/log/app",
+            destination.to_str().unwrap(),
+            "--json",
+        ],
+        "",
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["policy"]["checks"]["get"]["matched_rule"], "/var/log");
+    assert_eq!(value["policy"]["checks"]["get"]["match_type"], "path");
+    assert!(!destination.exists());
+}
+
+#[test]
+fn policy_mutations_report_changes_and_preserve_no_op_files() {
+    let home = home();
+    add(home.path());
+    let path = home.path().join("policy.json");
+    let legacy = "{ \"enabled\": false, \"allow_commands\": [\"id\"] }\n";
+    std::fs::write(&path, legacy).unwrap();
+    for (args, change) in [
+        (
+            vec!["policy", "allow", "command", "id", "--json"],
+            "already_present",
+        ),
+        (
+            vec!["policy", "remove", "command", "idd", "--json"],
+            "not_found",
+        ),
+        (vec!["policy", "disable", "--json"], "unchanged"),
+    ] {
+        let output = successful(home.path(), &args, "");
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["changed"], false);
+        assert_eq!(value["change"], change);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), legacy);
+    }
+    for kind in ["command", "put", "get"] {
+        let entry = if kind == "command" {
+            "uptime"
+        } else {
+            "/srv/app"
+        };
+        for (action, changed, change) in [
+            ("allow", true, "added"),
+            ("allow", false, "already_present"),
+            ("remove", true, "removed"),
+            ("remove", false, "not_found"),
+        ] {
+            let output = successful(home.path(), &["policy", action, kind, entry, "--json"], "");
+            let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(value["changed"], changed);
+            assert_eq!(value["change"], change);
+        }
+    }
+    let output = successful(home.path(), &["policy", "remove", "command", "missing"], "");
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("not found")
+    );
+    let output = successful(home.path(), &["policy", "show", "--json"], "");
+    assert!(
+        serde_json::from_slice::<Value>(&output.stdout)
+            .unwrap()
+            .get("changed")
+            .is_none()
+    );
+}
+
+#[test]
+fn policy_matched_rule_explanations_redact_secrets() {
+    let home = home();
+    add(home.path());
+    let command = "echo token=policy-explanation-fixture";
+    std::fs::write(
+        home.path().join("policy.json"),
+        json!({"version":2,"enabled":true,"allow_commands":[command]}).to_string(),
+    )
+    .unwrap();
+    for json in [false, true] {
+        let mut args = vec!["policy", "check", "web", command];
+        if json {
+            args.push("--json");
+        }
+        let output = successful(home.path(), &args, "");
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(!text.contains("policy-explanation-fixture"));
+        assert!(text.contains("<redacted>"));
+    }
+}
+
+#[test]
+fn policy_explanations_keep_safety_and_traversal_blocks_distinct() {
+    let home = home();
+    add(home.path());
+    std::fs::write(
+        home.path().join("policy.json"),
+        json!({"version":2,"enabled":true,"allow_commands":["rm"],"allow_get_paths":["/var/log"]})
+            .to_string(),
+    )
+    .unwrap();
+    let output = run(
+        home.path(),
+        &["policy", "check", "web", "rm -rf /tmp/fixture", "--json"],
+        "",
+    );
+    assert_eq!(output.status.code(), Some(2));
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["allowed"], false);
+    assert_eq!(value["policy"]["checks"]["command"]["allowed"], true);
+    assert_eq!(value["reasons"].as_array().unwrap().len(), 1);
+    let destination = home.path().join("download");
+    let output = run(
+        home.path(),
+        &[
+            "policy",
+            "check-get",
+            "web",
+            "remote:/var/log/../etc",
+            destination.to_str().unwrap(),
+            "--json",
+        ],
+        "",
+    );
+    assert_eq!(output.status.code(), Some(7));
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        value["policy"]["checks"]["get"]["reason"],
+        "parent_traversal"
+    );
+    assert!(!destination.exists());
+}
+
+#[test]
+fn policy_account_mutations_and_state_changes_report_no_ops() {
+    let home = home();
+    add(home.path());
+    successful(
+        home.path(),
+        &["account", "add", "web", "ops", "--auth", "agent"],
+        "",
+    );
+    let output = successful(home.path(), &["policy", "init", "--json"], "");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()["changed"],
+        true
+    );
+    for (action, changed, change) in [
+        ("allow", true, "added"),
+        ("allow", false, "already_present"),
+        ("remove", true, "removed"),
+        ("remove", false, "not_found"),
+    ] {
+        let output = successful(
+            home.path(),
+            &["policy", action, "account", "web", "ops", "--json"],
+            "",
+        );
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["changed"], changed);
+        assert_eq!(value["change"], change);
+    }
+    for (action, changed) in [
+        ("enable", true),
+        ("enable", false),
+        ("disable", true),
+        ("disable", false),
+    ] {
+        let output = successful(home.path(), &["policy", action, "--json"], "");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&output.stdout).unwrap()["changed"],
+            changed
+        );
+    }
+}
+
+#[test]
 fn policy_checks_all_restrictions_and_validates_account_entries() {
     let home = home();
     add(home.path());
@@ -637,6 +1293,205 @@ fn policy_checks_all_restrictions_and_validates_account_entries() {
             "--yes",
             "--json",
         ],
+        "",
+    );
+}
+
+fn assert_run_check_failure(home: &Path, arguments: &[&str], expected: i32) {
+    let mut execute_args = vec!["run"];
+    execute_args.extend_from_slice(arguments);
+    execute_args.push("--json");
+    let mut check_args = vec!["policy", "check"];
+    check_args.extend_from_slice(arguments);
+    check_args.push("--json");
+    let executed = run(home, &execute_args, "");
+    let checked = run(home, &check_args, "");
+    assert_eq!(
+        executed.status.code(),
+        Some(expected),
+        "{execute_args:?}: {executed:?}"
+    );
+    assert_eq!(
+        checked.status.code(),
+        Some(expected),
+        "{check_args:?}: {checked:?}"
+    );
+    let executed: Value = serde_json::from_slice(&executed.stdout).unwrap();
+    let checked: Value = serde_json::from_slice(&checked.stdout).unwrap();
+    if checked["ok"] == true {
+        assert_eq!(checked["allowed"], false);
+        assert_eq!(
+            checked["reasons"][0], executed["error"]["message"],
+            "{arguments:?}"
+        );
+        assert_eq!(checked["connection_tested"], false);
+        assert_eq!(checked["credentials_checked"], false);
+    } else {
+        assert_eq!(checked["error"], executed["error"], "{arguments:?}");
+    }
+}
+
+#[test]
+fn run_preflight_matches_first_failure_across_combined_local_errors() {
+    let home = home();
+    add(home.path());
+    successful(home.path(), &["default", "web"], "");
+    assert_run_check_failure(home.path(), &["web", "sudo id", "--user", "missing"], 2);
+    assert_run_check_failure(home.path(), &["web", "whoami", "--user", "missing"], 3);
+    assert_run_check_failure(home.path(), &["missing", "sudo id"], 3);
+    assert_run_check_failure(home.path(), &["web", "whoami", "--as-root"], 3);
+    successful(
+        home.path(),
+        &["account", "add", "web", "auditor", "--auth", "agent"],
+        "",
+    );
+    successful(home.path(), &["policy", "init"], "");
+    successful(home.path(), &["policy", "allow", "command", "uptime"], "");
+    successful(home.path(), &["policy", "enable"], "");
+    assert_run_check_failure(home.path(), &["web", "whoami", "--user", "missing"], 7);
+    assert_run_check_failure(home.path(), &["web", "sudo id", "--user", "missing"], 2);
+    assert_run_check_failure(home.path(), &["web", "uptime", "--user", "missing"], 3);
+    assert_run_check_failure(
+        home.path(),
+        &["web", "uptime", "--user", "auditor", "--as-root"],
+        7,
+    );
+    let check = run(
+        home.path(),
+        &[
+            "policy", "check", "web", "sudo id", "--user", "missing", "--json",
+        ],
+        "",
+    );
+    let value: Value = serde_json::from_slice(&check.stdout).unwrap();
+    assert_eq!(value["reasons"].as_array().unwrap().len(), 3);
+    assert!(
+        value["reasons"][2]
+            .as_str()
+            .unwrap()
+            .contains("unknown account")
+    );
+}
+
+#[test]
+fn run_preflight_resolves_default_server_without_credentials_or_writes() {
+    let home = home();
+    successful(
+        home.path(),
+        &[
+            "add",
+            "web",
+            "--host",
+            "127.0.0.1",
+            "--user",
+            "deploy",
+            "--password-stdin",
+        ],
+        "fixture-only\n",
+    );
+    successful(home.path(), &["default", "web"], "");
+    let before_config = std::fs::read(home.path().join("servers.json")).unwrap();
+    let before_audit = std::fs::read(home.path().join("audit.jsonl")).unwrap();
+    let implicit = successful(home.path(), &["policy", "check", "uptime", "--json"], "");
+    let explicit = successful(
+        home.path(),
+        &["policy", "check", "web", "uptime", "--json"],
+        "",
+    );
+    let implicit: Value = serde_json::from_slice(&implicit.stdout).unwrap();
+    let explicit: Value = serde_json::from_slice(&explicit.stdout).unwrap();
+    assert_eq!(implicit, explicit);
+    assert_eq!(implicit["allowed"], true);
+    assert_eq!(implicit["server"], "web");
+    assert_eq!(implicit["user"], "deploy");
+    assert_eq!(implicit["connection_tested"], false);
+    assert_eq!(implicit["credentials_checked"], false);
+    assert_eq!(
+        std::fs::read(home.path().join("servers.json")).unwrap(),
+        before_config
+    );
+    assert_eq!(
+        std::fs::read(home.path().join("audit.jsonl")).unwrap(),
+        before_audit
+    );
+    assert_run_check_failure(home.path(), &["sudo id"], 2);
+    let human = run(home.path(), &["policy", "check", "sudo id"], "");
+    assert_eq!(human.status.code(), Some(2));
+    assert!(
+        String::from_utf8(human.stdout)
+            .unwrap()
+            .contains("web/deploy")
+    );
+}
+
+#[test]
+fn run_preflight_matches_config_policy_loading_and_target_errors() {
+    let home = home();
+    assert_run_check_failure(home.path(), &["uptime"], 3);
+    assert_run_check_failure(home.path(), &["sudo id", "--policy"], 7);
+    add(home.path());
+    std::fs::write(home.path().join("policy.json"), "{").unwrap();
+    assert_run_check_failure(home.path(), &["web", "sudo id", "--user", "missing"], 7);
+    assert_run_check_failure(home.path(), &["missing", "sudo id"], 7);
+    std::fs::write(home.path().join("servers.json"), "{").unwrap();
+    assert_run_check_failure(home.path(), &["web", "sudo id", "--user", "missing"], 3);
+}
+
+#[test]
+fn run_preflight_keeps_privilege_modes_and_checks_metadata_only() {
+    let home = home();
+    add(home.path());
+    successful(home.path(), &["default", "web"], "");
+    let missing = run(
+        home.path(),
+        &["policy", "check", "whoami", "--as-root", "--json"],
+        "",
+    );
+    assert_eq!(missing.status.code(), Some(3));
+    let value: Value = serde_json::from_slice(&missing.stdout).unwrap();
+    assert_eq!(value["ok"], true);
+    assert_eq!(value["allowed"], false);
+    successful(
+        home.path(),
+        &[
+            "policy",
+            "check",
+            "whoami",
+            "--as-root",
+            "--no-password",
+            "--json",
+        ],
+        "",
+    );
+    successful(
+        home.path(),
+        &[
+            "privilege",
+            "set",
+            "web",
+            "--method",
+            "su",
+            "--password-stdin",
+        ],
+        "fixture-only\n",
+    );
+    assert_run_check_failure(home.path(), &["whoami", "--as-root", "--no-password"], 3);
+    successful(
+        home.path(),
+        &[
+            "privilege",
+            "set",
+            "web",
+            "--user",
+            "service",
+            "--no-password",
+            "--force",
+        ],
+        "",
+    );
+    successful(
+        home.path(),
+        &["policy", "check", "whoami", "--as-root", "--json"],
         "",
     );
 }

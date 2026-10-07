@@ -4,6 +4,7 @@ pub mod config;
 pub mod credentials;
 pub mod error;
 pub mod home;
+mod local_command;
 pub mod output;
 pub mod policy;
 pub mod profile;

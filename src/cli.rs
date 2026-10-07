@@ -7,20 +7,20 @@ use crate::config::{
 use crate::credentials::keyring_store::KeyringCredentialStore;
 use crate::credentials::session_store::SessionOnlyStore;
 use crate::credentials::{AuthMaterial, CredentialStore, CredentialStoreHealth};
-use crate::error::{ResultErrorKindExt, app_error};
+use crate::error::{ResultErrorKindExt, app_error, redacted_error_detail};
 use crate::home::{CredentialPurpose, ResolvedHome, builtin_default_home, sshw_base_dir};
 use crate::output::{
     ErrorKind, ErrorResponse, RunOutput, filter_startup_stderr_noise, redact_secrets,
 };
 use crate::policy::{Policy, describe_policy, resolve_policy};
-use crate::profile::{load_registry, resolve_home_with_registry};
+use crate::profile::{load_registry, resolve_home_with_registry, select_home_with_registry};
 use crate::safety::{SafetyDecision, classify_command, command_program};
 use crate::sandbox::{NoopSandbox, PolicyOnlySandbox, Sandbox, SandboxDecision};
+use crate::ssh::known_hosts::LocalKnownHosts;
 use crate::ssh::ssh2_client::{
     Ssh2Client, runtime_library_versions, su_begin_marker, su_end_prefix,
 };
 use crate::ssh::{SshClient, SshTarget};
-use anyhow::Context;
 use clap::Parser;
 use serde_json::json;
 use std::ffi::OsStr;
@@ -30,6 +30,8 @@ use std::time::Duration;
 use zeroize::Zeroizing;
 
 mod account;
+mod diagnostics;
+mod hints;
 mod model;
 mod policy_cmd;
 mod privilege;
@@ -111,7 +113,7 @@ pub fn run() -> i32 {
         };
         eprintln!(
             "sshw: starting remote operation ({})\n{feedback}",
-            home.description
+            hints::redacted_argument(&home.description)
         );
     }
     let output = execute_for_runtime_selecting_backend(
@@ -159,7 +161,7 @@ fn resolve_runtime_with_base(
         })
     ) && cli.profile.is_none()
     {
-        let home = resolve_home_with_registry(
+        let home = select_home_with_registry(
             cli.home.as_deref(),
             env_home,
             None,
@@ -174,11 +176,19 @@ fn resolve_runtime_with_base(
         Ok(resolved) => Ok(resolved),
         Err(_err)
             if matches!(&cli.command, Command::Doctor(_))
-                && !(cli.home.is_some() && cli.profile.is_some())
-                && !(env_home.is_some() && cli.profile.is_some())
+                && cli.home.is_none()
+                && env_home.is_none()
                 && load_registry(&registry_path).is_err() =>
         {
-            Ok((builtin_default_home(sshw_base), registry_path))
+            let home = resolve_home_with_registry(
+                None,
+                None,
+                None,
+                &crate::profile::ProfileRegistry::default(),
+                sshw_base,
+            )
+            .with_error_kind(ErrorKind::Config)?;
+            Ok((home, registry_path))
         }
         Err(err) => Err(err),
     }
@@ -197,7 +207,12 @@ fn resolve_runtime_with_base_strict(
     } else {
         crate::profile::ProfileRegistry::default()
     };
-    let home = resolve_home_with_registry(
+    let resolve = if matches!(&cli.command, Command::Profile(_)) {
+        select_home_with_registry
+    } else {
+        resolve_home_with_registry
+    };
+    let home = resolve(
         cli.home.as_deref(),
         env_home,
         cli.profile.as_deref(),
@@ -715,10 +730,68 @@ fn audit_descriptor(command: &Command, config: &SshwConfig) -> Option<AuditDescr
 }
 
 fn build_sandbox(policy_path: &Path, forced: bool) -> anyhow::Result<Box<dyn Sandbox>> {
-    match resolve_policy(policy_path, forced).with_error_kind(ErrorKind::Policy)? {
-        Policy::Disabled => Ok(Box::new(NoopSandbox)),
-        Policy::Enabled(rules) => Ok(Box::new(PolicyOnlySandbox::new(rules))),
+    Ok(sandbox_from_policy(
+        resolve_policy(policy_path, forced).with_error_kind(ErrorKind::Policy)?,
+    ))
+}
+
+fn sandbox_from_policy(policy: Policy) -> Box<dyn Sandbox> {
+    match policy {
+        Policy::Disabled => Box::new(NoopSandbox),
+        Policy::Enabled(rules) => Box::new(PolicyOnlySandbox::new(rules)),
     }
+}
+
+/// Shared local checks, in execution order. Execution returns each denial
+/// immediately; preflight records independent denials and keeps inspecting.
+/// An unresolved account stops checks that depend on that account's metadata.
+fn check_run_access<'a>(
+    name: &str,
+    command: &str,
+    user: Option<&str>,
+    yes: bool,
+    sandbox: &dyn Sandbox,
+    config: &'a SshwConfig,
+    mut on_denied: impl FnMut(anyhow::Error) -> anyhow::Result<()>,
+) -> anyhow::Result<(&'a ServerConfig, &'a str, &'a AccountConfig)> {
+    if let SafetyDecision::Block { reason } = classify_command(command, yes) {
+        on_denied(app_error(ErrorKind::Safety, reason))?;
+    }
+    if let SandboxDecision::Deny { reason } = sandbox.check_command(command) {
+        on_denied(app_error(ErrorKind::Policy, reason))?;
+    }
+    let server = get_server(config, name)?;
+    let (user, account) = select_account(name, server, user)?;
+    if let SandboxDecision::Deny { reason } =
+        sandbox.check_account(name, user, user == server.default_user)
+    {
+        on_denied(app_error(ErrorKind::Policy, reason))?;
+    }
+    Ok((server, user, account))
+}
+
+fn check_run_privilege(
+    name: &str,
+    user: &str,
+    account: &AccountConfig,
+    as_root: bool,
+    no_password: bool,
+) -> anyhow::Result<()> {
+    if as_root && !no_password && account.privilege.is_none() {
+        return Err(privilege::missing_privilege(name, user));
+    }
+    if no_password
+        && account
+            .privilege
+            .as_ref()
+            .is_some_and(|privilege| privilege.method != PrivilegeMethod::Sudo)
+    {
+        return Err(app_error(
+            ErrorKind::Config,
+            "--no-password requires a sudo privilege path; this account is configured for su",
+        ));
+    }
+    Ok(())
 }
 
 fn run_remote<C, S>(
@@ -743,22 +816,15 @@ where
     } = args;
     let (server_name, command) = resolve_run_target(target, config)?;
 
-    match classify_command(&command, yes) {
-        SafetyDecision::Allow => {}
-        SafetyDecision::Block { reason } => return Err(app_error(ErrorKind::Safety, reason)),
-    }
-
-    if let SandboxDecision::Deny { reason } = sandbox.check_command(&command) {
-        return Err(app_error(ErrorKind::Policy, reason));
-    }
-
-    let server = get_server(config, &server_name)?;
-    let (login_user, account) = select_account(&server_name, server, user.as_deref())?;
-    if let SandboxDecision::Deny { reason } =
-        sandbox.check_account(&server_name, login_user, login_user == server.default_user)
-    {
-        return Err(app_error(ErrorKind::Policy, reason));
-    }
+    let (server, login_user, account) = check_run_access(
+        &server_name,
+        &command,
+        user.as_deref(),
+        yes,
+        sandbox,
+        config,
+        Err,
+    )?;
     if stream
         && as_root
         && account
@@ -771,19 +837,16 @@ where
             "--stream is not supported with su PTY; use the ordinary buffered run or a sudo privilege path",
         ));
     }
-    let auth = resolve_auth(account, login_user, credentials)?;
+    check_run_privilege(&server_name, login_user, account, as_root, no_password)?;
+    let auth = resolve_auth(&server_name, account, login_user, credentials)?;
     let ssh_target = SshTarget::new(server, login_user);
-    let privileged = if no_password {
-        if account
-            .privilege
-            .as_ref()
-            .is_some_and(|p| p.method != PrivilegeMethod::Sudo)
-        {
-            return Err(app_error(
-                ErrorKind::Config,
-                "--no-password requires a sudo privilege path; this account is configured for su",
-            ));
-        }
+    let privileged = if no_password
+        || (as_root
+            && account
+                .privilege
+                .as_ref()
+                .is_some_and(|privilege| privilege.no_password))
+    {
         let target_user = account
             .privilege
             .as_ref()
@@ -860,9 +923,7 @@ where
                 Ok(result)
             }
             Err(error) => Err(match error.downcast::<crate::ssh::PartialRunError>() {
-                Ok(partial) => partial
-                    .source
-                    .context("streamed command failed; completion was not confirmed"),
+                Ok(partial) => streamed_run_error(partial.source, &secrets),
                 Err(error) => error,
             }),
         }
@@ -951,41 +1012,60 @@ where
         .ok_or_else(|| privilege::missing_privilege(server_name, login_user))?;
 
     match privilege.method {
-        PrivilegeMethod::Sudo => sudo_execution(command, privilege, credentials),
-        PrivilegeMethod::Su => su_execution(command, privilege, credentials),
+        PrivilegeMethod::Sudo => {
+            sudo_execution(server_name, login_user, command, privilege, credentials)
+        }
+        PrivilegeMethod::Su => {
+            su_execution(server_name, login_user, command, privilege, credentials)
+        }
     }
 }
 
 /// Fetch the stored privilege password for `privilege` and validate its shape.
 /// Shared by the sudo and su execution builders so the credential lookup,
-/// missing-entry context, and non-empty/single-line validation stay identical.
+/// failure context, and non-empty/single-line validation stay identical.
 fn fetch_validated_privilege_password<C>(
+    server_name: &str,
+    login_user: &str,
     privilege: &PrivilegeConfig,
     credentials: &C,
 ) -> anyhow::Result<Zeroizing<String>>
 where
     C: CredentialStore,
 {
+    let credential = privilege.credential.as_deref().ok_or_else(|| {
+        app_error(
+            ErrorKind::Config,
+            "password privilege requires a credential",
+        )
+    })?;
     let password = Zeroizing::new(
         credentials
-            .get_password_for(
-                CredentialPurpose::Privilege,
-                &privilege.credential,
-                &privilege.user,
-            )
-            .with_error_kind(ErrorKind::Auth)
-            .with_context(|| {
-                format!(
-                    "missing credential entry for {} and privilege user {}",
-                    privilege.credential, privilege.user
-                )
-            })?,
+            .get_password_for(CredentialPurpose::Privilege, credential, &privilege.user)
+            .map_err(|error| {
+                let detail = redacted_error_detail(&error);
+                let persistent = credentials.is_persistent();
+                let recovery = privilege::recovery_step(server_name, login_user, privilege, persistent);
+                let recovery = if persistent {
+                    format!("check the credential backend with sshw doctor; if the entry is missing, {recovery}")
+                } else {
+                    recovery
+                };
+                error.context(format!(
+                    "failed to load privilege credential for server {} login account {} ({} target {})\ncaused by: {detail}\nnext: {recovery}",
+                    hints::quote_local_argument(server_name), hints::quote_local_argument(login_user),
+                    privilege::method_label(privilege.method), hints::quote_local_argument(&privilege.user)
+                ))
+            })
+            .with_error_kind(ErrorKind::Auth)?,
     );
     privilege::validate_privilege_password(password.as_str())?;
     Ok(password)
 }
 
 fn sudo_execution<C>(
+    server_name: &str,
+    login_user: &str,
     command: &str,
     privilege: &PrivilegeConfig,
     credentials: &C,
@@ -993,7 +1073,8 @@ fn sudo_execution<C>(
 where
     C: CredentialStore,
 {
-    let password = fetch_validated_privilege_password(privilege, credentials)?;
+    let password =
+        fetch_validated_privilege_password(server_name, login_user, privilege, credentials)?;
     Ok(PrivilegedExecution {
         command: sudo_command(command, &privilege.user),
         stdin: Some(Zeroizing::new(format!("{}\n", password.as_str()))),
@@ -1004,6 +1085,8 @@ where
 }
 
 fn su_execution<C>(
+    server_name: &str,
+    login_user: &str,
     command: &str,
     privilege: &PrivilegeConfig,
     credentials: &C,
@@ -1011,7 +1094,8 @@ fn su_execution<C>(
 where
     C: CredentialStore,
 {
-    let password = fetch_validated_privilege_password(privilege, credentials)?;
+    let password =
+        fetch_validated_privilege_password(server_name, login_user, privilege, credentials)?;
     let marker_nonce = su_marker_nonce();
     Ok(PrivilegedExecution {
         command: su_command(command, &privilege.user, &marker_nonce),
@@ -1100,6 +1184,22 @@ fn redact_with_known_secrets(input: &str, secrets: &[Option<&str>]) -> String {
     redacted
 }
 
+fn streamed_run_error(source: anyhow::Error, secrets: &[Option<&str>]) -> anyhow::Error {
+    // Redact causes individually before joining: a prefix or adjacent PEM
+    // blocks can otherwise hide a key marker from the line-oriented redactor.
+    let mut causes = Vec::new();
+    for cause in source.chain() {
+        let cause = redact_with_known_secrets(&cause.to_string(), secrets);
+        if causes.last() != Some(&cause) {
+            causes.push(cause);
+        }
+    }
+    source.context(format!(
+        "streamed command failed; completion was not confirmed: {}",
+        causes.join(": ")
+    ))
+}
+
 fn redact_partial_run_error(err: anyhow::Error, secrets: &[Option<&str>]) -> anyhow::Error {
     match err.downcast::<crate::ssh::PartialRunError>() {
         Ok(mut partial) => {
@@ -1161,7 +1261,10 @@ where
         Err(err) => err.kind() != std::io::ErrorKind::NotFound,
     };
     let policy = describe_policy(&home.policy_path, policy_forced);
-    let audit_writable = audit::is_writable(&home.audit_path);
+    let audit_message = audit::check_writable(&home.audit_path)
+        .err()
+        .map(|error| redacted_error_detail(&error));
+    let audit_writable = audit_message.is_none();
     let health = credentials
         .health_check()
         .unwrap_or_else(|err| CredentialStoreHealth {
@@ -1169,10 +1272,17 @@ where
             available: false,
             message: format!("credential store unavailable: {err}"),
         });
-    let missing_credentials = config_result
+    let credential_checks = config_result
         .as_ref()
-        .map(|config| missing_credentials(credentials, config))
+        .map(|config| diagnostics::credential_checks(credentials, config))
         .unwrap_or_default();
+    let missing_credentials: Vec<_> = credential_checks
+        .iter()
+        .filter(|check| {
+            check.purpose == "login" && check.status == diagnostics::CredentialStatus::Missing
+        })
+        .map(|check| format!("{}/{}", check.server, check.user))
+        .collect();
     let library_versions = runtime_library_versions();
     let mut issues = Vec::new();
     let mut issue = |kind: &str, message: String, next_step: String| {
@@ -1208,19 +1318,25 @@ where
     if !audit_writable {
         issue(
             "audit",
-            "audit log is not writable".to_string(),
-            "check permissions at the reported audit path".to_string(),
+            format!("audit log is not writable: {}", audit_message.as_deref().unwrap_or_default()),
+            "check create/write permissions at the reported audit path and parent directory; rerun sshw doctor using the same home/profile selection".to_string(),
         );
     }
-    for entry in &missing_credentials {
-        issue(
-            "login_credential",
-            format!("missing login credential for {entry}"),
-            "register the account password again or supply SSHW_PASSWORD for session-only use"
-                .to_string(),
-        );
+    for check in &credential_checks {
+        if let Some(next_step) = &check.next_step {
+            issue(
+                if check.purpose == "login" {
+                    "login_credential"
+                } else {
+                    "privilege_credential"
+                },
+                check.message.clone(),
+                next_step.clone(),
+            );
+        }
     }
     let mut uses_agent = false;
+    let mut host_trust = Vec::new();
     if let Ok(config) = &config_result {
         if config.servers.is_empty() {
             issue(
@@ -1229,33 +1345,65 @@ where
                 "sshw add web --host <host> --user <user>".to_string(),
             );
         }
+        let local_hosts = if config.servers.is_empty() {
+            None
+        } else {
+            Some(LocalKnownHosts::load(&home.known_hosts_path))
+        };
         for (name, server) in &config.servers {
-            if !home.known_hosts_path.is_file() {
-                issue(
-                    "host_trust",
-                    format!("no known_hosts file for server '{name}'"),
-                    format!("sshw trust {name}"),
-                );
+            let hosts = local_hosts.as_ref().expect("servers are not empty");
+            let inspection = hosts
+                .as_ref()
+                .map_err(redacted_error_detail)
+                .and_then(|hosts| {
+                    hosts
+                        .has_entry(&server.host, server.port)
+                        .map_err(|error| redacted_error_detail(&error))
+                });
+            let (entry_present, message) = match &inspection {
+                Ok(true) => (
+                    Some(true),
+                    "local entry found; remote key not checked".to_string(),
+                ),
+                Ok(false) => (
+                    Some(false),
+                    format!(
+                        "no local host key entry for server {} ({}:{}); remote key not checked",
+                        hints::quote_local_argument(name),
+                        redact_secrets(&server.host),
+                        server.port
+                    ),
+                ),
+                Err(detail) => (
+                    None,
+                    format!(
+                        "cannot inspect local host keys for server {}: {detail}; remote key not checked",
+                        hints::quote_local_argument(name)
+                    ),
+                ),
+            };
+            host_trust.push(json!({"server":redact_secrets(name),"host":redact_secrets(&server.host),"port":server.port,"entry_present":entry_present,"key_match_checked":false,"message":message}));
+            if entry_present != Some(true) {
+                let missing_file = hosts.as_ref().err().is_some_and(|error| {
+                    error.chain().any(|cause| {
+                        cause
+                            .downcast_ref::<io::Error>()
+                            .is_some_and(|error| error.kind() == io::ErrorKind::NotFound)
+                    })
+                });
+                let next_step = if inspection.is_err() && !missing_file {
+                    format!(
+                        "check read access and repair known_hosts at {}; then run {}",
+                        hints::quote_local_argument(&home.known_hosts_path.display().to_string()),
+                        hints::trust(name)
+                    )
+                } else {
+                    hints::trust(name)
+                };
+                issue("host_trust", message, next_step);
             }
-            for (user, account) in &server.accounts {
+            for account in server.accounts.values() {
                 uses_agent |= matches!(account.auth, AuthConfig::Agent);
-                if let Some(privilege) = &account.privilege {
-                    let available = credentials
-                        .get_password_for(
-                            CredentialPurpose::Privilege,
-                            &privilege.credential,
-                            &privilege.user,
-                        )
-                        .map(Zeroizing::new)
-                        .is_ok_and(|password| !password.is_empty());
-                    if !available {
-                        issue(
-                            "privilege_credential",
-                            format!("missing privilege credential for {name}/{user}"),
-                            format!("sshw privilege set {name} --account {user}"),
-                        );
-                    }
-                }
             }
         }
     }
@@ -1310,12 +1458,14 @@ where
             "config_valid": config_valid,
             "config_message": config_message,
             "known_hosts_path": home.known_hosts_path,
+            "host_trust": host_trust,
             "policy_path": home.policy_path,
             "policy_present": policy.present,
             "policy_valid": policy.valid,
             "policy_enabled": policy.enabled,
             "audit_path": home.audit_path,
             "audit_writable": audit_writable,
+            "audit_message": audit_message,
             "credential_namespace": home.namespace.token(),
             "os": std::env::consts::OS,
             "libssh2_version": library_versions.libssh2,
@@ -1324,6 +1474,7 @@ where
             "credential_available": health.available,
             "credential_message": health.message,
             "missing_credentials": missing_credentials,
+            "credential_checks": credential_checks,
         });
         return Ok(ok(format!("{}\n", serde_json::to_string(&output)?)));
     }
@@ -1360,6 +1511,13 @@ where
             missing_credentials.join(", ")
         ));
     }
+    for entry in &host_trust {
+        stdout.push_str(&format!(
+            "host trust {}: {}\n",
+            entry["server"].as_str().unwrap_or_default(),
+            entry["message"].as_str().unwrap_or_default()
+        ));
+    }
     stdout.push_str(&format!(
         "local checks: {} (SSH connectivity and host-key matching are not tested)\n",
         if issues.is_empty() {
@@ -1378,7 +1536,18 @@ where
     Ok(ok(stdout))
 }
 
+fn check_registration_auth(auth: AuthArg, password_stdin: bool) -> anyhow::Result<()> {
+    if password_stdin && matches!(auth, AuthArg::Agent) {
+        return Err(app_error(
+            ErrorKind::Config,
+            "--password-stdin cannot be used with --auth agent",
+        ));
+    }
+    Ok(())
+}
+
 fn resolve_auth<C>(
+    server_name: &str,
     account: &AccountConfig,
     login_user: &str,
     credentials: &C,
@@ -1390,13 +1559,16 @@ where
         AuthConfig::Password { credential } => {
             let password = credentials
                 .get_password_for(CredentialPurpose::Login, credential, login_user)
-                .with_error_kind(ErrorKind::Auth)
-                .with_context(|| {
-                    format!(
-                        "missing credential entry for {} and user {}",
-                        credential, login_user
-                    )
-                })?;
+                .map_err(|error| {
+                    let detail = redacted_error_detail(&error);
+                    let recovery = if credentials.is_persistent() {
+                        format!("using the same home/profile selection, run sshw doctor to check the credential backend; if the entry is missing, run `{}` to register the account password again. Confirm the update, or insert --force and --password-stdin before -- for non-interactive secret-manager input", hints::account_password(server_name, login_user))
+                    } else {
+                        "supply SSHW_PASSWORD at run time using the same home/profile selection; session-only passwords are not persisted. Never put the password in arguments".to_string()
+                    };
+                    error.context(format!("failed to load login credential for server {} account {}\ncaused by: {detail}\nnext: {recovery}", hints::quote_local_argument(server_name), hints::quote_local_argument(login_user)))
+                })
+                .with_error_kind(ErrorKind::Auth)?;
             Ok(AuthMaterial::Password(password))
         }
         AuthConfig::Agent => Ok(AuthMaterial::Agent),
@@ -1439,11 +1611,19 @@ fn resolve_run_target(
         return Err(app_error(
             ErrorKind::Config,
             format!(
-                "unknown server '{name}'; run 'sshw list' to see registered servers. Quote the whole remote command: sshw run <server> \"<command>\", or sshw run \"<command>\" for the default server"
+                "{}\nQuote the whole remote command: sshw run <server> \"<command>\", or sshw run \"<command>\" for the default server",
+                unknown_server_message(name)
             ),
         ));
     }
-    Ok((resolve_target_server(name, config)?, rest[0].clone()))
+    let server = resolve_target_server(name, config)?;
+    if rest[0].trim().is_empty() {
+        return Err(app_error(
+            ErrorKind::Usage,
+            "remote command cannot be empty or whitespace; check the command variable and quote the whole command, for example sshw run <server> \"uptime\"",
+        ));
+    }
+    Ok((server, rest[0].clone()))
 }
 
 fn default_server_name(config: &SshwConfig) -> anyhow::Result<String> {
@@ -1475,29 +1655,15 @@ fn select_account<'a>(
 }
 
 fn unknown_server(name: &str) -> anyhow::Error {
-    app_error(ErrorKind::Config, format!("unknown server '{name}'"))
+    app_error(ErrorKind::Config, unknown_server_message(name))
 }
 
-fn missing_credentials<C>(credentials: &C, config: &SshwConfig) -> Vec<String>
-where
-    C: CredentialStore,
-{
-    config
-        .servers
-        .iter()
-        .flat_map(|(name, server)| {
-            server
-                .accounts
-                .iter()
-                .filter_map(move |(user, account)| match &account.auth {
-                    AuthConfig::Password { credential } => credentials
-                        .get_password_for(CredentialPurpose::Login, credential, user)
-                        .err()
-                        .map(|_| format!("{name}/{user}")),
-                    AuthConfig::Agent => None,
-                })
-        })
-        .collect()
+fn unknown_server_message(name: &str) -> String {
+    format!(
+        "unknown server '{}'; only registered servers can be selected\nnext: using the same home/profile selection, run `sshw list` to see registered servers; to register this name, replace the host/login-user placeholders in `{}`. Registration uses hidden password input by default; insert --auth agent or --password-stdin before the suggested command's -- as appropriate",
+        hints::redacted_argument(name),
+        hints::server_add(name),
+    )
 }
 
 fn ok(stdout: String) -> CommandOutput {
@@ -1542,6 +1708,7 @@ fn error_json_line(response: &ErrorResponse) -> String {
             let fallback = ErrorResponse {
                 ok: false,
                 partial_output: None,
+                mutation: None,
                 error: crate::output::ErrorBody {
                     kind: ErrorKind::Unknown,
                     message: format!("failed to serialize error response: {err}"),
@@ -1618,7 +1785,7 @@ where
 /// usage errors get the dedicated `usage` kind / exit code 9 (distinct from the
 /// safety code 2), surfaced as a JSON envelope on stdout when `--json` was
 /// requested, or clap's formatted message on stderr otherwise.
-fn parse_error_output(err: clap::Error, json: bool) -> CommandOutput {
+fn parse_error_output(mut err: clap::Error, json: bool) -> CommandOutput {
     use clap::error::ErrorKind as ClapErrorKind;
 
     if matches!(
@@ -1636,12 +1803,18 @@ fn parse_error_output(err: clap::Error, json: bool) -> CommandOutput {
 
     let kind = ErrorKind::Usage;
     let exit_code = kind.exit_code();
-    let rendered = err.render().to_string();
+    redact_clap_context(&mut err);
+    if json {
+        // Retain diagnostics and correction tips, not the full usage banner.
+        let _ = err.remove(clap::error::ContextKind::Usage);
+    }
+    let rendered = redact_usage_text(&err.render().to_string());
 
     if json {
         let response = ErrorResponse {
             ok: false,
             partial_output: None,
+            mutation: None,
             error: crate::output::ErrorBody {
                 kind,
                 message: clap_usage_summary(&rendered),
@@ -1663,15 +1836,68 @@ fn parse_error_output(err: clap::Error, json: bool) -> CommandOutput {
     }
 }
 
-/// Condense clap's multi-line usage error into a concise single-line message for
-/// the JSON envelope (the first non-empty line, minus clap's `error: ` prefix).
+fn redact_clap_context(error: &mut clap::Error) {
+    use clap::error::ContextValue;
+    // Mask values before clap embeds them in prose or correction suggestions.
+    // In particular, a PEM marker must not gain a prefix before redaction.
+    let contexts: Vec<_> = error
+        .context()
+        .map(|(kind, value)| {
+            let value = match value {
+                ContextValue::String(text) => ContextValue::String(redact_usage_text(text)),
+                ContextValue::Strings(values) => ContextValue::Strings(
+                    values
+                        .iter()
+                        .map(|value| redact_usage_text(value))
+                        .collect(),
+                ),
+                ContextValue::StyledStr(text) => {
+                    ContextValue::StyledStr(redact_usage_text(&text.to_string()).into())
+                }
+                ContextValue::StyledStrs(values) => ContextValue::StyledStrs(
+                    values
+                        .iter()
+                        .map(|value| redact_usage_text(&value.to_string()).into())
+                        .collect(),
+                ),
+                _ => value.clone(),
+            };
+            (kind, value)
+        })
+        .collect();
+    for (kind, value) in contexts {
+        let _ = error.insert(kind, value);
+    }
+}
+
+fn redact_usage_text(text: &str) -> String {
+    if text.contains("-----BEGIN") && text.contains("PRIVATE KEY") {
+        // A suggestion can repeat a key after a prose prefix. Discard that
+        // diagnostic fragment rather than trying to recover its key boundary.
+        "[redacted private key]".to_string()
+    } else {
+        redact_secrets(text)
+    }
+}
+
+/// Compact the already-redacted diagnostic, retaining missing argument lists,
+/// accepted values and correction tips. Only remove the generic help footer.
 fn clap_usage_summary(rendered: &str) -> String {
-    rendered
+    let mut lines: Vec<_> = rendered
         .lines()
         .map(str::trim)
-        .find(|line| !line.is_empty())
-        .map(|line| line.trim_start_matches("error: ").to_string())
-        .unwrap_or_else(|| rendered.trim().to_string())
+        .filter(|line| !line.is_empty())
+        .collect();
+    if lines
+        .last()
+        .is_some_and(|line| line.starts_with("For more information, try "))
+    {
+        lines.pop();
+    }
+    if let Some(first) = lines.first_mut() {
+        *first = first.trim_start_matches("error: ");
+    }
+    lines.join(" ")
 }
 
 #[cfg(test)]
@@ -1683,6 +1909,113 @@ mod runtime_backend_tests {
     use crate::home::ResolvedHome;
     use crate::ssh::{HostKeyInfo, RunResult, TransferResult};
     use std::cell::Cell;
+
+    #[test]
+    fn run_access_short_circuits_execution_and_collects_preflight_denials_in_order() {
+        struct TraceSandbox(std::cell::RefCell<Vec<&'static str>>);
+        impl Sandbox for TraceSandbox {
+            fn check_command(&self, _: &str) -> SandboxDecision {
+                self.0.borrow_mut().push("command");
+                SandboxDecision::Deny {
+                    reason: "command denied".into(),
+                }
+            }
+            fn check_account(&self, _: &str, _: &str, _: bool) -> SandboxDecision {
+                self.0.borrow_mut().push("account");
+                SandboxDecision::Deny {
+                    reason: "account denied".into(),
+                }
+            }
+            fn check_put(&self, _: &str) -> SandboxDecision {
+                unreachable!()
+            }
+            fn check_get(&self, _: &str) -> SandboxDecision {
+                unreachable!()
+            }
+        }
+        let mut config = SshwConfig::default();
+        config.servers.insert(
+            "web".into(),
+            ServerConfig::single_account("localhost", 22, "deploy", AuthConfig::Agent),
+        );
+        let sandbox = TraceSandbox(Default::default());
+        let error =
+            check_run_access("web", "sudo id", None, false, &sandbox, &config, Err).unwrap_err();
+        assert_eq!(crate::output::classify_error(&error), ErrorKind::Safety);
+        assert!(
+            sandbox.0.borrow().is_empty(),
+            "execution must not call later checks after failure"
+        );
+        let mut errors = Vec::new();
+        let (_, user, _) =
+            check_run_access("web", "sudo id", None, false, &sandbox, &config, |error| {
+                errors.push(error);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(user, "deploy");
+        assert_eq!(*sandbox.0.borrow(), ["command", "account"]);
+        let reasons: Vec<_> = errors.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            reasons,
+            [
+                error.to_string(),
+                "command denied".into(),
+                "account denied".into()
+            ]
+        );
+    }
+
+    #[test]
+    fn streamed_failure_shows_causes_without_replaying_output() {
+        for cause in [
+            "ssh operation timed out after 1000 milliseconds",
+            "connection reset by peer",
+            "ssh session output exceeded 1024-byte limit",
+        ] {
+            let error = streamed_run_error(
+                crate::error::app_error(ErrorKind::Ssh, cause).context("ssh session error"),
+                &[],
+            );
+            let output = error_output(&error, false);
+            assert_eq!(output.exit_code, 5);
+            assert!(output.stdout.is_empty());
+            assert!(output.stderr.contains("completion was not confirmed"));
+            assert!(output.stderr.contains(cause), "{}", output.stderr);
+            assert_eq!(output.stderr.matches(cause).count(), 1);
+        }
+    }
+
+    #[test]
+    fn streamed_failure_redacts_each_cause_and_preserves_io_kind() {
+        let detail = "sink closed for login-secret and privilege-secret\npassword=synthetic\n-----BEGIN OPENSSH PRIVATE KEY-----\nprivate-key-body\n-----END OPENSSH PRIVATE KEY-----";
+        let source = crate::error::classified_io_error(
+            ErrorKind::Io,
+            io::ErrorKind::BrokenPipe,
+            anyhow::anyhow!(detail),
+        );
+        let error = streamed_run_error(
+            anyhow::Error::new(source).context(detail),
+            &[Some("login-secret"), Some("privilege-secret")],
+        );
+        let output = error_output(&error, false);
+        assert_eq!(output.exit_code, 6);
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.contains("sink closed"), "{}", output.stderr);
+        for secret in [
+            "login-secret",
+            "privilege-secret",
+            "synthetic",
+            "private-key-body",
+        ] {
+            assert!(!output.stderr.contains(secret), "{}", output.stderr);
+        }
+        assert_eq!(output.stderr.matches("sink closed").count(), 1);
+        assert_eq!(
+            error.downcast_ref::<io::Error>().unwrap().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+    }
 
     #[test]
     fn partial_output_redacts_full_and_truncated_known_secrets() {
@@ -1885,6 +2218,48 @@ mod runtime_backend_tests {
     }
 
     #[test]
+    fn explicit_unknown_profile_reports_recovery_without_default_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut registry = crate::profile::ProfileRegistry {
+            default: Some("work".into()),
+            ..Default::default()
+        };
+        registry.profiles.insert(
+            "work".into(),
+            crate::profile::ProfileEntry {
+                id: "p_work".into(),
+                home: temp.path().join("work-home"),
+            },
+        );
+        let registry_path = temp.path().join("profiles.json");
+        crate::profile::save_registry(&registry_path, &registry).unwrap();
+        let before = std::fs::read(&registry_path).unwrap();
+        for command in ["list", "doctor"] {
+            let cli = Cli::try_parse_from(["sshw", "--profile=missing", command]).unwrap();
+            let error = resolve_runtime_with_base(&cli, temp.path(), None).unwrap_err();
+            for machine in [false, true] {
+                let output = error_output(&error, machine);
+                assert_eq!(output.exit_code, 3);
+                let text = if machine {
+                    output.stdout
+                } else {
+                    output.stderr
+                };
+                assert!(
+                    text.contains("unknown profile 'missing'")
+                        && text.contains("sshw profile list")
+                );
+                assert!(
+                    text.contains("profile add -- 'missing'")
+                        && text.contains("separate namespace")
+                );
+            }
+        }
+        assert_eq!(std::fs::read(&registry_path).unwrap(), before);
+        assert!(!temp.path().join("work-home").exists());
+    }
+
+    #[test]
     fn explicit_home_resolution_does_not_load_corrupt_registry() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join("profiles.json"), "{").unwrap();
@@ -1946,6 +2321,70 @@ mod runtime_backend_tests {
     }
 
     #[test]
+    fn home_readiness_doctor_recovery_never_hides_an_invalid_explicit_or_builtin_home() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("profiles.json"), "{").unwrap();
+        let file = temp.path().join("file");
+        std::fs::write(&file, "preserve").unwrap();
+        let explicit =
+            Cli::try_parse_from(["sshw", "--home", file.to_str().unwrap(), "doctor", "--json"])
+                .unwrap();
+        let env = Cli::try_parse_from(["sshw", "doctor", "--json"]).unwrap();
+        for error in [
+            resolve_runtime_with_base(&explicit, temp.path(), None).unwrap_err(),
+            resolve_runtime_with_base(&env, temp.path(), Some(file.as_os_str())).unwrap_err(),
+        ] {
+            assert!(error.to_string().contains("requires a directory"));
+            assert_eq!(ErrorResponse::from_error(&error).error.exit_code, 3);
+        }
+        std::fs::create_dir(temp.path().join("profiles")).unwrap();
+        std::fs::write(temp.path().join("profiles/default"), "preserve").unwrap();
+        let error = resolve_runtime_with_base(&env, temp.path(), None).unwrap_err();
+        assert!(error.to_string().contains("requires a directory"));
+    }
+
+    #[test]
+    fn home_readiness_keeps_registry_management_reachable_for_a_bad_selected_home() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("file");
+        std::fs::write(&file, "preserve").unwrap();
+        let registry = crate::profile::ProfileRegistry {
+            default: Some("bad".into()),
+            profiles: std::collections::BTreeMap::from([(
+                "bad".into(),
+                crate::profile::ProfileEntry {
+                    id: "p_bad".into(),
+                    home: file,
+                },
+            )]),
+            ..Default::default()
+        };
+        crate::profile::save_registry(&temp.path().join("profiles.json"), &registry).unwrap();
+        for argv in [
+            vec!["sshw", "profile", "list"],
+            vec!["sshw", "profile", "show", "bad"],
+            vec!["sshw", "profile", "default", "healthy"],
+            vec!["sshw", "profile", "remove", "bad"],
+        ] {
+            let cli = Cli::try_parse_from(argv).unwrap();
+            assert!(resolve_runtime_with_base(&cli, temp.path(), None).is_ok());
+        }
+        for command in [
+            vec!["sshw", "list"],
+            vec!["sshw", "policy", "show"],
+            vec!["sshw", "doctor"],
+        ] {
+            let error = resolve_runtime_with_base(
+                &Cli::try_parse_from(command).unwrap(),
+                temp.path(),
+                None,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("requires a directory"));
+        }
+    }
+
+    #[test]
     fn all_profile_commands_use_the_global_profile_audit_path() {
         let temp = tempfile::tempdir().unwrap();
         let registry = temp.path().join("profiles.json");
@@ -1991,6 +2430,77 @@ mod parse_error_tests {
 
     fn parse_err(args: &[&str]) -> clap::Error {
         Cli::try_parse_from(args).unwrap_err()
+    }
+
+    #[test]
+    fn operation_target_arity_accepts_defaults_and_explicit_servers() {
+        for (prefix, minimum) in [
+            (vec!["sshw", "run"], 1),
+            (vec!["sshw", "put"], 2),
+            (vec!["sshw", "get"], 2),
+            (vec!["sshw", "policy", "check"], 1),
+            (vec!["sshw", "policy", "check-put"], 2),
+            (vec!["sshw", "policy", "check-get"], 2),
+        ] {
+            for count in 0..=minimum + 2 {
+                let mut args = prefix.clone();
+                args.extend(std::iter::repeat_n("fixture", count));
+                let result = Cli::try_parse_from(&args);
+                if count == minimum || count == minimum + 1 {
+                    assert!(result.is_ok(), "{args:?}: {result:?}");
+                } else {
+                    let output = parse_error_output(result.unwrap_err(), true);
+                    assert_eq!(output.exit_code, 9, "{args:?}");
+                }
+            }
+            for json in [false, true] {
+                let mut args = prefix.clone();
+                if json {
+                    args.push("--json");
+                }
+                args.push("--help");
+                let output = parse_error_output(parse_err(&args), json);
+                assert_eq!(output.exit_code, 0);
+                assert!(output.stderr.is_empty());
+                assert!(output.stdout.contains("Usage:"));
+            }
+        }
+        let output = parse_error_output(parse_err(&["sshw", "--version"]), false);
+        assert_eq!(output.exit_code, 0);
+        assert!(output.stdout.starts_with("sshw "));
+    }
+
+    #[test]
+    fn usage_diagnostics_redact_input_before_formatting_and_compacting() {
+        for value in [
+            "password=fixture-sensitive",
+            "Bearer fixture-sensitive",
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture-sensitive\n-----END OPENSSH PRIVATE KEY-----",
+        ] {
+            let argument = format!("--mode={value}");
+            for json in [false, true] {
+                let error = parse_err(&["sshw", "put", "local", "remote", &argument]);
+                let output = parse_error_output(error, json);
+                assert_eq!(output.exit_code, 9);
+                assert!(!output.stdout.contains("fixture-sensitive"));
+                assert!(!output.stderr.contains("fixture-sensitive"));
+                assert!(format!("{}{}", output.stdout, output.stderr).contains("redacted"));
+                if json {
+                    serde_json::from_str::<serde_json::Value>(&output.stdout).unwrap();
+                }
+            }
+        }
+        // Unknown option errors can repeat an input in a styled "pass it as a
+        // value" tip. That copy must also be masked before adding a prefix.
+        let key = "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture-sensitive\n-----END OPENSSH PRIVATE KEY-----";
+        for json in [false, true] {
+            let output =
+                parse_error_output(parse_err(&["sshw", "put", "local", "remote", key]), json);
+            assert_eq!(output.exit_code, 9);
+            assert!(!output.stdout.contains("fixture-sensitive"));
+            assert!(!output.stderr.contains("fixture-sensitive"));
+            assert!(format!("{}{}", output.stdout, output.stderr).contains("redacted"));
+        }
     }
 
     #[test]

@@ -193,6 +193,86 @@ fn trailing_slash_path_entry_matches_children() {
 }
 
 #[test]
+fn path_rules_windows_separators_preserve_boundaries_traversal_and_posix_literals() {
+    for (entry, allowed, denied) in [
+        (
+            "C:/",
+            vec![r"C:\Data\file", "C:/Data/file"],
+            vec![r"D:\Data\file", r"C:Data\file", "C:/Data/../other"],
+        ),
+        (r"\\", vec![], vec![r"\\server\share\file", "/tmp/file"]),
+        (
+            r"C:\Data\",
+            vec![
+                r"C:\Data",
+                r"C:\Data\file",
+                "C:/Data/file",
+                r"C:\Data/sub\file",
+            ],
+            vec![
+                r"C:\Database\file",
+                r"D:\Data\file",
+                r"c:\Data\file",
+                r"C:Data\file",
+                r"C:\Data\..\other",
+                "C:/Data/../other",
+            ],
+        ),
+        (
+            r"\\server\share\Data\",
+            vec![
+                r"\\server\share\Data",
+                r"\\server\share\Data\file",
+                r"\\server/share/Data/file",
+            ],
+            vec![
+                r"\\server\share\Database\file",
+                r"\\other\share\Data\file",
+                r"\\server\other\Data\file",
+                r"\\server\share\Data\..\other",
+            ],
+        ),
+        (
+            r"/srv/app\literal",
+            vec![r"/srv/app\literal", r"/srv/app\literal/file"],
+            vec![
+                "/srv/app/literal/file",
+                r"/srv/app\literal\file",
+                r"/srv/app\literal/../other",
+            ],
+        ),
+        (
+            r"relative\literal",
+            vec![r"relative\literal", r"relative\literal/file"],
+            vec!["relative/literal/file", r"relative\literal\file"],
+        ),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = write_policy(
+            temp.path(),
+            &serde_json::json!({"version":2,"enabled":true,
+            "allow_put_paths":[entry],"allow_get_paths":[entry]})
+            .to_string(),
+        );
+        let Policy::Enabled(rules) = resolve_policy(&path, false).unwrap() else {
+            panic!("expected enabled policy");
+        };
+        for path in allowed {
+            assert!(
+                rules.allows_put(path) && rules.allows_get(path),
+                "{entry:?} should allow {path:?}"
+            );
+        }
+        for path in denied {
+            assert!(
+                !rules.allows_put(path) && !rules.allows_get(path),
+                "{entry:?} must deny {path:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn command_allowlist_rejects_metacharacter_bypass_samples() {
     let temp = tempfile::tempdir().unwrap();
     let path = write_policy(

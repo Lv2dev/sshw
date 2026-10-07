@@ -544,10 +544,10 @@ fn atomic_state_writer_sets_permissions_before_publish_and_syncs_parent_after() 
         .and_then(|rest| rest.split("fn temp_sibling_path").next())
         .expect("write_owner_only_atomic body is missing");
     let permission = body
-        .find("set_owner_only(&temp_path)?")
+        .find("set_owner_only(&temp_path)")
         .expect("temp permissions must be finalized before publish");
     let publish = body
-        .find("replace_atomic(&temp_path, path)?")
+        .find("replace_atomic(&temp_path, path)")
         .expect("atomic publish step is missing");
     let parent_sync = body
         .find("sync_parent_directory(path)")
@@ -559,7 +559,7 @@ fn atomic_state_writer_sets_permissions_before_publish_and_syncs_parent_after() 
         "parent sync must follow atomic publish"
     );
     assert!(
-        !body.contains("set_owner_only(path)?"),
+        !body.contains("set_owner_only(path)"),
         "post-publish chmod can fail after the new state becomes visible"
     );
 }

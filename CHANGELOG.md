@@ -8,6 +8,40 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-10-07
+
+### 추가
+
+- 로그인 계정별로 `privilege set --no-password --user <target>`를 저장하고 `run --as-root`에서 `sudo -n`으로 실행할 수 있습니다. 일반 실행은 자동 승격하지 않으며 서버 sudoers가 허용해야 합니다. 조회·doctor·삭제·비밀번호 방식 전환도 같은 설정을 지원합니다.
+- `policy check/check-put/check-get`에서 실제 실행과 같은 대상 선택·검사 순서, 정책 상태·강제 적용 이유·규칙 일치 근거를 확인할 수 있습니다. 사전 검사는 SSH·자격 증명·원격 권한을 조회하지 않습니다.
+- 설정 저장 뒤 자격 증명 정리에 실패해도 적용된 변경과 기본값 전환을 JSON `mutation` 및 일반 출력으로 확인할 수 있습니다. 기본 서버·프로필 삭제 후 자동 전환과 잘못된 프로필의 복구 방법도 안내합니다.
+- `doctor`가 실제 로컬 known_hosts 파싱과 endpoint 등록 여부, 로그인/승격 자격 증명의 ready/missing/unavailable/invalid 상태, SSH agent 및 감사 파일 쓰기 준비를 구분합니다. 원격 key 일치·접속·sudoers를 검사했다고 표시하지 않습니다.
+
+### 변경
+
+- 동일한 기본 서버·계정·프로필, agent 등록, 무비밀번호 승격 및 정책 설정은 저장을 생략하고 `changed/change`와 변경 없음을 표시합니다. 원본 형식·bytes/mtime 및 검증·확인·잠금·감사를 유지하며, 비밀번호 재등록은 계속 실제 회전으로 처리합니다.
+- 미등록 서버·계정·프로필과 자격 증명 오류에 해당 목록 조회·등록·같은 home/profile의 복구 안내를 표시합니다. 복사용 명령은 값별 마스킹·Windows PowerShell/POSIX 인용·`--` 경계를 사용하고 자동 등록·다른 home fallback을 수행하지 않습니다. 빈 프로필 목록도 선택적인 등록 방법을 안내합니다.
+- 연결·인증·SSH 실행·일반 SCP·설정 읽기/잠금/저장 오류에 실패 단계·선택 계정/endpoint·경로·마스킹한 원인과 점검 방법을 표시합니다. 일반 native 오류로 파일 부재·권한 거부·잘못된 비밀번호를 단정하지 않습니다.
+- 확인창은 로그인 계정·승격 대상과 인증 방식을 구분하고 값별 마스킹으로 지문·작업 설명·`[y/N]`를 보존합니다. 터미널 확인/비밀번호 읽기 실패는 원래 원인과 해당 입력 옵션을 안내합니다. 대화형 원격 작업 시작의 home 표시도 마스킹합니다.
+- 기존 CLI 종료 코드·JSON envelope와 설정 읽기 호환성을 유지합니다. 새 JSON 진단·변경·정책 필드는 추가되며 무비밀번호 승격의 `credential`은 null입니다. 라이브러리 소비자는 아래 Rust API 변경을 반영해야 합니다.
+
+### 수정
+
+- 일반 실행·sudo의 timeout·출력 제한·완료 오류 뒤 SSH 정리 대기를 짧게 제한하고 부분 출력·완료 미확정·스트리밍 원인을 보존합니다. 이미 출력한 내용은 재생하지 않습니다. native 오류의 직접/owned downcast와 IO/Auth/SSH 분류를 유지하고, 계정/host의 오류 marker 문구가 종류를 바꾸지 않게 합니다.
+- `run/put/get` 및 사전 검사에서 필수/빈 인자·공백 명령·잘못된 주소/port/승격 대상과 agent/password-stdin 충돌을 입력·인증 전에 거부합니다. JSON 사용 오류에도 필수 항목과 수정 제안을 보존합니다. `--password-stdin`은 터미널 stdin을 읽지 않고 숨김 입력/redirect 방법을 안내합니다.
+- 업로드는 자격 증명 조회 전에 읽을 수 있는 일반 로컬 파일을 검사합니다. 다운로드는 디렉터리 목적지·파일 아래 부모를 Windows에서도 사전에 거부하고, 심볼릭 링크 교체와 완료 확인 후 staging 반영·기존 목적지 보존을 유지합니다.
+- home 경로와 가장 가까운 기존 부모를 검사하고 프로필 등록/기본 전환의 target schema·namespace를 검증합니다. 손상된 현재 home을 복구하는 registry 관리 경로는 유지합니다. `trust`는 비대화형 확인 가능 여부를 SSH 접속 전에 검사합니다.
+- 정책 경로는 무효 root-only 항목을 거부하고 Windows drive/UNC 구분자·경계·부모 이동을 처리하며 POSIX 리터럴 역슬래시 의미를 유지합니다. 명령·계정·로컬 준비 검사의 첫 실패 순서를 실제 실행과 맞춥니다.
+- 설정·known_hosts의 민감 패턴 경로가 원인 문구까지 잘라버리지 않게 경로와 cause를 각각 마스킹합니다. 원래 IO/JSON/native source, CAS·atomic published 상태와 실제 비밀 정리의 적용 여부를 보존합니다.
+
+### Rust API 이행
+
+- `PrivilegeConfig.credential`이 `Option<String>`으로 바뀌고 `no_password: bool`이 추가됩니다. 비밀번호 설정은 `Some(...)`/`false`, 무비밀번호 sudo는 `None`/`true`를 사용합니다. 기존 저장 설정은 비밀번호 방식으로 읽습니다.
+- `ErrorResponse`에 `mutation: Option<ConfigMutationOutput>` 필드가 추가됩니다. 직접 구조체를 구성하는 호출자는 새 필드를 반영해야 합니다.
+- `Prompter::ensure_confirmation_available`는 기본 구현이 있는 hook이므로 기존 trait 구현을 그대로 사용할 수 있습니다.
+
+공식 `ssh2`/`libssh2-sys 0.3.3` 의존성과 기존 native 보안 제한은 그대로입니다. 이 릴리스는 native 취약점 해결을 보장하지 않습니다. `SECURITY.md`를 확인하세요.
+
 ## [0.14.2] - 2026-09-27
 
 ### 원자적 업로드 오류 안내
@@ -292,7 +326,8 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 
 - Initial public release: registered-server SSH `run`/`put`/`get` with secrets kept in the OS credential store, fail-closed `known_hosts` verification, and explicit `sshw trust`.
 
-[Unreleased]: https://github.com/Lv2dev/sshw/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/Lv2dev/sshw/compare/v0.15.0...HEAD
+[0.15.0]: https://github.com/Lv2dev/sshw/compare/v0.14.2...v0.15.0
 [0.11.0]: https://github.com/Lv2dev/sshw/compare/v0.10.1...v0.11.0
 [0.10.1]: https://github.com/Lv2dev/sshw/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/Lv2dev/sshw/compare/v0.9.1...v0.10.0

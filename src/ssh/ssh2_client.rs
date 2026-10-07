@@ -1,8 +1,12 @@
+use super::known_hosts::read_known_hosts_file;
 use super::{HostKeyInfo, PartialRunError, RunResult, SshClient, SshTarget, TransferResult};
 use crate::config::ServerConfig;
 use crate::credentials::AuthMaterial;
-use crate::error::{ResultErrorKindExt, app_error, classified_error, classified_io_error};
-use crate::output::ErrorKind;
+use crate::error::{
+    ResultErrorKindExt, app_error, classified_error, classified_io_error, redacted_error_detail,
+};
+use crate::local_command::redacted_argument;
+use crate::output::{ErrorKind, redact_secrets};
 use anyhow::Context;
 use base64::Engine;
 use directories::BaseDirs;
@@ -102,61 +106,43 @@ impl Ssh2Client {
             self.op_timeout,
             &known_hosts,
         )?;
+        let diagnostic = ScpDiagnostic::new(true, target, local, remote);
         let deadline = OperationDeadline::new(self.op_timeout);
-        deadline.apply(&session)?;
-        let mut remote_file = session
-            .scp_send(
+        diagnostic.ssh_step(deadline.apply(&session), "open remote file")?;
+        let mut remote_file = diagnostic.ssh_step(
+            session.scp_send(
                 Path::new(remote),
                 mode.unwrap_or(0o600) as i32,
                 metadata.len(),
                 times,
-            )
-            .context("ssh transfer error")
-            .with_error_kind(ErrorKind::Ssh)?;
+            ),
+            "open remote file",
+        )?;
         // scp promised `metadata.len()` bytes up front. Cap the reader at that
         // length so a file that grows mid-transfer never writes past the
         // declared size, and fail closed below if fewer bytes were sent (the
         // file shrank), so a truncated upload is never reported as a success.
-        let copied = copy_file_with_deadline(
-            &mut local_file,
-            &mut remote_file,
-            metadata.len(),
-            &session,
-            &deadline,
+        let copied = diagnostic.step(
+            copy_file_with_deadline(
+                &mut local_file,
+                &mut remote_file,
+                metadata.len(),
+                &session,
+                &deadline,
+            ),
+            "send file data",
         )?;
         if copied != metadata.len() {
-            return Err(anyhow::anyhow!(
-                "ssh transfer aborted: local file changed during transfer (expected {} bytes, sent {})",
-                metadata.len(),
-                copied
-            ));
+            return diagnostic.step(
+                Err(anyhow::anyhow!(
+                    "ssh transfer aborted: local file changed during transfer (expected {} bytes, sent {})",
+                    metadata.len(),
+                    copied
+                )),
+                "send file data",
+            );
         }
-        deadline.apply(&session)?;
-        remote_file
-            .write_all(&[0])
-            .context("ssh transfer error")
-            .with_error_kind(ErrorKind::Ssh)?;
-        deadline.apply(&session)?;
-        remote_file
-            .send_eof()
-            .context("ssh transfer error")
-            .with_error_kind(ErrorKind::Ssh)?;
-        deadline.apply(&session)?;
-        remote_file
-            .wait_eof()
-            .context("ssh transfer error")
-            .with_error_kind(ErrorKind::Ssh)?;
-        deadline.apply(&session)?;
-        remote_file
-            .close()
-            .context("ssh transfer error")
-            .with_error_kind(ErrorKind::Ssh)?;
-        deadline.apply(&session)?;
-        remote_file
-            .wait_close()
-            .context("ssh transfer error")
-            .with_error_kind(ErrorKind::Ssh)?;
-        ensure_scp_transfer_succeeded(&remote_file)?;
+        complete_scp_transfer(&session, &mut remote_file, &deadline, &diagnostic)?;
 
         Ok(TransferResult {
             bytes: copied,
@@ -390,6 +376,7 @@ impl SshClient for Ssh2Client {
         local: &Path,
         overwrite: bool,
     ) -> anyhow::Result<TransferResult> {
+        crate::storage::check_download_destination(local, overwrite)?;
         let known_hosts = self.resolved_known_hosts_path()?;
         let session = connect_verified_authenticated(
             target.server,
@@ -399,22 +386,24 @@ impl SshClient for Ssh2Client {
             self.op_timeout,
             &known_hosts,
         )?;
+        let diagnostic = ScpDiagnostic::new(false, target, local, remote);
         let deadline = OperationDeadline::new(self.op_timeout);
-        deadline.apply(&session)?;
-        let (mut remote_file, stat) = session
-            .scp_recv(Path::new(remote))
-            .context("ssh transfer error")
-            .with_error_kind(ErrorKind::Ssh)?;
+        diagnostic.ssh_step(deadline.apply(&session), "open remote file")?;
+        let (mut remote_file, stat) =
+            diagnostic.ssh_step(session.scp_recv(Path::new(remote)), "open remote file")?;
 
         // Stage locally first. The final path stays untouched until both the
         // announced size and the remote SCP channel completion are verified.
         let staged = {
             let mut reader = DeadlineReader::new(&mut remote_file, &session, &deadline);
-            crate::storage::stage_stream_owner_only(
-                local,
-                &mut reader,
-                overwrite,
-                Some(stat.size()),
+            diagnostic.step(
+                crate::storage::stage_stream_owner_only(
+                    local,
+                    &mut reader,
+                    overwrite,
+                    Some(stat.size()),
+                ),
+                "receive file data to local staging",
             )?
         };
 
@@ -423,32 +412,7 @@ impl SshClient for Ssh2Client {
             // hiding SCP's trailing status byte. Acknowledge the completed file
             // so a normal source can exit 0; source-side errors still surface in
             // the SSH channel's non-zero exit status below.
-            deadline.apply(&session)?;
-            remote_file
-                .write_all(&[0])
-                .context("ssh transfer error")
-                .with_error_kind(ErrorKind::Ssh)?;
-            deadline.apply(&session)?;
-            remote_file
-                .send_eof()
-                .context("ssh transfer error")
-                .with_error_kind(ErrorKind::Ssh)?;
-            deadline.apply(&session)?;
-            remote_file
-                .wait_eof()
-                .context("ssh transfer error")
-                .with_error_kind(ErrorKind::Ssh)?;
-            deadline.apply(&session)?;
-            remote_file
-                .close()
-                .context("ssh transfer error")
-                .with_error_kind(ErrorKind::Ssh)?;
-            deadline.apply(&session)?;
-            remote_file
-                .wait_close()
-                .context("ssh transfer error")
-                .with_error_kind(ErrorKind::Ssh)?;
-            ensure_scp_transfer_succeeded(&remote_file)
+            complete_scp_transfer(&session, &mut remote_file, &deadline, &diagnostic)
         })?;
 
         Ok(TransferResult {
@@ -478,40 +442,57 @@ impl Ssh2Client {
             self.op_timeout,
             &known_hosts,
         )?;
+        let diagnostic = RunDiagnostic {
+            server: target.server,
+            user: target.user,
+        };
         let deadline = OperationDeadline::new(self.op_timeout);
-        deadline.apply(&session)?;
-        let mut channel = session.channel_session().context("ssh session error")?;
-        deadline.apply(&session)?;
-        channel.exec(command).context("ssh session error")?;
-        if let Some(stdin) = stdin {
-            deadline.apply(&session)?;
-            channel
-                .write_all(stdin.as_bytes())
-                .context("ssh session error")?;
-        }
-        deadline.apply(&session)?;
-        channel.send_eof().context("ssh session error")?;
+        diagnostic.ssh_step(deadline.apply(&session), "open SSH session")?;
+        let mut channel = diagnostic.ssh_step(session.channel_session(), "open SSH session")?;
+        let result = (|| {
+            diagnostic.ssh_step(deadline.apply(&session), "execute remote command")?;
+            diagnostic.ssh_step(channel.exec(command), "execute remote command")?;
+            if let Some(stdin) = stdin {
+                diagnostic.ssh_step(deadline.apply(&session), "send command input")?;
+                diagnostic.ssh_step(channel.write_all(stdin.as_bytes()), "send command input")?;
+            }
+            diagnostic.ssh_step(deadline.apply(&session), "send input EOF")?;
+            diagnostic.ssh_step(channel.send_eof(), "send input EOF")?;
 
-        let (stdout, stderr) =
-            read_channel_outputs(&session, &mut channel, &deadline, self.output_limit, output)?;
-        let completion = (|| {
-            deadline.apply(&session)?;
-            channel.wait_close().context("ssh session error")?;
-            ensure_remote_command_not_signaled(&channel)?;
-            channel.exit_status().context("ssh session error")
+            let (stdout, stderr) = diagnostic.step(
+                read_channel_outputs(&session, &mut channel, &deadline, self.output_limit, output),
+                "read command output",
+            )?;
+            let completion = (|| {
+                diagnostic.ssh_step(deadline.apply(&session), "wait for command completion")?;
+                diagnostic.ssh_step(channel.wait_close(), "wait for command completion")?;
+                diagnostic.step(
+                    ensure_remote_command_not_signaled(&channel),
+                    "check command exit signal",
+                )?;
+                diagnostic.ssh_step(channel.exit_status(), "read command exit status")
+            })();
+            let exit_status = completion.map_err(|source| PartialRunError {
+                source,
+                stdout: stdout.clone(),
+                stderr: stderr.clone(),
+            })?;
+
+            Ok(RunResult {
+                exit_status,
+                stdout,
+                stderr,
+                duration_ms: started.elapsed().as_millis(),
+            })
         })();
-        let exit_status = completion.map_err(|source| PartialRunError {
-            source,
-            stdout: stdout.clone(),
-            stderr: stderr.clone(),
-        })?;
-
-        Ok(RunResult {
-            exit_status,
-            stdout,
-            stderr,
-            duration_ms: started.elapsed().as_millis(),
-        })
+        if result.is_err() {
+            // Bound blocking channel/session destruction after any run error,
+            // including completion errors, regardless of the output mode.
+            // Keep the original error and never reuse the operation timeout
+            // (which can be 15 minutes or explicitly unlimited) for cleanup.
+            session.set_timeout(100);
+        }
+        result
     }
 
     fn run_pty_inner(
@@ -532,35 +513,46 @@ impl Ssh2Client {
             self.op_timeout,
             &known_hosts,
         )?;
+        let diagnostic = RunDiagnostic {
+            server: target.server,
+            user: target.user,
+        };
         let deadline = OperationDeadline::new(self.op_timeout);
-        deadline.apply(&session)?;
-        let mut channel = session.channel_session().context("ssh session error")?;
+        diagnostic.ssh_step(deadline.apply(&session), "open SSH session")?;
+        let mut channel = diagnostic.ssh_step(session.channel_session(), "open SSH session")?;
         // Disable PTY echo so the injected password is never echoed back into
         // the output stream we collect.
         let mut modes = ssh2::PtyModes::new();
         modes.set_boolean(ssh2::PtyModeOpcode::ECHO, false);
-        channel
-            .request_pty("xterm", Some(modes), None)
-            .context("ssh session error")?;
-        deadline.apply(&session)?;
-        channel.exec(command).context("ssh session error")?;
+        diagnostic.ssh_step(
+            channel.request_pty("xterm", Some(modes), None),
+            "request su PTY",
+        )?;
+        diagnostic.ssh_step(deadline.apply(&session), "execute su command")?;
+        diagnostic.ssh_step(channel.exec(command), "execute su command")?;
 
         let begin_marker = su_begin_marker(marker_nonce);
-        let raw = pty_collect_with_password(
-            &session,
-            &mut channel,
-            password,
-            &deadline,
-            &begin_marker,
-            self.output_limit,
+        let raw = diagnostic.step(
+            pty_collect_with_password(
+                &session,
+                &mut channel,
+                password,
+                &deadline,
+                &begin_marker,
+                self.output_limit,
+            ),
+            "read su PTY output",
         )?;
-        deadline.apply(&session)?;
-        channel.wait_close().context("ssh session error")?;
+        diagnostic.ssh_step(deadline.apply(&session), "wait for su completion")?;
+        diagnostic.ssh_step(channel.wait_close(), "wait for su completion")?;
         // The PTY channel exit status is unreliable (a signal-killed process can
         // report 0), so the command's real exit code comes from the END marker
         // the wrapper printed. Drain the channel status but do not trust it.
         let _ = channel.exit_status();
-        let (stdout, exit_status) = extract_su_output(&raw, marker_nonce)?;
+        let (stdout, exit_status) = diagnostic.step(
+            extract_su_output(&raw, marker_nonce),
+            "verify su completion",
+        )?;
 
         Ok(RunResult {
             exit_status,
@@ -629,6 +621,123 @@ mod local_file_error_tests {
             }
         }
     }
+}
+
+struct RunDiagnostic<'a> {
+    server: &'a ServerConfig,
+    user: &'a str,
+}
+
+impl RunDiagnostic<'_> {
+    fn context(&self, error: anyhow::Error, stage: &str) -> anyhow::Error {
+        let detail = redacted_error_detail(&error);
+        let recovery = if stage == "open SSH session" || stage == "request su PTY" {
+            "check the server's session/PTY limits and access for the selected login account"
+        } else {
+            "check the connection, server session/command permissions and the selected privilege method if used. Remote completion may be unconfirmed; inspect the command's effects before retrying"
+        };
+        error.context(format!(
+            "SSH execution failed during {stage} for login account '{}' at {}:{}\ncaused by: {detail}\nnext: {recovery}",
+            redacted_argument(self.user), redacted_argument(&self.server.host), self.server.port
+        ))
+    }
+
+    fn step<T>(&self, result: anyhow::Result<T>, stage: &str) -> anyhow::Result<T> {
+        result.map_err(|error| match error.downcast::<PartialRunError>() {
+            Ok(mut partial) => {
+                partial.source = self.context(partial.source, stage);
+                anyhow::Error::new(partial)
+            }
+            Err(error) => self.context(error, stage),
+        })
+    }
+
+    fn ssh_step<T, E: Into<anyhow::Error>>(
+        &self,
+        result: Result<T, E>,
+        stage: &str,
+    ) -> anyhow::Result<T> {
+        self.step(
+            result.map_err(|error| {
+                crate::error::context_with_error_kind(
+                    error.into(),
+                    ErrorKind::Ssh,
+                    "ssh session error".into(),
+                )
+            }),
+            stage,
+        )
+    }
+}
+
+struct ScpDiagnostic<'a> {
+    upload: bool,
+    server: &'a ServerConfig,
+    user: &'a str,
+    local: &'a Path,
+    remote: &'a str,
+}
+
+impl<'a> ScpDiagnostic<'a> {
+    fn new(upload: bool, target: &SshTarget<'a>, local: &'a Path, remote: &'a str) -> Self {
+        Self {
+            upload,
+            server: target.server,
+            user: target.user,
+            local,
+            remote,
+        }
+    }
+
+    fn step<T>(&self, result: anyhow::Result<T>, stage: &str) -> anyhow::Result<T> {
+        result.map_err(|error| {
+            let detail = redacted_error_detail(&error);
+            let recovery = if self.upload {
+                "check the remote destination and its parent directory, write permissions for the selected login account, and server SCP support. The remote destination may have changed; inspect it before retrying"
+            } else {
+                "check that the remote source is a readable regular file for the selected login account, server SCP support, and local destination/parent permissions. Inspect the reported paths before retrying"
+            };
+            error.context(format!(
+                "SCP {} failed during {stage} for login account '{}' at {}:{}\nlocal: {}\nremote: {}\ncaused by: {detail}\nnext: {recovery}",
+                if self.upload { "upload" } else { "download" },
+                redacted_argument(self.user), redacted_argument(&self.server.host), self.server.port,
+                redacted_argument(&self.local.display().to_string()), redacted_argument(self.remote)
+            ))
+        })
+    }
+
+    fn ssh_step<T, E: Into<anyhow::Error>>(
+        &self,
+        result: Result<T, E>,
+        stage: &str,
+    ) -> anyhow::Result<T> {
+        self.step(
+            result.map_err(Into::into).with_error_kind(ErrorKind::Ssh),
+            stage,
+        )
+    }
+}
+
+fn complete_scp_transfer(
+    session: &Session,
+    channel: &mut ssh2::Channel,
+    deadline: &OperationDeadline,
+    diagnostic: &ScpDiagnostic<'_>,
+) -> anyhow::Result<()> {
+    diagnostic.ssh_step(deadline.apply(session), "acknowledge transfer")?;
+    diagnostic.ssh_step(channel.write_all(&[0]), "acknowledge transfer")?;
+    diagnostic.ssh_step(deadline.apply(session), "send EOF")?;
+    diagnostic.ssh_step(channel.send_eof(), "send EOF")?;
+    diagnostic.ssh_step(deadline.apply(session), "wait for EOF")?;
+    diagnostic.ssh_step(channel.wait_eof(), "wait for EOF")?;
+    diagnostic.ssh_step(deadline.apply(session), "close channel")?;
+    diagnostic.ssh_step(channel.close(), "close channel")?;
+    diagnostic.ssh_step(deadline.apply(session), "wait for channel close")?;
+    diagnostic.ssh_step(channel.wait_close(), "wait for channel close")?;
+    diagnostic.step(
+        ensure_scp_transfer_succeeded(channel),
+        "verify remote completion",
+    )
 }
 
 fn ensure_scp_transfer_succeeded(channel: &ssh2::Channel) -> anyhow::Result<()> {
@@ -717,12 +826,57 @@ fn connect_verified_authenticated(
 ) -> anyhow::Result<Session> {
     let session = connect(server, connect_timeout).with_error_kind(ErrorKind::Ssh)?;
     verify_known_host(&session, server, known_hosts_path).with_error_kind(ErrorKind::Ssh)?;
-    authenticate(&session, user, auth).with_error_kind(ErrorKind::Auth)?;
+    authenticate(&session, server, user, auth).with_error_kind(ErrorKind::Auth)?;
     // Switch from the connect-phase timeout to the operation budget (0 = an
     // explicit opt-out). Individual operation steps tighten this to the
     // absolute deadline's remaining time.
     session.set_timeout(op_timeout_millis(op_timeout));
     Ok(session)
+}
+
+#[derive(Clone, Copy)]
+enum ConnectStage {
+    Resolve,
+    Tcp,
+    Handshake,
+}
+
+fn diagnostic_value(value: &str) -> String {
+    let redacted = redact_secrets(value);
+    if redacted == value {
+        redacted
+    } else {
+        "<redacted>".into()
+    }
+}
+
+fn connect_diagnostic(
+    source: anyhow::Error,
+    server: &ServerConfig,
+    timeout: Duration,
+    stage: ConnectStage,
+) -> anyhow::Error {
+    let (operation, recovery) = match stage {
+        ConnectStage::Resolve => (
+            "resolve",
+            "check the configured host/port, DNS availability and network connectivity",
+        ),
+        ConnectStage::Tcp => (
+            "connect to",
+            "check the configured host/port, that the SSH service is listening, and network/firewall access",
+        ),
+        ConnectStage::Handshake => (
+            "complete SSH handshake with",
+            "check that the endpoint is running SSH and inspect server/network logs before retrying",
+        ),
+    };
+    let host = diagnostic_value(&server.host);
+    let detail = redacted_error_detail(&source);
+    source.context(format!(
+        "failed to {operation} {host}:{} (connect timeout budget: {} ms)\ncaused by: {detail}\nnext: {recovery}",
+        server.port,
+        timeout.as_millis(),
+    ))
 }
 
 fn connect(server: &ServerConfig, timeout: Duration) -> anyhow::Result<Session> {
@@ -734,27 +888,44 @@ fn connect(server: &ServerConfig, timeout: Duration) -> anyhow::Result<Session> 
             .to_socket_addrs()
             .map(|addresses| addresses.collect())
     })
-    .with_context(|| format!("failed to resolve {address}"))?;
+    .map_err(|error| connect_diagnostic(error, server, timeout, ConnectStage::Resolve))?;
     let mut last_error = None;
     let mut resolved_any = false;
     for socket_addr in socket_addrs {
         resolved_any = true;
         let mut kex_retries_remaining = WINDOWS_KEX_HANDSHAKE_RETRIES;
         loop {
-            let remaining = deadline.remaining()?;
+            let remaining = deadline
+                .remaining()
+                .map_err(|error| connect_diagnostic(error, server, timeout, ConnectStage::Tcp))?;
             match TcpStream::connect_timeout(&socket_addr, remaining) {
                 Ok(tcp) => {
-                    tcp.set_read_timeout(Some(deadline.remaining()?))?;
-                    tcp.set_write_timeout(Some(deadline.remaining()?))?;
-                    let mut session = Session::new()?;
-                    session.set_timeout(timeout_millis(deadline.remaining()?));
-                    session.set_tcp_stream(tcp);
-                    match session.handshake() {
-                        Ok(()) => return Ok(session),
-                        Err(err) if should_retry_windows_kex(&err, kex_retries_remaining) => {
+                    let handshake = (|| -> anyhow::Result<Session> {
+                        tcp.set_read_timeout(Some(deadline.remaining()?))?;
+                        tcp.set_write_timeout(Some(deadline.remaining()?))?;
+                        let mut session = Session::new()?;
+                        session.set_timeout(timeout_millis(deadline.remaining()?));
+                        session.set_tcp_stream(tcp);
+                        session.handshake()?;
+                        Ok(session)
+                    })();
+                    match handshake {
+                        Ok(session) => return Ok(session),
+                        Err(err)
+                            if err.downcast_ref::<ssh2::Error>().is_some_and(|error| {
+                                should_retry_windows_kex(error, kex_retries_remaining)
+                            }) =>
+                        {
                             kex_retries_remaining -= 1;
                         }
-                        Err(err) => return Err(err.into()),
+                        Err(err) => {
+                            return Err(connect_diagnostic(
+                                err,
+                                server,
+                                timeout,
+                                ConnectStage::Handshake,
+                            ));
+                        }
                     }
                 }
                 Err(err) => {
@@ -766,20 +937,18 @@ fn connect(server: &ServerConfig, timeout: Duration) -> anyhow::Result<Session> 
     }
 
     if !resolved_any {
-        return Err(anyhow::anyhow!("failed to resolve {address}"));
+        return Err(connect_diagnostic(
+            anyhow::anyhow!("resolver returned no addresses"),
+            server,
+            timeout,
+            ConnectStage::Resolve,
+        ));
     }
 
     let err = last_error
         .map(anyhow::Error::from)
         .unwrap_or_else(|| anyhow::anyhow!("no resolved address was reachable"));
-    Err(err).with_context(|| {
-        format!(
-            "failed to connect to {}:{} within {} seconds",
-            server.host,
-            server.port,
-            timeout.as_secs()
-        )
-    })
+    Err(connect_diagnostic(err, server, timeout, ConnectStage::Tcp))
 }
 
 fn should_retry_windows_kex(error: &ssh2::Error, retries_remaining: usize) -> bool {
@@ -1218,14 +1387,8 @@ fn read_channel_outputs(
     output_limit: usize,
     output: Option<&mut super::OutputCallback<'_>>,
 ) -> anyhow::Result<(String, String)> {
-    let streaming = output.is_some();
     session.set_blocking(false);
     let drained = drain_both_streams(channel, deadline, output_limit, output);
-    if streaming && drained.is_err() {
-        // A failed output sink must not leave channel destruction waiting for
-        // the original (possibly 15-minute) operation timeout.
-        session.set_timeout(100);
-    }
     session.set_blocking(true);
     let (out, err) = drained?;
     let stdout = decode_remote_output_lossy(out);
@@ -1349,24 +1512,6 @@ fn verify_known_host(
     )
 }
 
-fn read_known_hosts_file(known_hosts: &mut ssh2::KnownHosts, path: &Path) -> anyhow::Result<()> {
-    let content = fs::read_to_string(path)
-        .with_context(|| format!("failed to read known_hosts file: {}", path.display()))?;
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        let mut entry = String::with_capacity(line.len() + 1);
-        entry.push_str(line);
-        entry.push('\n');
-        known_hosts
-            .read_str(&entry, KnownHostFileKind::OpenSSH)
-            .with_context(|| format!("failed to parse known_hosts file: {}", path.display()))?;
-    }
-    Ok(())
-}
-
 fn write_known_hosts_file(known_hosts: &ssh2::KnownHosts, path: &Path) -> anyhow::Result<()> {
     let mut output = String::new();
     for host in known_hosts.hosts()? {
@@ -1396,21 +1541,57 @@ fn known_host_verification_result(
     }
 }
 
-fn authenticate(session: &Session, user: &str, auth: &AuthMaterial) -> anyhow::Result<()> {
+fn agent_auth_diagnostic(
+    source: anyhow::Error,
+    server: &ServerConfig,
+    user: &str,
+) -> anyhow::Error {
+    let detail = redacted_error_detail(&source);
+    source.context(format!(
+        "SSH agent authentication failed for login account '{}' at {}:{}\ncaused by: {detail}\nnext: using the same home/profile and execution environment, run `sshw doctor` to check agent availability and identities; check the agent connection and load the intended key if needed, then verify that the server allows this login account/key",
+        diagnostic_value(user), diagnostic_value(&server.host), server.port,
+    ))
+}
+
+fn password_auth_diagnostic(
+    source: anyhow::Error,
+    server: &ServerConfig,
+    user: &str,
+) -> anyhow::Error {
+    let detail = redacted_error_detail(&source);
+    source.context(format!(
+        "SSH password authentication failed for login account '{}' at {}:{}\ncaused by: {detail}\nnext: using the same home/profile selection, run `sshw doctor` to inspect local credential readiness; check the selected login password (SSHW_PASSWORD for session-only homes), the server's password authentication settings and whether this account is allowed to log in. Never put passwords in arguments",
+        diagnostic_value(user), diagnostic_value(&server.host), server.port,
+    ))
+}
+
+fn authenticate(
+    session: &Session,
+    server: &ServerConfig,
+    user: &str,
+    auth: &AuthMaterial,
+) -> anyhow::Result<()> {
     match auth {
         AuthMaterial::Password(password) => {
             session
                 .userauth_password(user, password)
-                .context("SSH authentication failed")?;
+                .map_err(|error| password_auth_diagnostic(error.into(), server, user))?;
         }
         AuthMaterial::Agent => {
             session
                 .userauth_agent(user)
-                .context("SSH agent authentication failed")?;
+                .map_err(|error| agent_auth_diagnostic(error.into(), server, user))?;
         }
     }
 
     if !session.authenticated() {
+        if matches!(auth, AuthMaterial::Password(_)) {
+            return Err(password_auth_diagnostic(
+                anyhow::anyhow!("SSH authentication did not complete"),
+                server,
+                user,
+            ));
+        }
         return Err(anyhow::anyhow!("SSH authentication failed"));
     }
 
@@ -1495,11 +1676,560 @@ example.test ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB9zU1OEQ2tzYhrXq4/DEjvRNvKv6cU
 ";
 
     #[test]
+    fn run_diagnostic_kind_ignores_marker_like_accounts_and_preserves_native_downcast() {
+        for marker in [
+            "authentication",
+            "unknown server",
+            "requires --yes",
+            "blocked by policy",
+        ] {
+            let server = ServerConfig::single_account(marker, 22, "deploy", AuthConfig::Agent);
+            let diagnostic = super::RunDiagnostic {
+                server: &server,
+                user: marker,
+            };
+            let error = diagnostic
+                .ssh_step(
+                    Err::<(), _>(ssh2::Error::from_errno(ssh2::ErrorCode::Session(-21))),
+                    "open SSH session",
+                )
+                .unwrap_err();
+            assert!(error.downcast_ref::<ssh2::Error>().is_some());
+            assert_eq!(crate::output::classify_error(&error), ErrorKind::Ssh);
+            let partial = crate::ssh::PartialRunError {
+                source: error,
+                stdout: "previous output".into(),
+                stderr: String::new(),
+            };
+            assert!(partial.source.downcast_ref::<ssh2::Error>().is_some());
+            let error = anyhow::Error::new(partial).context("caller context");
+            let error = Err::<(), _>(error)
+                .with_error_kind(ErrorKind::Io)
+                .unwrap_err();
+            let response = crate::output::ErrorResponse::from_error(&error);
+            assert_eq!(response.error.kind, ErrorKind::Ssh);
+            assert_eq!(response.error.exit_code, 5);
+            assert_eq!(response.partial_output.unwrap().stdout, "previous output");
+            let partial = error.downcast::<crate::ssh::PartialRunError>().unwrap();
+            assert!(partial.source.downcast::<ssh2::Error>().is_ok());
+        }
+    }
+
+    #[test]
+    fn run_diagnostic_preserves_native_codes_and_masks_account_endpoint_and_cause() {
+        let server =
+            ServerConfig::single_account("token=host-marker", 2222, "deploy", AuthConfig::Agent);
+        let diagnostic = super::RunDiagnostic {
+            server: &server,
+            user: "password=user-marker",
+        };
+        let native = ssh2::Error::from_errno(ssh2::ErrorCode::Session(-21));
+        let error = diagnostic
+            .ssh_step(
+                Err::<(), _>(anyhow::Error::new(native).context("token=cause-marker")),
+                "open SSH session",
+            )
+            .unwrap_err();
+        let response = crate::output::ErrorResponse::from_error(&error);
+        assert_eq!(response.error.kind, ErrorKind::Ssh);
+        assert_eq!(response.error.exit_code, 5);
+        assert!(
+            response.error.message.contains("open SSH session")
+                && response.error.message.contains("session/PTY limits")
+        );
+        assert!(error.chain().any(|cause| {
+            cause
+                .downcast_ref::<ssh2::Error>()
+                .is_some_and(|native| native.code() == ssh2::ErrorCode::Session(-21))
+        }));
+        let rendered = serde_json::to_string(&response).unwrap();
+        for marker in ["host-marker", "user-marker", "cause-marker"] {
+            assert!(!rendered.contains(marker), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn run_diagnostic_retains_partial_output_and_io_kind_through_owned_downcast() {
+        let server = ServerConfig::single_account("example.test", 22, "deploy", AuthConfig::Agent);
+        let diagnostic = super::RunDiagnostic {
+            server: &server,
+            user: "deploy",
+        };
+        let source = crate::error::classified_error(
+            ErrorKind::Io,
+            anyhow::Error::new(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "output sink closed",
+            )),
+        );
+        let partial = crate::ssh::PartialRunError {
+            source,
+            stdout: "previous output".into(),
+            stderr: "previous stderr".into(),
+        };
+        let error = diagnostic
+            .step(
+                Err::<(), _>(anyhow::Error::new(partial)),
+                "read command output",
+            )
+            .unwrap_err();
+        let partial = error.downcast::<crate::ssh::PartialRunError>().unwrap();
+        assert_eq!(partial.stdout, "previous output");
+        assert_eq!(partial.stderr, "previous stderr");
+        let error = anyhow::Error::new(partial);
+        let response = crate::output::ErrorResponse::from_error(&error);
+        assert_eq!(response.error.kind, ErrorKind::Io);
+        assert!(
+            response.error.message.contains("read command output")
+                && response.error.message.contains("output sink closed")
+        );
+        assert!(error.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::BrokenPipe)
+        }));
+        assert_eq!(response.partial_output.unwrap().stdout, "previous output");
+        // Completion callers expose this anyhow source directly, so preserve
+        // native anyhow downcasting as well as the standard source chain.
+        let source = diagnostic
+            .ssh_step(
+                Err::<(), _>(ssh2::Error::from_errno(ssh2::ErrorCode::Session(-9))),
+                "wait for command completion",
+            )
+            .unwrap_err();
+        assert!(source.downcast_ref::<ssh2::Error>().is_some());
+        let partial = crate::ssh::PartialRunError {
+            source,
+            stdout: "complete output".into(),
+            stderr: String::new(),
+        };
+        assert!(partial.source.downcast_ref::<ssh2::Error>().is_some());
+        assert_eq!(
+            crate::output::classify_error(&anyhow::Error::new(partial)),
+            ErrorKind::Ssh
+        );
+    }
+
+    #[test]
+    fn scp_diagnostics_keep_native_codes_and_mask_fields_and_causes() {
+        for upload in [false, true] {
+            for sensitive in [false, true] {
+                let server = ServerConfig::single_account(
+                    if sensitive {
+                        "token=host-marker"
+                    } else {
+                        "example.test"
+                    },
+                    2222,
+                    "deploy",
+                    AuthConfig::Agent,
+                );
+                let user = if sensitive {
+                    "password=user-marker"
+                } else {
+                    "deploy"
+                };
+                let local = std::path::Path::new(if sensitive {
+                    "token=local-marker"
+                } else {
+                    "local's $file"
+                });
+                let remote = if sensitive {
+                    "password=remote-marker"
+                } else {
+                    "/srv/remote's $file"
+                };
+                let target = crate::ssh::SshTarget::new(&server, user);
+                let diagnostic = super::ScpDiagnostic::new(upload, &target, local, remote);
+                let native = ssh2::Error::from_errno(ssh2::ErrorCode::Session(
+                    libssh2_sys::LIBSSH2_ERROR_SCP_PROTOCOL,
+                ));
+                let native_message = native.to_string();
+                let source = if sensitive {
+                    anyhow::Error::new(native).context("token=cause-marker\n-----BEGIN PRIVATE KEY-----\nkey-material\n-----END PRIVATE KEY-----")
+                } else {
+                    anyhow::Error::new(native)
+                };
+                let error = diagnostic
+                    .ssh_step(Err::<(), _>(source), "open remote file")
+                    .unwrap_err();
+                let response = crate::output::ErrorResponse::from_error(&error);
+                let rendered = serde_json::to_string(&response).unwrap();
+                assert_eq!(response.error.kind, ErrorKind::Ssh);
+                assert_eq!(response.error.exit_code, 5);
+                assert!(
+                    response
+                        .error
+                        .message
+                        .contains("failed during open remote file for login account")
+                );
+                assert!(
+                    response.error.message.contains("\nlocal: ")
+                        && response.error.message.contains("\nremote: ")
+                );
+                assert!(
+                    response.error.message.contains("server SCP support")
+                        && response.error.message.contains("next:")
+                );
+                assert!(
+                    response
+                        .error
+                        .causes
+                        .iter()
+                        .any(|cause| cause == &native_message)
+                );
+                assert!(error.chain().any(|cause| {
+                    cause.downcast_ref::<ssh2::Error>().is_some_and(|native| {
+                        native.code()
+                            == ssh2::ErrorCode::Session(libssh2_sys::LIBSSH2_ERROR_SCP_PROTOCOL)
+                    })
+                }));
+                if upload {
+                    assert!(
+                        response.error.message.contains("SCP upload")
+                            && response.error.message.contains("may have changed")
+                    );
+                } else {
+                    assert!(
+                        response.error.message.contains("SCP download")
+                            && response.error.message.contains("readable regular file")
+                    );
+                }
+                if sensitive {
+                    for marker in [
+                        "host-marker",
+                        "user-marker",
+                        "local-marker",
+                        "remote-marker",
+                        "cause-marker",
+                        "key-material",
+                    ] {
+                        assert!(!rendered.contains(marker), "{rendered}");
+                    }
+                } else {
+                    assert!(
+                        response.error.message.contains("example.test:2222")
+                            && response.error.message.contains("local's $file")
+                            && response.error.message.contains("/srv/remote's $file")
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scp_data_and_completion_context_preserves_io_classification_and_typed_sources() {
+        let server = ServerConfig::single_account("example.test", 22, "deploy", AuthConfig::Agent);
+        let target = crate::ssh::SshTarget::new(&server, "deploy");
+        for upload in [false, true] {
+            let diagnostic = super::ScpDiagnostic::new(
+                upload,
+                &target,
+                std::path::Path::new("local"),
+                "/srv/file",
+            );
+            for kind in [ErrorKind::Io, ErrorKind::Ssh] {
+                for stage in [
+                    "send file data",
+                    "receive file data to local staging",
+                    "verify remote completion",
+                ] {
+                    let source = crate::error::classified_error(
+                        kind,
+                        anyhow::Error::new(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "transfer deadline elapsed",
+                        )),
+                    );
+                    let error = diagnostic.step(Err::<(), _>(source), stage).unwrap_err();
+                    let response = crate::output::ErrorResponse::from_error(&error);
+                    assert_eq!(response.error.kind, kind);
+                    assert!(
+                        response.error.message.contains(stage)
+                            && response.error.message.contains("transfer deadline elapsed")
+                    );
+                    assert!(error.chain().any(|cause| {
+                        cause
+                            .downcast_ref::<std::io::Error>()
+                            .is_some_and(|io| io.kind() == std::io::ErrorKind::TimedOut)
+                    }));
+                }
+            }
+            assert_eq!(diagnostic.step(Ok(17), "send file data").unwrap(), 17);
+        }
+    }
+
+    #[test]
     fn default_client_has_connect_timeout() {
         assert_eq!(
             super::Ssh2Client::default().connect_timeout(),
             std::time::Duration::from_secs(15)
         );
+    }
+
+    #[test]
+    fn password_auth_diagnostics_preserve_native_errors_and_mask_each_field_and_cause() {
+        for sensitive in [false, true] {
+            let server = ServerConfig::single_account(
+                if sensitive {
+                    "token=host-marker"
+                } else {
+                    "example.test"
+                },
+                2222,
+                "deploy",
+                AuthConfig::Agent,
+            );
+            let user = if sensitive {
+                "password=user-marker"
+            } else {
+                "deploy"
+            };
+            let native = ssh2::Error::from_errno(ssh2::ErrorCode::Session(
+                libssh2_sys::LIBSSH2_ERROR_AUTHENTICATION_FAILED,
+            ));
+            let native_message = native.to_string();
+            let source = if sensitive {
+                anyhow::Error::new(native).context("password=cause-marker\n-----BEGIN PRIVATE KEY-----\nkey-material\n-----END PRIVATE KEY-----")
+            } else {
+                anyhow::Error::new(native)
+            };
+            let error = Err::<(), _>(super::password_auth_diagnostic(source, &server, user))
+                .with_error_kind(ErrorKind::Auth)
+                .unwrap_err();
+            let response = crate::output::ErrorResponse::from_error(&error);
+            let rendered = serde_json::to_string(&response).unwrap();
+            assert_eq!(response.error.kind, ErrorKind::Auth);
+            assert_eq!(response.error.exit_code, 4);
+            assert!(
+                response
+                    .error
+                    .message
+                    .contains("SSH password authentication failed for login account")
+            );
+            assert!(
+                response.error.message.contains("caused by:")
+                    && response.error.message.contains("same home/profile")
+                    && response.error.message.contains("sshw doctor")
+            );
+            assert!(
+                response.error.message.contains("SSHW_PASSWORD")
+                    && response
+                        .error
+                        .message
+                        .contains("server's password authentication settings")
+            );
+            assert!(
+                response
+                    .error
+                    .causes
+                    .iter()
+                    .any(|cause| cause == &native_message)
+            );
+            assert!(
+                error
+                    .chain()
+                    .any(|cause| cause
+                        .downcast_ref::<ssh2::Error>()
+                        .is_some_and(|native| native.code()
+                            == ssh2::ErrorCode::Session(
+                                libssh2_sys::LIBSSH2_ERROR_AUTHENTICATION_FAILED
+                            )))
+            );
+            if sensitive {
+                for marker in ["host-marker", "user-marker", "cause-marker", "key-material"] {
+                    assert!(!rendered.contains(marker));
+                }
+                assert!(response.error.message.contains("<redacted>"));
+            } else {
+                assert!(
+                    response
+                        .error
+                        .message
+                        .contains("'deploy' at example.test:2222")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn agent_auth_diagnostics_keep_native_source_and_mask_fields_and_causes() {
+        for sensitive in [false, true] {
+            let server = ServerConfig::single_account(
+                if sensitive {
+                    "token=host-marker"
+                } else {
+                    "example.test"
+                },
+                2222,
+                "deploy",
+                AuthConfig::Agent,
+            );
+            let user = if sensitive {
+                "password=user-marker"
+            } else {
+                "deploy"
+            };
+            let native = ssh2::Error::from_errno(ssh2::ErrorCode::Session(
+                libssh2_sys::LIBSSH2_ERROR_AGENT_PROTOCOL,
+            ));
+            let native_message = native.to_string();
+            let source = if sensitive {
+                anyhow::Error::new(native).context("agent unavailable: token=cause-marker\n-----BEGIN PRIVATE KEY-----\nkey-material\n-----END PRIVATE KEY-----")
+            } else {
+                anyhow::Error::new(native)
+            };
+            let error = super::agent_auth_diagnostic(source, &server, user);
+            let error = Err::<(), _>(error)
+                .with_error_kind(ErrorKind::Auth)
+                .unwrap_err();
+            let response = crate::output::ErrorResponse::from_error(&error);
+            let rendered = serde_json::to_string(&response).unwrap();
+            assert_eq!(response.error.exit_code, 4);
+            assert!(
+                response
+                    .error
+                    .message
+                    .contains("SSH agent authentication failed for login account")
+            );
+            assert!(
+                response.error.message.contains("caused by:")
+                    && response.error.message.contains("sshw doctor")
+            );
+            assert!(
+                response
+                    .error
+                    .message
+                    .contains("same home/profile and execution environment")
+            );
+            assert!(
+                response
+                    .error
+                    .causes
+                    .iter()
+                    .any(|cause| cause == &native_message)
+            );
+            assert!(error.chain().any(|cause| {
+                cause.downcast_ref::<ssh2::Error>().is_some_and(|native| {
+                    native.code()
+                        == ssh2::ErrorCode::Session(libssh2_sys::LIBSSH2_ERROR_AGENT_PROTOCOL)
+                })
+            }));
+            if sensitive {
+                assert!(
+                    response
+                        .error
+                        .message
+                        .contains("'<redacted>' at <redacted>:2222")
+                );
+                for marker in ["host-marker", "user-marker", "cause-marker", "key-material"] {
+                    assert!(!rendered.contains(marker), "{rendered}");
+                }
+            } else {
+                assert!(
+                    response
+                        .error
+                        .message
+                        .contains("'deploy' at example.test:2222")
+                );
+                assert!(response.error.message.contains(&native_message));
+            }
+        }
+    }
+
+    #[test]
+    fn connect_diagnostics_keep_typed_causes_and_redact_endpoint_and_secrets() {
+        for (stage, operation) in [
+            (super::ConnectStage::Resolve, "resolve"),
+            (super::ConnectStage::Tcp, "connect to"),
+        ] {
+            let server = ServerConfig::single_account(
+                "token=endpoint-secret",
+                2222,
+                "deploy",
+                AuthConfig::Agent,
+            );
+            let error = anyhow::Error::new(std::io::Error::new(std::io::ErrorKind::ConnectionRefused,
+                "socket failure: password=cause-secret\n-----BEGIN PRIVATE KEY-----\nprivate-material\n-----END PRIVATE KEY-----"))
+                .context("setup denied");
+            let error = super::connect_diagnostic(
+                error,
+                &server,
+                std::time::Duration::from_millis(250),
+                stage,
+            );
+            let error = Err::<(), _>(error)
+                .with_error_kind(ErrorKind::Ssh)
+                .unwrap_err();
+            let response = crate::output::ErrorResponse::from_error(&error);
+            let rendered = serde_json::to_string(&response).unwrap();
+            for secret in ["endpoint-secret", "cause-secret", "private-material"] {
+                assert!(!rendered.contains(secret), "{rendered}");
+            }
+            assert_eq!(response.error.exit_code, 5);
+            assert!(
+                response
+                    .error
+                    .message
+                    .contains(&format!("failed to {operation} <redacted>:2222"))
+            );
+            assert!(
+                response.error.message.contains("setup denied")
+                    && response.error.message.contains("socket failure")
+            );
+            assert!(
+                response
+                    .error
+                    .message
+                    .contains("connect timeout budget: 250 ms")
+                    && response.error.message.contains("next: check")
+            );
+            assert!(error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::ConnectionRefused)
+            }));
+        }
+    }
+
+    #[test]
+    fn connect_diagnostics_keep_native_handshake_error_and_recovery() {
+        let server = ServerConfig::single_account("127.0.0.1", 2222, "deploy", AuthConfig::Agent);
+        let native = ssh2::Error::from_errno(ssh2::ErrorCode::Session(
+            libssh2_sys::LIBSSH2_ERROR_KEY_EXCHANGE_FAILURE,
+        ));
+        let message = native.to_string();
+        let error = super::connect_diagnostic(
+            native.into(),
+            &server,
+            std::time::Duration::from_secs(15),
+            super::ConnectStage::Handshake,
+        );
+        let error = Err::<(), _>(error)
+            .with_error_kind(ErrorKind::Ssh)
+            .unwrap_err();
+        let response = crate::output::ErrorResponse::from_error(&error);
+        assert_eq!(response.error.exit_code, 5);
+        assert!(
+            response
+                .error
+                .message
+                .contains("complete SSH handshake with 127.0.0.1:2222")
+        );
+        assert!(response.error.message.contains(&message));
+        assert!(
+            response
+                .error
+                .message
+                .contains("next: check that the endpoint is running SSH")
+        );
+        assert!(response.error.causes.iter().any(|cause| cause == &message));
+        assert!(error.chain().any(|cause| {
+            cause.downcast_ref::<ssh2::Error>().is_some_and(|native| {
+                native.code()
+                    == ssh2::ErrorCode::Session(libssh2_sys::LIBSSH2_ERROR_KEY_EXCHANGE_FAILURE)
+            })
+        }));
     }
 
     #[test]
@@ -1514,6 +2244,28 @@ example.test ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB9zU1OEQ2tzYhrXq4/DEjvRNvKv6cU
         release_sender.send(()).unwrap();
 
         assert!(err.to_string().contains("connect phase timed out"));
+        let server = ServerConfig::single_account("example.test", 22, "deploy", AuthConfig::Agent);
+        let err = super::connect_diagnostic(
+            err,
+            &server,
+            std::time::Duration::from_millis(25),
+            super::ConnectStage::Resolve,
+        );
+        let response = crate::output::ErrorResponse::from_error(&err);
+        assert_eq!(response.error.exit_code, 5);
+        assert!(
+            response
+                .error
+                .message
+                .contains("timed out after 25 milliseconds")
+        );
+        assert!(
+            response
+                .error
+                .message
+                .contains("connect timeout budget: 25 ms")
+                && response.error.message.contains("DNS availability")
+        );
     }
 
     #[test]

@@ -49,6 +49,78 @@ pub struct ErrorResponse {
     pub error: ErrorBody,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub partial_output: Option<PartialOutput>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mutation: Option<ConfigMutationOutput>,
+}
+
+/// A persisted default selection changed as a consequence of a mutation.
+#[derive(Debug, Clone, Serialize)]
+pub struct DefaultChange {
+    pub resource: &'static str,
+    pub previous: Option<String>,
+    pub current: Option<String>,
+}
+
+impl DefaultChange {
+    pub(crate) fn between(
+        resource: &'static str,
+        previous: Option<String>,
+        current: Option<String>,
+    ) -> Option<Self> {
+        (previous != current).then_some(Self {
+            resource,
+            previous,
+            current,
+        })
+    }
+
+    pub(crate) fn redacted(&self) -> Self {
+        Self {
+            resource: self.resource,
+            previous: self.previous.as_deref().map(redact_secrets),
+            current: self.current.as_deref().map(redact_secrets),
+        }
+    }
+
+    pub(crate) fn human_message(&self) -> String {
+        let change = self.redacted();
+        let mut message = format!(
+            "default {} changed: {} -> {}\n",
+            change.resource,
+            change.previous.as_deref().unwrap_or("none"),
+            change.current.as_deref().unwrap_or("none"),
+        );
+        if change.resource == "profile" && change.current.is_none() {
+            message.push_str(
+                "without an explicit home/profile selector, the built-in default home is used\n",
+            );
+        }
+        message
+    }
+}
+
+/// The configuration was saved, but cleanup of obsolete credentials failed.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConfigMutationOutput {
+    pub config_applied: bool,
+    pub failed_stage: &'static str,
+    pub action: &'static str,
+    pub server: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_change: Option<DefaultChange>,
+}
+
+impl ConfigMutationOutput {
+    fn redacted(&self) -> Self {
+        Self {
+            server: redact_secrets(&self.server),
+            account: self.account.as_deref().map(redact_secrets),
+            default_change: self.default_change.as_ref().map(DefaultChange::redacted),
+            ..self.clone()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -75,6 +147,10 @@ impl ErrorResponse {
         }
         Self {
             ok: false,
+            mutation: err
+                .chain()
+                .find_map(|cause| cause.downcast_ref::<crate::error::CredentialCleanupError>())
+                .map(|cleanup| cleanup.mutation.redacted()),
             partial_output: err
                 .chain()
                 .find_map(|cause| cause.downcast_ref::<crate::ssh::PartialRunError>())
@@ -157,6 +233,10 @@ pub fn classify_error(err: &anyhow::Error) -> ErrorKind {
         .find_map(|cause| cause.downcast_ref::<ClassifiedError>())
     {
         return classified.kind();
+    }
+
+    if let Some(kind) = crate::error::contextual_error_kind(err) {
+        return kind;
     }
 
     let message = format!("{err:#}").to_ascii_lowercase();

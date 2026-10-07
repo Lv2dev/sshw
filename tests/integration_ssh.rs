@@ -411,7 +411,8 @@ fn docker_privileged_config(
     server.account_mut(TEST_USER).unwrap().privilege = Some(PrivilegeConfig {
         method,
         user: "root".to_string(),
-        credential: privilege_credential.clone(),
+        credential: Some(privilege_credential.clone()),
+        no_password: false,
     });
     let mut config = SshwConfig {
         default: Some("docker-password".to_string()),
@@ -785,6 +786,112 @@ fn streaming_sudo_redacts_loaded_password_and_closes_command_stdin() {
 
 #[test]
 #[ignore = "spawns a Docker-backed sshd; run with --ignored --test-threads=1"]
+fn saved_passwordless_sudo_runs_as_non_root_target_without_a_privilege_secret() {
+    let Some(srv) = DockerPasswordServer::start() else {
+        return;
+    };
+    srv.trust();
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join("servers.json");
+    let (mut config, login_credential, _) =
+        docker_privileged_config(&path, &srv, PrivilegeMethod::Sudo);
+    config
+        .servers
+        .get_mut("docker-password")
+        .unwrap()
+        .account_mut(TEST_USER)
+        .unwrap()
+        .privilege = None;
+    save_config(&path, &config).unwrap();
+    let store = SessionOnlyStore::new();
+    store
+        .set_password_for(
+            CredentialPurpose::Login,
+            &login_credential,
+            TEST_USER,
+            TEST_PASSWORD,
+        )
+        .unwrap();
+    let mut prompter = NoopPrompter;
+    execute(
+        Cli::try_parse_from([
+            "sshw",
+            "privilege",
+            "set",
+            "docker-password",
+            "--user",
+            "daemon",
+            "--no-password",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &srv.client(),
+        &mut prompter,
+    )
+    .unwrap();
+    let output = execute(
+        Cli::try_parse_from([
+            "sshw",
+            "run",
+            "docker-password",
+            "id -un; cat",
+            "--as-root",
+            "--yes",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &srv.client(),
+        &mut prompter,
+    )
+    .unwrap();
+    assert_eq!(output.exit_code, 0);
+    assert_eq!(output.stdout, "daemon\n");
+    assert!(output.stderr.is_empty());
+
+    // Root still requires a password in this fixture. No interactive fallback.
+    execute(
+        Cli::try_parse_from([
+            "sshw",
+            "privilege",
+            "set",
+            "docker-password",
+            "--user",
+            "root",
+            "--no-password",
+            "--force",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &srv.client(),
+        &mut prompter,
+    )
+    .unwrap();
+    let denied = execute(
+        Cli::try_parse_from([
+            "sshw",
+            "run",
+            "docker-password",
+            "id -un",
+            "--as-root",
+            "--json",
+        ])
+        .unwrap(),
+        &path,
+        &store,
+        &srv.client(),
+        &mut prompter,
+    )
+    .unwrap();
+    assert_eq!(denied.exit_code, 8);
+    let value: serde_json::Value = serde_json::from_str(&denied.stdout).unwrap();
+    assert_eq!(value["command_succeeded"], false);
+}
+
+#[test]
+#[ignore = "spawns a Docker-backed sshd; run with --ignored --test-threads=1"]
 fn run_as_root_uses_su_against_real_sshd_with_pty_password() {
     let Some(srv) = DockerPasswordServer::start() else {
         return;
@@ -940,6 +1047,81 @@ fn put_then_get_roundtrip() {
     assert_eq!(fs::read(&dest).expect("read dest"), payload);
 
     let _ = client.run(&target, &AuthMaterial::Agent, &format!("rm -f {remote}"));
+}
+
+#[test]
+#[ignore = "spawns a real sshd; run with --ignored --test-threads=1"]
+fn get_validates_local_paths_and_preserves_symlink_targets() {
+    use std::os::unix::fs::symlink;
+    let srv = TestServer::start();
+    let client = srv.client();
+    let server = srv.server();
+    let work = tempfile::tempdir().unwrap();
+    let source = work.path().join("source");
+    fs::write(&source, b"DATA").unwrap();
+    let directory = work.path().join("directory");
+    fs::create_dir(&directory).unwrap();
+    let parent_file = work.path().join("parent-file");
+    fs::write(&parent_file, b"ORIGINAL").unwrap();
+    // No host trust yet: direct library calls must reject local path errors
+    // before connecting and before any remote download could start.
+    for destination in [&directory, &parent_file.join("child")] {
+        for overwrite in [false, true] {
+            let error = client
+                .get(
+                    &default_target(&server),
+                    &AuthMaterial::Agent,
+                    source.to_str().unwrap(),
+                    destination,
+                    overwrite,
+                )
+                .unwrap_err();
+            assert_eq!(
+                sshw::output::classify_error(&error),
+                sshw::output::ErrorKind::Io
+            );
+            assert!(
+                error.to_string().contains(destination.to_str().unwrap()),
+                "{error:#}"
+            );
+        }
+    }
+    srv.trust();
+    let nested = work.path().join("missing/parents/download");
+    client
+        .get(
+            &default_target(&server),
+            &AuthMaterial::Agent,
+            source.to_str().unwrap(),
+            &nested,
+            false,
+        )
+        .unwrap();
+    assert_eq!(fs::read(&nested).unwrap(), b"DATA");
+    let missing = work.path().join("missing-target");
+    for (index, target) in [&parent_file, &directory, &missing].iter().enumerate() {
+        let destination = work.path().join(format!("link-{index}"));
+        symlink(target, &destination).unwrap();
+        client
+            .get(
+                &default_target(&server),
+                &AuthMaterial::Agent,
+                source.to_str().unwrap(),
+                &destination,
+                true,
+            )
+            .unwrap();
+        assert!(
+            !fs::symlink_metadata(&destination)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read(destination).unwrap(), b"DATA");
+    }
+    assert_eq!(fs::read(parent_file).unwrap(), b"ORIGINAL");
+    assert!(directory.is_dir());
+    assert!(!missing.exists());
 }
 
 #[test]
@@ -1671,6 +1853,168 @@ fn op_timeout_aborts_idle_command() {
     assert!(
         started.elapsed() < Duration::from_secs(5),
         "op timeout did not fire promptly: {err}"
+    );
+}
+
+#[test]
+#[ignore = "spawns a real sshd; run with --ignored --test-threads=1"]
+fn run_timeout_cli_has_bounded_cleanup_and_actionable_errors() {
+    let srv = TestServer::start();
+    srv.trust();
+    let home = tempfile::tempdir().unwrap();
+    let mut config = SshwConfig {
+        default: Some("test".into()),
+        credential_backend: sshw::config::CredentialBackend::SessionOnly,
+        ..SshwConfig::default()
+    };
+    config.servers.insert("test".into(), srv.server());
+    save_config(&home.path().join("servers.json"), &config).unwrap();
+    fs::copy(&srv.known_hosts, home.path().join("known_hosts")).unwrap();
+
+    for mode in ["buffered", "json", "stream"] {
+        let ready = home.path().join("ready");
+        // Start measuring only when the remote command is running, so slow
+        // SSH connection/authentication on CI does not consume the time budget.
+        let script = format!(
+            "printf 'started\\n'; printf 'warning\\n' >&2; touch '{}'; sleep 4",
+            ready.display()
+        );
+        let mut command = Command::new(env!("CARGO_BIN_EXE_sshw"));
+        command
+            .env("SSHW_HOME", home.path())
+            .env_remove("SSHW_PASSWORD")
+            .env_remove("SSHW_PRIVILEGE_PASSWORD")
+            .args(["--timeout", "1", "run", "test", &script])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if mode != "buffered" {
+            command.arg(format!("--{mode}"));
+        }
+        let mut child = command.spawn().unwrap();
+        let started = Instant::now();
+        while !ready.exists() {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "command exited before marker: {mode}"
+            );
+            if started.elapsed() > Duration::from_secs(10) {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("remote command did not start: {mode}");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let running = Instant::now();
+        while child.try_wait().unwrap().is_none() {
+            if running.elapsed() > Duration::from_secs(5) {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("timeout failed to terminate CLI: {mode}");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let elapsed = running.elapsed();
+        let result = child.wait_with_output().unwrap();
+        fs::remove_file(&ready).unwrap();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "{mode} cleanup took {elapsed:?}"
+        );
+        assert_eq!(result.status.code(), Some(5));
+        if mode == "json" {
+            let value: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+            assert_eq!(value["error"]["kind"], "ssh");
+            assert!(
+                value["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("timed out")
+            );
+            assert_eq!(value["partial_output"]["stdout"], "started\n");
+            assert_eq!(value["partial_output"]["stderr"], "warning\n");
+            assert_eq!(value["partial_output"]["completion_confirmed"], false);
+            assert!(result.stderr.is_empty());
+        } else {
+            assert_eq!(String::from_utf8(result.stdout).unwrap(), "started\n");
+            let stderr = String::from_utf8(result.stderr).unwrap();
+            assert!(
+                stderr.contains("timed out after 1000 milliseconds"),
+                "{stderr}"
+            );
+            assert!(stderr.contains("completion was not confirmed"), "{stderr}");
+            assert_eq!(stderr.matches("warning").count(), 1);
+        }
+    }
+}
+
+#[test]
+#[ignore = "spawns a real sshd; run with --ignored --test-threads=1"]
+fn run_output_limit_bounds_cleanup_even_without_an_operation_timeout() {
+    let srv = TestServer::start();
+    srv.trust();
+    let server = srv.server();
+    for timeout in [None, Some(Duration::from_secs(5))] {
+        let client = srv.client().with_op_timeout(timeout).with_output_limit(16);
+        let started = Instant::now();
+        // Exercise the stdin path shared with sudo, after the password-sized
+        // input has been consumed. The server remains alive after the cap.
+        let error = client
+            .run_with_stdin(
+                &default_target(&server),
+                &AuthMaterial::Agent,
+                "cat >/dev/null; head -c 1024 /dev/zero; sleep 4",
+                "synthetic-input\n",
+            )
+            .unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "cleanup took {:?}",
+            started.elapsed()
+        );
+        assert!(
+            error.to_string().contains("output exceeded 16-byte limit"),
+            "{error:#}"
+        );
+        assert_eq!(
+            sshw::output::classify_error(&error),
+            sshw::output::ErrorKind::Ssh
+        );
+    }
+}
+
+#[test]
+#[ignore = "spawns a real sshd; run with --ignored --test-threads=1"]
+fn run_completion_timeout_bounds_cleanup_and_preserves_partial_output() {
+    let srv = TestServer::start();
+    srv.trust();
+    let server = srv.server();
+    let started = Instant::now();
+    let error = srv
+        .client()
+        .with_op_timeout(Some(Duration::from_secs(1)))
+        .run(
+            &default_target(&server),
+            &AuthMaterial::Agent,
+            "printf 'complete output\\n'; exec 1>&- 2>&-; sleep 4",
+        )
+        .unwrap_err();
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "cleanup took {:?}",
+        started.elapsed()
+    );
+    let partial = error.downcast_ref::<sshw::ssh::PartialRunError>().unwrap();
+    assert_eq!(partial.stdout, "complete output\n");
+    assert!(partial.stderr.is_empty());
+    // EOF was already drained: this must exercise the native wait_close
+    // timeout, not the operation deadline in the output-reading loop.
+    assert!(
+        partial.source.downcast_ref::<ssh2::Error>().is_some(),
+        "expected a native completion error: {error:#}"
+    );
+    assert_eq!(
+        sshw::output::classify_error(&error),
+        sshw::output::ErrorKind::Ssh
     );
 }
 

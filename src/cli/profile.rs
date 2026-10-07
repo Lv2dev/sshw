@@ -9,11 +9,12 @@ use super::{
     ProfileListArgs, ProfileRemoveArgs, ProfileShowArgs, ok,
 };
 use crate::error::ResultErrorKindExt;
-use crate::home::generate_profile_id;
-use crate::output::ErrorKind;
+use crate::home::{ResolvedHome, generate_profile_id};
+use crate::output::{DefaultChange, ErrorKind, redact_secrets};
 use crate::profile::{
     ProfileEntry, ProfileRegistry, RegistryRevision, load_registry_for_removal_with_revision,
-    load_registry_with_revision, save_registry_if_unchanged, validate_profile_name,
+    load_registry_with_revision, profile_registration_hint, save_registry_if_unchanged,
+    unknown_profile, validate_home_directory, validate_profile_name,
 };
 use serde_json::json;
 use std::fs;
@@ -80,16 +81,25 @@ fn profile_add(
         ));
     }
 
-    let id = registry
-        .profiles
-        .get(&args.name)
+    let previous = registry.profiles.get(&args.name).cloned();
+    let id = previous
+        .as_ref()
         .filter(|entry| same_profile_home(&entry.home, &home))
         .map(|entry| entry.id.clone())
         .unwrap_or_else(|| generate_profile_id(&args.name, &home));
+    validate_profile_target(&args.name, &home, &id)?;
+    let namespace_changed = previous.as_ref().is_some_and(|entry| entry.id != id);
+    let action = if previous.is_some() {
+        "updated"
+    } else {
+        "added"
+    };
+    let warning = namespace_changed.then_some("home changed; a fresh credential namespace was created. Previous home and keyring entries are left intact; password credentials must be registered again when needed");
+    let before = registry.clone();
     registry.profiles.insert(
         args.name.clone(),
         ProfileEntry {
-            id,
+            id: id.clone(),
             home: home.clone(),
         },
     );
@@ -97,18 +107,39 @@ fn profile_add(
         registry.default = Some(args.name.clone());
     }
 
-    save_registry_if_unchanged(registry_path, registry, revision)?;
-    if args.json {
-        return Ok(ok(format!(
-            "{}\n",
-            json!({"ok":true,"action":"added","name":args.name,"home":home})
-        )));
+    let changed = *registry != before;
+    if changed {
+        save_registry_if_unchanged(registry_path, registry, revision)?;
     }
-    Ok(ok(format!(
-        "added profile {} -> {}\n",
-        args.name,
-        home.display()
-    )))
+    if args.json {
+        let mut output = json!({"ok":true,"action":action,"name":args.name,"home":home,"id":id,"namespace_changed":namespace_changed,
+            "changed":changed,"change":if changed { action } else { "unchanged" }});
+        if let Some(warning) = warning {
+            output["warning"] = json!(warning);
+        }
+        if namespace_changed && let Some(previous) = &previous {
+            output["previous_home"] = json!(redact_secrets(&previous.home.display().to_string()));
+        }
+        return Ok(ok(format!("{}\n", output)));
+    }
+    let mut message = if changed {
+        format!("{action} profile {} -> {}\n", args.name, home.display())
+    } else {
+        format!("profile {} -> {} (unchanged)\n", args.name, home.display())
+    };
+    if let Some(warning) = warning {
+        if let Some(previous) = &previous {
+            message.push_str(&format!(
+                "home changed: {} -> {}\n",
+                redact_secrets(&previous.home.display().to_string()),
+                redact_secrets(&home.display().to_string())
+            ));
+        }
+        message.push_str(&format!("warning: {warning}\n"));
+    } else if previous.is_some() {
+        message.push_str("credential namespace unchanged\n");
+    }
+    Ok(ok(message))
 }
 
 fn same_profile_home(existing: &Path, requested: &Path) -> bool {
@@ -128,6 +159,7 @@ fn normalize_profile_home(home: &Path) -> anyhow::Result<std::path::PathBuf> {
             home.display()
         )
     })?;
+    validate_home_directory(&absolute)?;
     match fs::canonicalize(&absolute) {
         Ok(canonical) => Ok(canonical),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(absolute),
@@ -136,6 +168,18 @@ fn normalize_profile_home(home: &Path) -> anyhow::Result<std::path::PathBuf> {
             absolute.display()
         )),
     }
+}
+
+fn validate_profile_target(name: &str, home: &Path, id: &str) -> anyhow::Result<()> {
+    inspect_profile_target(name, home, id).map_err(|error| {
+        let detail = redact_secrets(&error.to_string());
+        error.context(format!("cannot connect profile '{}' to target home {}: {detail}; profile registry was not changed", redact_secrets(name), redact_secrets(&home.display().to_string())))
+    })
+}
+
+fn inspect_profile_target(name: &str, home: &Path, id: &str) -> anyhow::Result<()> {
+    let target = ResolvedHome::profile(home.to_path_buf(), id, format!("profile '{name}'"));
+    validate_home_directory(home).and_then(|()| super::load_active_config(&target).map(|_| ()))
 }
 
 fn profile_list(
@@ -158,6 +202,12 @@ fn profile_list(
         return Ok(ok(format!("{}\n", serde_json::to_string(&entries)?)));
     }
 
+    if registry.profiles.is_empty() {
+        return Ok(ok(format!(
+            "no named profiles registered\nnext: to register one, replace the home/name placeholders in `{}`; then select it with --profile=<name> (omit --home and unset SSHW_HOME). Named profiles are optional; normal home selection, including the built-in default home, remains available\n",
+            profile_registration_hint("<name>")
+        )));
+    }
     let mut stdout = String::new();
     for (name, entry) in &registry.profiles {
         let marker = if registry.default.as_deref() == Some(name) {
@@ -181,7 +231,7 @@ fn profile_show(
     let entry = registry
         .profiles
         .get(&args.name)
-        .ok_or_else(|| anyhow::anyhow!("unknown profile '{}'", args.name))?;
+        .ok_or_else(|| unknown_profile(&args.name))?;
     let is_default = registry.default.as_deref() == Some(args.name.as_str());
 
     if args.json {
@@ -210,19 +260,29 @@ fn profile_default(
     revision: &RegistryRevision,
     registry: &mut ProfileRegistry,
 ) -> anyhow::Result<CommandOutput> {
-    if !registry.profiles.contains_key(&args.name) {
-        return Err(anyhow::anyhow!("unknown profile '{}'", args.name));
-    }
+    let entry = registry
+        .profiles
+        .get(&args.name)
+        .ok_or_else(|| unknown_profile(&args.name))?;
+    validate_profile_target(&args.name, &entry.home, &entry.id)?;
 
-    registry.default = Some(args.name.clone());
-    save_registry_if_unchanged(registry_path, registry, revision)?;
+    let changed = registry.default.as_deref() != Some(args.name.as_str());
+    if changed {
+        registry.default = Some(args.name.clone());
+        save_registry_if_unchanged(registry_path, registry, revision)?;
+    }
     if args.json {
         return Ok(ok(format!(
             "{}\n",
-            json!({"ok":true,"action":"default","name":args.name})
+            json!({"ok":true,"action":"default","name":args.name,"changed":changed,
+                "change":if changed { "updated" } else { "unchanged" }})
         )));
     }
-    Ok(ok(format!("default profile set to {}\n", args.name)))
+    Ok(ok(if changed {
+        format!("default profile set to {}\n", args.name)
+    } else {
+        format!("default profile already set to {} (unchanged)\n", args.name)
+    }))
 }
 
 fn profile_remove(
@@ -231,22 +291,58 @@ fn profile_remove(
     revision: &RegistryRevision,
     registry: &mut ProfileRegistry,
 ) -> anyhow::Result<CommandOutput> {
+    let previous_default = registry.default.clone();
     if registry.profiles.remove(&args.name).is_none() {
-        return Err(anyhow::anyhow!("unknown profile '{}'", args.name));
+        return Err(unknown_profile(&args.name));
     }
     if registry.default.as_deref() == Some(args.name.as_str()) {
         registry.default = registry.profiles.keys().next().cloned();
     }
 
+    let default_change =
+        DefaultChange::between("profile", previous_default, registry.default.clone());
+    let target_warning = default_change.as_ref().and_then(|_| {
+        let name = registry.default.as_ref()?;
+        let entry = registry.profiles.get(name)?;
+        let error = inspect_profile_target(name, &entry.home, &entry.id).err()?;
+        let message = format!(
+            "cannot validate automatically selected default profile {}: {}; removal was completed, but commands using this profile may fail",
+            super::hints::quote_local_argument(name),
+            super::redacted_error_detail(&error)
+        );
+        let next_step = format!(
+            "repair the settings/home at {}; inspect with sshw --profile={} doctor (unset SSHW_HOME and omit --home); or choose a valid profile from sshw profile list and run sshw profile default -- {}",
+            super::hints::quote_local_argument(&entry.home.display().to_string()),
+            super::hints::quote_local_argument(name),
+            super::hints::quote_local_argument("<valid-profile>")
+        );
+        Some(json!({"name":redact_secrets(name),"home":redact_secrets(&entry.home.display().to_string()),
+            "message":message,"next_step":next_step}))
+    });
     save_registry_if_unchanged(registry_path, registry, revision)?;
     if args.json {
-        return Ok(ok(format!(
-            "{}\n",
-            json!({"ok":true,"action":"removed","name":args.name,"warning":"home and keyring entries left intact; re-adding requires credentials to be registered again"})
-        )));
+        let mut output = json!({"ok":true,"action":"removed","name":args.name,"warning":"home and keyring entries left intact; re-adding requires credentials to be registered again"});
+        if let Some(change) = default_change {
+            output["default_change"] = serde_json::to_value(change.redacted())?;
+        }
+        if let Some(warning) = target_warning {
+            output["default_target_warning"] = warning;
+        }
+        return Ok(ok(format!("{}\n", output)));
     }
-    Ok(ok(format!(
+    let mut message = format!(
         "removed profile {} (home and keyring entries left intact; re-adding creates a fresh credential namespace)\n",
         args.name
-    )))
+    );
+    if let Some(change) = default_change {
+        message.push_str(&change.human_message());
+    }
+    if let Some(warning) = target_warning {
+        message.push_str(&format!(
+            "warning: {}\nnext: {}\n",
+            warning["message"].as_str().unwrap_or_default(),
+            warning["next_step"].as_str().unwrap_or_default()
+        ));
+    }
+    Ok(ok(message))
 }

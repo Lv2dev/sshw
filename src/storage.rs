@@ -1,4 +1,4 @@
-use crate::error::{ResultErrorKindExt, app_error};
+use crate::error::{ResultErrorKindExt, app_error, classified_error, persistence_error};
 use crate::output::ErrorKind;
 use anyhow::Result;
 use std::fmt;
@@ -72,7 +72,8 @@ pub fn acquire_exclusive_lock_with_timeout(
     timeout: Duration,
 ) -> Result<ExclusiveFileLock> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        fs::create_dir_all(parent).map_err(|error| persistence_error(error.into(), "create lock parent directory", parent,
+            "check that the lock parent is a directory and allows creation; keep the same home/profile selection before retrying"))?;
     }
 
     let mut options = fs::OpenOptions::new();
@@ -80,8 +81,10 @@ pub fn acquire_exclusive_lock_with_timeout(
     #[cfg(unix)]
     options.mode(0o600);
 
-    let file = options.open(path)?;
-    set_owner_only(path)?;
+    let file = options.open(path).map_err(|error| persistence_error(error.into(), "open lock file", path,
+        "check that the lock path is a regular writable file and that its parent allows creation; keep the same home/profile selection before retrying"))?;
+    set_owner_only(path).map_err(|error| persistence_error(error, "set private lock permissions", path,
+        "check ownership and permission to update the reported lock file, then retry using the same home/profile selection"))?;
     let started = Instant::now();
     loop {
         match file.try_lock() {
@@ -89,14 +92,21 @@ pub fn acquire_exclusive_lock_with_timeout(
             Err(fs::TryLockError::WouldBlock) => {
                 if started.elapsed() >= timeout {
                     return Err(anyhow::anyhow!(
-                        "timed out waiting for lock at {} after {} milliseconds",
-                        path.display(),
+                        "timed out waiting for lock at {} after {} milliseconds\nnext: wait for the process using this home/profile to finish, then retry; inspect the reported lock path if timeouts continue",
+                        crate::error::diagnostic_path(path),
                         timeout.as_millis()
                     ));
                 }
                 std::thread::sleep(Duration::from_millis(5));
             }
-            Err(fs::TryLockError::Error(err)) => return Err(err.into()),
+            Err(fs::TryLockError::Error(err)) => {
+                return Err(persistence_error(
+                    err.into(),
+                    "acquire exclusive lock",
+                    path,
+                    "check filesystem locking support and access to the reported lock file, then retry using the same home/profile selection",
+                ));
+            }
         }
     }
     Ok(ExclusiveFileLock { file })
@@ -114,23 +124,34 @@ pub fn acquire_exclusive_lock_with_timeout(
 /// (NTFS ACLs already restrict the per-user config directory).
 pub fn write_owner_only_atomic(path: &Path, contents: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        fs::create_dir_all(parent).map_err(|error| persistence_error(error.into(), "create state parent directory", parent,
+            "check that the state parent is a directory and allows creation; repair the reported path before retrying"))?;
     }
 
     let temp_path = temp_sibling_path(path);
     write_temp(&temp_path, contents)?;
-    set_owner_only(&temp_path)?;
-    fs::OpenOptions::new()
+    set_owner_only(&temp_path).map_err(|error| persistence_error(error, "set private state staging permissions", &temp_path,
+        "check ownership and permission to update the staging file; inspect the saved state before retrying"))?;
+    let file = fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .open(&temp_path)?
-        .sync_all()?;
-    replace_atomic(&temp_path, path)?;
+        .open(&temp_path).map_err(|error| persistence_error(error.into(), "reopen state staging file for sync", &temp_path,
+            "check access to the staging file and its parent; inspect the saved state before retrying"))?;
+    file.sync_all().map_err(|error| persistence_error(error.into(), "sync state staging file", &temp_path,
+        "check filesystem errors and available storage; inspect the saved state before retrying"))?;
+    drop(file);
+    replace_atomic(&temp_path, path).map_err(|error| persistence_error(error, "replace state file atomically", path,
+        "check the destination type and parent write permissions, file locks, and filesystem errors; inspect the saved state before retrying"))?;
     if let Err(source) = sync_parent_directory(path) {
-        return Err(anyhow::Error::new(PublishedWriteError {
-            path: path.to_path_buf(),
-            source,
-        }));
+        return Err(persistence_error(
+            anyhow::Error::new(PublishedWriteError {
+                path: path.to_path_buf(),
+                source,
+            }),
+            "sync parent directory after publishing state",
+            path.parent().unwrap_or(path),
+            "the state was published; inspect it before retrying and check parent-directory durability/filesystem errors",
+        ));
     }
     Ok(())
 }
@@ -157,9 +178,12 @@ fn write_temp(path: &Path, contents: &str) -> Result<()> {
     #[cfg(unix)]
     options.mode(0o600);
 
-    let mut file = options.open(path)?;
-    file.write_all(contents.as_bytes())?;
-    file.sync_all()?;
+    let mut file = options.open(path).map_err(|error| persistence_error(error.into(), "create temporary state file", path,
+        "check parent directory creation/write permissions and available storage; inspect the saved state before retrying"))?;
+    file.write_all(contents.as_bytes()).map_err(|error| persistence_error(error.into(), "write temporary state file", path,
+        "check write permissions, available storage, and filesystem errors; inspect the saved state before retrying"))?;
+    file.sync_all().map_err(|error| persistence_error(error.into(), "sync temporary state file", path,
+        "check filesystem errors and available storage; inspect the saved state before retrying"))?;
     Ok(())
 }
 
@@ -229,6 +253,7 @@ impl StagedStreamWrite {
             overwrite,
             bytes,
         } = self;
+        check_download_destination(&destination, overwrite)?;
         set_owner_only(temp.path())?;
 
         let persisted = if overwrite {
@@ -247,10 +272,11 @@ impl StagedStreamWrite {
                 if already_exists {
                     return Err(already_exists_error(&destination));
                 }
-                return Err(anyhow::Error::new(error).context(format!(
-                    "failed to persist staged file at {}",
-                    destination.display()
-                )));
+                return Err(download_path_error(
+                    &destination,
+                    "persist staged file",
+                    error,
+                ));
             }
         }
         sync_parent_directory(&destination)?;
@@ -268,22 +294,91 @@ pub fn stage_stream_owner_only(
         .with_error_kind(ErrorKind::Io)
 }
 
+/// Check only path shape and overwrite consent; do not create directories or
+/// claim that future writes will succeed. Directory classification inspects
+/// the final entry itself: publishing replaces a symlink, not its target.
+pub(crate) fn check_download_destination(path: &Path, overwrite: bool) -> Result<()> {
+    let exists = path
+        .try_exists()
+        .map_err(|error| download_path_error(path, "inspect path", error))?;
+    if exists {
+        let metadata = fs::symlink_metadata(path)
+            .map_err(|error| download_path_error(path, "inspect path", error))?;
+        if metadata.is_dir() {
+            return Err(app_error(
+                ErrorKind::Io,
+                format!(
+                    "local download destination is a directory: {}; specify a file path",
+                    path.display()
+                ),
+            ));
+        }
+        if !overwrite {
+            return Err(already_exists_error(path));
+        }
+        return Ok(());
+    }
+
+    // Windows may report a child of an existing file as NotFound rather than
+    // NotADirectory. Check the nearest existing parent while allowing missing
+    // directories to be created later by the actual download.
+    let mut parent = parent_directory(path);
+    loop {
+        match fs::metadata(parent) {
+            Ok(metadata) if metadata.is_dir() => return Ok(()),
+            Ok(_) => {
+                return Err(app_error(
+                    ErrorKind::Io,
+                    format!(
+                        "local download destination {} has a parent that is not a directory: {}; choose a file path under a directory",
+                        path.display(),
+                        parent.display()
+                    ),
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let Some(next) = parent.parent() else {
+                    return Err(download_path_error(path, "inspect parent directory", error));
+                };
+                let next = if next.as_os_str().is_empty() {
+                    Path::new(".")
+                } else {
+                    next
+                };
+                if next == parent {
+                    return Err(download_path_error(path, "inspect parent directory", error));
+                }
+                parent = next;
+            }
+            Err(error) => return Err(download_path_error(path, "inspect parent directory", error)),
+        }
+    }
+}
+
+fn download_path_error(path: &Path, operation: &str, error: std::io::Error) -> anyhow::Error {
+    let message = format!(
+        "failed to {operation} for local download destination {}: {error}",
+        path.display()
+    );
+    classified_error(ErrorKind::Io, anyhow::Error::new(error).context(message))
+}
+
 fn stage_stream_owner_only_inner(
     path: &Path,
     reader: &mut dyn Read,
     overwrite: bool,
     expected_len: Option<u64>,
 ) -> Result<StagedStreamWrite> {
-    if !overwrite && path.try_exists()? {
-        return Err(already_exists_error(path));
-    }
+    check_download_destination(path, overwrite)?;
 
     let parent = parent_directory(path);
-    fs::create_dir_all(parent)?;
+    fs::create_dir_all(parent)
+        .map_err(|error| download_path_error(path, "create parent directory", error))?;
     let mut temp = tempfile::Builder::new()
         .prefix(".sshw-download-")
         .suffix(".tmp")
-        .tempfile_in(parent)?;
+        .tempfile_in(parent)
+        .map_err(|error| download_path_error(path, "create staging file", error))?;
 
     let bytes = std::io::copy(reader, temp.as_file_mut())?;
     temp.as_file_mut().flush()?;
@@ -383,6 +478,33 @@ mod stream_tests {
     };
     use std::fs;
     use std::io::{self, Read};
+
+    #[test]
+    fn clear_persistence_published_marker_survives_all_diagnostic_contexts() {
+        let path = std::path::Path::new("state.json");
+        let error = anyhow::Error::new(super::PublishedWriteError {
+            path: path.into(),
+            source: io::Error::new(io::ErrorKind::PermissionDenied, "parent sync refused").into(),
+        });
+        let error = crate::error::persistence_error(
+            error,
+            "sync parent directory after publishing state",
+            path,
+            "the state was published; inspect it before retrying",
+        );
+        let error = crate::error::persistence_context(error, "save config", path);
+        let error = crate::error::classified_error(crate::output::ErrorKind::Config, error);
+        assert!(super::write_was_published(&error));
+        assert!(
+            error.to_string().contains("published")
+                && error.to_string().contains("parent sync refused")
+        );
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.downcast_ref::<io::Error>().is_some())
+        );
+    }
 
     /// Reader that yields `remaining` bytes, then fails — simulates a download
     /// that dies partway (network drop, timeout, disk full).
@@ -534,6 +656,109 @@ mod stream_tests {
 
         assert!(err.to_string().contains("already exists"));
         assert_eq!(fs::read_to_string(&dest).unwrap(), "ORIGINAL");
+    }
+
+    struct UnreadableFixture;
+
+    impl Read for UnreadableFixture {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            panic!("invalid destination must be rejected before reading remote data")
+        }
+    }
+
+    #[test]
+    fn download_directory_is_rejected_before_reading_any_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        for overwrite in [false, true] {
+            let error =
+                write_stream_owner_only_atomic(dir.path(), &mut UnreadableFixture, overwrite, None)
+                    .unwrap_err();
+            assert!(error.to_string().contains("is a directory"), "{error:#}");
+            assert_eq!(
+                crate::output::classify_error(&error),
+                crate::output::ErrorKind::Io
+            );
+            assert_eq!(count_temp_files(dir.path()), 0);
+        }
+    }
+
+    #[test]
+    fn download_missing_parents_are_created_only_when_staging() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("nested/missing/file");
+        super::check_download_destination(&destination, false).unwrap();
+        assert!(!destination.parent().unwrap().exists());
+        let mut source = &b"DATA"[..];
+        write_stream_owner_only_atomic(&destination, &mut source, false, Some(4)).unwrap();
+        assert_eq!(fs::read(destination).unwrap(), b"DATA");
+    }
+
+    #[test]
+    fn download_rechecks_directory_created_after_staging() {
+        for overwrite in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let destination = dir.path().join("destination");
+            let staged =
+                stage_stream_owner_only(&destination, &mut &b"DATA"[..], overwrite, Some(4))
+                    .unwrap();
+            fs::create_dir(&destination).unwrap();
+            fs::write(destination.join("original"), "keep").unwrap();
+            let error = staged.persist().unwrap_err();
+            assert!(error.to_string().contains("is a directory"), "{error:#}");
+            assert!(!error.to_string().contains("pass --yes"));
+            assert_eq!(fs::read(destination.join("original")).unwrap(), b"keep");
+            assert_eq!(count_temp_files(dir.path()), 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn download_path_context_preserves_original_io_error_and_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("requires --yes");
+        fs::write(&parent, "keep").unwrap();
+        let destination = parent.join("file");
+        let expected = destination.try_exists().unwrap_err();
+        let error = super::check_download_destination(&destination, true).unwrap_err();
+        let original = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<io::Error>())
+            .unwrap();
+        assert_eq!(original.raw_os_error(), expected.raw_os_error());
+        assert!(error.to_string().contains(destination.to_str().unwrap()));
+        assert!(error.to_string().ends_with(&expected.to_string()));
+        assert_eq!(
+            crate::output::classify_error(&error),
+            crate::output::ErrorKind::Io
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn download_replaces_symlinks_without_changing_their_targets() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("file");
+        let directory = dir.path().join("directory");
+        let missing = dir.path().join("missing");
+        fs::write(&file, "ORIGINAL").unwrap();
+        fs::create_dir(&directory).unwrap();
+        for (index, target) in [&file, &directory, &missing].iter().enumerate() {
+            let destination = dir.path().join(format!("link-{index}"));
+            symlink(target, &destination).unwrap();
+            let mut source = &b"DATA"[..];
+            write_stream_owner_only_atomic(&destination, &mut source, true, Some(4)).unwrap();
+            assert!(
+                !fs::symlink_metadata(&destination)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            assert_eq!(fs::read(destination).unwrap(), b"DATA");
+        }
+        assert_eq!(fs::read(file).unwrap(), b"ORIGINAL");
+        assert!(directory.is_dir());
+        assert!(!missing.exists());
     }
 
     #[cfg(unix)]
