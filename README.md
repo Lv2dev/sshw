@@ -639,6 +639,8 @@ done
 
 ### 저장 구조와 profile
 
+`0.15.0`은 기존 CLI 호출·종료 코드·설정 읽기를 유지하며 진단과 변경 여부 필드를 추가합니다. Rust 라이브러리에서 `PrivilegeConfig`를 직접 구성한다면 `credential: Some(...)`과 `no_password: false`로 기존 비밀번호 설정을 표현하세요. 무비밀번호 sudo는 `credential: None`, `no_password: true`입니다. `ErrorResponse` 구조체를 직접 구성하는 호출자는 새 `mutation` 필드를 반영해야 합니다. `Prompter`의 새 확인 준비 hook은 기본 구현이 있어 기존 구현을 유지할 수 있습니다.
+
 모든 상태는 프로젝트별 **home** 아래에 있습니다. home 디렉터리 구성:
 
 ```text

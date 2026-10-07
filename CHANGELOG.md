@@ -8,124 +8,39 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 
 ## [Unreleased]
 
-### SSH 실행·로컬 신뢰 파일 오류 안내
-- 인증 후 세션/PTY·명령 요청·입출력·완료 확인 오류에 실제 단계·로그인 계정/endpoint·마스킹한 원인과 점검 방법을 추가했습니다. 원래 native/code·auth/ssh/IO 분류·partial output·완료 미확정·정리 timeout을 유지하며 원격 명령·입력 내용을 진단에 추가하지 않습니다. known_hosts 읽기/파싱 원인과 복구 위치를 보존하고 대화형 시작 메시지도 home 표시를 마스킹합니다.
+## [0.15.0] - 2026-10-07
 
-### 설정 읽기 진단 보존
-- servers/profile registry/policy 파일의 읽기·JSON·형식 검사 오류는 경로와 원인을 따로 마스킹해 민감 패턴 경로가 진단을 지우지 않게 했습니다. 원래 IO/JSON source와 기존 분류·strict schema·없는 파일 처리·CAS를 유지하고 파일/권한/형식 복구 위치를 안내합니다.
+### 추가
 
-### 확인창 대상 표시·입력 오류 안내
-- 서버·계정·승격 설정의 갱신/삭제와 host trust 확인창은 대상 값을 각각 마스킹해 작업 설명·승격 대상/방식·지문과 `[y/N]` 표시를 유지합니다. 확인 읽기 오류에는 마스킹한 원인과 해당 작업의 `--yes`/`--force` 안내를 추가하며 기존 terminal gate·승인/거절·원래 IO source를 유지합니다.
+- 로그인 계정별로 `privilege set --no-password --user <target>`를 저장하고 `run --as-root`에서 `sudo -n`으로 실행할 수 있습니다. 일반 실행은 자동 승격하지 않으며 서버 sudoers가 허용해야 합니다. 조회·doctor·삭제·비밀번호 방식 전환도 같은 설정을 지원합니다.
+- `policy check/check-put/check-get`에서 실제 실행과 같은 대상 선택·검사 순서, 정책 상태·강제 적용 이유·규칙 일치 근거를 확인할 수 있습니다. 사전 검사는 SSH·자격 증명·원격 권한을 조회하지 않습니다.
+- 설정 저장 뒤 자격 증명 정리에 실패해도 적용된 변경과 기본값 전환을 JSON `mutation` 및 일반 출력으로 확인할 수 있습니다. 기본 서버·프로필 삭제 후 자동 전환과 잘못된 프로필의 복구 방법도 안내합니다.
+- `doctor`가 실제 로컬 known_hosts 파싱과 endpoint 등록 여부, 로그인/승격 자격 증명의 ready/missing/unavailable/invalid 상태, SSH agent 및 감사 파일 쓰기 준비를 구분합니다. 원격 key 일치·접속·sudoers를 검사했다고 표시하지 않습니다.
 
-### 일반 SCP 전송 오류·프로필 복구 안내
-- 일반 `put/get` 오류에 실패 단계·로그인 사용자와 endpoint·local/remote 경로·개별 마스킹한 원인 및 점검 방법을 표시합니다. native SCP 오류만으로 파일 부재와 권한 거부를 단정하지 않으며 원래 source/code·ssh/IO 분류·deadline·완료 확인과 다운로드 staging을 유지합니다. 업로드 실패 시 목적지가 이미 변경됐을 수 있음을 안내하고 기존 atomic/MSYS/인증 진단을 보존합니다.
-- 미등록 프로필의 선택·show/default/remove 오류가 전역 목록 조회와 이름을 인용한 등록 안내를 공유합니다. 빈 human 목록은 선택적인 등록 방법과 내장 기본 home 사용 가능 여부를 설명하며 JSON `[]`는 유지합니다. 값별 마스킹·플랫폼 인용·`--` 경계·config/3·선택 우선순위·namespace·registry 저장/잠금/감사 계약을 유지합니다.
+### 변경
 
-### 무비밀번호 승격 재설정·미등록 서버 복구 안내
-- `privilege set --no-password`는 최종 전체 설정이 같으면 저장을 생략하고 human 변경 없음·JSON `changed:false`/`change:"unchanged"`를 표시합니다. 실제 신규·변경은 `true`와 `added/updated`이며 기존 metadata/credential 필드·확인/force·검증/lock/audit·원본 bytes/mtime를 유지합니다. Password 갱신·target 변경 및 실제 CAS/atomic/비밀 정리·부분 적용 오류는 보존하고 서버 sudoers를 검사하지 않습니다.
-- 공통 미등록 서버 오류에 등록된 서버 선택 의미와 같은 home/profile의 목록 조회·서버 등록 안내를 추가했습니다. 값별 마스킹·플랫폼 인용·`--` 경계를 공유하고 run/policy check의 기존 전체 명령 인용 안내를 유지합니다. config/3·JSON·기존 오류 순서를 보존하며 자동 등록/다른 home 조회·서버 전환·접속은 수행하지 않습니다.
+- 동일한 기본 서버·계정·프로필, agent 등록, 무비밀번호 승격 및 정책 설정은 저장을 생략하고 `changed/change`와 변경 없음을 표시합니다. 원본 형식·bytes/mtime 및 검증·확인·잠금·감사를 유지하며, 비밀번호 재등록은 계속 실제 회전으로 처리합니다.
+- 미등록 서버·계정·프로필과 자격 증명 오류에 해당 목록 조회·등록·같은 home/profile의 복구 안내를 표시합니다. 복사용 명령은 값별 마스킹·Windows PowerShell/POSIX 인용·`--` 경계를 사용하고 자동 등록·다른 home fallback을 수행하지 않습니다. 빈 프로필 목록도 선택적인 등록 방법을 안내합니다.
+- 연결·인증·SSH 실행·일반 SCP·설정 읽기/잠금/저장 오류에 실패 단계·선택 계정/endpoint·경로·마스킹한 원인과 점검 방법을 표시합니다. 일반 native 오류로 파일 부재·권한 거부·잘못된 비밀번호를 단정하지 않습니다.
+- 확인창은 로그인 계정·승격 대상과 인증 방식을 구분하고 값별 마스킹으로 지문·작업 설명·`[y/N]`를 보존합니다. 터미널 확인/비밀번호 읽기 실패는 원래 원인과 해당 입력 옵션을 안내합니다. 대화형 원격 작업 시작의 home 표시도 마스킹합니다.
+- 기존 CLI 종료 코드·JSON envelope와 설정 읽기 호환성을 유지합니다. 새 JSON 진단·변경·정책 필드는 추가되며 무비밀번호 승격의 `credential`은 null입니다. 라이브러리 소비자는 아래 Rust API 변경을 반영해야 합니다.
 
-### 동일 agent 재등록·비밀번호 SSH 인증 안내
-- `add/account add`의 agent 재등록은 최종 전체 설정이 같으면 저장을 생략하고 human 변경 없음과 JSON `changed:false`/`change:"unchanged"`를 표시합니다. 기존 action/대상 필드·확인/force·검증/lock/audit를 유지하며 원본 v1/형식/bytes/mtime를 보존합니다. 신규·endpoint/default/account/replace 변경과 비밀번호 재발급은 `changed:true`로 저장하고 기존 CAS/atomic/비밀 정리·부분 적용 오류를 유지합니다.
-- `run/put/get`의 비밀번호 SSH 인증 실패도 로그인 사용자·host/port·개별 마스킹한 native 원인과 같은 home/profile의 credential/로그인 비밀번호·서버 계정/password 인증 설정 점검을 안내합니다. 실패만으로 잘못된 비밀번호라고 단정하지 않으며 typed source/code·auth/4·JSON causes·host key 확인 후 인증·Agent/승격을 유지합니다. 자동 비밀번호 갱신·agent fallback·추가 접속/재시도는 수행하지 않습니다.
+### 수정
 
-### home 경로 검사·trust 확인 준비
-- 선택한 home과 가장 가까운 기존 부모를 공통 검사해 파일·파일 아래 경로·경로 검사 실패를 설정/정책 로딩 전에 config/3으로 거절합니다. 경로·마스킹한 원인·폴더/권한 복구 안내와 원래 IO source를 보존하며, 없는 폴더를 만들거나 상대 경로·선택 우선순위·namespace를 변경하지 않습니다. `profile` 관리의 복구 경로와 add/default 대상 검사를 유지하고 doctor의 registry 복구가 잘못된 명시적 home을 숨기지 않게 합니다.
-- `trust`는 `--yes`가 없으면 서버 조회 뒤·SSH 접속 전에 확인 가능 여부를 검사합니다. 비대화형 입력에서는 접속 오류보다 config/3과 interactive/`--yes` 안내를 먼저 표시합니다. 지문 조회 후 확인·저장 직전 재검증과 `--yes` 흐름은 유지합니다. 공개 `Prompter`에 기본 구현이 있는 `ensure_confirmation_available` hook을 추가해 기존 구현의 호환성을 유지합니다.
+- 일반 실행·sudo의 timeout·출력 제한·완료 오류 뒤 SSH 정리 대기를 짧게 제한하고 부분 출력·완료 미확정·스트리밍 원인을 보존합니다. 이미 출력한 내용은 재생하지 않습니다. native 오류의 직접/owned downcast와 IO/Auth/SSH 분류를 유지하고, 계정/host의 오류 marker 문구가 종류를 바꾸지 않게 합니다.
+- `run/put/get` 및 사전 검사에서 필수/빈 인자·공백 명령·잘못된 주소/port/승격 대상과 agent/password-stdin 충돌을 입력·인증 전에 거부합니다. JSON 사용 오류에도 필수 항목과 수정 제안을 보존합니다. `--password-stdin`은 터미널 stdin을 읽지 않고 숨김 입력/redirect 방법을 안내합니다.
+- 업로드는 자격 증명 조회 전에 읽을 수 있는 일반 로컬 파일을 검사합니다. 다운로드는 디렉터리 목적지·파일 아래 부모를 Windows에서도 사전에 거부하고, 심볼릭 링크 교체와 완료 확인 후 staging 반영·기존 목적지 보존을 유지합니다.
+- home 경로와 가장 가까운 기존 부모를 검사하고 프로필 등록/기본 전환의 target schema·namespace를 검증합니다. 손상된 현재 home을 복구하는 registry 관리 경로는 유지합니다. `trust`는 비대화형 확인 가능 여부를 SSH 접속 전에 검사합니다.
+- 정책 경로는 무효 root-only 항목을 거부하고 Windows drive/UNC 구분자·경계·부모 이동을 처리하며 POSIX 리터럴 역슬래시 의미를 유지합니다. 명령·계정·로컬 준비 검사의 첫 실패 순서를 실제 실행과 맞춥니다.
+- 설정·known_hosts의 민감 패턴 경로가 원인 문구까지 잘라버리지 않게 경로와 cause를 각각 마스킹합니다. 원래 IO/JSON/native source, CAS·atomic published 상태와 실제 비밀 정리의 적용 여부를 보존합니다.
 
-### 등록 옵션 검사·동일 프로필 재등록
-- `add/account add`는 기존 대상·endpoint/replace 검증 후 확인 입력 전에 agent/`--password-stdin` 충돌을 config/3으로 안내합니다. 유효한 갱신의 확인/force와 비밀번호 입력·설정 저장·credential 정리를 유지합니다.
-- `profile add --force`는 대상 설정 검사 후 전체 registry가 같으면 저장을 생략하고 일반 출력의 변경 없음과 JSON `changed:false`/`change:"unchanged"`를 표시합니다. 실제 변경은 `true`와 기존 `added/updated` 의미를 표시하며, 기존 action/id/home/namespace_changed·force·lock/audit 및 실제 변경의 CAS/atomic/default/namespace warning을 보존합니다.
+### Rust API 이행
 
-### 계정 선택·SSH agent 인증 오류 안내
-- 미등록 로그인 계정 오류에 같은 home/profile의 계정 목록 조회와 새 계정 등록 명령을 안내합니다. 등록 계정 선택이라는 의미를 설명하고, 이름을 개별 마스킹·플랫폼 인용하며 `--` 경계를 유지합니다. config/3·미등록 거부·기존 검사 순서와 설정/비밀 미변경을 보존합니다.
-- `run/put/get`의 SSH agent 인증 실패는 로그인 사용자·host/port·개별 마스킹한 native 원인과 같은 실행 환경의 doctor/agent/키/서버 허용 점검 방법을 표시합니다. 원래 source/type/code·auth/4·JSON causes·host key 검증 후 인증과 비밀번호/승격 동작을 유지하며 agent 시작·키 로드·fallback을 자동 실행하지 않습니다.
+- `PrivilegeConfig.credential`이 `Option<String>`으로 바뀌고 `no_password: bool`이 추가됩니다. 비밀번호 설정은 `Some(...)`/`false`, 무비밀번호 sudo는 `None`/`true`를 사용합니다. 기존 저장 설정은 비밀번호 방식으로 읽습니다.
+- `ErrorResponse`에 `mutation: Option<ConfigMutationOutput>` 필드가 추가됩니다. 직접 구조체를 구성하는 호출자는 새 필드를 반영해야 합니다.
+- `Prompter::ensure_confirmation_available`는 기본 구현이 있는 hook이므로 기존 trait 구현을 그대로 사용할 수 있습니다.
 
-### 승격 설정 검사 순서·연결 오류 안내
-- `run --as-root`는 로그인 비밀번호를 조회하기 전에 필요한 승격 설정과 su/`--no-password` 불일치를 검사합니다. 두 문제가 함께 있으면 config/3 승격 오류를 먼저 안내합니다. 기존 safety/policy/account·stream/su 검사, 일반 로그인 오류와 무설정 `--no-password` 허용 의미는 유지합니다.
-- `run/put/get/trust`의 공통 연결 실패에 주소 해석·TCP·SSH handshake 단계, host/port, 개별 마스킹한 원인과 다음 조치를 표시합니다. 최대 연결 예산은 실제 대기 시간과 구분하며, 원래 오류 타입·ssh/5·JSON causes·deadline/retry·host key/인증 순서를 보존합니다.
-
-### 빈 로컬 경로·비밀번호 stdin 터미널 입력
-- `put/get`과 대응 정책 검사는 길이0인 로컬 원본/목적지를 공통 target 해석에서 usage/9로 거절하고 변수 확인·입력 예시를 안내합니다. 설정/정책/default server/remote 검증 순서와 원본·유효한 공백 파일명은 유지합니다.
-- `--password-stdin`의 stdin이 터미널이면 읽기 전에 auth/4로 거절하고 옵션을 생략한 hidden 입력 또는 비밀 관리자의 pipe/redirection 사용법을 안내합니다. 자동 입력 방식 전환 없이 기존 파이프/파일·EOF/CRLF 처리·login 내부 줄바꿈·승격 형식 검증을 보존합니다.
-
-### 승격 설정 해제·잠금/저장 오류 안내
-- 존재하는 계정의 저장된 승격 설정이 이미 없으면 `privilege clear`는 확인 입력·설정 저장·비밀 삭제 없이 변경 없는 성공으로 처리합니다. JSON은 기존 cleared action/대상 필드와 `changed:false`/`change:"unchanged"`를, 실제 해제는 `true`/`"removed"`를 표시합니다. unknown target·schema·lock/audit와 실제 해제의 credential cleanup/부분 적용 계약은 유지합니다.
-- 공통 잠금과 atomic config/registry 저장 실패에 파일 경로·작업 단계·마스킹한 원인·복구 방법을 표시합니다. 원래 typed source·exit/envelope·timeout/CAS·atomic 저장 및 저장 후 디렉터리 sync 실패의 published 상태를 유지하고, 저장 완료 여부에 따른 자격 증명 정리 판단을 바꾸지 않습니다.
-
-### 기본값 재설정·감사 로그 쓰기 진단
-- 이미 같은 기본 서버·로그인 계정·프로필을 지정하면 설정/registry 저장을 생략하고 일반 출력의 변경 없음 및 JSON `changed:false`/`change:"unchanged"`를 표시합니다. 실제 변경은 `changed:true`/`change:"updated"`로 표시하며 기존 action/대상 필드·대상 검증·lock/CAS·감사 기록을 유지합니다. no-op은 v1 형식·원본 bytes/mtime을 보존합니다.
-- `doctor`는 감사 파일이 없을 때 기존 부모에 비밀 없는 private 임시 파일을 생성·정리해 생성 권한을 검사합니다. 기존 로그는 append 준비만 확인하고 내용을 바꾸지 않으며, 없는 부모나 감사 파일을 만들지 않습니다. 실패 원인·경로·복구 방법과 JSON `audit_message`를 추가하고 기존 진단 exit0/`ok:true`·best-effort 기록 계약을 유지합니다.
-
-### 빈 실행 대상·자격 증명 진단
-- `run`과 `policy check`는 빈 값·공백뿐인 명령을, `put/get`과 대응 사전 검사는 빈 원격 경로를 인증 조회 전에 usage/9로 거절하고 입력 예시를 안내합니다. 같은 target 해석을 사용하며 기존 설정/정책 로딩·서버 오류 순서와 유효한 공백 파일명·원본 명령/경로를 유지합니다.
-- `doctor`는 실행과 같은 승격 비밀번호 형식 검사를 사용하고, 확인된 항목 부재와 조회 불가·형식 오류를 구분해 마스킹한 원인과 복구 방법을 표시합니다. JSON `credential_checks`에 로그인/승격별 `ready`·`missing`·`unavailable`·`invalid` 상태를 추가하고 `missing_credentials`에는 확인된 로그인 부재만 포함합니다. 기존 진단 exit0/`ok:true`·비접속·비밀번호 내용 미출력·passwordless 의미를 유지합니다.
-
-### 경로 권한 규칙·프로필 자동 전환 안내
-- `policy allow put/get`은 접근을 허용하지 않는 `/`·반복 슬래시 규칙을 저장 전에 policy/7로 거절하고 구체적인 디렉터리 예시를 안내합니다. 기존 항목의 비활성/삭제 의미와 v1/v2 호환을 유지합니다. Windows drive 절대 경로·UNC 경로는 하위 경로 구분자를 인식하며 대소문자·경계·부모 이동 차단·POSIX 역슬래시 의미와 atomic SFTP 경로 요구사항을 보존합니다.
-- 기본 프로필 삭제는 이름순으로 선택된 다음 프로필을 읽기 전용 검사하고, 불량이면 삭제 완료 상태·원인·복구 방법을 일반 출력과 JSON `default_target_warning`에 표시합니다. 삭제 성공·자동 선택 순서·기존 `warning`/`default_change`·home/keyring 보존을 유지하며 비밀 조회나 SSH 접속은 하지 않습니다.
-
-### 승격 인증 오류·정책 적용 상태
-- `run --as-root`의 sudo/su 승격 비밀번호 조회 실패에 서버·로그인 계정·승격 방식/대상과 마스킹한 원래 원인을 표시합니다. 세션 전용은 `SSHW_PRIVILEGE_PASSWORD`, 저장 백엔드는 doctor 및 항목 부재 시 기존 승격 설정을 보존하는 재등록 방법을 안내합니다. source·auth/4·JSON causes·비밀번호 검증과 실행 순서를 유지합니다.
-- 정책 관리의 일반 출력에 파일 존재·저장 enabled·현재 enforcement와 `--policy` 강제 적용 원인을 표시합니다. 파일이 없으면 초기화 방법을, 비활성 저장값에도 강제 적용 중이면 `--policy` 해제 방법을 안내합니다. JSON에는 `forced`를 추가하며 기존 `present`·`enforced`·저장/allowlist/no-op 계약을 유지합니다.
-
-### host key 로컬 진단·실행 인증 오류
-- `doctor`는 실제 연결과 공유하는 `known_hosts` 파서로 파일 읽기·파싱·key 데이터와 서버별 등록 여부를 확인합니다. 빈 파일·다른 서버만 등록된 파일은 등록 누락으로, 읽기/파싱 실패는 미확인으로 표시하고 복구 방법을 안내합니다. JSON `host_trust`에 서버별 `entry_present`(미확인은 null)와 `key_match_checked:false`를 추가하며 원격 접속/key 일치는 검사하지 않습니다.
-- `run`·`put`·`get`의 로그인 자격 증명 조회 실패에 서버·로그인 계정과 마스킹한 원래 원인을 표시합니다. 세션 전용 백엔드는 `SSHW_PASSWORD`, 저장 백엔드는 같은 home/profile의 doctor 및 계정 비밀번호 재등록 방법을 안내합니다. 원래 source·auth/4·JSON envelope/causes와 검사 순서를 유지합니다.
-
-### 기본 프로필 전환·비밀번호 입력 복구
-- `profile default`는 등록된 home과 기존 credential namespace로 대상 서버 설정과 경로를 다시 검사한 뒤 기본값을 저장합니다. 잘못된 설정·호환되지 않는 자격 증명 참조·파일로 막힌 경로는 config/3으로 거부하며 이전 기본값과 대상 파일을 보존합니다. 빈 home 선택 및 손상된 현재 프로필에서 정상 프로필로의 전환은 유지합니다.
-- `add`·`account add`·`privilege set`의 비밀번호 terminal 입력이 실패하면 대화형 터미널에서 재실행하거나 비밀 관리자에서 pipe로 전달하는 `--password-stdin` 사용법을 안내합니다. 원래 OS 오류·auth/4·JSON 구조를 유지하고 stdin 입력은 명시적인 옵션으로만 사용합니다.
-
-### 서버 주소 검사·계정 권한 표시
-- 서버 등록은 빈 호스트·공백만 있는 호스트·제어 문자·포트 `0`을 확인 질문·비밀번호 입력 전에 config/3으로 거부합니다. 같은 검사를 v1/v2 설정 로딩 및 메모리 설정 검증에도 적용해 doctor에서 서버 이름과 원인을 진단합니다. 정상 hostname/IP/IPv6 값과 포트1..65535는 유지하며 DNS/접속 검사나 입력 자동 변경은 하지 않습니다.
-- `account list/show`의 일반 출력에 승격 방식·대상 사용자·비밀번호 사용 여부를 함께 표시합니다. 기존 로그인 계정·승격 실행·JSON 구조를 유지하고 대상의 민감한 패턴은 마스킹합니다.
-
-### 업로드 검사 순서·복사용 안내
-- `put`과 `put --atomic`은 접근 정책·안전 검사를 통과한 뒤, 로컬 원본을 읽을 수 있는 일반 파일인지 자격 증명 조회 전에 확인합니다. 없는 파일·디렉터리는 인증 정보가 없어도 먼저 io/6으로 진단하며 `policy check-put`과 같은 파일 검사를 사용합니다. 실제 전송은 자체 파일 handle을 다시 검증·유지합니다.
-- 등록 후 trust/run, `doctor` host trust 및 승격 설정 누락 안내에 인자별 마스킹·셸 인용·`--` 경계를 공통 적용합니다. 공백·따옴표·`-`로 시작하는 유효한 이름을 유지하며 Windows는 PowerShell, 다른 OS는 POSIX 셸 기준입니다. 민감한 패턴을 포함한 안내 인자는 전체를 `<redacted>`로 표시해 후속 마스킹이 명령의 나머지를 지우지 않게 합니다.
-
-### 승격 대상 검사·복구 안내
-- 승격 대상 계정에도 로그인 계정과 같은 빈 값·제어 문자 검사를 적용합니다. `privilege set`은 확인·비밀번호 입력·저장 전에 config/3으로 거부하고, v1/v2 설정 로딩과 사전 검사도 같은 기준을 따릅니다. 정상 계정명과 비밀번호/무비밀번호 설정은 유지합니다.
-- `doctor`의 누락된 승격 비밀번호 안내는 기존 로그인 계정·승격 방식·대상을 보존합니다. 저장 가능한 백엔드는 안전하게 인용한 재등록 명령과 확인/`--force` 사용법을, 세션 전용 백엔드는 `SSHW_PRIVILEGE_PASSWORD` 사용법을 안내합니다. 기존 home/profile 선택을 유지하도록 설명하고 안내 값도 마스킹합니다.
-
-### 등록·갱신 영향 안내
-- 서버 `add --user`로 기존 기본 로그인 계정이 바뀌면 확인 문구와 human/JSON에 이전·새 계정을 표시합니다. JSON에 `user`와 계정 전환의 `default_change`를 추가하고, 저장 후 정리 실패에도 전환을 보존합니다. 기존 선택 동작은 유지하며 도움말에 `account add`와의 차이를 명시합니다.
-- 프로필 추가·갱신은 사용할 namespace로 대상 서버 설정을 검사한 뒤 registry를 저장합니다. 호환되지 않는 자격 증명 참조·잘못된 설정·파일로 막힌 home 경로를 config/3으로 거부하고 기존 연결·기본값·대상 파일을 보존합니다. 빈 home·agent 설정·같은 home의 namespace 및 v1 설정 호환은 유지합니다.
-- 프로필 결과는 신규 `added`와 갱신 `updated`를 구분하고 JSON에 `id`·`namespace_changed`를 추가합니다. 경로 이동으로 namespace가 바뀌면 `previous_home`과 비밀번호 재등록 안내도 표시합니다. 비밀 조회/이전이나 대상 설정 재저장은 수행하지 않습니다.
-
-### 설정 변경 결과 안내
-- 서버·계정·권한 설정 저장 후 이전 자격 증명 정리가 실패하면 설정은 이미 적용됐다는 사실과 원인을 표시합니다. JSON에 `mutation.config_applied`·`failed_stage`·변경 대상/작업을 추가하며 기존 auth/4와 오류 envelope, 저장 후 정리 순서를 유지합니다.
-- 기본 서버·프로필 삭제로 기본값이 바뀌면 이전·새 값을 human 출력과 JSON `default_change`로 안내합니다. 마지막 항목 삭제의 기본값 없음, 등록된 기본 프로필이 없을 때 기본 home 선택도 설명합니다. 자동 기본값 선택과 프로필의 home/keyring 보존 경고는 유지합니다.
-- 기본 서버 전환 후 자격 증명 정리에 실패해도 적용된 기본값 전환을 오류의 `mutation.default_change`에 보존합니다. 새 설명 필드와 원인에는 비밀 마스킹을 적용합니다. Rust API의 `ErrorResponse`에는 `mutation: Option<ConfigMutationOutput>` 필드가 추가됩니다.
-
-### 정책 판정·변경 결과 안내
-- `policy check/check-put/check-get`에서 정책 활성·비활성·`--policy` 강제 적용 상태, 매칭된 명령/경로/계정 규칙과 기본 계정의 암묵 허용을 표시합니다. 쉘 구문의 정확한 명령 규칙 요구, `..` 경로 차단, 원자적 업로드의 부모 경로 판정도 설명합니다.
-- JSON에 `policy` 설명을 추가하며 기존 `allowed`·`reasons`·첫 실패 종료 코드를 유지합니다. 설명은 실제 검사와 같은 정책 snapshot과 matcher를 사용하고 비밀을 마스킹하며 자격 증명이나 SSH를 조회하지 않습니다.
-- 정책 수정은 추가됨·이미 있음·삭제됨·항목 없음·상태 변경 여부를 구분하고 JSON에 `changed`·`change`를 표시합니다. 변경 없는 요청도 성공으로 처리하며 파일 저장을 생략해 기존 형식과 내용을 보존합니다. v1 정책은 실제 내용이 바뀔 때 v2로 저장합니다.
-
-### CLI 사용 오류 처리
-- `run`·`put`·`get`과 대응하는 policy 검사에서 필수 명령/경로 인자가 없으면 파싱 단계에서 usage/9로 거부합니다. 기본 서버 문법은 유지하며 잘못된 호출로 home이나 감사 파일을 만들지 않습니다.
-- JSON 사용 오류 메시지에 누락된 필수 인자·허용 값·수정 제안을 보존합니다. 전체 사용 구문과 반복 도움말 문구는 생략하고, 입력 진단은 렌더링 전에 마스킹합니다. 명시적인 도움말·버전 요청은 기존처럼 성공으로 처리합니다.
-
-### 명령 사전 검사 일치
-- `policy check [server] "<command>"`가 `run`과 같은 기본 서버 선택·명령 인자 해석을 사용합니다. 기존 서버명 명시 호출도 유지합니다.
-- 설정·정책 로딩과 공통 로컬 검사를 실제 실행 순서에 맞춰 첫 실패 이유와 종료 코드를 일치시킵니다. 실제 실행은 첫 오류에서 중단하고, 사전 검사는 추가 차단 이유를 계속 표시하며 자격 증명이나 SSH를 조회하지 않습니다.
-
-### 다운로드 경로 검사·안내 수정
-- 디렉터리를 로컬 파일 목적지로 지정하면 SSH 연결 전에 정확한 파일 경로를 지정하도록 안내합니다. `--yes`로 해결되지 않는 덮어쓰기 안내를 제거하고 `policy check-get`도 같은 판정을 사용합니다.
-- 잘못된 로컬 경로 오류에 검사 작업·목적지·원인을 표시하며, 사전 검사에서 원인이 반복되는 현상을 제거합니다. Windows에서도 부모가 파일인 경로를 사전에 거부합니다.
-- 기존 덮어쓰기·심볼릭 링크 교체·없는 부모 디렉터리 생성 동작을 유지하며, 임시 저장 후 목적지가 디렉터리로 바뀐 경우도 기존 내용을 보존하고 실패합니다.
-
-### 권한 설정 개선
-- `privilege set --no-password --user <target>`로 로그인 계정별 sudo 대상을 비밀번호 없이 등록할 수 있습니다. 이후 `run --as-root`는 해당 설정으로 `sudo -n`을 사용하며 일반 실행은 자동 승격하지 않습니다.
-- 비밀번호 방식과의 전환, doctor, 계정·서버 삭제가 무비밀번호 상태를 지원합니다. `su` 또는 credential과 무비밀번호 상태를 섞은 설정은 거부하며, 기존 비밀번호는 설정 저장 성공 뒤에만 정리합니다.
-- 권한 설정·조회·삭제 결과와 확인 질문에 로그인 계정과 승격 대상을 구분해 표시합니다. JSON은 기존 필드를 유지하면서 `no_password`를 추가하고 무비밀번호 설정의 `credential`은 null로 반환합니다.
-- 기존 설정 파일은 그대로 읽고 비밀번호 방식으로 유지합니다. Rust API의 `PrivilegeConfig.credential`은 `Option<String>`으로 바뀌며 `no_password: bool`이 추가됩니다.
-
-### 실행 오류 처리 수정
-- 일반 실행·sudo의 타임아웃, 출력 제한 및 완료 확인 오류 이후 SSH 정리 대기를 짧게 제한합니다. 기본 출력·JSON·스트리밍에 동일하게 적용하며 원래 오류 종류와 부분 출력을 유지합니다.
-- `run --stream` 실패 시 완료 미확정 안내와 함께 실제 원인을 표시합니다. 각 원인의 비밀을 먼저 마스킹하고 이미 출력한 내용은 반복하지 않습니다.
+공식 `ssh2`/`libssh2-sys 0.3.3` 의존성과 기존 native 보안 제한은 그대로입니다. 이 릴리스는 native 취약점 해결을 보장하지 않습니다. `SECURITY.md`를 확인하세요.
 
 ## [0.14.2] - 2026-09-27
 
@@ -411,7 +326,8 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 
 - Initial public release: registered-server SSH `run`/`put`/`get` with secrets kept in the OS credential store, fail-closed `known_hosts` verification, and explicit `sshw trust`.
 
-[Unreleased]: https://github.com/Lv2dev/sshw/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/Lv2dev/sshw/compare/v0.15.0...HEAD
+[0.15.0]: https://github.com/Lv2dev/sshw/compare/v0.14.2...v0.15.0
 [0.11.0]: https://github.com/Lv2dev/sshw/compare/v0.10.1...v0.11.0
 [0.10.1]: https://github.com/Lv2dev/sshw/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/Lv2dev/sshw/compare/v0.9.1...v0.10.0

@@ -98,7 +98,7 @@ Updating a server at the same host/port preserves other registered accounts and 
 
 0.13.0은 사용성 개선 릴리스입니다. Cargo 설치와 공식 실행 파일은 기존 공식 `ssh2`와 `libssh2-sys 0.3.3`을 사용하며, native SSH 보안 문제가 모두 해결됐다고 보장하지 않습니다. 새 자체 의존성 패키지는 도입하지 않습니다.
 
-0.14.x도 같은 공식 의존성을 유지하며 아래 native 보안 제한이 동일하게 적용됩니다.
+0.14.x와 0.15.x도 같은 공식 의존성을 유지하며 아래 native 보안 제한이 동일하게 적용됩니다.
 
 `libssh2-sys 0.3.3`의 실제 배포 archive(SHA-256 `0f5eb74291e8691cab524a01274a1b1e7742b1a94f29d8b101d8aadc8372c1cd`)는 libssh2 1.11.1에 일부 보안 수정을 backport한 소스입니다. CVE-2026-55200, CVE-2026-55199, CVE-2025-15661 및 SFTP 후속 수정은 포함하지만, 확인한 ETM/GCM 후속 수정인 [CVE-2026-66035](https://www.cve.org/CVERecord?id=CVE-2026-66035)와 [CVE-2026-66033](https://www.cve.org/CVERecord?id=CVE-2026-66033)은 포함하지 않습니다. 적용되는 암호화 backend와 협상 알고리즘에 따라 노출 경로가 달라집니다.
 
