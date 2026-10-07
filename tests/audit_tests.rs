@@ -194,8 +194,6 @@ fn default_audit_readiness_checks_windows_directory_acl_and_keeps_append_access(
     let temp = tempfile::tempdir().unwrap();
     let parent = temp.path().join("audit-home");
     std::fs::create_dir(&parent).unwrap();
-    let existing = parent.join("existing.jsonl");
-    std::fs::write(&existing, "existing audit data\n").unwrap();
     let saved_acl = temp.path().join("audit-acl.txt");
     let invoke = |args: &[&std::ffi::OsStr]| {
         let mut command = std::process::Command::new("icacls.exe");
@@ -208,6 +206,15 @@ fn default_audit_readiness_checks_windows_directory_acl_and_keeps_append_access(
             String::from_utf8_lossy(&output.stderr)
         );
     };
+    // Use a normal inherited DACL on this new empty fixture. Otherwise an
+    // icacls edit can convert the initial descriptor and add inherited ACEs.
+    invoke(&[
+        parent.as_os_str(),
+        std::ffi::OsStr::new("/reset"),
+        std::ffi::OsStr::new("/q"),
+    ]);
+    let existing = parent.join("existing.jsonl");
+    std::fs::write(&existing, "existing audit data\n").unwrap();
     let identity = std::process::Command::new("whoami.exe")
         .args(["/user", "/fo", "csv", "/nh"])
         .output()
