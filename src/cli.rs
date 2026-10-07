@@ -113,7 +113,7 @@ pub fn run() -> i32 {
         };
         eprintln!(
             "sshw: starting remote operation ({})\n{feedback}",
-            home.description
+            hints::redacted_argument(&home.description)
         );
     }
     let output = execute_for_runtime_selecting_backend(

@@ -8,6 +8,9 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 
 ## [Unreleased]
 
+### SSH 실행·로컬 신뢰 파일 오류 안내
+- 인증 후 세션/PTY·명령 요청·입출력·완료 확인 오류에 실제 단계·로그인 계정/endpoint·마스킹한 원인과 점검 방법을 추가했습니다. 원래 native/code·auth/ssh/IO 분류·partial output·완료 미확정·정리 timeout을 유지하며 원격 명령·입력 내용을 진단에 추가하지 않습니다. known_hosts 읽기/파싱 원인과 복구 위치를 보존하고 대화형 시작 메시지도 home 표시를 마스킹합니다.
+
 ### 설정 읽기 진단 보존
 - servers/profile registry/policy 파일의 읽기·JSON·형식 검사 오류는 경로와 원인을 따로 마스킹해 민감 패턴 경로가 진단을 지우지 않게 했습니다. 원래 IO/JSON source와 기존 분류·strict schema·없는 파일 처리·CAS를 유지하고 파일/권한/형식 복구 위치를 안내합니다.
 

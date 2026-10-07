@@ -442,28 +442,35 @@ impl Ssh2Client {
             self.op_timeout,
             &known_hosts,
         )?;
+        let diagnostic = RunDiagnostic {
+            server: target.server,
+            user: target.user,
+        };
         let deadline = OperationDeadline::new(self.op_timeout);
-        deadline.apply(&session)?;
-        let mut channel = session.channel_session().context("ssh session error")?;
+        diagnostic.ssh_step(deadline.apply(&session), "open SSH session")?;
+        let mut channel = diagnostic.ssh_step(session.channel_session(), "open SSH session")?;
         let result = (|| {
-            deadline.apply(&session)?;
-            channel.exec(command).context("ssh session error")?;
+            diagnostic.ssh_step(deadline.apply(&session), "execute remote command")?;
+            diagnostic.ssh_step(channel.exec(command), "execute remote command")?;
             if let Some(stdin) = stdin {
-                deadline.apply(&session)?;
-                channel
-                    .write_all(stdin.as_bytes())
-                    .context("ssh session error")?;
+                diagnostic.ssh_step(deadline.apply(&session), "send command input")?;
+                diagnostic.ssh_step(channel.write_all(stdin.as_bytes()), "send command input")?;
             }
-            deadline.apply(&session)?;
-            channel.send_eof().context("ssh session error")?;
+            diagnostic.ssh_step(deadline.apply(&session), "send input EOF")?;
+            diagnostic.ssh_step(channel.send_eof(), "send input EOF")?;
 
-            let (stdout, stderr) =
-                read_channel_outputs(&session, &mut channel, &deadline, self.output_limit, output)?;
+            let (stdout, stderr) = diagnostic.step(
+                read_channel_outputs(&session, &mut channel, &deadline, self.output_limit, output),
+                "read command output",
+            )?;
             let completion = (|| {
-                deadline.apply(&session)?;
-                channel.wait_close().context("ssh session error")?;
-                ensure_remote_command_not_signaled(&channel)?;
-                channel.exit_status().context("ssh session error")
+                diagnostic.ssh_step(deadline.apply(&session), "wait for command completion")?;
+                diagnostic.ssh_step(channel.wait_close(), "wait for command completion")?;
+                diagnostic.step(
+                    ensure_remote_command_not_signaled(&channel),
+                    "check command exit signal",
+                )?;
+                diagnostic.ssh_step(channel.exit_status(), "read command exit status")
             })();
             let exit_status = completion.map_err(|source| PartialRunError {
                 source,
@@ -506,35 +513,46 @@ impl Ssh2Client {
             self.op_timeout,
             &known_hosts,
         )?;
+        let diagnostic = RunDiagnostic {
+            server: target.server,
+            user: target.user,
+        };
         let deadline = OperationDeadline::new(self.op_timeout);
-        deadline.apply(&session)?;
-        let mut channel = session.channel_session().context("ssh session error")?;
+        diagnostic.ssh_step(deadline.apply(&session), "open SSH session")?;
+        let mut channel = diagnostic.ssh_step(session.channel_session(), "open SSH session")?;
         // Disable PTY echo so the injected password is never echoed back into
         // the output stream we collect.
         let mut modes = ssh2::PtyModes::new();
         modes.set_boolean(ssh2::PtyModeOpcode::ECHO, false);
-        channel
-            .request_pty("xterm", Some(modes), None)
-            .context("ssh session error")?;
-        deadline.apply(&session)?;
-        channel.exec(command).context("ssh session error")?;
+        diagnostic.ssh_step(
+            channel.request_pty("xterm", Some(modes), None),
+            "request su PTY",
+        )?;
+        diagnostic.ssh_step(deadline.apply(&session), "execute su command")?;
+        diagnostic.ssh_step(channel.exec(command), "execute su command")?;
 
         let begin_marker = su_begin_marker(marker_nonce);
-        let raw = pty_collect_with_password(
-            &session,
-            &mut channel,
-            password,
-            &deadline,
-            &begin_marker,
-            self.output_limit,
+        let raw = diagnostic.step(
+            pty_collect_with_password(
+                &session,
+                &mut channel,
+                password,
+                &deadline,
+                &begin_marker,
+                self.output_limit,
+            ),
+            "read su PTY output",
         )?;
-        deadline.apply(&session)?;
-        channel.wait_close().context("ssh session error")?;
+        diagnostic.ssh_step(deadline.apply(&session), "wait for su completion")?;
+        diagnostic.ssh_step(channel.wait_close(), "wait for su completion")?;
         // The PTY channel exit status is unreliable (a signal-killed process can
         // report 0), so the command's real exit code comes from the END marker
         // the wrapper printed. Drain the channel status but do not trust it.
         let _ = channel.exit_status();
-        let (stdout, exit_status) = extract_su_output(&raw, marker_nonce)?;
+        let (stdout, exit_status) = diagnostic.step(
+            extract_su_output(&raw, marker_nonce),
+            "verify su completion",
+        )?;
 
         Ok(RunResult {
             exit_status,
@@ -602,6 +620,47 @@ mod local_file_error_tests {
                 assert!(!error.to_string().contains("not found"));
             }
         }
+    }
+}
+
+struct RunDiagnostic<'a> {
+    server: &'a ServerConfig,
+    user: &'a str,
+}
+
+impl RunDiagnostic<'_> {
+    fn context(&self, error: anyhow::Error, stage: &str) -> anyhow::Error {
+        let detail = redacted_error_detail(&error);
+        let recovery = if stage == "open SSH session" || stage == "request su PTY" {
+            "check the server's session/PTY limits and access for the selected login account"
+        } else {
+            "check the connection, server session/command permissions and the selected privilege method if used. Remote completion may be unconfirmed; inspect the command's effects before retrying"
+        };
+        error.context(format!(
+            "SSH execution failed during {stage} for login account '{}' at {}:{}\ncaused by: {detail}\nnext: {recovery}",
+            redacted_argument(self.user), redacted_argument(&self.server.host), self.server.port
+        ))
+    }
+
+    fn step<T>(&self, result: anyhow::Result<T>, stage: &str) -> anyhow::Result<T> {
+        result.map_err(|error| match error.downcast::<PartialRunError>() {
+            Ok(mut partial) => {
+                partial.source = self.context(partial.source, stage);
+                anyhow::Error::new(partial)
+            }
+            Err(error) => self.context(error, stage),
+        })
+    }
+
+    fn ssh_step<T, E: Into<anyhow::Error>>(
+        &self,
+        result: Result<T, E>,
+        stage: &str,
+    ) -> anyhow::Result<T> {
+        self.step(
+            result.map_err(Into::into).with_error_kind(ErrorKind::Ssh),
+            stage,
+        )
     }
 }
 
@@ -1609,6 +1668,82 @@ mod tests {
     const KNOWN_HOSTS_LINE: &str = "\
 example.test ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB9zU1OEQ2tzYhrXq4/DEjvRNvKv6cU4Xar6gghj1p7D
 ";
+
+    #[test]
+    fn run_diagnostic_preserves_native_codes_and_masks_account_endpoint_and_cause() {
+        let server =
+            ServerConfig::single_account("token=host-marker", 2222, "deploy", AuthConfig::Agent);
+        let diagnostic = super::RunDiagnostic {
+            server: &server,
+            user: "password=user-marker",
+        };
+        let native = ssh2::Error::from_errno(ssh2::ErrorCode::Session(-21));
+        let error = diagnostic
+            .ssh_step(
+                Err::<(), _>(anyhow::Error::new(native).context("token=cause-marker")),
+                "open SSH session",
+            )
+            .unwrap_err();
+        let response = crate::output::ErrorResponse::from_error(&error);
+        assert_eq!(response.error.kind, ErrorKind::Ssh);
+        assert_eq!(response.error.exit_code, 5);
+        assert!(
+            response.error.message.contains("open SSH session")
+                && response.error.message.contains("session/PTY limits")
+        );
+        assert!(error.chain().any(|cause| {
+            cause
+                .downcast_ref::<ssh2::Error>()
+                .is_some_and(|native| native.code() == ssh2::ErrorCode::Session(-21))
+        }));
+        let rendered = serde_json::to_string(&response).unwrap();
+        for marker in ["host-marker", "user-marker", "cause-marker"] {
+            assert!(!rendered.contains(marker), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn run_diagnostic_retains_partial_output_and_io_kind_through_owned_downcast() {
+        let server = ServerConfig::single_account("example.test", 22, "deploy", AuthConfig::Agent);
+        let diagnostic = super::RunDiagnostic {
+            server: &server,
+            user: "deploy",
+        };
+        let source = crate::error::classified_error(
+            ErrorKind::Io,
+            anyhow::Error::new(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "output sink closed",
+            )),
+        );
+        let partial = crate::ssh::PartialRunError {
+            source,
+            stdout: "previous output".into(),
+            stderr: "previous stderr".into(),
+        };
+        let error = diagnostic
+            .step(
+                Err::<(), _>(anyhow::Error::new(partial)),
+                "read command output",
+            )
+            .unwrap_err();
+        let partial = error.downcast::<crate::ssh::PartialRunError>().unwrap();
+        assert_eq!(partial.stdout, "previous output");
+        assert_eq!(partial.stderr, "previous stderr");
+        let error = anyhow::Error::new(partial);
+        let response = crate::output::ErrorResponse::from_error(&error);
+        assert_eq!(response.error.kind, ErrorKind::Io);
+        assert!(
+            response.error.message.contains("read command output")
+                && response.error.message.contains("output sink closed")
+        );
+        assert!(error.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::BrokenPipe)
+        }));
+        assert_eq!(response.partial_output.unwrap().stdout, "previous output");
+    }
 
     #[test]
     fn scp_diagnostics_keep_native_codes_and_mask_fields_and_causes() {

@@ -1,6 +1,6 @@
 //! Local known_hosts parsing shared by diagnostics and connection verification.
 
-use anyhow::Context;
+use crate::error::settings_error;
 use base64::Engine;
 use ssh2::{CheckResult, KnownHostFileKind, KnownHosts, Session};
 use std::fs;
@@ -19,12 +19,8 @@ impl LocalKnownHosts {
         for host in hosts.hosts()? {
             base64::engine::general_purpose::STANDARD
                 .decode(host.key())
-                .with_context(|| {
-                    format!(
-                        "invalid host key data in known_hosts file: {}",
-                        path.display()
-                    )
-                })?;
+                .map_err(|error| settings_error(error.into(), "invalid host key data in known_hosts file", path,
+                    "repair the reported known_hosts key data; use sshw doctor with the same home/profile to inspect local trust entries"))?;
         }
         Ok(Self(hosts))
     }
@@ -45,7 +41,8 @@ impl LocalKnownHosts {
 
 pub(crate) fn read_known_hosts_file(hosts: &mut KnownHosts, path: &Path) -> anyhow::Result<()> {
     let content = fs::read_to_string(path)
-        .with_context(|| format!("failed to read known_hosts file: {}", path.display()))?;
+        .map_err(|error| settings_error(error.into(), "failed to read known_hosts file", path,
+            "check read access and UTF-8/OpenSSH format at the reported known_hosts path; use sshw doctor with the same home/profile to inspect local trust entries"))?;
     for (index, line) in content.lines().enumerate() {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -56,13 +53,32 @@ pub(crate) fn read_known_hosts_file(hosts: &mut KnownHosts, path: &Path) -> anyh
         entry.push('\n');
         hosts
             .read_str(&entry, KnownHostFileKind::OpenSSH)
-            .with_context(|| {
-                format!(
-                    "failed to parse known_hosts file at line {}: {}",
-                    index + 1,
-                    path.display()
-                )
-            })?;
+            .map_err(|error| settings_error(error.into(), &format!("failed to parse known_hosts file at line {}", index + 1), path,
+                "repair the reported known_hosts line in OpenSSH format; verify the server identity before explicitly trusting a replacement key"))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn known_hosts_read_failure_shows_masked_path_cause_and_keeps_io_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("token=path-marker");
+        std::fs::create_dir(&path).unwrap();
+        let error = super::LocalKnownHosts::load(&path).err().unwrap();
+        let response = crate::output::ErrorResponse::from_error(&error);
+        assert!(
+            response.error.message.contains("caused by:")
+                && response.error.message.contains("next:")
+                && response.error.message.contains("known_hosts")
+        );
+        assert!(!response.error.message.contains("path-marker"));
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.downcast_ref::<std::io::Error>().is_some())
+        );
+        assert!(path.is_dir());
+    }
 }
