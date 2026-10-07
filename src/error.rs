@@ -49,6 +49,19 @@ pub(crate) fn persistence_context(
     ))
 }
 
+pub(crate) fn settings_error(
+    source: anyhow::Error,
+    label: &str,
+    path: &Path,
+    recovery: &str,
+) -> anyhow::Error {
+    let detail = redacted_error_detail(&source);
+    source.context(format!(
+        "{label} at {}\ncaused by: {detail}\nnext: {recovery}",
+        diagnostic_path(path)
+    ))
+}
+
 /// Error wrapper carrying a stable machine-facing kind independently from its
 /// human-readable message and dynamic values.
 #[derive(Debug)]

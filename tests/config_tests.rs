@@ -7,6 +7,58 @@ use sshw::home::{CredentialNamespace, CredentialPurpose};
 use std::fs;
 
 #[test]
+fn settings_load_errors_preserve_causes_types_and_files_when_paths_are_masked() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("token=path-marker");
+    fs::create_dir(&home).unwrap();
+    for document in ["servers.json", "profiles.json", "policy.json"] {
+        let path = home.join(document);
+        let load = || match document {
+            "servers.json" => load_config(&path).map(|_| ()),
+            "profiles.json" => sshw::profile::load_registry(&path).map(|_| ()),
+            _ => sshw::policy::resolve_policy(&path, false).map(|_| ()),
+        };
+        assert!(load().is_ok());
+        assert!(!path.exists());
+        fs::write(&path, "{").unwrap();
+        let before = (
+            fs::read(&path).unwrap(),
+            fs::metadata(&path).unwrap().modified().unwrap(),
+        );
+        let error = load().unwrap_err();
+        let response = sshw::output::ErrorResponse::from_error(&error);
+        assert!(
+            response.error.message.contains("EOF while parsing")
+                && response.error.message.contains("next:")
+        );
+        assert!(!response.error.message.contains("path-marker"));
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.downcast_ref::<serde_json::Error>().is_some())
+        );
+        assert_eq!(fs::read(&path).unwrap(), before.0);
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), before.1);
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        let error = load().unwrap_err();
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.downcast_ref::<std::io::Error>().is_some())
+        );
+        let response = sshw::output::ErrorResponse::from_error(&error);
+        assert!(
+            response.error.message.contains("caused by:")
+                && response.error.message.contains("next:")
+        );
+        assert!(!response.error.message.contains("path-marker"));
+        assert!(path.is_dir());
+        fs::remove_dir(&path).unwrap();
+    }
+}
+
+#[test]
 fn new_config_starts_empty() {
     let config = SshwConfig::default();
 

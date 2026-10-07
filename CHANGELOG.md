@@ -8,6 +8,9 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 
 ## [Unreleased]
 
+### 설정 읽기 진단 보존
+- servers/profile registry/policy 파일의 읽기·JSON·형식 검사 오류는 경로와 원인을 따로 마스킹해 민감 패턴 경로가 진단을 지우지 않게 했습니다. 원래 IO/JSON source와 기존 분류·strict schema·없는 파일 처리·CAS를 유지하고 파일/권한/형식 복구 위치를 안내합니다.
+
 ### 확인창 대상 표시·입력 오류 안내
 - 서버·계정·승격 설정의 갱신/삭제와 host trust 확인창은 대상 값을 각각 마스킹해 작업 설명·승격 대상/방식·지문과 `[y/N]` 표시를 유지합니다. 확인 읽기 오류에는 마스킹한 원인과 해당 작업의 `--yes`/`--force` 안내를 추가하며 기존 terminal gate·승인/거절·원래 IO source를 유지합니다.
 

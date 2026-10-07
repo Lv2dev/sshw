@@ -990,6 +990,8 @@ policy는 fail-closed입니다. `--policy`인데 파일이 없으면 에러이�
 
 ### Doctor
 
+설정 파일을 읽거나 JSON·형식을 검사하다 실패하면 파일 경로와 원인을 각각 마스킹하고 해당 파일의 접근 권한·UTF-8·구문/지원 필드 점검을 안내합니다. 민감 패턴이 있는 경로 때문에 오류 원인까지 잘리지 않으며, 진단 과정에서 파일을 초기화하거나 형식 검사를 완화하지 않습니다.
+
 `local_checks_passed`는 로컬 검사 결과이고 `issues`에는 문제와 다음 조치가 담깁니다. SSH agent와 누락된 privilege credential도 확인합니다. `connection_tested:false`이며 원격 접속·host key 일치·sudoers를 검사하지는 않습니다. `ok:true`는 진단 실행 성공을 뜻합니다.
 
 감사 파일이 없으면 기존 부모 폴더에 비밀 없는 private 임시 파일을 생성하고 즉시 정리해 새 로그의 생성 권한을 확인합니다. Unix probe는 owner-only이며 기존 `audit.jsonl`이나 없는 부모는 만들지 않습니다. 기존 로그는 append용 열기만 확인하고 내용·권한을 바꾸거나 레코드를 추가하지 않습니다. 실패하면 경로·원인·복구 방법을 표시하고 JSON `audit_message`에 마스킹한 원인을 제공합니다(성공은 null). 파일 생성 probe는 부모 폴더의 mtime을 바꿀 수 있습니다. 이 시점의 준비 상태가 이후 기록/lock 성공을 보장하지는 않으며, 실제 기록 실패의 best-effort 의미와 doctor exit0/`ok:true`는 유지합니다.

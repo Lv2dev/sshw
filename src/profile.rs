@@ -1,5 +1,5 @@
 use crate::error::{
-    diagnostic_path, persistence_context, persistence_error, redacted_error_detail,
+    diagnostic_path, persistence_context, persistence_error, redacted_error_detail, settings_error,
 };
 use crate::home::{ResolvedHome, builtin_default_home, is_reserved_profile_id};
 use crate::local_command::{quote_local_argument, redacted_argument};
@@ -52,12 +52,7 @@ pub fn load_registry_with_revision(path: &Path) -> Result<(ProfileRegistry, Regi
         return Ok((ProfileRegistry::default(), RegistryRevision(None)));
     };
     let registry = parse_registry(path, &contents)?;
-    validate_registry(&registry).map_err(|err| {
-        anyhow::anyhow!(
-            "failed to load profile registry at {}: {err}",
-            path.display()
-        )
-    })?;
+    validate_registry(&registry).map_err(|err| registry_load_error(err, path))?;
     let revision = RegistryRevision(Some(contents.into_bytes()));
     Ok((registry, revision))
 }
@@ -72,33 +67,30 @@ pub fn load_registry_for_removal_with_revision(
     let registry = parse_registry(path, &contents)?;
     let mut remainder = registry.clone();
     if remainder.profiles.remove(target_name).is_none() {
-        validate_registry(&registry).map_err(|err| {
-            anyhow::anyhow!(
-                "failed to load profile registry at {}: {err}",
-                path.display()
-            )
-        })?;
+        validate_registry(&registry).map_err(|err| registry_load_error(err, path))?;
     }
     if remainder.default.as_deref() == Some(target_name) {
         remainder.default = remainder.profiles.keys().next().cloned();
     }
     validate_registry(&remainder).map_err(|err| {
-        anyhow::anyhow!(
-            "failed to load profile registry at {} after removing profile '{target_name}': {err}",
-            path.display()
-        )
+        settings_error(err, &format!("failed to load profile registry after removing profile '{}'", redacted_argument(target_name)), path,
+            "repair the remaining profile registry entries at the reported profiles.json before retrying")
     })?;
     let revision = RegistryRevision(Some(contents.into_bytes()));
     Ok((registry, revision))
 }
 
 fn parse_registry(path: &Path, contents: &str) -> Result<ProfileRegistry> {
-    serde_json::from_str(contents).map_err(|err| {
-        anyhow::anyhow!(
-            "failed to load profile registry at {}: {err}",
-            path.display()
-        )
-    })
+    serde_json::from_str(contents).map_err(|err| registry_load_error(err.into(), path))
+}
+
+fn registry_load_error(error: anyhow::Error, path: &Path) -> anyhow::Error {
+    settings_error(
+        error,
+        "failed to load profile registry",
+        path,
+        "check read access, UTF-8 JSON syntax and supported profile entries at the reported profiles.json; repair the registry and retry the profile command",
+    )
 }
 
 fn read_registry_contents(path: &Path) -> Result<Option<String>> {
@@ -110,24 +102,15 @@ fn read_registry_contents(path: &Path) -> Result<Option<String>> {
                     return Ok(None);
                 }
                 Err(metadata_err) => {
-                    return Err(anyhow::anyhow!(
-                        "failed to load profile registry at {}: {metadata_err}",
-                        path.display()
-                    ));
+                    return Err(registry_load_error(metadata_err.into(), path));
                 }
                 Ok(_) => {
-                    return Err(anyhow::anyhow!(
-                        "failed to load profile registry at {}: {err}",
-                        path.display()
-                    ));
+                    return Err(registry_load_error(err.into(), path));
                 }
             }
         }
         Err(err) => {
-            return Err(anyhow::anyhow!(
-                "failed to load profile registry at {}: {err}",
-                path.display()
-            ));
+            return Err(registry_load_error(err.into(), path));
         }
     };
     Ok(Some(contents))

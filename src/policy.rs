@@ -366,27 +366,28 @@ fn read_optional_policy(path: &Path) -> Result<Option<String>> {
                 Err(metadata_err) if metadata_err.kind() == std::io::ErrorKind::NotFound => {
                     Ok(None)
                 }
-                Err(metadata_err) => Err(anyhow::anyhow!(
-                    "failed to read policy file at {}: {metadata_err}",
-                    path.display()
-                )),
-                Ok(_) => Err(anyhow::anyhow!(
-                    "failed to read policy file at {}: {err}",
-                    path.display()
-                )),
+                Err(metadata_err) => Err(policy_read_error(metadata_err, path)),
+                Ok(_) => Err(policy_read_error(err, path)),
             }
         }
-        Err(err) => Err(anyhow::anyhow!(
-            "failed to read policy file at {}: {err}",
-            path.display()
-        )),
+        Err(err) => Err(policy_read_error(err, path)),
     }
 }
 
 fn parse_policy_file(path: &Path, contents: &str) -> Result<PolicyFile> {
     let file: PolicyFile = serde_json::from_str(contents)
-        .map_err(|err| anyhow::anyhow!("invalid policy file at {}: {err}", path.display()))?;
+        .map_err(|err| crate::error::settings_error(err.into(), "invalid policy file", path,
+            "repair JSON syntax and supported policy fields at the reported policy.json; inspect it with sshw policy show using the same home/profile selection"))?;
     Ok(file)
+}
+
+fn policy_read_error(error: std::io::Error, path: &Path) -> anyhow::Error {
+    crate::error::settings_error(
+        error.into(),
+        "failed to read policy file",
+        path,
+        "check that the reported policy.json is a readable UTF-8 file and its parent path is accessible; rerun using the same home/profile selection",
+    )
 }
 
 pub(crate) fn load_policy_with_revision(

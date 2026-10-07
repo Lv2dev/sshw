@@ -1,4 +1,4 @@
-use crate::error::{persistence_context, persistence_error};
+use crate::error::{persistence_context, persistence_error, settings_error};
 use crate::home::{CredentialNamespace, CredentialPurpose, validate_server_name};
 use crate::storage::write_owner_only_atomic;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -336,7 +336,8 @@ pub fn load_config_with_revision(path: &Path) -> anyhow::Result<(SshwConfig, Con
         return Ok((SshwConfig::default(), ConfigRevision::missing()));
     };
     let config: SshwConfig = serde_json::from_str(&contents)
-        .map_err(|err| anyhow::anyhow!("failed to load config at {}: {err}", path.display()))?;
+        .map_err(|err| settings_error(err.into(), "failed to load config", path,
+            "repair JSON syntax and supported config fields at the reported servers.json; rerun using the same home/profile selection"))?;
     let revision = ConfigRevision(Some(contents.into_bytes()));
     Ok((config, revision))
 }
@@ -350,27 +351,27 @@ fn read_config_contents(path: &Path) -> anyhow::Result<Option<String>> {
                     return Ok(None);
                 }
                 Err(metadata_err) => {
-                    return Err(anyhow::anyhow!(
-                        "failed to load config at {}: {metadata_err}",
-                        path.display()
-                    ));
+                    return Err(config_read_error(metadata_err, path));
                 }
                 Ok(_) => {
-                    return Err(anyhow::anyhow!(
-                        "failed to load config at {}: {err}",
-                        path.display()
-                    ));
+                    return Err(config_read_error(err, path));
                 }
             }
         }
         Err(err) => {
-            return Err(anyhow::anyhow!(
-                "failed to load config at {}: {err}",
-                path.display()
-            ));
+            return Err(config_read_error(err, path));
         }
     };
     Ok(Some(contents))
+}
+
+fn config_read_error(error: std::io::Error, path: &Path) -> anyhow::Error {
+    settings_error(
+        error.into(),
+        "failed to load config",
+        path,
+        "check that the reported servers.json is a readable UTF-8 file and its parent path is accessible; rerun using the same home/profile selection",
+    )
 }
 
 pub fn save_config(path: &Path, config: &SshwConfig) -> anyhow::Result<()> {
@@ -392,12 +393,7 @@ pub fn save_config_if_unchanged(
     revision: &ConfigRevision,
 ) -> anyhow::Result<()> {
     let current = read_config_contents(path)
-        .map_err(|err| {
-            anyhow::anyhow!(
-                "failed to save config at {} while checking its revision: {err}",
-                path.display()
-            )
-        })?
+        .map_err(|err| persistence_context(err, "save config while checking its revision", path))?
         .map(String::into_bytes);
     if current != revision.0 {
         return Err(anyhow::anyhow!(
