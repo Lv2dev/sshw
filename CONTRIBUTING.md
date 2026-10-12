@@ -29,8 +29,10 @@ cargo metadata --manifest-path fuzz/Cargo.toml --locked --format-version 1
 2. Add a regression test that fails without the change.
 3. Preserve stable JSON fields and exit codes unless the change is explicitly a
    documented compatibility break.
-4. Update `README.md`, `SECURITY.md`, and `CHANGELOG.md` when their contracts or
-   security claims change.
+4. Update `README.md`, `README.ko.md`, the corresponding `docs/reference*.md`,
+   `SECURITY.md`, and `CHANGELOG.md` when their contracts or security claims change.
+   Keep the READMEs focused on first use and common tasks; put exact options,
+   configuration compatibility and failure contracts in the reference documents.
 
 Use only synthetic SSH endpoints and credentials in tests. Integration tests that
 need a real SSH server must remain opt-in and isolated from personal infrastructure.
@@ -57,3 +59,19 @@ Describe the user-visible behavior, security implications, tests, and documentat
 changes. Small, reviewable commits are preferred, but no particular commit format
 is required. A maintainer may ask for changes when a patch expands the trust boundary
 or leaves a regression path untested.
+
+## Releases
+
+Release tags must match the version in `Cargo.toml`. After the release changes
+have been reviewed, verified and approved, create and push the new tag:
+
+```bash
+git tag vX.Y.Z
+git push origin vX.Y.Z
+```
+
+This triggers the release workflow, not a local installation. The workflow uses
+the protected `release` environment, Rust 1.97.0, and pinned GitHub Actions to
+verify, build platform archives, attest them and publish the release/package.
+Do not move an existing release tag. See the [release verification reference](docs/reference.md#release-verification)
+for archive metadata, checksums and attestation checks.
