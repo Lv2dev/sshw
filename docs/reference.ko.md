@@ -1,6 +1,6 @@
 # sshw 상세 참조
 
-[처음 사용하기](../README.ko.md) | [English](reference.md)
+[처음 사용하기](../README.md#한국어) | [English](reference.md)
 
 옵션의 정확한 동작, 설정 규칙과 오류 처리 방식이 필요할 때 보는 문서입니다. 첫 연결은 README의 순서대로 진행하세요.
 

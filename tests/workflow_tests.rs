@@ -78,11 +78,13 @@ fn msrv_uses_standard_file_locks_without_fs2() {
     assert!(root_manifest.contains("rust-version = \"1.89\""));
     assert!(fuzz_manifest.contains("rust-version = \"1.89\""));
     assert!(ci.contains("toolchain: \"1.89\""));
-    let korean_readme = read_workflow("README.ko.md");
-    for (path, document) in [("README.md", &readme), ("README.ko.md", &korean_readme)] {
+    let (english_readme, korean_readme) = readme
+        .split_once("\n# 한국어\n")
+        .expect("README must include both language sections on the same page");
+    for (language, document) in [("English", english_readme), ("한국어", korean_readme)] {
         assert!(
             document.contains("Rust 1.89"),
-            "{path} must document the MSRV"
+            "{language} must document the MSRV"
         );
     }
     assert!(contributing.contains("Rust 1.89 or newer"));
@@ -473,9 +475,11 @@ fn repository_governance_files_define_secure_contribution_paths() {
 #[test]
 fn public_docs_cover_hardening_contracts_and_residual_risks() {
     let readme = read_workflow("README.md");
-    let korean_readme = read_workflow("README.ko.md");
+    let (english_readme, korean_readme) = readme
+        .split_once("\n# 한국어\n")
+        .expect("README must include both language sections on the same page");
     let reference = read_workflow("docs/reference.md");
-    let english_docs = format!("{readme}\n{reference}");
+    let english_docs = format!("{english_readme}\n{reference}");
     for marker in [
         "DNS resolution, all resolved-address attempts, TCP setup, and the SSH handshake share one 15-second connection deadline.",
         "optional `causes` array",
@@ -497,7 +501,7 @@ fn public_docs_cover_hardening_contracts_and_residual_risks() {
             "English README/reference is missing {marker:?}"
         );
     }
-    for section in [&readme, &korean_readme] {
+    for section in [english_readme, korean_readme] {
         assert!(
             section.contains("cargo install sshw-agent --locked"),
             "each language must document the crates.io install command"
@@ -509,8 +513,9 @@ fn public_docs_cover_hardening_contracts_and_residual_risks() {
     }
     assert!(readme.contains("The crates.io package is named `sshw-agent`"));
     assert!(korean_readme.contains("crates.io 패키지명은 `sshw-agent`"));
-    assert!(readme.contains("(README.ko.md)"));
-    assert!(korean_readme.contains("(README.md)"));
+    assert!(english_readme.contains("[한국어](#한국어)"));
+    assert!(korean_readme.contains("[English](#sshw)"));
+    assert!(read_workflow("README.ko.md").contains("(README.md#한국어)"));
     assert!(readme.contains("(docs/reference.md)"));
     assert!(korean_readme.contains("(docs/reference.ko.md)"));
 
