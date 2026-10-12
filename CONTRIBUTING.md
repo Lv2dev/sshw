@@ -29,9 +29,9 @@ cargo metadata --manifest-path fuzz/Cargo.toml --locked --format-version 1
 2. Add a regression test that fails without the change.
 3. Preserve stable JSON fields and exit codes unless the change is explicitly a
    documented compatibility break.
-4. Update `README.md`, `README.ko.md`, the corresponding `docs/reference*.md`,
+4. Update both language sections in `README.md`, the corresponding `docs/reference*.md`,
    `SECURITY.md`, and `CHANGELOG.md` when their contracts or security claims change.
-   Keep the READMEs focused on first use and common tasks; put exact options,
+   Keep the README focused on first use and common tasks; put exact options,
    configuration compatibility and failure contracts in the reference documents.
 
 Use only synthetic SSH endpoints and credentials in tests. Integration tests that
