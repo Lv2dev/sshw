@@ -16,6 +16,8 @@ include = [
     "/build.rs",
     "/Cargo.lock",
     "/README.md",
+    "/README.ko.md",
+    "/docs/*.md",
     "/LICENSE",
     "/CHANGELOG.md",
     "/SECURITY.md",

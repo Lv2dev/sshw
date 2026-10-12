@@ -78,7 +78,13 @@ fn msrv_uses_standard_file_locks_without_fs2() {
     assert!(root_manifest.contains("rust-version = \"1.89\""));
     assert!(fuzz_manifest.contains("rust-version = \"1.89\""));
     assert!(ci.contains("toolchain: \"1.89\""));
-    assert_eq!(readme.matches("Rust 1.89").count(), 2);
+    let korean_readme = read_workflow("README.ko.md");
+    for (path, document) in [("README.md", &readme), ("README.ko.md", &korean_readme)] {
+        assert!(
+            document.contains("Rust 1.89"),
+            "{path} must document the MSRV"
+        );
+    }
     assert!(contributing.contains("Rust 1.89 or newer"));
     assert!(!root_manifest.contains("fs2 ="));
     assert!(!storage.contains("fs2::"));
@@ -318,6 +324,9 @@ fn crates_io_package_preserves_sshw_targets_and_excludes_repository_only_files()
         "Cargo.toml",
         "Cargo.lock",
         "README.md",
+        "README.ko.md",
+        "docs/reference.md",
+        "docs/reference.ko.md",
         "LICENSE",
         "build.rs",
     ] {
@@ -464,6 +473,9 @@ fn repository_governance_files_define_secure_contribution_paths() {
 #[test]
 fn public_docs_cover_hardening_contracts_and_residual_risks() {
     let readme = read_workflow("README.md");
+    let korean_readme = read_workflow("README.ko.md");
+    let reference = read_workflow("docs/reference.md");
+    let english_docs = format!("{readme}\n{reference}");
     for marker in [
         "DNS resolution, all resolved-address attempts, TCP setup, and the SSH handshake share one 15-second connection deadline.",
         "optional `causes` array",
@@ -480,22 +492,27 @@ fn public_docs_cover_hardening_contracts_and_residual_risks() {
         "allow_accounts",
         "Schema v1 remains readable",
     ] {
-        assert!(readme.contains(marker), "README is missing {marker:?}");
+        assert!(
+            english_docs.contains(marker),
+            "English README/reference is missing {marker:?}"
+        );
     }
-    let (english, korean) = readme.split_once("## 한국어").expect("bilingual README");
-    for section in [english, korean] {
+    for section in [&readme, &korean_readme] {
         assert!(
             section.contains("cargo install sshw-agent --locked"),
             "each language must document the crates.io install command"
         );
+        assert!(
+            section.contains("Visual C++ Build Tools/Windows SDK"),
+            "each language must document Windows native build prerequisites"
+        );
     }
-    assert_eq!(
-        readme.matches("Visual C++ Build Tools/Windows SDK").count(),
-        2,
-        "README must document Windows native build prerequisites in both languages"
-    );
     assert!(readme.contains("The crates.io package is named `sshw-agent`"));
-    assert!(readme.contains("crates.io 패키지명은 `sshw-agent`"));
+    assert!(korean_readme.contains("crates.io 패키지명은 `sshw-agent`"));
+    assert!(readme.contains("(README.ko.md)"));
+    assert!(korean_readme.contains("(README.md)"));
+    assert!(readme.contains("(docs/reference.md)"));
+    assert!(korean_readme.contains("(docs/reference.ko.md)"));
 
     let security = read_workflow("SECURITY.md");
     for marker in [
