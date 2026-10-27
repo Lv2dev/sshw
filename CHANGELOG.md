@@ -336,7 +336,8 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 
 - Initial public release: registered-server SSH `run`/`put`/`get` with secrets kept in the OS credential store, fail-closed `known_hosts` verification, and explicit `sshw trust`.
 
-[Unreleased]: https://github.com/Lv2dev/sshw/compare/v0.15.0...HEAD
+[Unreleased]: https://github.com/Lv2dev/sshw/compare/v0.15.1...HEAD
+[0.15.1]: https://github.com/Lv2dev/sshw/compare/v0.15.0...v0.15.1
 [0.15.0]: https://github.com/Lv2dev/sshw/compare/v0.14.2...v0.15.0
 [0.11.0]: https://github.com/Lv2dev/sshw/compare/v0.10.1...v0.11.0
 [0.10.1]: https://github.com/Lv2dev/sshw/compare/v0.10.0...v0.10.1

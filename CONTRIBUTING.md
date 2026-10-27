@@ -15,8 +15,9 @@ in an issue, pull request, test fixture, screenshot, or log. Use synthetic value
 ## Development Setup
 
 Install Rust 1.89 or newer and Python 3, then clone the repository and verify the
-locked dependency graphs before making changes. Python 3 is required by the
-deterministic ZIP/tar.gz packaging regression in the normal Rust test suite.
+locked dependency graphs before making changes. The normal Rust test suite uses
+Python 3 for deterministic ZIP/tar.gz packaging and, on Windows, the isolated
+console-input regression.
 
 ```bash
 cargo metadata --locked --format-version 1
