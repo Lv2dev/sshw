@@ -8,6 +8,16 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 
 ## [Unreleased]
 
+## [0.15.1] - 2026-10-27
+
+### 수정
+
+- Windows에서 비밀번호 입력을 Ctrl+C로 중단한 뒤에도 다음 확인창의 문자 입력과 Enter가 정상 동작하도록, 확인 중 사용할 콘솔 입력 모드를 준비하고 종료 시 원래 모드로 복구합니다.
+
+### 문서
+
+- README의 설치·첫 연결·자주 쓰는 작업 안내를 정리하고, 같은 페이지에서 한국어와 English 사이를 이동할 수 있게 했습니다. 상세 옵션과 동작 계약은 언어별 참조 문서에서 확인할 수 있습니다.
+
 ## [0.15.0] - 2026-10-07
 
 ### 추가

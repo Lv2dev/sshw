@@ -2,6 +2,11 @@ use std::io::{self, IsTerminal, Read};
 #[cfg(test)]
 use std::io::{BufRead, Write};
 
+#[cfg(not(windows))]
+use rprompt::prompt_reply;
+#[cfg(windows)]
+use windows_confirmation::prompt_reply;
+
 pub trait Prompter {
     /// Check readiness without prompting. Existing programmatic prompters remain available.
     fn ensure_confirmation_available(&mut self, _option: &str) -> anyhow::Result<()> {
@@ -32,8 +37,9 @@ impl Prompter for TerminalPrompter {
         // Read the reply from the controlling terminal (CONIN$ on Windows) instead of the
         // inherited stdin handle. std's buffered stdin read_line can hang under ConPTY
         // (Windows Terminal / PowerShell), whereas rprompt opens the console device
-        // directly, the same way rpassword does for the password prompt.
-        confirmation_from_reply(rprompt::prompt_reply(prompt), option)
+        // directly. On Windows also prepare line input: Ctrl+C can terminate a previous
+        // password reader before it restores the console's raw/no-echo input mode.
+        confirmation_from_reply(prompt_reply(prompt), option)
     }
 
     fn password(&mut self, prompt: &str) -> anyhow::Result<String> {
@@ -51,6 +57,71 @@ impl Prompter for TerminalPrompter {
             let mut input = stdin.lock();
             password_from_reader(&mut input)
         })
+    }
+}
+
+#[cfg(windows)]
+mod windows_confirmation {
+    use std::fs::{File, OpenOptions};
+    use std::io;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::Console::{
+        ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT,
+        ENABLE_VIRTUAL_TERMINAL_INPUT, GetConsoleMode, SetConsoleMode,
+    };
+
+    struct ConsoleInputMode {
+        input: File,
+        original: Option<u32>,
+    }
+
+    impl ConsoleInputMode {
+        fn line_input() -> io::Result<Self> {
+            let input = OpenOptions::new().read(true).write(true).open("CONIN$")?;
+            let mut original = 0;
+            // SAFETY: input owns a live console handle and original is a writable DWORD.
+            if unsafe { GetConsoleMode(input.as_raw_handle(), &mut original) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let mode = Self {
+                input,
+                original: Some(original),
+            };
+            let line_input =
+                (original | ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT)
+                    & !ENABLE_VIRTUAL_TERMINAL_INPUT;
+            // SAFETY: mode owns the console handle until restoration and close.
+            if unsafe { SetConsoleMode(mode.input.as_raw_handle(), line_input) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(mode)
+        }
+
+        fn restore(&mut self) -> io::Result<()> {
+            if let Some(original) = self.original {
+                // SAFETY: input remains open and original came from GetConsoleMode.
+                if unsafe { SetConsoleMode(self.input.as_raw_handle(), original) } == 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                self.original = None;
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for ConsoleInputMode {
+        fn drop(&mut self) {
+            // Also restore on unwinding; normal completion reports restoration failures.
+            let _ = self.restore();
+        }
+    }
+
+    pub(super) fn prompt_reply(prompt: &str) -> io::Result<String> {
+        let mut mode = ConsoleInputMode::line_input()?;
+        let reply = rprompt::prompt_reply(prompt);
+        let restored = mode.restore();
+        // Preserve the original read error when both reading and restoration fail.
+        reply.and_then(|answer| restored.map(|()| answer))
     }
 }
 
