@@ -12,7 +12,7 @@ use crate::home::{CredentialPurpose, ResolvedHome, builtin_default_home, sshw_ba
 use crate::output::{
     ErrorKind, ErrorResponse, RunOutput, filter_startup_stderr_noise, redact_secrets,
 };
-use crate::policy::{Policy, describe_policy, resolve_policy};
+use crate::policy::{Policy, PolicyState, resolve_policy};
 use crate::profile::{load_registry, resolve_home_with_registry, select_home_with_registry};
 use crate::safety::{SafetyDecision, classify_command, command_program};
 use crate::sandbox::{NoopSandbox, PolicyOnlySandbox, Sandbox, SandboxDecision};
@@ -30,24 +30,36 @@ use std::time::Duration;
 use zeroize::Zeroizing;
 
 mod account;
+mod completions;
+mod connection_test;
 mod diagnostics;
+mod endpoint;
 mod hints;
+mod lookup_recovery;
 mod model;
+mod password;
 mod policy_cmd;
+pub(crate) mod policy_recovery;
 mod privilege;
 mod profile;
+mod project_cmd;
 mod prompt;
+mod removal_policy;
+mod rename;
 mod server;
 mod stream;
 mod transfer;
+mod transfer_progress;
 
 pub use model::{
     AccountAddArgs, AccountArgs, AccountCommand, AccountDefaultArgs, AccountListArgs,
-    AccountRemoveArgs, AccountShowArgs, AddArgs, AuthArg, Cli, Command, DefaultArgs, DoctorArgs,
-    GetArgs, ListArgs, PrivilegeArgs, PrivilegeClearArgs, PrivilegeCommand, PrivilegeMethodArg,
-    PrivilegeSetArgs, PrivilegeShowArgs, ProfileAddArgs, ProfileArgs, ProfileCommand,
-    ProfileDefaultArgs, ProfileListArgs, ProfileRemoveArgs, ProfileShowArgs, PutArgs, RemoveArgs,
-    RunArgs, ShowArgs, TrustArgs,
+    AccountRemoveArgs, AccountShowArgs, AddArgs, AuthArg, Cli, Command, CompletionShell,
+    CompletionsArgs, DefaultArgs, DoctorArgs, EndpointArgs, GetArgs, ListArgs, PasswordArgs,
+    PrivilegeArgs, PrivilegeClearArgs, PrivilegeCommand, PrivilegeMethodArg, PrivilegeSetArgs,
+    PrivilegeShowArgs, ProfileAddArgs, ProfileArgs, ProfileCommand, ProfileDefaultArgs,
+    ProfileListArgs, ProfileRemoveArgs, ProfileRenameArgs, ProfileShowArgs, ProjectArgs,
+    ProjectCommand, ProjectInitArgs, ProjectStatusArgs, PutArgs, RemoveArgs, RenameArgs, RunArgs,
+    ShowArgs, TestArgs, TrustArgs,
 };
 pub use policy_cmd::PolicyArgs;
 pub use prompt::Prompter;
@@ -80,6 +92,17 @@ pub fn run() -> i32 {
         Err(err) => return print_output(parse_error_output(err, json_requested_in_args())),
     };
     let json_errors = cli.command.wants_json_errors();
+    if let Err(error) = cli.validate_usage() {
+        return print_output(parse_error_output(error, json_errors));
+    }
+    // Shell registration and data-only suggestions must work without initializing
+    // a home, credential backend, SSH client, mutation lock or audit sink.
+    if let Command::Completions(args) = &cli.command {
+        return print_output(match completions::run(args) {
+            Ok(output) => output,
+            Err(error) => error_output(&error, false),
+        });
+    }
     let (home, registry_path) = match resolve_runtime(&cli) {
         Ok(resolved) => resolved,
         Err(err) => return print_output(error_output(&err, json_errors)),
@@ -92,6 +115,11 @@ pub fn run() -> i32 {
     }
     let mut prompter = TerminalPrompter;
     let audit = FileAuditSink::new(runtime_audit_path(&cli, &home, &registry_path));
+    let audit = if home.project.is_some() {
+        audit.with_settings(crate::project::sources(&home))
+    } else {
+        audit
+    };
     let ctx = ExecContext {
         home: &home,
         registry_path: &registry_path,
@@ -103,10 +131,14 @@ pub fn run() -> i32 {
         && io::stderr().is_terminal()
         && matches!(
             cli.command,
-            Command::Run(_) | Command::Put(_) | Command::Get(_)
+            Command::Run(_) | Command::Put(_) | Command::Get(_) | Command::Test(_)
         )
     {
-        let feedback = if matches!(&cli.command, Command::Run(args) if args.stream) {
+        let feedback = if matches!(&cli.command, Command::Put(args) if args.progress)
+            || matches!(&cli.command, Command::Get(args) if args.progress)
+        {
+            "transfer progress is shown on stderr; use --timeout to set the operation deadline"
+        } else if matches!(&cli.command, Command::Run(args) if args.stream) {
             "redacted complete lines are streamed; use --timeout to set the operation deadline"
         } else {
             "output is returned on completion; use --timeout to set the operation deadline"
@@ -144,7 +176,52 @@ fn runtime_audit_path(cli: &Cli, home: &ResolvedHome, registry_path: &Path) -> P
 fn resolve_runtime(cli: &Cli) -> anyhow::Result<(ResolvedHome, PathBuf)> {
     let sshw_base = sshw_base_dir().with_error_kind(ErrorKind::Config)?;
     let env_home = std::env::var_os("SSHW_HOME").filter(|value| !value.is_empty());
-    resolve_runtime_with_base(cli, &sshw_base, env_home.as_deref())
+    let cwd = std::env::current_dir().with_error_kind(ErrorKind::Config)?;
+    resolve_runtime_at(cli, &sshw_base, env_home.as_deref(), &cwd)
+}
+
+/// Resolve selectors and cwd resource inheritance without initializing backends.
+pub fn resolve_runtime_at(
+    cli: &Cli,
+    base: &Path,
+    env_home: Option<&OsStr>,
+    cwd: &Path,
+) -> anyhow::Result<(ResolvedHome, PathBuf)> {
+    let env_home = if cli.global || cli.project_dir.is_some() {
+        None
+    } else {
+        env_home
+    };
+    if cli.home.is_none()
+        && cli.profile.is_none()
+        && env_home.is_none()
+        && !cli.global
+        && !matches!(&cli.command, Command::Profile(_))
+    {
+        let cwd = cli.project_dir.as_deref().unwrap_or(cwd);
+        if let Command::Project(ProjectArgs {
+            command: ProjectCommand::Init(args),
+        }) = &cli.command
+        {
+            if let Some(home) = project_cmd::local_initialization_home(args, base, cwd)? {
+                return Ok((home, base.join("profiles.json")));
+            }
+        } else {
+            if let Some(home) = crate::project::resolve_automatic(cwd, base)? {
+                return Ok((home, base.join("profiles.json")));
+            }
+            if cli.project_dir.is_some() && !matches!(&cli.command, Command::Project(_)) {
+                return Err(app_error(
+                    ErrorKind::Config,
+                    format!(
+                        "--project-dir requires a .sshw directory; {}",
+                        crate::project::initialization_hint(cwd, false, false)
+                    ),
+                ));
+            }
+        }
+    }
+    resolve_runtime_with_base(cli, base, env_home)
 }
 
 fn resolve_runtime_with_base(
@@ -154,13 +231,16 @@ fn resolve_runtime_with_base(
 ) -> anyhow::Result<(ResolvedHome, PathBuf)> {
     let registry_path = sshw_base.join("profiles.json");
 
-    if matches!(
-        &cli.command,
+    let profile_recovery = match &cli.command {
         Command::Profile(ProfileArgs {
-            command: ProfileCommand::Remove(_)
-        })
-    ) && cli.profile.is_none()
-    {
+            command: ProfileCommand::Remove(_) | ProfileCommand::Rename(_),
+        }) => true,
+        Command::Profile(ProfileArgs {
+            command: ProfileCommand::Default(args),
+        }) => args.clear,
+        _ => false,
+    };
+    if profile_recovery && cli.profile.is_none() {
         let home = select_home_with_registry(
             cli.home.as_deref(),
             env_home,
@@ -207,7 +287,7 @@ fn resolve_runtime_with_base_strict(
     } else {
         crate::profile::ProfileRegistry::default()
     };
-    let resolve = if matches!(&cli.command, Command::Profile(_)) {
+    let resolve = if matches!(&cli.command, Command::Profile(_) | Command::Project(_)) {
         select_home_with_registry
     } else {
         resolve_home_with_registry
@@ -298,7 +378,7 @@ where
     P: Prompter,
     MakeSession: FnOnce() -> E,
 {
-    let backend = if matches!(&cli.command, Command::Profile(_)) {
+    let backend = if matches!(&cli.command, Command::Profile(_) | Command::Project(_)) {
         CredentialBackend::Native
     } else {
         load_config(&ctx.home.config_path)
@@ -347,17 +427,38 @@ where
     S: SshClient,
     P: Prompter,
 {
+    let global = cli.global;
+    execute_selected(cli, ctx, credentials, ssh, prompter)
+        .map_err(|error| lookup_recovery::attach(error, ctx, global))
+}
+
+fn execute_selected<C: CredentialStore, S: SshClient, P: Prompter>(
+    cli: Cli,
+    ctx: &ExecContext,
+    credentials: &C,
+    ssh: &S,
+    prompter: &mut P,
+) -> anyhow::Result<CommandOutput> {
+    if let Err(error) = cli.validate_usage() {
+        return Err(app_error(ErrorKind::Usage, error.to_string()));
+    }
     let Cli {
         home: home_flag,
         profile: _,
         policy: _,
         timeout: _,
+        global,
+        project_dir,
         command,
     } = cli;
 
     let config_path = ctx.home.config_path.as_path();
     let command = match command {
-        Command::Policy(args) => return policy_cmd::run_policy(args, ctx),
+        Command::Completions(args) => return completions::run(&args),
+        Command::Policy(args) => return policy_cmd::run_policy(args, ctx, global),
+        Command::Project(args) => {
+            return project_cmd::run(args, ctx, project_dir.as_deref(), global);
+        }
         Command::Profile(args) => {
             let descriptor = profile_audit_descriptor(&args.command);
             let result = profile::run_profile(args, ctx.registry_path, home_flag.as_deref());
@@ -365,26 +466,37 @@ where
             return result;
         }
         Command::Doctor(args) => {
-            return doctor(
-                args,
-                ctx.home,
-                ctx.registry_path,
-                ctx.policy_forced,
-                credentials,
-                ssh,
-            );
+            return doctor(args, ctx, global, credentials, ssh);
         }
         command => command,
     };
-    let _home_lock = if command_mutates_home(&command) {
-        Some(
-            crate::storage::acquire_exclusive_lock(&ctx.home.root.join(".sshw.lock"))
-                .with_error_kind(ErrorKind::Config)?,
-        )
+    let mutating = command_mutates_home(&command);
+    let policy_cleanup = matches!(
+        &command,
+        Command::Rename(_)
+            | Command::Remove(_)
+            | Command::Account(AccountArgs {
+                command: AccountCommand::Remove(_)
+            })
+    );
+    if mutating {
+        crate::project::ensure_writable(ctx.home, true, false)?;
+    }
+    let policy_writable = ctx
+        .home
+        .project
+        .as_ref()
+        .is_none_or(|p| p.policy == crate::project::ResourceSource::Local);
+    let _home_lock = if mutating {
+        crate::project::acquire_write_locks(ctx.home, true, policy_cleanup && policy_writable)
+            .with_error_kind(ErrorKind::Config)?
     } else {
-        None
+        Vec::new()
     };
     let (mut config, revision) = load_active_config_with_revision(ctx.home)?;
+    if policy_cleanup && !policy_writable {
+        check_inherited_policy_cleanup(&command, ctx.home, &config)?;
+    }
 
     let descriptor = audit_descriptor(&command, &config);
     // Captured before `command` is consumed by dispatch: used to remap a remote
@@ -395,17 +507,31 @@ where
     let result = match command {
         Command::Add(args) => server::add_server(
             args,
-            config_path,
             &revision,
-            &ctx.home.namespace,
+            ctx,
+            global,
             credentials,
             prompter,
             &mut config,
         ),
-        Command::List(args) => server::list_servers(args, &config),
+        Command::List(args) => server::list_servers(args, &config, ctx, global),
         Command::Show(args) => server::show_server(args, &config),
+        Command::Endpoint(args) => {
+            endpoint::update_endpoint(args, config_path, &revision, &mut config, prompter)
+        }
+        Command::Rename(args) => {
+            rename::rename_server(args, ctx.home, &revision, credentials, &config)
+        }
+        Command::Password(args) => {
+            password::update_password(args, ctx.home, &revision, credentials, prompter, &config)
+        }
         Command::Default(args) => server::default_server(args, config_path, &revision, &mut config),
-        Command::Trust(args) => server::trust_server(args, ssh, prompter, &config),
+        Command::Trust(args) => server::trust_server(args, ssh, prompter, &config, ctx, global),
+        Command::Test(args) => {
+            build_sandbox(&ctx.home.policy_path, ctx.policy_forced).and_then(|sandbox| {
+                connection_test::test_connection(args, sandbox.as_ref(), credentials, ssh, &config)
+            })
+        }
         Command::Run(args) => build_sandbox(&ctx.home.policy_path, ctx.policy_forced)
             .and_then(|sandbox| run_remote(args, sandbox.as_ref(), credentials, ssh, &config)),
         Command::Put(args) => {
@@ -421,6 +547,7 @@ where
         Command::Remove(args) => server::remove_server(
             args,
             config_path,
+            &ctx.home.policy_path,
             &revision,
             credentials,
             prompter,
@@ -428,6 +555,7 @@ where
         ),
         Command::Doctor(_) => unreachable!("doctor is dispatched before config enforcement"),
         Command::Policy(_) => unreachable!("policy is dispatched before config enforcement"),
+        Command::Project(_) => unreachable!("project is dispatched before config enforcement"),
         Command::Privilege(args) => match args.command {
             PrivilegeCommand::Set(args) => privilege::set_privilege(
                 args,
@@ -466,6 +594,7 @@ where
             AccountCommand::Remove(args) => account::remove_account(
                 args,
                 config_path,
+                &ctx.home.policy_path,
                 &revision,
                 credentials,
                 prompter,
@@ -473,8 +602,18 @@ where
             ),
         },
         Command::Profile(_) => unreachable!("profile is dispatched before config loading"),
+        Command::Completions(_) => unreachable!("completions are dispatched before config loading"),
     };
 
+    let result = result.map_err(|error| {
+        let error = policy_recovery::attach(error, ctx, global);
+        // The descriptor already resolves the selected alias, including the configured default.
+        if let Some((_, Some(name), _, _)) = &descriptor {
+            hints::attach_host_trust(error, ctx, global, name)
+        } else {
+            error
+        }
+    });
     record_audit_result(ctx.audit, descriptor, &result);
 
     // Remap a remote command's non-zero exit (recorded above) so it cannot be
@@ -510,6 +649,12 @@ fn record_audit_result(
     });
 }
 
+fn removal_selection_detail(replacement: Option<&str>, clear: bool) -> Option<String> {
+    replacement
+        .map(|name| format!("switch-default:{}", hints::redacted_argument(name)))
+        .or_else(|| clear.then(|| "clear-default".into()))
+}
+
 fn profile_audit_descriptor(command: &ProfileCommand) -> Option<AuditDescriptor> {
     match command {
         ProfileCommand::Add(args) => {
@@ -519,11 +664,38 @@ fn profile_audit_descriptor(command: &ProfileCommand) -> Option<AuditDescriptor>
             "profile",
             None,
             None,
-            Some(format!("default:{}", args.name)),
+            Some(if args.clear {
+                "default:clear".into()
+            } else {
+                format!("default:{}", args.name.as_deref().unwrap_or_default())
+            }),
         )),
         ProfileCommand::Remove(args) => {
-            Some(("profile", None, None, Some(format!("remove:{}", args.name))))
+            let selection =
+                removal_selection_detail(args.switch_default.as_deref(), args.clear_default);
+            Some((
+                "profile",
+                None,
+                None,
+                Some(format!(
+                    "remove:{}{}",
+                    hints::redacted_argument(&args.name),
+                    selection
+                        .map(|detail| format!(";{detail}"))
+                        .unwrap_or_default()
+                )),
+            ))
         }
+        ProfileCommand::Rename(args) => Some((
+            "profile",
+            None,
+            None,
+            Some(format!(
+                "rename:{} -> {}",
+                hints::redacted_argument(&args.name),
+                hints::redacted_argument(&args.new_name)
+            )),
+        )),
         ProfileCommand::List(_) | ProfileCommand::Show(_) => None,
     }
 }
@@ -531,8 +703,13 @@ fn profile_audit_descriptor(command: &ProfileCommand) -> Option<AuditDescriptor>
 fn command_mutates_home(command: &Command) -> bool {
     matches!(
         command,
-        Command::Add(_) | Command::Trust(_) | Command::Remove(_)
-    ) || matches!(command, Command::Default(args) if args.name.is_some())
+        Command::Add(_)
+            | Command::Endpoint(_)
+            | Command::Trust(_)
+            | Command::Remove(_)
+            | Command::Rename(_)
+            | Command::Password(_)
+    ) || matches!(command, Command::Default(args) if args.name.is_some() || args.clear)
         || matches!(
             command,
             Command::Account(AccountArgs {
@@ -547,6 +724,52 @@ fn command_mutates_home(command: &Command) -> bool {
                 command: PrivilegeCommand::Set(_) | PrivilegeCommand::Clear(_),
             })
         )
+}
+
+fn check_inherited_policy_cleanup(
+    command: &Command,
+    home: &ResolvedHome,
+    config: &SshwConfig,
+) -> anyhow::Result<()> {
+    let (name, user, destination) = match command {
+        Command::Rename(args) => (args.name.as_str(), None, Some(args.new_name.as_str())),
+        Command::Remove(args) => (args.name.as_str(), None, None),
+        Command::Account(AccountArgs {
+            command: AccountCommand::Remove(args),
+        }) => (args.name.as_str(), Some(args.user.as_str()), None),
+        _ => return Ok(()),
+    };
+    let Some(server) = config.servers.get(name) else {
+        return Ok(());
+    };
+    if user.is_some_and(|user| !server.accounts.contains_key(user)) {
+        return Ok(());
+    }
+    if destination == Some(name) {
+        return Ok(());
+    }
+    let (policy, _) = crate::policy::load_policy_with_revision(&home.policy_path)
+        .with_error_kind(ErrorKind::Policy)?;
+    if policy.is_some_and(|policy| {
+        policy.allow_accounts.iter().any(|rule| {
+            (rule.server == name && user.is_none_or(|user| rule.user == user))
+                || destination == Some(rule.server.as_str())
+        })
+    }) {
+        let project = home.project.as_ref().expect("inherited project policy");
+        let hint = crate::project::initialization_hint(
+            project.root.parent().unwrap_or(&project.root),
+            false,
+            true,
+        );
+        return Err(app_error(
+            ErrorKind::Config,
+            format!(
+                "this edit also changes inherited global account rules; no configuration or credentials were changed. First {hint}. Use --global only when intending to edit the global server list"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn load_active_config(home: &ResolvedHome) -> anyhow::Result<SshwConfig> {
@@ -593,9 +816,59 @@ fn audit_descriptor(command: &Command, config: &SshwConfig) -> Option<AuditDescr
     let default = || config.default.clone();
     match command {
         Command::Add(a) => Some(("add", Some(a.name.clone()), Some(a.user.clone()), None)),
-        Command::Remove(a) => Some(("remove", Some(a.name.clone()), None, None)),
+        Command::Endpoint(a) => Some((
+            "endpoint",
+            Some(a.name.clone()),
+            None,
+            Some(format!(
+                "host:{};port:{}",
+                a.host
+                    .as_deref()
+                    .map(hints::redacted_argument)
+                    .unwrap_or_else(|| "unchanged".into()),
+                a.port
+                    .map(|port| port.to_string())
+                    .unwrap_or_else(|| "unchanged".into())
+            )),
+        )),
+        Command::Remove(a) => Some((
+            "remove",
+            Some(a.name.clone()),
+            None,
+            removal_selection_detail(a.switch_default.as_deref(), a.clear_default),
+        )),
+        Command::Password(a) => Some((
+            "password",
+            Some(a.name.clone()),
+            a.user
+                .clone()
+                .or_else(|| config.servers.get(&a.name).map(|s| s.default_user.clone())),
+            a.privilege.then(|| "privilege".into()),
+        )),
+        Command::Rename(a) => Some((
+            "rename",
+            Some(a.name.clone()),
+            None,
+            Some(a.new_name.clone()),
+        )),
         Command::Trust(a) => Some(("trust", Some(a.name.clone()), None, None)),
-        Command::Default(a) => Some(("default", a.name.clone().or_else(default), None, None)),
+        Command::Test(a) => Some((
+            "test",
+            Some(a.name.clone()),
+            a.user.clone().or_else(|| {
+                config
+                    .servers
+                    .get(&a.name)
+                    .map(|server| server.default_user.clone())
+            }),
+            None,
+        )),
+        Command::Default(a) => Some((
+            "default",
+            a.name.clone().or_else(default),
+            None,
+            a.clear.then(|| "clear".into()),
+        )),
         Command::Run(a) => {
             // target is `[name] <command>`.
             let (server, command) = match split_target(&a.target, 1) {
@@ -664,13 +937,14 @@ fn audit_descriptor(command: &Command, config: &SshwConfig) -> Option<AuditDescr
         }
         Command::Get(a) => {
             // target is `[name] <remote> <local>`; audit records the remote source.
-            let (server, detail) = match split_target(&a.target, 2) {
-                Some((name, rest)) => (
-                    name.map(str::to_string).or_else(default),
-                    Some(transfer::remote_path_for_audit(&rest[0])),
-                ),
-                None => (default(), None),
-            };
+            let (server, detail) =
+                match split_target(&a.target, if a.into.is_some() { 1 } else { 2 }) {
+                    Some((name, rest)) => (
+                        name.map(str::to_string).or_else(default),
+                        Some(transfer::remote_path_for_audit(&rest[0])),
+                    ),
+                    None => (default(), None),
+                };
             let user = a.user.clone().or_else(|| {
                 server
                     .as_deref()
@@ -721,7 +995,15 @@ fn audit_descriptor(command: &Command, config: &SshwConfig) -> Option<AuditDescr
                 "account",
                 Some(args.name.clone()),
                 Some(args.user.clone()),
-                Some(format!("remove:{}", args.user)),
+                Some(if let Some(replacement) = &args.switch_default {
+                    format!(
+                        "remove:{};switch-default:{}",
+                        hints::redacted_argument(&args.user),
+                        hints::redacted_argument(replacement)
+                    )
+                } else {
+                    format!("remove:{}", args.user)
+                }),
             )),
             AccountCommand::List(_) | AccountCommand::Show(_) => None,
         },
@@ -758,14 +1040,20 @@ fn check_run_access<'a>(
         on_denied(app_error(ErrorKind::Safety, reason))?;
     }
     if let SandboxDecision::Deny { reason } = sandbox.check_command(command) {
-        on_denied(app_error(ErrorKind::Policy, reason))?;
+        on_denied(policy_recovery::denial(
+            reason,
+            policy_recovery::Rule::Command(command.into()),
+        ))?;
     }
     let server = get_server(config, name)?;
     let (user, account) = select_account(name, server, user)?;
     if let SandboxDecision::Deny { reason } =
         sandbox.check_account(name, user, user == server.default_user)
     {
-        on_denied(app_error(ErrorKind::Policy, reason))?;
+        on_denied(policy_recovery::denial(
+            reason,
+            policy_recovery::Rule::Account(name.into(), user.into()),
+        ))?;
     }
     Ok((server, user, account))
 }
@@ -1233,9 +1521,8 @@ fn redact_partial_text(text: &str, secrets: &[Option<&str>]) -> String {
 
 fn doctor<C, S>(
     args: DoctorArgs,
-    home: &ResolvedHome,
-    registry_path: &Path,
-    policy_forced: bool,
+    ctx: &ExecContext<'_>,
+    global_selection: bool,
     credentials: &C,
     ssh: &S,
 ) -> anyhow::Result<CommandOutput>
@@ -1243,6 +1530,10 @@ where
     C: CredentialStore,
     S: SshClient,
 {
+    let home = ctx.home;
+    let registry_path = ctx.registry_path;
+    let policy_forced = ctx.policy_forced;
+    let recovery = hints::RecoveryCommands::new(ctx, global_selection);
     let config_path = home.config_path.as_path();
     let registry_result = load_registry(registry_path);
     let registry_valid = registry_result.is_ok();
@@ -1251,6 +1542,16 @@ where
         .map(|_| "ok".to_string())
         .unwrap_or_else(|err| err.to_string());
     let config_result = load_active_config(home);
+    if let Some(name) = args.name.as_deref() {
+        crate::home::validate_server_name(name).with_error_kind(ErrorKind::Config)?;
+        if let Ok(config) = &config_result {
+            let server = get_server(config, name)?;
+            if let Some(user) = args.user.as_deref() {
+                crate::config::validate_account_user(user).with_error_kind(ErrorKind::Config)?;
+                select_account(name, server, Some(user))?;
+            }
+        }
+    }
     let config_valid = config_result.is_ok();
     let config_message = config_result
         .as_ref()
@@ -1260,7 +1561,7 @@ where
         Ok(_) => true,
         Err(err) => err.kind() != std::io::ErrorKind::NotFound,
     };
-    let policy = describe_policy(&home.policy_path, policy_forced);
+    let (policy, policy_error) = PolicyState::inspect(&home.policy_path, policy_forced);
     let audit_message = audit::check_writable(&home.audit_path)
         .err()
         .map(|error| redacted_error_detail(&error));
@@ -1274,7 +1575,15 @@ where
         });
     let credential_checks = config_result
         .as_ref()
-        .map(|config| diagnostics::credential_checks(credentials, config))
+        .map(|config| {
+            diagnostics::credential_checks(
+                credentials,
+                config,
+                args.name.as_deref(),
+                args.user.as_deref(),
+                &recovery,
+            )
+        })
         .unwrap_or_default();
     let missing_credentials: Vec<_> = credential_checks
         .iter()
@@ -1302,11 +1611,15 @@ where
             "repair servers.json at the reported config path".to_string(),
         );
     }
-    let policy_message = resolve_policy(&home.policy_path, policy_forced)
-        .err()
-        .map(|err| redact_secrets(&err.to_string()));
+    let policy_message = policy_error.map(|err| redact_secrets(&err.to_string()));
     if let Some(message) = &policy_message {
-        issue("policy", message.clone(), "inspect the policy file at the reported path; use sshw policy show after correcting it".to_string());
+        let next = if !policy.present {
+            policy_cmd::missing_policy_hint(ctx, global_selection)
+        } else {
+            recovery.read("sshw policy show", &[]).map(|command| format!("inspect the policy file at the reported path. Use `{command}` after correcting it"))
+                .unwrap_or_else(|| "inspect the policy file at the reported path using the original settings selection".into())
+        };
+        issue("policy", message.clone(), next);
     }
     if !health.available {
         issue(
@@ -1319,7 +1632,8 @@ where
         issue(
             "audit",
             format!("audit log is not writable: {}", audit_message.as_deref().unwrap_or_default()),
-            "check create/write permissions at the reported audit path and parent directory; rerun sshw doctor using the same home/profile selection".to_string(),
+            recovery.read("sshw doctor", &[]).map(|command| format!("check create/write permissions at the reported audit path and parent directory; rerun `{command}`"))
+                .unwrap_or_else(|| "check the reported audit path permissions, then rerun doctor with the original settings selection".into()),
         );
     }
     for check in &credential_checks {
@@ -1339,11 +1653,8 @@ where
     let mut host_trust = Vec::new();
     if let Ok(config) = &config_result {
         if config.servers.is_empty() {
-            issue(
-                "setup",
-                "no servers registered".to_string(),
-                "sshw add web --host <host> --user <user>".to_string(),
-            );
+            let (summary, guidance) = hints::empty_server_list(ctx, global_selection);
+            issue("setup", summary.to_owned(), guidance);
         }
         let local_hosts = if config.servers.is_empty() {
             None
@@ -1351,6 +1662,9 @@ where
             Some(LocalKnownHosts::load(&home.known_hosts_path))
         };
         for (name, server) in &config.servers {
+            if args.name.as_ref().is_some_and(|selected| selected != name) {
+                continue;
+            }
             let hosts = local_hosts.as_ref().expect("servers are not empty");
             let inspection = hosts
                 .as_ref()
@@ -1391,18 +1705,25 @@ where
                             .is_some_and(|error| error.kind() == io::ErrorKind::NotFound)
                     })
                 });
+                let approval = recovery.write(&hints::trust(name), &[name]).map(|command| {
+                    if recovery.inherited_servers {format!("host approvals are inherited and read-only here; for an intentional global approval use `{command}`")}
+                    else {command}
+                }).unwrap_or_else(|| "keep the original settings selection when approving this host; no copyable command is available for the selection/name".into());
                 let next_step = if inspection.is_err() && !missing_file {
                     format!(
                         "check read access and repair known_hosts at {}; then run {}",
                         hints::quote_local_argument(&home.known_hosts_path.display().to_string()),
-                        hints::trust(name)
+                        approval
                     )
                 } else {
-                    hints::trust(name)
+                    approval
                 };
                 issue("host_trust", message, next_step);
             }
-            for account in server.accounts.values() {
+            for (user, account) in &server.accounts {
+                if args.user.as_ref().is_some_and(|selected| selected != user) {
+                    continue;
+                }
                 uses_agent |= matches!(account.auth, AuthConfig::Agent);
             }
         }
@@ -1441,7 +1762,7 @@ where
     };
 
     if args.json {
-        let output = json!({
+        let mut output = json!({
             "ok": true,
             "local_checks_passed": issues.is_empty(),
             "connection_tested": false,
@@ -1462,7 +1783,8 @@ where
             "policy_path": home.policy_path,
             "policy_present": policy.present,
             "policy_valid": policy.valid,
-            "policy_enabled": policy.enabled,
+            "policy_enabled": policy.requested_enabled(),
+            "policy_status": policy,
             "audit_path": home.audit_path,
             "audit_writable": audit_writable,
             "audit_message": audit_message,
@@ -1476,11 +1798,20 @@ where
             "missing_credentials": missing_credentials,
             "credential_checks": credential_checks,
         });
+        if let Some(name) = &args.name {
+            output["server"] = hints::redacted_argument(name).into();
+        }
+        if let Some(user) = &args.user {
+            output["user"] = hints::redacted_argument(user).into();
+        }
+        if home.project.is_some() {
+            output["settings_sources"] = crate::project::sources(home);
+        }
         return Ok(ok(format!("{}\n", serde_json::to_string(&output)?)));
     }
 
     let mut stdout = format!(
-        "home: {}\nhome source: {}\nregistry path: {}\nregistry valid: {}\nregistry message: {}\nconfig path: {}\nconfig exists: {}\nconfig valid: {}\nconfig message: {}\nknown_hosts path: {}\npolicy path: {}\npolicy present: {}\npolicy valid: {}\npolicy enabled: {}\naudit path: {}\naudit writable: {}\ncredential namespace: {}\nos: {}\nlibssh2 version: {}\nopenssl version: {}\ncredential backend: {}\ncredential available: {}\ncredential message: {}\n",
+        "home: {}\nhome source: {}\nregistry path: {}\nregistry valid: {}\nregistry message: {}\nconfig path: {}\nconfig exists: {}\nconfig valid: {}\nconfig message: {}\nknown_hosts path: {}\npolicy path: {}\npolicy valid: {}\n{}audit path: {}\naudit writable: {}\ncredential namespace: {}\nos: {}\nlibssh2 version: {}\nopenssl version: {}\ncredential backend: {}\ncredential available: {}\ncredential message: {}\n",
         home.root.display(),
         home.description,
         registry_path.display(),
@@ -1492,9 +1823,8 @@ where
         config_message,
         home.known_hosts_path.display(),
         home.policy_path.display(),
-        policy.present,
         policy.valid,
-        policy.enabled,
+        policy.render(),
         home.audit_path.display(),
         audit_writable,
         home.namespace.token(),
@@ -1505,6 +1835,23 @@ where
         health.available,
         health.message
     );
+    if let Some(name) = &args.name {
+        stdout.insert_str(0, &format!("server: {}\n", hints::redacted_argument(name)));
+    }
+    if let Some(user) = &args.user {
+        stdout.insert_str(0, &format!("user: {}\n", hints::redacted_argument(user)));
+    }
+    if let Some(project) = &home.project {
+        stdout.insert_str(
+            0,
+            &format!(
+                "project: {}\nservers source: {:?}\npolicy source: {:?}\n",
+                project.root.display(),
+                project.servers,
+                project.policy
+            ),
+        );
+    }
     if !missing_credentials.is_empty() {
         stdout.push_str(&format!(
             "missing credential entries: {}\n",
@@ -1608,13 +1955,10 @@ fn resolve_run_target(
     if let Some(name) = name
         && !config.servers.contains_key(name)
     {
-        return Err(app_error(
-            ErrorKind::Config,
-            format!(
-                "{}\nQuote the whole remote command: sshw run <server> \"<command>\", or sshw run \"<command>\" for the default server",
-                unknown_server_message(name)
-            ),
-        ));
+        return Err(lookup_recovery::error(lookup_recovery::Lookup::Server {
+            name: name.into(),
+            quote_command: true,
+        }));
     }
     let server = resolve_target_server(name, config)?;
     if rest[0].trim().is_empty() {
@@ -1627,14 +1971,16 @@ fn resolve_run_target(
 }
 
 fn default_server_name(config: &SshwConfig) -> anyhow::Result<String> {
-    config.default.clone().ok_or_else(no_default_server_error)
+    config
+        .default
+        .clone()
+        .ok_or_else(|| no_default_server_error(config))
 }
 
-fn no_default_server_error() -> anyhow::Error {
-    app_error(
-        ErrorKind::Config,
-        "no default server configured; run 'sshw default <name>' to set one or pass an explicit server name",
-    )
+fn no_default_server_error(config: &SshwConfig) -> anyhow::Error {
+    lookup_recovery::error(lookup_recovery::Lookup::DefaultServer {
+        empty: config.servers.is_empty(),
+    })
 }
 
 fn get_server<'a>(config: &'a SshwConfig, name: &str) -> anyhow::Result<&'a ServerConfig> {
@@ -1655,15 +2001,10 @@ fn select_account<'a>(
 }
 
 fn unknown_server(name: &str) -> anyhow::Error {
-    app_error(ErrorKind::Config, unknown_server_message(name))
-}
-
-fn unknown_server_message(name: &str) -> String {
-    format!(
-        "unknown server '{}'; only registered servers can be selected\nnext: using the same home/profile selection, run `sshw list` to see registered servers; to register this name, replace the host/login-user placeholders in `{}`. Registration uses hidden password input by default; insert --auth agent or --password-stdin before the suggested command's -- as appropriate",
-        hints::redacted_argument(name),
-        hints::server_add(name),
-    )
+    lookup_recovery::error(lookup_recovery::Lookup::Server {
+        name: name.into(),
+        quote_command: false,
+    })
 }
 
 fn ok(stdout: String) -> CommandOutput {
@@ -1707,6 +2048,7 @@ fn error_json_line(response: &ErrorResponse) -> String {
         Err(err) => {
             let fallback = ErrorResponse {
                 ok: false,
+                suggestions: Vec::new(),
                 partial_output: None,
                 mutation: None,
                 error: crate::output::ErrorBody {
@@ -1813,6 +2155,7 @@ fn parse_error_output(mut err: clap::Error, json: bool) -> CommandOutput {
     if json {
         let response = ErrorResponse {
             ok: false,
+            suggestions: Vec::new(),
             partial_output: None,
             mutation: None,
             error: crate::output::ErrorBody {
@@ -1903,6 +2246,53 @@ fn clap_usage_summary(rendered: &str) -> String {
 #[cfg(test)]
 mod runtime_backend_tests {
     use super::*;
+
+    #[test]
+    fn default_clear_takes_the_home_lock_and_profile_clear_can_recover_a_broken_home() {
+        assert!(command_mutates_home(
+            &Cli::try_parse_from(["sshw", "default", "--clear"])
+                .unwrap()
+                .command
+        ));
+        assert!(!command_mutates_home(
+            &Cli::try_parse_from(["sshw", "default"]).unwrap().command
+        ));
+        let temp = tempfile::tempdir().unwrap();
+        let broken = temp.path().join("broken");
+        std::fs::write(&broken, "not a home directory").unwrap();
+        let registry = crate::profile::ProfileRegistry {
+            default: Some("prod".into()),
+            profiles: std::collections::BTreeMap::from([(
+                "prod".into(),
+                crate::profile::ProfileEntry {
+                    id: "p_prod".into(),
+                    home: broken,
+                },
+            )]),
+            ..Default::default()
+        };
+        crate::profile::save_registry(&temp.path().join("profiles.json"), &registry).unwrap();
+        let cli = Cli::try_parse_from(["sshw", "profile", "default", "--clear"]).unwrap();
+        let (home, _) = resolve_runtime_with_base(&cli, temp.path(), None).unwrap();
+        assert_eq!(home.root, builtin_default_home(temp.path()).root);
+        let rename = Cli::try_parse_from(["sshw", "profile", "rename", "prod", "new"]).unwrap();
+        let (home, _) = resolve_runtime_with_base(&rename, temp.path(), None).unwrap();
+        assert_eq!(home.root, builtin_default_home(temp.path()).root);
+        let remove =
+            Cli::try_parse_from(["sshw", "profile", "remove", "prod", "--clear-default"]).unwrap();
+        let (home, _) = resolve_runtime_with_base(&remove, temp.path(), None).unwrap();
+        assert_eq!(home.root, builtin_default_home(temp.path()).root);
+        let explicit = Cli::try_parse_from([
+            "sshw",
+            "--profile",
+            "missing",
+            "profile",
+            "default",
+            "--clear",
+        ])
+        .unwrap();
+        assert!(resolve_runtime_with_base(&explicit, temp.path(), None).is_err());
+    }
     use crate::audit::NoopAudit;
     use crate::config::{CredentialBackend, save_config};
     use crate::credentials::{CredentialStore, CredentialStoreHealth};
@@ -2445,7 +2835,8 @@ mod parse_error_tests {
             for count in 0..=minimum + 2 {
                 let mut args = prefix.clone();
                 args.extend(std::iter::repeat_n("fixture", count));
-                let result = Cli::try_parse_from(&args);
+                let result =
+                    Cli::try_parse_from(&args).and_then(|cli| cli.validate_usage().map(|()| cli));
                 if count == minimum || count == minimum + 1 {
                     assert!(result.is_ok(), "{args:?}: {result:?}");
                 } else {

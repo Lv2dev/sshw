@@ -1,10 +1,54 @@
 //! Local known_hosts parsing shared by diagnostics and connection verification.
 
+use crate::config::ServerConfig;
 use crate::error::settings_error;
+use crate::local_command::display_value;
 use base64::Engine;
 use ssh2::{CheckResult, KnownHostFileKind, KnownHosts, Session};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+#[derive(Debug)]
+pub(crate) enum HostTrustFailure {
+    Unapproved,
+    Changed(PathBuf),
+}
+
+#[derive(Debug)]
+pub(crate) struct HostTrustError {
+    pub(crate) failure: HostTrustFailure,
+    endpoint: String,
+}
+
+impl HostTrustError {
+    pub(crate) fn new(server: &ServerConfig, failure: HostTrustFailure) -> Self {
+        let host = display_value(&server.host);
+        let port = server.port;
+        let endpoint = if host.contains(':') && !host.starts_with('[') {
+            format!("[{host}]:{port}")
+        } else {
+            format!("{host}:{port}")
+        };
+        Self { failure, endpoint }
+    }
+}
+
+impl std::fmt::Display for HostTrustError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.failure {
+            HostTrustFailure::Unapproved => {
+                write!(f, "host key for {} is not trusted", self.endpoint)
+            }
+            HostTrustFailure::Changed(_) => write!(
+                f,
+                "host key verification failed for {}; trusted key changed",
+                self.endpoint
+            ),
+        }
+    }
+}
+
+impl std::error::Error for HostTrustError {}
 
 pub(crate) struct LocalKnownHosts(KnownHosts);
 

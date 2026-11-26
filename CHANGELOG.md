@@ -8,6 +8,70 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-11-26
+
+### 보안
+
+- 공식 `libssh2-sys`를 0.3.4로 올려 이전 배포에 빠졌던 CVE-2026-66035와 CVE-2026-66033 수정본을 포함합니다. 내장 libssh2가 오래된 SHA-1 기반 알고리즘, DSA, 3DES를 기본 비활성화하므로 해당 알고리즘만 지원하는 서버는 연결 설정을 점검해야 합니다. [보안 문서](SECURITY.md)에 적용 범위를 정리했습니다.
+- `rustix` 잠금 버전을 1.1.6으로 올려 [RUSTSEC-2026-0486](https://rustsec.org/advisories/RUSTSEC-2026-0486.html) 수정본을 포함합니다.
+- `libz-sys` 잠금 버전을 1.1.33으로 올려 [RUSTSEC-2026-0418](https://rustsec.org/advisories/RUSTSEC-2026-0418.html)과 [RUSTSEC-2026-0544](https://rustsec.org/advisories/RUSTSEC-2026-0544.html) 수정본을 포함합니다.
+
+### 수정
+
+- PowerShell 자동완성 요청은 현재 세션의 입력 인코딩을 유지하면서 ASCII로 보내고, Windows 런타임이 붙이는 선행 UTF-8 BOM도 처리합니다.
+
+- 다운로드 경로의 상위 폴더가 깨진 링크인 경우 사전 검사와 실제 다운로드 모두 접속 전에 차단합니다. 정상 폴더 링크와 새로 만들 수 있는 경로는 허용합니다.
+- 업로드·다운로드 완료 메시지에서 로컬과 원격 경로의 민감값을 각각 마스킹합니다.
+- 다운로드 목적지의 깨진 심볼릭 링크도 접속 전에 `--yes` 확인 대상으로 처리합니다. 교체할 때는 링크 자체만 바꿉니다.
+- `policy check-get --json`에 `local_destination_status`를 추가해 목적지 검사와 덮어쓰기 확인 여부를 표시합니다.
+- 기본 서버가 없을 때 실제 설정 범위의 목록 조회와 기본값 설정을 안내합니다. 빈 목록은 등록 안내를 보여주고, 상속 목록의 기본값 변경에는 글로벌 대상을 명시합니다.
+- 필요한 로컬 서버 목록이나 권한 파일이 없으면 프로젝트 경로와 해당 출처 옵션을 넣은 초기화 명령을 안내합니다.
+- 정책 거부 후 제안하는 `policy allow` 명령에 `--global`과 선택한 설정을 유지합니다. 프로젝트 폴더에서 복사해도 원래 검사한 글로벌 정책을 대상으로 합니다.
+- `policy show`와 `doctor`가 정책 적용이 막힌 상태를 `project status`와 같은 `blocked`로 표시합니다. JSON의 `policy_status`에서 실제 적용 상태를 확인할 수 있습니다.
+- `run`, `put`, `get`, `test`의 미승인 호스트 오류에 실제 서버와 설정 출처를 담은 `trust` 명령을 표시합니다. 승인된 키가 바뀌면 확인할 `known_hosts` 파일을 안내합니다.
+- 빈 서버 목록에서 `doctor`와 `list`가 같은 등록 방법을 안내합니다. 글로벌 목록을 상속 중이면 글로벌 등록과 로컬 목록 초기화를 구분합니다.
+- doctor·서버/계정/승격 조회 오류의 복구 안내에 선택한 설정 출처를 유지합니다. 상속 서버의 trust/비밀번호 복구는 글로벌 변경임을 명시하고, 민감·제어 문자·재현 불가 대상의 실행 명령은 생략합니다. 기존 오류 분류·조회 순서·비밀/신뢰 보존은 유지합니다.
+- trust 승인 질문에 실제 주소·포트와 서버 설정 출처·config/known_hosts 경로를 표시합니다. 민감 값 마스킹·터미널 제어문자 이스케이프를 적용하며 기존 지문 확인·취소·--yes·JSON 계약은 그대로입니다.
+- `add` 주소 충돌 오류가 계정·비밀번호·승격 설정을 보존하는 `endpoint` 명령을 먼저 안내합니다. 선택 출처와 바뀐 필드만 반영하며 명시적 `--replace` 전체 교체 동작은 유지합니다.
+- 완전 로컬 `project init`이 미사용 글로벌 프로필 손상 때문에 막히지 않게 합니다. 기존 로컬 정책이 없는 복사나 글로벌 출처 선택은 여전히 실제 글로벌 기준이 필요하며, 잠금 뒤 의존성을 재검사해 잘못된 정책으로 넘어가지 않습니다.
+- 서버 등록 뒤 trust/run 안내에 실제 home·profile namespace·project-dir·명시 global과 강제 policy를 유지합니다. 경로/이름을 셸에 맞게 인용하고 민감·재현 불가 대상에는 복사 명령을 생략합니다.
+- 빈 글로벌 상속 서버 목록에서 곧바로 차단될 add 대신 글로벌 등록과 로컬 목록 초기화를 구분해 안내합니다. 로컬/명시 home 빈 목록과 검색 일치 없음도 선택 출처를 유지하며 JSON 배열과 상속 쓰기 보호는 그대로입니다.
+- 프로젝트 초기화·상속 변경/정책 복구·출처 변경 안내에 실제 `--project-dir`을 유지해 다른 작업 폴더를 잘못 초기화하지 않게 합니다. 절대 경로·셸 인용을 적용하고 민감/표현 불가 경로에는 복사 가능한 명령을 생략합니다.
+- `project init/status`에 저장된 정책 활성화 값과 적용 상태(on/off/blocked), 이번 `--policy` 강제 여부를 표시합니다. JSON은 `policy_status`를 추가하고 비활성 로컬 정책의 명시적 활성화 명령을 제공하며, 상속 쓰기 보호와 자동 활성화 없음은 유지합니다.
+- Tab 자동완성이 이미 지정한 옵션·위치 인자와 충돌하는 옵션을 양방향으로 제외합니다. `--stream/--json`, 기본값 교체/해제, 비밀번호 stdin/무비밀번호 조합과 `--option=value` 입력에도 적용합니다.
+- `policy check-get --atomic`을 설정/home 초기화 전에 usage/9로 거절해, 잘못된 설정 경로에서도 사용 오류를 일관되게 안내합니다.
+- 계정 자동완성이 실제 실행과 같은 인자 수 규칙으로 기본/명시 서버를 구분합니다. 명령·파일명이 다른 서버 별명과 같아도 해당 서버 계정을 잘못 제안하지 않으며 `get --into`와 정책 사전 검사에도 적용합니다.
+- `policy check-put`의 `--into`, `policy check-get`의 `--atomic`을 도움말·Tab 후보에서 숨깁니다. 기존 지원 옵션과 미지원 입력의 usage/9 거절은 유지합니다.
+
+### 추가
+
+- 현재 폴더의 `.sshw`에서 서버 목록과 권한을 독립적으로 선택합니다. 로컬 목록은 글로벌과 병합하지 않으며, 누락/명시 글로벌 항목만 기본 프로필을 상속합니다. `project init/status`, `--global`, `--project-dir`로 초기화·출처 확인·명시 선택을 지원하고 상속 항목의 암묵적 변경을 막습니다. 자동완성·진단·권한 복구·감사도 같은 출처를 사용합니다. Rust의 `Cli`·`ResolvedHome` 직접 구성과 새 enum variant 이행은 참조 문서를 확인하세요.
+- `endpoint <name> --host/--port [--yes] [--json]`로 전체 계정·비밀번호·승격·기본값·정책을 보존하며 서버 주소만 편집합니다. 기존 호스트 승인을 옮기지 않고 변경한 endpoint의 호스트키 검증을 유지하며, 실제 변경 확인/no-op/CAS/공개 후 오류·감사·자동완성을 지원합니다. Rust에 EndpointArgs/Command::Endpoint가 추가됩니다.
+
+- `doctor <server> --user <login>`으로 계정 하나의 비밀번호·승격·agent 진단에 집중합니다. 공통 home 진단과 기존 전체/서버 범위를 유지합니다. Rust `DoctorArgs`에 `user: None`을 추가하세요.
+- `get [server] <remote> --into <directory>`로 원격 파일명을 유지해 다운로드합니다. `policy check-get`도 같은 최종 경로를 검사하며 기존 덮어쓰기·원자적 저장·progress·감사를 유지합니다. 인자 조건 오류는 runtime 전에 usage/9로 거절합니다. Rust `GetArgs`와 policy transfer check는 `into: None`을 추가하고 필요하면 `Cli::validate_usage()`로 사전 검사하세요.
+
+- `remove`·`profile remove`에서 현재 기본 항목 삭제 시 `--switch-default <name>` 또는 `--clear-default`로 다음 기본값을 지정합니다. 미지정 동작을 유지하고 대체 대상 검사·감사·JSON·자동완성을 연결합니다. Rust `RemoveArgs`·`ProfileRemoveArgs` 직접 구성에 `switch_default: None`, `clear_default: false`를 추가하세요.
+- 숨김 비밀번호 입력창에 서버·로그인 계정과 sudo/su 방식·대상을 표시합니다. 각 식별자의 기존 비밀 패턴 마스킹과 `--password-stdin` 동작은 유지합니다.
+
+- `account remove --switch-default <user>`로 다른 등록 로그인을 기본값으로 지정하면서 기존 기본 로그인 등록을 한 번에 정리합니다. 실제 서버 계정은 유지하고, 삭제 대상의 credential·계정 허용 규칙만 정리하며 부분 적용 오류에도 기본값 전환을 표시합니다. Rust `AccountRemoveArgs` 직접 구성에는 `switch_default: None`을 추가하세요.
+- `profile rename <old> <new> [--json]`으로 home·내부 id·저장된 비밀번호를 유지하며 프로필 이름을 바꿉니다. 기본 선택도 따라가고 기존 이름 충돌은 거절하며 같은 이름은 파일을 다시 쓰지 않습니다. registry 잠금·revision·감사·JSON·자동완성을 지원합니다.
+
+- 정책 차단 시 필요한 `policy allow` 명령과 계정·프로그램/명령·경로의 허용 범위를 안내합니다. 현재 home/profile과 셸 인용을 유지하고 민감한 값·무효 경로는 복사 명령을 생략합니다. 자동 허용 없이 실행 오류와 사전 검사에 `suggestions`를 추가합니다. Rust `ErrorResponse` 직접 구성은 `suggestions: Vec::new()`를 반영하세요.
+- `test <name> [--user <user>] [--json]`로 기존 호스트 승인과 로그인 인증을 실제 확인합니다. 계정 정책과 자격 증명 선택을 유지하고 원격 명령·전송·승격을 실행하지 않습니다. 감사·오류 코드·JSON·자동완성을 지원하며 기존 `doctor`는 로컬 검사로 유지합니다.
+
+- `put/get --progress`로 stderr 전송량·퍼센트·평균 속도를 확인합니다. JSON stdout을 유지하며 SCP·atomic SFTP·빈 파일을 지원하고, 원격 완료 확인과 다운로드 반영 뒤에만 100% 성공으로 표시합니다. Rust `PutArgs/GetArgs` 직접 구성에 `progress: false`를 추가하세요.
+- `default --clear`, `profile default --clear`로 등록 내용을 보존하며 기본 선택만 해제합니다. 남은 등록이 있으면 이후 추가·갱신이 기본값을 되살리지 않습니다. 서버는 명시적 대상이 필요하고 프로필은 selector 우선순위 후 내장 home을 사용합니다. 잠금·revision·감사·미변경 저장 생략을 유지합니다. Rust `DefaultArgs`에 `clear: false`, `ProfileDefaultArgs`에 `name: Some(name), clear: false`를 반영하세요.
+
+- 서버·계정을 삭제하면 연결된 `allow_accounts` 규칙도 정리합니다. 다른 규칙과 정책 활성 여부를 유지하고, 저장 일부만 적용된 경우 실제 삭제 상태와 복구 방법을 표시합니다. JSON에 `policy_changed`, `policy_rules_removed`를 추가합니다.
+- `doctor <name>`으로 한 서버의 자격 증명·호스트 승인·agent 관련 진단을 모아볼 수 있습니다. home 공통 문제와 기존 무인자 동작을 유지하며 SSH 연결은 하지 않습니다. Rust `DoctorArgs` 직접 구성에는 `name: None`을 추가하세요.
+- `password --privilege`로 기존 sudo/su 방식·승격 대상·로그인 인증을 유지하며 저장된 승격 비밀번호만 갱신합니다. SSH-agent 로그인도 기존 비밀번호 승격 설정이 있으면 지원하고, 미설정·무비밀번호 승격은 입력 전에 안내합니다. Rust `PasswordArgs` 직접 구성에는 `privilege: false`를 추가하세요.
+- `show`에서 모든 계정·기본 계정·인증 방식과 sudo/su 대상을 함께 볼 수 있습니다. JSON은 기존 최상위 필드를 유지하며 계정별 설정의 `accounts` 배열을 추가합니다. 비밀 조회나 SSH 접속은 하지 않습니다.
+- PowerShell Tab 자동완성을 `completions powershell`로 등록할 수 있습니다. 현재 home/profile의 서버·계정과 등록 프로필, 명령·옵션을 제안하고 공백·따옴표가 있는 이름도 인용합니다. 자동완성은 비밀 조회·SSH 접속·설정 변경을 하지 않습니다.
+- `password <name> [--user <user>] [--password-stdin] [--json]`으로 저장된 로그인 비밀번호만 갱신할 수 있습니다. 기존 계정·기본값·승격·정책·호스트 승인을 보존하며 저장 전후 실패의 실제 적용 상태를 알립니다.
+- `list --filter <text>`로 서버 이름이나 호스트의 일부를 대소문자 구분 없이 검색할 수 있습니다. 기존 JSON 배열·정렬·기본값 표시를 유지합니다. Rust 호출자가 `ListArgs`를 직접 만들 때는 `filter: None`을 추가하세요.
+- `rename <name> <new_name> [--json]`으로 서버 이름을 바꿀 수 있습니다. 계정·로그인/승격 비밀번호·기본 서버와 계정별 허용 규칙을 함께 옮기고 서버 키 승인을 유지합니다. 기존 이름 충돌을 거절하고 같은 이름은 저장 없이 처리하며, 저장 뒤 정책·자격 증명 정리 실패는 실제 적용 상태와 복구 방법을 표시합니다.
+
 ## [0.15.1] - 2026-10-27
 
 ### 수정
@@ -336,7 +400,8 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 
 - Initial public release: registered-server SSH `run`/`put`/`get` with secrets kept in the OS credential store, fail-closed `known_hosts` verification, and explicit `sshw trust`.
 
-[Unreleased]: https://github.com/Lv2dev/sshw/compare/v0.15.1...HEAD
+[Unreleased]: https://github.com/Lv2dev/sshw/compare/v0.16.0...HEAD
+[0.16.0]: https://github.com/Lv2dev/sshw/compare/v0.15.1...v0.16.0
 [0.15.1]: https://github.com/Lv2dev/sshw/compare/v0.15.0...v0.15.1
 [0.15.0]: https://github.com/Lv2dev/sshw/compare/v0.14.2...v0.15.0
 [0.11.0]: https://github.com/Lv2dev/sshw/compare/v0.10.1...v0.11.0

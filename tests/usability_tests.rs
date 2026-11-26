@@ -189,6 +189,108 @@ fn missing_operation_targets_fail_during_parsing_without_state_writes() {
 }
 
 #[test]
+fn conditional_into_usage_errors_precede_broken_home_and_do_not_create_state() {
+    let home = home();
+    std::fs::write(home.path().join("servers.json"), "{broken").unwrap();
+    let fresh = home.path().join("fresh");
+    for args in [
+        vec!["get", "remote", "--json"],
+        vec![
+            "get",
+            "web",
+            "remote",
+            "local",
+            "--into",
+            "downloads",
+            "--json",
+        ],
+        vec!["policy", "check-get", "remote", "--json"],
+        vec![
+            "policy",
+            "check-get",
+            "web",
+            "remote",
+            "local",
+            "--into",
+            "downloads",
+            "--json",
+        ],
+        vec![
+            "policy",
+            "check-put",
+            "local",
+            "remote",
+            "--into",
+            "downloads",
+            "--json",
+        ],
+        vec!["doctor", "--user", "ops", "--json"],
+    ] {
+        for target in [home.path(), fresh.as_path()] {
+            let output = run(target, &args, "");
+            assert_eq!(output.status.code(), Some(9), "{args:?}: {output:?}");
+            let body: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(body["error"]["kind"], "usage");
+            assert!(output.stderr.is_empty());
+        }
+        assert!(!fresh.exists());
+        assert!(!home.path().join("audit.jsonl").exists());
+        assert!(!home.path().join(".sshw.lock").exists());
+    }
+}
+
+#[test]
+fn unsupported_check_get_atomic_precedes_home_errors_without_creating_state() {
+    let home = home();
+    let invalid_home = home.path().join("home-is-a-file");
+    std::fs::write(&invalid_home, "keep this file").unwrap();
+    std::fs::write(home.path().join("servers.json"), "{broken").unwrap();
+    let missing = home.path().join("missing home");
+    for target in [invalid_home.as_path(), home.path(), missing.as_path()] {
+        for json in [false, true] {
+            let mut args = vec![
+                "policy",
+                "check-get",
+                "web",
+                "source",
+                "destination",
+                "--atomic",
+            ];
+            if json {
+                args.push("--json");
+            }
+            let output = run(target, &args, "");
+            assert_eq!(output.status.code(), Some(9), "{target:?}: {output:?}");
+            if json {
+                let body: Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(body["error"]["kind"], "usage");
+                assert!(
+                    body["error"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("--atomic is only supported by check-put")
+                );
+                assert!(output.stderr.is_empty());
+            } else {
+                assert!(output.stdout.is_empty());
+                assert!(
+                    String::from_utf8_lossy(&output.stderr)
+                        .contains("--atomic is only supported by check-put")
+                );
+            }
+        }
+    }
+    assert_eq!(std::fs::read(&invalid_home).unwrap(), b"keep this file");
+    assert_eq!(
+        std::fs::read(home.path().join("servers.json")).unwrap(),
+        b"{broken"
+    );
+    assert!(!missing.exists());
+    assert!(!home.path().join("audit.jsonl").exists());
+    assert!(!home.path().join(".sshw.lock").exists());
+}
+
+#[test]
 fn json_usage_preserves_required_arguments_suggestions_and_value_guidance() {
     let home = home();
     for (args, expected) in [
@@ -295,7 +397,7 @@ fn transfer_preflight_and_execution_choose_the_same_first_failure() {
             6,
         ),
     ] {
-        for mut prefix in [vec![operation], vec!["policy", check]] {
+        for (preflight, mut prefix) in [(false, vec![operation]), (true, vec!["policy", check])] {
             prefix.extend([
                 "web",
                 operands[0],
@@ -311,8 +413,48 @@ fn transfer_preflight_and_execution_choose_the_same_first_failure() {
                 "{prefix:?}: {}",
                 String::from_utf8_lossy(&output.stdout)
             );
+            if preflight && operation == "get" {
+                let body: Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(body["allowed"], false);
+                assert_eq!(
+                    body["local_destination_status"],
+                    if expected == 6 {
+                        "overwrite_confirmation_required"
+                    } else {
+                        "not_checked"
+                    }
+                );
+                assert_eq!(body["connection_tested"], false);
+                assert_eq!(body["credentials_checked"], false);
+            }
         }
     }
+    successful(
+        home.path(),
+        &["account", "add", "web", "operator", "--auth", "agent"],
+        "",
+    );
+    let result = run(
+        home.path(),
+        &[
+            "policy",
+            "check-get",
+            "web",
+            "/allowed/file",
+            existing.to_str().unwrap(),
+            "--yes",
+            "--user",
+            "operator",
+            "--json",
+        ],
+        "",
+    );
+    assert_eq!(result.status.code(), Some(7), "{result:?}");
+    let body: Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(body["allowed"], false);
+    assert_eq!(body["local_destination_status"], "ready");
+    assert_eq!(body["policy"]["checks"]["account"]["allowed"], false);
+    assert_eq!(std::fs::read_to_string(existing).unwrap(), "original");
 }
 
 #[test]
@@ -343,6 +485,7 @@ fn download_directory_is_rejected_with_a_file_path_hint_before_ssh() {
                     if check {
                         assert_eq!(value["allowed"], false);
                         assert_eq!(value["connection_tested"], false);
+                        assert_eq!(value["local_destination_status"], "blocked");
                         value["reasons"][0].as_str().unwrap().to_string()
                     } else {
                         assert_eq!(value["error"]["kind"], "io");
@@ -423,6 +566,85 @@ fn download_invalid_parent_reports_local_path_and_one_copy_of_each_cause() {
 }
 
 #[test]
+#[cfg(unix)]
+fn download_preflight_reports_overwrite_for_a_dangling_destination_link() {
+    let home = home();
+    add(home.path());
+    let destination = home.path().join("source");
+    let missing = home.path().join("missing-target");
+    std::os::unix::fs::symlink(&missing, &destination).unwrap();
+    for overwrite in [false, true] {
+        let mut args = vec![
+            "policy",
+            "check-get",
+            "web",
+            "/tmp/source",
+            "--into",
+            home.path().to_str().unwrap(),
+            "--json",
+        ];
+        if overwrite {
+            args.push("--yes");
+        }
+        let output = run(home.path(), &args, "");
+        assert_eq!(
+            output.status.code(),
+            Some(if overwrite { 0 } else { 6 }),
+            "{output:?}"
+        );
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["allowed"], overwrite);
+        assert_eq!(
+            value["local_destination_status"],
+            if overwrite {
+                "ready"
+            } else {
+                "overwrite_confirmation_required"
+            }
+        );
+        assert_eq!(value["connection_tested"], false);
+        assert_eq!(std::fs::read_link(&destination).unwrap(), missing);
+        assert!(!missing.exists());
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn download_preflight_rejects_a_dangling_parent_after_walking_missing_directories() {
+    let home = home();
+    add(home.path());
+    let parent = home.path().join("parent-link");
+    let target = home.path().join("missing-target");
+    std::os::unix::fs::symlink(&target, &parent).unwrap();
+    let directory = parent.join("new/subfolder");
+    let args = [
+        "policy",
+        "check-get",
+        "web",
+        "/tmp/source",
+        "--into",
+        directory.to_str().unwrap(),
+        "--yes",
+        "--json",
+    ];
+    let blocked = run(home.path(), &args, "");
+    assert_eq!(blocked.status.code(), Some(6), "{blocked:?}");
+    let body: Value = serde_json::from_slice(&blocked.stdout).unwrap();
+    assert_eq!(body["allowed"], false);
+    assert_eq!(body["local_destination_status"], "blocked");
+    assert_eq!(body["connection_tested"], false);
+    assert!(body["reasons"][0].as_str().unwrap().contains("parent-link"));
+    assert_eq!(std::fs::read_link(&parent).unwrap(), target);
+    assert!(!target.exists());
+
+    std::fs::create_dir(&target).unwrap();
+    let allowed = successful(home.path(), &args, "");
+    let body: Value = serde_json::from_slice(&allowed.stdout).unwrap();
+    assert_eq!(body["local_destination_status"], "ready");
+    assert!(!directory.exists());
+}
+
+#[test]
 fn download_preflight_accepts_missing_relative_parents_without_creating_them() {
     let home = home();
     add(home.path());
@@ -444,6 +666,8 @@ fn download_preflight_accepts_missing_relative_parents_without_creating_them() {
     assert!(output.status.success(), "{output:?}");
     let value: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["allowed"], true);
+    assert_eq!(value["local_destination_status"], "ready");
+    assert_eq!(value["local_file_checked"], false);
     assert_eq!(value["local_file_ready"], Value::Null);
     assert!(!home.path().join("missing").exists());
 }
@@ -794,7 +1018,9 @@ fn update_confirmation_names_the_option_that_command_accepts() {
 fn first_use_has_default_port_and_next_steps_without_changing_json_list() {
     let home = home();
     let empty = successful(home.path(), &["list"], "");
-    assert!(String::from_utf8_lossy(&empty.stdout).contains("sshw add"));
+    let empty_text = String::from_utf8_lossy(&empty.stdout);
+    assert!(empty_text.contains("sshw --home="), "{empty_text}");
+    assert!(empty_text.contains(" add --host "), "{empty_text}");
     let json_list = successful(home.path(), &["list", "--json"], "");
     assert_eq!(
         serde_json::from_slice::<Value>(&json_list.stdout).unwrap(),
@@ -814,7 +1040,14 @@ fn first_use_has_default_port_and_next_steps_without_changing_json_list() {
         ],
         "",
     );
-    assert!(String::from_utf8_lossy(&added.stdout).contains("sshw trust"));
+    let added_text = String::from_utf8_lossy(&added.stdout);
+    assert!(added_text.contains("next: sshw --home="), "{added_text}");
+    assert!(added_text.contains(" trust -- 'web'"), "{added_text}");
+    assert!(added_text.contains("then: sshw --home="), "{added_text}");
+    assert!(
+        added_text.contains(" run -- 'web' 'hostname'"),
+        "{added_text}"
+    );
     let shown = successful(home.path(), &["show", "web", "--json"], "");
     assert_eq!(
         serde_json::from_slice::<Value>(&shown.stdout).unwrap()["port"],
@@ -1558,6 +1791,116 @@ fn defaults_offer_json_and_unknown_target_explains_quoting() {
     let result = run(home.path(), &["run", "echo", "hello", "--json"], "");
     assert_eq!(result.status.code(), Some(3));
     assert!(String::from_utf8_lossy(&result.stdout).contains("Quote the whole remote command"));
+}
+
+#[test]
+fn server_rename_cli_keeps_default_accounts_privilege_policy_and_audit_without_stdin() {
+    let home = home();
+    successful(
+        home.path(),
+        &[
+            "add",
+            "web",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "2222",
+            "--user",
+            "deploy",
+            "--auth",
+            "agent",
+        ],
+        "",
+    );
+    successful(
+        home.path(),
+        &["account", "add", "web", "ops", "--auth", "agent"],
+        "",
+    );
+    successful(
+        home.path(),
+        &[
+            "privilege",
+            "set",
+            "web",
+            "--account",
+            "ops",
+            "--no-password",
+            "--user",
+            "root",
+        ],
+        "",
+    );
+    successful(home.path(), &["policy", "init"], "");
+    successful(home.path(), &["policy", "allow", "command", "uptime"], "");
+    successful(
+        home.path(),
+        &["policy", "allow", "account", "web", "ops"],
+        "",
+    );
+    successful(home.path(), &["policy", "enable"], "");
+    let trusted = b"# host approval fixture\n";
+    std::fs::write(home.path().join("known_hosts"), trusted).unwrap();
+    let output = successful(home.path(), &["rename", "web", "production", "--json"], "");
+    let renamed: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(renamed["server"], "production");
+    assert_eq!(renamed["changed"], true);
+    assert_eq!(renamed["policy_changed"], true);
+    let default = successful(home.path(), &["default", "--json"], "");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&default.stdout).unwrap()["server"],
+        "production"
+    );
+    let privilege = successful(
+        home.path(),
+        &[
+            "privilege",
+            "show",
+            "production",
+            "--account",
+            "ops",
+            "--json",
+        ],
+        "",
+    );
+    assert!(
+        String::from_utf8(privilege.stdout)
+            .unwrap()
+            .contains("no_password")
+    );
+    let check = successful(
+        home.path(),
+        &[
+            "policy",
+            "check",
+            "production",
+            "uptime",
+            "--user",
+            "ops",
+            "--json",
+        ],
+        "",
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&check.stdout).unwrap()["allowed"],
+        true
+    );
+    assert_eq!(
+        std::fs::read(home.path().join("known_hosts")).unwrap(),
+        trusted
+    );
+    let records = std::fs::read_to_string(home.path().join("audit.jsonl")).unwrap();
+    let record = records
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|line| line["action"] == "rename")
+        .unwrap();
+    assert_eq!(record["server"], "web");
+    assert_eq!(record["detail"], "production");
+    let missing = run(home.path(), &["rename", "production", "--json"], "");
+    assert_eq!(missing.status.code(), Some(9));
+    let error: Value = serde_json::from_slice(&missing.stdout).unwrap();
+    assert_eq!(error["error"]["kind"], "usage");
 }
 
 #[test]

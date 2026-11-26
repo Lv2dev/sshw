@@ -45,7 +45,7 @@ sshw:v3:<encoded-namespace>:privilege:<encoded-server>:<encoded-user>:<generatio
 
 The namespace, server, and user components are base64url-encoded. Each credential update receives a new generation. Legacy v1 keys (`sshw:<namespace>:<server>` and `sshw:<namespace>:privilege:<server>`) and server-scoped v2 keys remain readable only when they match the active namespace, purpose, and server without colliding with another account; new writes use v3.
 
-`servers.json` schema v2 stores `default_user` plus a username-keyed `accounts` map under each server. Schema v1 remains readable: its single `user`/`auth` pair becomes the default account in memory, together with any matching server entry from the top-level `privileges` map. A v1 server object does not accept a nested `privilege` field. Read-only commands do not rewrite the file; the next successful config mutation persists schema v2 while retaining the legacy credential reference.
+`servers.json` schema v2 stores `default_user` plus a username-keyed `accounts` map under each server. Schema v1 remains readable: its single `user`/`auth` pair becomes the default account in memory, together with any matching server entry from the top-level `privileges` map. A v1 server object does not accept a nested `privilege` field. Read-only commands do not rewrite the file; the next successful config mutation persists schema v2. Legacy credential references remain until an operation replaces or removes them; `rename` copies them to references for the new name before saving.
 
 ## Selecting A Home
 
@@ -54,8 +54,9 @@ Home selection priority, highest first:
 1. `--home <path>` — a one-off / project-local home for this invocation.
 2. `SSHW_HOME` — same, from the environment.
 3. `--profile <name>` — a registered profile (errors if unknown).
-4. the registry's default profile.
-5. the built-in default profile home (`<config_dir>/sshw/profiles/default`).
+4. the current directory's `.sshw`, independently for servers and policy (unless `--global`).
+5. the registry's default profile for inherited resources.
+6. the built-in default profile home (`<config_dir>/sshw/profiles/default`).
 
 `--home` and `--profile` cannot be combined (exit code 3). An explicit `--profile` also conflicts with a non-empty `SSHW_HOME`: unset the environment variable to use the profile, or omit the flag to use the environment home. SSHW never silently substitutes one for the other.
 
@@ -67,6 +68,56 @@ SSHW_HOME=./.sshw sshw list
 sshw --profile prod run web "uptime"
 ```
 
+## Current-directory project settings
+
+Without an explicit home/profile/environment selector, sshw inspects only `<cwd>/.sshw`; it never searches parents. Server lists and policy are whole, independently selected resources. Local server lists never merge with or fall back to global servers, including empty lists and unknown names. The global source is the registry default profile, or the built-in default when no profile is selected.
+
+Optional `.sshw/project.json` specifies each source:
+
+```json
+{"version":1,"servers":"global","policy":"local"}
+```
+
+| Mode | Selection for that resource |
+| --- | --- |
+| `auto` (default) | Local `servers.json` / `policy.json` when the entry exists, otherwise global |
+| `local` | Local file required; missing data fails closed |
+| `global` | Global resource; unused local data is ignored |
+
+Without `project.json`, both modes are `auto`. Local files retain the existing schemas. Invalid project metadata, unsupported version, unknown fields, an invalid `.sshw` directory or selected missing local data produce config/3. Invalid selected resource data retains the corresponding config/policy error; it never silently falls back. Unused global config/registry is not loaded when both resources are local.
+
+```bash
+sshw project init                            # global servers, a local copy of global policy
+sshw project init --servers-source local     # a separate, initially empty server list
+sshw project init --policy-source global     # explicitly inherit global permissions
+sshw project init --servers-source auto --policy-source auto
+sshw project status --json
+sshw --global list --json
+sshw --project-dir /work/app list --json      # directory containing .sshw
+```
+
+On first initialization, existing local files stay selected with `auto`; otherwise defaults are global servers and local policy. A newly created local policy copies global rules and enabled state, or the normal disabled default when global policy is absent. Server data and passwords are never copied. New local server lists start empty. Repeated initialization preserves existing data; unchanged manifest bytes/mtime are preserved. Changing a source to global leaves local files intact. Global settings are never written by `project init`.
+
+Automatic initialization (including `--project-dir`) resolves the prospective source modes before looking up a global profile. If both resources will be local and local policy exists, unused global registry/config data is not read. This includes existing `auto` files, first manifest creation over existing local files and creation of a new empty local server list. Explicit `--home`/`--profile`/`--global` or `SSHW_HOME` retain their selection rules. Global resources or copying a missing local policy still require the real global baseline. After acquiring project/data locks, initialization recalculates those dependencies; if data or source selection changed, it resolves any newly required global source before writing. Invalid required globals fail closed, without creating a disabled substitute. Existing CAS/no-op/partial-publication guarantees remain.
+
+`--global` ignores cwd discovery and `SSHW_HOME`. `--project-dir` ignores `SSHW_HOME` and requires a `.sshw` directory for normal commands; `project init` can create it. These flags conflict with each other and with `--home`/`--profile` (usage/9). Existing explicit home/profile/environment selectors bypass automatic discovery. `profile` administration always uses the global registry. `project init/status` explicitly administer the project directory; an explicit home/profile supplies their global baseline.
+
+In project mode, inherited server or policy resources are read-only. Mutations such as add/remove/password/trust or policy allow/enable fail with config/3 before credentials or resource writes. Use `--global` for an intentional global edit, or initialize that local resource. A local rename/removal that would change inherited global account grants is also blocked before config/secret changes; initialize local policy first. Local rules can grant more authority than global rules: project policy replaces the resource and is not an immutable security boundary.
+
+Credentials, credential backend and known_hosts follow the server source. Inherited servers reuse their exact global namespace and host approvals; local servers use the ad-hoc `.sshw` namespace and local known_hosts, without claiming global secrets or approvals. Project activity goes to `.sshw/audit.jsonl`; records add masked `settings` source metadata. Completion, doctor, execution and policy preflight use the same selection. Doctor adds `settings_sources`; policy checks add `policy.settings_sources`. `project status` reports `sources` without retrieving secrets or connecting. Local-policy recovery commands include an absolute `--project-dir`; inherited policy has an explanatory scope and no copyable grant command.
+
+Project mutations hold `.project.lock` and selected resource `.sshw.lock` locks in a stable order, recheck selection and retain existing data revision checks. Initialization publishes explicit selection before creating required missing data: readers fail closed during partial initialization. This is not a multi-file transaction. A post-publication error reports possible partial application; inspect `.sshw/project.json` and rerun the same initialization options. Existing resource files are preserved, and a newly appeared file is not overwritten.
+
+Initialization, inherited-write/account-cleanup and inherited-policy recovery hints retain an absolute, shell-quoted `--project-dir`, including when the selected `.sshw` does not exist yet. Source-change inspection hints also retain the project. If the path is sensitive, contains controls or cannot be represented, a copyable command is omitted rather than pointing at a masked path or cwd. Partial-initialization errors identify the manifest and project directory and ask you to repeat the original selectors/source options, preserving an explicit global baseline.
+
+If the manifest requires a missing local file, the config/3 error suggests `project init` for that project with `--servers-source local` or `--policy-source local`. A new server list is empty. A new policy starts from the selected global policy, or starts disabled if no global file exists. When `project status` uses a separate home or profile baseline, the error asks you to run initialization from the project directory with that same baseline selection.
+
+Both `project init` and `project status` add `policy_status` to their existing JSON objects. It reports `present`, `valid`, `saved_enabled`, `forced`, `enforced`, `state`, `enable_command`, `next_step` and `message`. Saved enablement is `null` for absent/invalid data. `state` is `on` or `off` for valid usable policy, and `blocked` for invalid/unreadable policy or a missing file required by `--policy`; blocked `enforced` is `null`, rather than falsely reporting disabled protection. Missing unforced policy is `off` with `enforced:false`. `forced` describes only this invocation; it never rewrites saved enablement. Human output shows the same distinction.
+
+A disabled, writable local policy gets a copyable `enable_command` for its exact project after allowlist review. Executing it is an explicit mutation; status/init never enable policy automatically. An inherited global policy instead gets a local-initialization hint, preserving inherited-write protection. Invalid policy gets repair guidance without an enable command. Status remains a successful observational diagnostic with `ok:true` even when policy is blocked; consumers should inspect `policy_status.state/valid`. It reads selected policy metadata without passwords, SSH, locks or audit writes, and does not enumerate or validate unused server data.
+
+Rust callers constructing public structs directly must add `Cli.global: false`, `Cli.project_dir: None` and `ResolvedHome.project: None`. Constructors already initialize the metadata. New variants/types include `Command::Project`, `ProjectArgs`, `ProjectCommand`, `ProjectInitArgs`, `ProjectStatusArgs` and `project::{ProjectSettings,ResourceMode,ResourceSource,ProjectContext}`. `cli::resolve_runtime_at` resolves sources explicitly; the legacy `execute(config_path, ...)` facade continues to use the provided home rather than discovering cwd. Existing resource schema versions and credential keys are unchanged.
+
 ## Managing Profiles
 
 ```bash
@@ -76,6 +127,7 @@ sshw profile list --json
 sshw profile show prod
 sshw profile show prod --json
 sshw profile default prod
+sshw profile rename prod production
 sshw profile remove prod                  # removes the registry entry only; home dir and credentials are left intact
 ```
 
@@ -95,13 +147,43 @@ Removing a default server or profile selects the first remaining name in sorted 
 
 Registries are validated strictly. If an older release stored a relative profile home, normal selection/list/show/default operations fail closed. `sshw doctor` reports `registry_valid: false` and an actionable `registry_message`; `sshw profile remove <affected-name>` is the only recovery exception and succeeds only when removing that exact entry leaves a fully valid registry. It never resolves or migrates the relative path against the current working directory.
 
+`sshw default --clear` clears only the default server selection, preserving servers, accounts, passwords, policy and host approvals. Subsequent `run/put/get` calls need an explicit server. `sshw profile default --clear` clears only the registry default, preserving profile entries, homes and credential namespaces. Explicit `--home`, `SSHW_HOME` and `--profile` precedence is unchanged; without a selector, the built-in home is used. A name and `--clear` are mutually exclusive.
+
+A missing default gives config/3 with a scoped `list` command and a `default` template when servers are registered. For an inherited server list, the write template explicitly uses `--global` and explains that it edits the global default. If the selected list is empty, the error gives the same registration guidance as `list`.
+
+Both commands retain their storage lock, revision check, atomic saving and audit. An already cleared or missing settings file is not created or rewritten. JSON retains `action:"default"` with `server:null` or `name:null`, `changed`, `change:"cleared"|"unchanged"`, and adds `default_change` when the selection changes. A post-publication durability error explains that clearing may already be applied. While any registered targets remain, updating or adding targets does not restore a cleared default. Registering the first target in an entirely empty list still selects it automatically. Set a default again with `sshw default web` or `sshw profile default prod`. `account default` still requires a default login and has no clear option. Rust callers constructing arguments directly must add `DefaultArgs.clear: false` and use `ProfileDefaultArgs { name: Some(name), clear: false, ... }`.
+
+`profile rename <old> <new> [--json]` changes only a registered profile's name. Its home path and internal id (credential namespace) stay unchanged, so saved login and privilege passwords do not need registration again. A default selection follows the new name; a cleared default or another selected profile stays unchanged. The old name no longer selects the profile: update scripts using `--profile`. An identical name is a no-write no-op, and an existing destination is never overwritten.
+
+Registry locking, revision checks, atomic saving and audit remain. Renaming does not read home/config contents or credentials and never connects over SSH, so damaged home contents do not prevent a rename. The registry itself must pass strict validation. JSON includes `action:"renamed"`, `previous_name`, `name`, `id`, `home`, `namespace_changed:false`, `is_default`, `changed`, `change:"renamed"|"unchanged"` and `default_change` when relevant. A post-publication durability failure returns config/3, describes the stored new name and directs you to `profile list`. Like other profile operations, it does not add a server `mutation` object.
+
+When removing the current default with `remove` or `profile remove`, use `--switch-default <name>` to select another registered entry or `--clear-default` to clear the selection. These mutually exclusive options are only valid for removing the current default. Omitting them preserves selection of the first remaining name. Self-reference and unknown replacements are rejected before confirmation or saving. An explicit replacement profile's home and local config receive the same validation as `profile default`; recovery of an invalid removed entry remains available.
+
+```sh
+sshw remove web --switch-default staging
+sshw remove web --clear-default --yes --json
+sshw profile remove prod --switch-default staging
+sshw profile remove prod --clear-default --json
+```
+
+The server confirmation identifies the requested transition. Clearing the server default requires explicit server names afterward; clearing the profile default follows normal selector precedence and otherwise uses the built-in home. Server removal cleans only the removed server's credentials/account grants; profile removal leaves its home and credentials intact. Existing locks, revision checks, atomic saves and audit remain in effect. JSON `default_change` describes the actual transition, including server policy/credential cleanup failures. A profile save durability error explains that removal was published and asks you to inspect the saved list. Rust callers constructing `RemoveArgs` or `ProfileRemoveArgs` must add `switch_default: None` and `clear_default: false`.
+
 ## Password Auth
+
+Hidden input for `add`, `account add`, `password` and `privilege set` identifies the actual server and selected login, such as `SSH password for 'web/ops':`. Privilege input also identifies the method and target, such as `Privilege password for 'web/ops' (su target: root):`. Secret-looking identifiers are masked individually; password values stay hidden. `--password-stdin` keeps its existing input behavior without a new prompt. The password requested by sudo depends on the server's sudoers settings.
+
 
 ```bash
 sshw add server-alpha --host 192.0.2.10 --port 2222 --user deploy
 ```
 
 Password auth is the default. `sshw` prompts for the password with hidden input and stores it in the active credential backend under the home's namespace.
+
+`sshw password <name> [--user <registered-user>] [--privilege] [--password-stdin] [--json]` updates the saved login password by default. It uses the server's default account unless `--user` selects another, and requires an existing password-authenticated account. SSH-agent accounts are rejected for login-password updates before reading input; use `account add --auth password` to explicitly switch authentication methods. The command asks for the new password with hidden input, or reads stdin only with `--password-stdin`. It has no extra confirmation prompt and never changes the remote password, endpoint, default selections, other accounts, privilege method/target, policy or host approval. Use the same home/profile selection as registration.
+
+`password --privilege` updates only that login account's saved privilege password while preserving its sudo/su method and target. `--user` still selects the login account; the backend username comes from the saved privilege target, while the credential key belongs to the login account. Agent logins are supported if their privilege configuration already uses a password. Missing privilege settings and passwordless sudo are rejected before input; use `privilege set` for an explicit configuration change. Privilege passwords must be a non-empty single line. No option accepts the password in argv.
+
+Password updates create a new account-qualified reference, atomically save config under the home lock and revision check, then remove the old secret for the selected purpose. A missing old entry is allowed so the command can repair a missing credential. Failure before publication attempts to remove the new secret and keeps the old config; a post-publication durability error retains both generations and reports `mutation.config_applied:true`, `failed_stage:"config_save"`. Obsolete cleanup failure reports auth/4 with `failed_stage:"credential_cleanup"`. Both identify server and account; the action is `password_updated` for login or `privilege_password_updated` for privilege. Success JSON also identifies `purpose` (`login`/`privilege`); privilege updates include `target_user` and the session-only warning uses `SSHW_PRIVILEGE_PASSWORD`. Success JSON includes the corresponding `action`, `server`, login `user`, `changed:true`, `change:"updated"` and a warning for the non-persistent session-only backend. Even the same password rotates the reference; passwords are not compared or read back.
 
 Registration rejects empty/whitespace-only hosts, control characters in hosts, and port `0` before confirmation or password input, with `config`/exit `3`. Ports are `1..65535`. The same checks apply when loading v1/v2 settings; `doctor` reports invalid settings with the server name and cause. Host values are preserved, including IPv6 addresses. These are metadata checks and do not resolve DNS or test connectivity. Correct an invalid saved endpoint in the reported `servers.json` path.
 
@@ -128,6 +210,14 @@ Agent auth stores no secret; it uses the active SSH agent.
 Re-registering an agent server with `add` or an agent account with `account add` still requires confirmation or `--force`. If the resulting configuration is identical, it skips saving, preserves the original format/bytes/mtime, and reports human `(unchanged)` and JSON `changed:false`/`change:"unchanged"`. Actual changes use `changed:true` with `change:"added"` or `"updated"`; existing action and target fields remain. Endpoint/default/account changes and replacement are compared as part of the whole configuration. Password registration always renews the credential and remains a real change. Validation, locking, auditing and actual-change concurrency/atomic-write/credential-cleanup checks remain.
 
 Agent authentication failures in `run`, `put` and `get` show the selected login user, endpoint, redacted native cause and recovery steps. Run `sshw doctor` with the same home/profile and execution environment, check the agent connection and loaded identities, then verify that the server allows that account/key. An unavailable agent and an agent with no identities can have different causes. These errors retain auth/4 and JSON `causes`; they do not automatically start an agent, load keys, or fall back to password auth. Host-key verification still happens before authentication.
+
+## Server registration guidance
+
+Human `add` output for a new server or `--replace` includes scoped `next`/`then` commands for trust and the example `hostname` run. Ad-hoc homes (including `SSHW_HOME`) use an absolute `--home`; project mode uses an absolute `--project-dir`. Registered profiles keep their validated namespace with `--profile`, rather than opening the directory as an ad-hoc home. Explicit `--global` registration retains `--global`, including with a default named profile or ambient `SSHW_HOME`; the built-in fallback is also explicit `--global` so cwd cannot shadow it. An invocation's forced `--policy` is carried into the follow-up commands.
+
+Selectors and server names use local-shell quoting. If a path/name is sensitive, contains controls or has no reproducible namespace binding, guidance asks for the original selection without emitting a command for a masked/different target. Profile selectors retain the existing conflict with non-empty `SSHW_HOME`. Generating guidance reads only metadata; it does not retrieve credentials, approve keys or run SSH commands. Running the suggested trust/run remains an explicit action subject to normal verification, safety and policy.
+
+An empty inherited global server list offers global registration with `--global`, or project-local initialization with `--servers-source local` followed by registration at that same `--project-dir`. These are choices, not automatic mutations. A local or explicit-home empty list instead gives a registration template for that selected list. Replace the quoted host/login-user placeholders. No-match filter guidance preserves the selection when removing `--filter`. Read-only list commands do not create homes, acquire mutation locks or append audit records. JSON list success remains an array, including `[]`; add's existing JSON fields/types and exit codes remain unchanged.
 
 ## Managing Server Accounts
 
@@ -159,7 +249,11 @@ Password accounts store a distinct credential per server and username. Updating 
 
 Human `account list/show` output includes the privilege method, target user, and authentication mode, such as `sudo -> service (no password)` or `su -> root (password)`. An omitted saved target defaults to `root`; accounts without privilege settings show `none`. The login account is listed separately. Human target labels mask secret patterns; the JSON structure is unchanged.
 
-Server, account and privilege mutations save configuration before cleaning up old credentials. A cleanup failure still returns exit 4 and ok:false, but explains that the configuration has already been applied. JSON mutation includes config_applied:true, failed_stage:"credential_cleanup", action, server and account where relevant. A default change from server removal is retained as mutation.default_change. Inspect show/list/account show/privilege show before retrying; repeating an applied command does not guarantee cleanup of credentials whose references have already been removed. Failed configuration saves do not report successful application.
+Server, account and privilege mutations save configuration before cleaning up old credentials. A cleanup failure still returns exit 4 and ok:false, but explains that the configuration has already been applied. JSON mutation includes config_applied:true, failed_stage:"credential_cleanup", action, server and account where relevant. A default change from server removal or rename is retained as mutation.default_change. Inspect show/list/account show/privilege show before retrying; repeating an applied command does not guarantee cleanup of credentials whose references have already been removed. A save failure before publication does not report successful application; `rename` and `password` also report applied mutation state if durability confirmation fails after publication, as described below.
+
+To remove a saved default login, use `sshw account remove web old-user --switch-default deploy` to select another registered default and remove the old registration together. **This does not delete any server OS account or files.** The option applies only when removing the current default; the replacement must already be registered and differ from the target. To remove the final account, remove the server registration. Omitting the option retains the existing default-account removal guard.
+
+Confirmation identifies the removed and replacement logins; `--yes` confirms noninteractively. The default change and account removal publish in one config save, followed by cleanup of only the removed account's grants and login/privilege credentials. Replacement/other accounts and privilege settings, the global default server and host trust are preserved. Default logins remain implicitly allowed by policy. Success JSON and post-publication errors retain `default_change` with `resource:"account"`, `previous` and `current`. Existing config_save/policy_update/credential_cleanup failure and recovery contracts apply; inspect stored state before reusing a name. Rust callers constructing `AccountRemoveArgs` must add `switch_default: None`.
 
 ## Credential Backends
 
@@ -200,9 +294,19 @@ sshw run web "id -un" --user ops --as-root
 
 The saved setting makes `--as-root` use `sudo -n` without prompting, storing or loading a privilege password. Ordinary runs still use the login account. `privilege set --no-password` rejects `--method su` and `--password-stdin`; omit `--no-password` on a later set to restore password-based authentication. Updating an existing setting requires confirmation or `--force`. Switching modes removes the old stored password only after the configuration is saved successfully. Doctor and removal commands skip nonexistent password entries. The server must independently allow the requested sudo target; denial returns the normal remote failure status without a password fallback.
 
+`endpoint <name> --host <host> --port <port>` edits only a registered server's address and port. At least one option is required; omitted values stay unchanged. All accounts, default login/server, privilege methods/targets, credential references, policy and known_hosts files are preserved. Existing `add --replace` behavior remains. A real change displays the previous/new endpoint for confirmation; `--yes` confirms non-interactively. Identical values skip confirmation, file saves and secret lookups.
+
+When `add` detects an address conflict without `--replace`, its config/3 error first recommends a scoped `endpoint` command containing only changed host/port fields. It preserves the selected home/profile/project/global and forced-policy settings, quotes values and omits copyable commands for sensitive/unrepresentable targets. The conflict is rejected before confirmation, password input or secret mutation. Suggested edits still need the normal endpoint confirmation; no automatic edit or host approval occurs.
+
+JSON `action:"endpoint_updated"` reports previous/current host and port, changed/change, credentials_changed:false and host_key_verified:false. This edits metadata without connecting or reading credentials. Connections to the new endpoint still use normal fail-closed host-key verification; approvals are not copied or automatically granted. Existing locks/CAS/atomic saves remain; a post-publication durability error reports mutation.config_applied, action:endpoint_updated and failed_stage:config_save. Inspect show with the same settings selection before retrying. Audit action endpoint records individually masked requested host/port. Rust gains EndpointArgs and Command::Endpoint.
+
 ## Host Trust Flow
 
+The confirmation identifies the saved alias, actual host:port (bracketed for IPv6), selected server-settings source and absolute config/known_hosts paths. Secret-pattern fields are masked individually and terminal controls are escaped. Readiness still precedes connection, cancel never writes trust, and the exact fetched fingerprint enters the existing storage/re-verification path. `--yes` and success JSON fields/types remain unchanged. Displaying source metadata does not retrieve credentials or approve a key.
+
 Host key verification fails closed; unknown or changed keys are not silently accepted. Trusted keys are stored in the active home's `known_hosts`.
+
+For an unapproved key, `run`, `put`, `get`, and `test` show a `trust` command with the selected settings and actual server alias, including when the default server was used. Approving a server inherited from global settings requires the explicit `--global` command shown in the message. Compare the fingerprint with a trusted source before approving. When a trusted key changes, the error identifies the `known_hosts` file that was checked and asks you to confirm the change with the server administrator. Both cases return ssh/5 and keep the existing JSON error envelope.
 
 ```bash
 sshw trust server-alpha
@@ -217,26 +321,45 @@ Without `--yes`, trust checks that confirmation is available after server lookup
 
 ```bash
 sshw add <name> --host <host> [--port <port>] --user <user> [--auth password|agent] [--password-stdin] [--force] [--replace] [--json]
-sshw list [--json]
+sshw list [--filter <text>] [--json]
 sshw show <name> [--json]
-sshw default [<name>] [--json]
+sshw rename <name> <new_name> [--json]
+sshw endpoint <name> [--host <host>] [--port <port>] [--yes] [--json]
+sshw test <name> [--user <registered-user>] [--json]
+sshw password <name> [--user <registered-user>] [--privilege] [--password-stdin] [--json]
+sshw completions powershell
+sshw default [<name> | --clear] [--json]
 sshw trust <name> [--yes] [--json]
 sshw run [<name>] "<command>" [--user <registered-user>] [--json|--stream] [--yes] [--as-root [--no-password]]
-sshw put [<name>] <local> <remote> [--user <registered-user>] [--atomic] [--mode <octal>] [--json] [--yes]
-sshw get [<name>] <remote> <local> [--user <registered-user>] [--json] [--yes]
-sshw remove <name> [--yes] [--json]
-sshw doctor [--json]
+sshw put [<name>] <local> <remote> [--user <registered-user>] [--atomic] [--mode <octal>] [--progress] [--json] [--yes]
+sshw get [<name>] <remote> <local> [--user <registered-user>] [--progress] [--json] [--yes]
+sshw get [<name>] <remote> --into <directory> [--user <registered-user>] [--progress] [--json] [--yes]
+sshw remove <name> [--switch-default <name> | --clear-default] [--yes] [--json]
+sshw doctor [<name>] [--user <registered-user>] [--json]
 sshw account add <name> <user> [--auth password|agent] [--password-stdin] [--force] [--json]
 sshw account list <name> [--json]
 sshw account show <name> <user> [--json]
 sshw account default <name> <user> [--json]
-sshw account remove <name> <user> [--yes] [--json]
+sshw account remove <name> <user> [--switch-default <registered-user>] [--yes] [--json]
 sshw privilege <set|show|clear> ... [--json]
-sshw profile <add|list|show|default|remove> ... [--json]
+sshw profile remove <name> [--switch-default <name> | --clear-default] [--json]
+sshw profile <add|list|show|default|remove|rename> ... [--json]
 sshw policy <init|show|enable|disable|allow|remove|check> ... [--json]
 ```
 
-`add`, `account add`, and `profile add` take `--force` to confirm an update non-interactively. Updating a server at the same host/port preserves its other accounts and the updated account's privilege settings; only the selected login credential is rotated. Changing host or port requires `--replace`, which explicitly resets the account set and privilege settings and cleans up stale credentials. Use a new server name to keep the old endpoint available. `--force` alone never authorizes endpoint replacement.
+`add`, `account add`, and `profile add` take `--force` to confirm an update non-interactively. Updating a server at the same host/port preserves its other accounts and the updated account's privilege settings; only the selected login credential is rotated. For address-only changes use `endpoint`. Address replacement through `add` requires `--replace`, which explicitly resets the account set and privilege settings and cleans up stale credentials. Use a new server name to keep the old endpoint available. `--force` alone never authorizes endpoint replacement.
+
+`show` displays the address, default server/login, every registered account's authentication method and privilege method/target, and whether that privilege configuration needs a password. A `*` marks the default login account. It only reads config: credential entries, SSH, policy and host-key files are not checked. Existing top-level JSON fields remain; `accounts` adds the same ordered array as `account list --json`, including credential references as metadata, never secret values. `list --json` is unchanged.
+
+`remove` also removes all `allow_accounts` entries for that server, including entries for accounts no longer registered. `account remove` removes only the exact server/user entries. This applies to enabled and disabled policies; command/path rules and other account entries remain. A missing policy, a legacy policy with no account rules or a policy without matching entries is not rewritten. Unknown targets, the default-account removal guard and declined confirmation retain their precedence. A present invalid policy blocks removal with policy/7 before config or credentials change.
+
+Removal uses the home lock and config/policy revision checks, saves config first, then policy, and attempts obsolete credential cleanup even if policy saving fails. The two files are separate atomic writes. Success JSON adds `policy_changed` and `policy_rules_removed`; human output reports the removed rule count when nonzero. Post-publication failure includes `mutation.config_applied:true`, `action:"removed"`, server/account and any `default_change`, with `failed_stage:"config_save"` (config/3), `"policy_update"` (policy/7) or `"credential_cleanup"` (auth/4). A config durability failure retains policy and secrets. Inspect the same home/profile before retrying or reusing the deleted name; remove any remaining grants with the policy CLI. Repeating removal of an absent target cannot clean up stale grants.
+
+`rename <name> <new_name>` changes only the local server alias, without a confirmation prompt or SSH connection. It preserves host/port, accounts, default login, privilege method/target and host approval; a default server follows the new name. Saved login and privilege passwords are copied to new purpose/account-qualified references and obsolete entries are removed after saving. A credential backend must be able to read and store those entries; the session-only backend needs its runtime password environment variables and does not make passwords persistent.
+
+Account allowlist entries for the old name follow the rename, including when policy is disabled. An existing destination server or destination `allow_accounts` reference is rejected rather than overwritten or inherited. Other policy rules, profiles and homes are unchanged. A same-name request validates the server and takes the normal mutation lock/audit path but skips secret access, policy loading and file saves, preserving original bytes/mtime and legacy format.
+
+Config and policy saves use the home lock and revision checks, but are separate atomic file updates. Config is saved before policy; when policy is enforced, the new name's non-default accounts are denied until the rules follow. Before config publication, failures retain the original name/secrets and attempt to remove temporary copies. After publication, an error includes `mutation.config_applied:true`, `action:"renamed"`, the saved `server` and `failed_stage` (`config_save`, `policy_update` or `credential_cleanup`), plus any `default_change`. Inspect the saved name and policy using the same home/profile; do not blindly retry the old name. Successful JSON has `previous_server`, `server`, `changed`, `change` (`renamed`/`unchanged`) and `policy_changed`.
 
 `add` and `account add` reject `--auth agent --password-stdin` with config/3 before asking to confirm an update. Existing config, target and endpoint-replacement checks retain their precedence. Valid updates still require confirmation or `--force`; password input and credential cleanup are unchanged.
 
@@ -252,6 +375,15 @@ When the name is omitted for `run`/`put`/`get`, the configured default server is
 
 ## Safer transfers and live output
 
+`put/get --progress` reports transferred bytes, percentage and average speed over the whole operation on stderr. It is off by default and can be combined with `--json` without changing stdout JSON. A terminal updates one line; redirected stderr uses throttled separate lines. Progress includes no paths or secrets. Native SCP and `put --atomic` are supported, including empty files.
+
+Even when all bytes have moved, the display stays at most 99% and shows completion verification until remote SCP completion, SFTP rename or local download publication succeeds. Only then does it show `100% ... complete`; failures end with completion unconfirmed. Display write failures do not change the transfer result. Absolute timeouts, completion checks, download staging and atomic upload guarantees remain; cancellation, retries and resuming are not added. Rust callers constructing `PutArgs/GetArgs` must add `progress: false`. Existing `SshClient` methods remain compatible: the new progress methods default to a successful-completion event only; `Ssh2Client` emits live byte events. Library callbacks must return quickly and do not extend deadlines.
+
+```sh
+sshw put web ./archive.tgz /tmp/archive.tgz --progress
+sshw get web /tmp/archive.tgz ./archive.tgz --progress --json
+```
+
 Atomic upload errors identify the failed step, its cause, the destination and temporary path, and the cleanup/replacement state. If the server's file-creation response is lost, the temporary file may exist but its creation is unconfirmed; sshw does not automatically delete that path. Inspect the path and ownership before retrying. Confirmed temporary files are cleaned up on failure when the connection and permissions allow it.
 
 ```bash
@@ -265,9 +397,20 @@ sshw run web "./long-build" --stream
 
 `run --stream` emits complete, redacted stdout/stderr lines while the command runs. Incomplete lines wait for completion; PEM private-key blocks and secrets split across network reads remain masked. Known multiline secrets require conservative buffering. The existing 16 MiB combined output limit and exit codes remain in force. JSON and `su` PTY are not supported with streaming; ordinary run and sudo are supported. Failures show the redacted cause together with the completion-unconfirmed notice. Output already emitted is not repeated on failure, and the remote command may have had side effects. Ordinary run and sudo use a short SSH cleanup timeout after channel errors in buffered, JSON and streaming modes; this does not confirm that the remote process stopped.
 
-`policy check-put/check-get` use the same positional arguments, `--user` and `--yes` as transfers; `check-put --atomic` also checks staging-directory policy. Shared checks use the execution order and report the first failing prerequisite. After access checks pass, both `put` (including `--atomic`) and `check-put` verify that the local source is a readable regular file without reading its contents. `put` performs this check before looking up the account password, so an invalid source is reported as IO/6 even when credentials are missing. JSON distinguishes `access_allowed`, `local_file_checked` and `local_file_ready`; `allowed` covers all evaluated local checks. These are point-in-time results, and the transfer still opens and validates its own file handle. SSH authentication, remote filesystem permissions and server extension support are not tested by preflight. `--yes` confirms a guardrail; it grants no remote OS permission.
+`policy check-put/check-get` use the same positional arguments, `--user` and `--yes` as transfers. `check-put --atomic` also checks staging-directory policy. Shared checks use the execution order and report the first failing prerequisite. After access checks pass, both `put` (including `--atomic`) and `check-put` verify that the local source is a readable regular file without reading its contents. `put` performs this check before looking up the account password, so an invalid source is reported as IO/6 even when credentials are missing. The JSON fields `local_file_checked` and `local_file_ready` refer to the upload source. `allowed` covers all evaluated local checks. These are point-in-time results. SSH authentication, remote filesystem permissions and server extension support are outside preflight.
 
-For `get`, specify a local file path. Both execution and `policy check-get` reject an existing directory destination and identify invalid local parent paths before connecting. `--yes` approves replacing a file; it does not make a directory a valid file destination. Missing parent directories are created only during the actual download. Preflight does not create files or verify local write permission. With `--yes`, a destination symlink is replaced rather than writing through it to its target. The destination is checked again before staging and final publication; failures before publication preserve the existing destination and clean up the staged file.
+For `get`, specify a local file path. Existing directories and invalid local parent paths are rejected before connection. Overwriting an existing file or symlink, including a dangling symlink, requires `--yes`. When confirmed, the download replaces the symlink itself and leaves its target untouched. Preflight checks path shape and overwrite consent without testing local write permission. Missing parent directories are created only during the download. Destination checks run again before staging and final publication, so failures before publication preserve the existing destination and clean up the staged file.
+
+`policy check-get --json` reports `local_destination_status` as `not_checked` when an earlier check stopped execution, `ready` when the path and overwrite checks pass, `overwrite_confirmation_required` when the destination already exists without `--yes`, or `blocked` for other destination errors, including a dangling parent symlink. A `ready` destination can still be followed by an account policy denial. See `allowed` and `reasons` for the overall result. `--yes` confirms a local overwrite and grants no remote permission. Successful transfers mask sensitive values in each displayed path in human and JSON output.
+
+`get [server] <remote> --into <directory>` replaces the positional local filename with a directory plus the remote source's filename. With the default server, use `get <remote> --into .`. The original remote path keeps its existing `remote:` decoding and policy checks. POSIX paths use `/`; explicit Windows drive/UNC paths use both separators to find the filename. Empty names, `.`/`..`, control characters and names that cannot be represented as one local file (including Windows reserved devices, ADS and trailing spaces/dots) fail with usage/9; specify a different local filename explicitly. Names are not silently rewritten or joined as paths outside the selected directory.
+
+```sh
+sshw get web /var/log/app.log --into ./downloads --progress
+sshw policy check-get web /var/log/app.log --into ./downloads --json
+```
+
+`policy check-get --into` resolves the same final destination and overwrite/parent checks without creating directories, reading secrets or connecting. Missing directories are created only when the actual download stages data. Existing files still require `--yes`; atomic publication, failure preservation and no-clobber race protection remain. Incorrect conditional argument counts and `check-put --into` fail with usage/9 before runtime initialization. Audit still records the remote source; JSON `local` identifies the final file. Rust callers constructing `GetArgs` or policy transfer checks must add `into: None`. After `Cli::try_parse_from`, use `Cli::validate_usage()` for an early conditional-arity check; execution entry points also validate automatically.
 
 ## Windows Shell Paths
 
@@ -323,7 +466,7 @@ sshw policy show --json
 
 `init` creates a disabled empty policy and refuses to replace an existing file. `allow` adds a rule without enabling enforcement; `remove` removes an exact entry, while other rules may still match. `enable`/`disable` change the saved `enabled` setting. Mutations distinguish added, already present, removed, not found and unchanged results. JSON adds `changed` and `change` (`created`, `added`, `already_present`, `removed`, `not_found`, `updated`, `unchanged`). A no-op still succeeds and skips saving. Policy mutations retain the home's lock and audit log; actual changes use revision checking and atomic save. Full command rules are never copied into audit detail. Existing policy v1 files remain readable and are saved as v2 when their contents change.
 
-Policy management output distinguishes file presence, the saved `enabled` setting, and enforcement for the current invocation. JSON includes `present`, `enforced`, and `forced` (`--policy`). A missing file is shown as not configured with an `sshw policy init` next step; forced operations still fail closed until the file exists. `disable` changes the saved setting, while `--policy` continues forcing enforcement for invocations that pass it. Remove that option to use the saved disabled setting, keeping the same home/profile selection.
+Policy management output distinguishes file presence, the saved `enabled` setting, and enforcement for the current invocation. `policy show`, `doctor`, and `project status` use the same `policy_status` fields for observed state. Check `policy_status.state` for `on`, `off`, or `blocked` and `policy_status.enforced` for the effective boolean or `null` if blocked. The existing top-level `enforced` and `policy_enabled` booleans retain their compatibility meaning of requested enablement. If `--policy` requires a missing file, the same settings selection is used in initialization guidance. An inherited policy remains read-only until the user chooses where to initialize it. An invalid or unreadable file yields a blocked `policy show` error with exit 7. `disable` changes the saved setting, while `--policy` continues to force enforcement for invocations with a usable policy file.
 
 `check`, `check-put` and `check-get` show policy enforcement state and matching rules in human output and a JSON `policy` object (`path`, `enforced`, `forced`, `checks`). Each check explains `allowed`, `reason`, and, when a rule matched, `matched_rule` and `match_type` (`program`, `exact`, `prefix`, `path`, `account`). The first matching rule in file order is reported. The explanation also distinguishes a disabled policy, an implicitly allowed default account, shell syntax requiring an exact full-command rule, unmatched rules and parent traversal. Atomic uploads explain the parent-directory rule separately as `atomic_parent`. Explanations use the same loaded policy and matching logic as enforcement and redact secrets. These policy decisions are independent of safety, account existence and local file readiness; the existing overall `allowed`, `reasons` and exit code remain authoritative. Local checks do not test credentials, SSH or sudoers.
 
@@ -353,23 +496,54 @@ Policy fails closed: with `--policy`, a missing policy file is an error, and a p
 
 Command rules have three forms: a full command such as `systemctl status app` matches exactly; a trailing `*` such as `systemctl status *` matches a text prefix; and a bare program name such as `cat` allows that program with arbitrary arguments when the command contains no shell metacharacters. Bare-program rules delegate that program's capabilities, including accessible files and subprocesses. Even an exact rule does not isolate what the permitted program can do. `allow_put_paths`/`allow_get_paths` match remote paths by lexical prefix and reject `..`, but they do not resolve remote symlinks or canonicalize paths, so a symlink under an allowed prefix can still point elsewhere on the host — the path allowlist is a guardrail, not a remote sandbox.
 
+### Recovering from a policy denial
+
+Actual policy denials from `run/put/get/test` and `policy check/check-put/check-get` include `suggestions`. Each item has a `kind` (`account`, `command`, `put`, `get`), a copyable `command` or null, and the grant's `scope`. Execution failures put the array at the top of the existing JSON error envelope; preflight includes it in the existing `ok:true`, `allowed:false` result. First-error precedence, exit codes, reasons and policy decisions remain. Human output also explains scope and the next command.
+
+Grants apply only when you explicitly run a suggested command. Rules are never automatically added, enabled or bypassed. Program rules cover arguments/subprocesses, trailing `*` rules cover a prefix, and full command rules describe exact scope. Path rules include descendants, rather than limiting access to one file. Atomic uploads may need parent-path permission for staging. These grants do not change server OS permissions or symlink behavior.
+
+Suggestions retain the selected home, profile, or project directory and the `--policy` option if supplied. For an explicit global invocation or the built-in default home, the command includes `--global` so copying it into a project directory still targets the global policy. Inherited project policies are read-only and get guidance to choose the write target. Copyable commands are omitted if selection cannot be reproduced or a value contains secret patterns/control characters. Root-only, parent-traversal and unrepresentable paths require manual inspection. Never store sensitive remote commands in policy. Values are masked individually before PowerShell/POSIX quoting and a `--` boundary. Safety blocks, local IO, unknown accounts and invalid/missing policy do not receive inappropriate grants. Rust callers constructing `ErrorResponse` directly must add `suggestions: Vec::new()`.
+
+## PowerShell Completion
+
+```powershell
+sshw completions powershell | Out-String | Invoke-Expression
+```
+
+This registers native Tab completion in the current session. Add the line to your PowerShell profile yourself to load it in future sessions. [PowerShell's native completer API](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/register-argumentcompleter) supplies the current command AST and cursor. sshw's script inspects literal tokens without evaluating expressions. Commands/options/enums follow the CLI definition; registered servers and login accounts follow cwd `.sshw`, preceding `--global`/`--project-dir`, explicit `--home`/`--profile`, `SSHW_HOME` and the registry default with the same precedence as execution. Profile suggestions come from the global registry. Invalid or conflicting selections produce no metadata suggestions and never fall back to another home. Script generation works even if the active home/config is unavailable.
+
+Completion reads local metadata, never passwords, SSH, mutation locks or audit. Names containing spaces, quotes and shell metacharacters are quoted for insertion; identifiers matching secret-redaction patterns are omitted. Expression-based arguments are not evaluated for completion. PowerShell stops invoking native completers after `--`; enter those operands manually, including aliases starting with `-`. The current release provides PowerShell completion; other shells are not yet supported. Native PowerShell 5.1 and 7 are covered by the Windows regression tests. Generating a script does not install it or edit a profile.
+
+`list --filter <text>` separately performs case-insensitive literal substring matching against the configured name or host. It preserves name ordering, default markers and the existing JSON array schema. Empty text matches all; no matches return an empty array or a human hint. Omitting `--filter` preserves the full list. This operation does not query SSH or the credential backend.
+
 ## Audit Log
 
-Mutating/active operations (`add`, `remove`, `trust`, `default`, `account add`, `account default`, `account remove`, `profile add`, `profile default`, `profile remove`, `run`, `put`, `get`, `privilege set`, `privilege clear`) are appended to `audit.jsonl`, one JSON object per line. Home-scoped operations use the active home's log; global profile-registry mutations consistently use the built-in default home's log regardless of the profile being added, selected, or removed:
+Mutating/active operations (`add`, `rename`, `password`, `remove`, `trust`, `default`, `account add`, `account default`, `account remove`, `profile add`, `profile default`, `profile remove`, `run`, `put`, `get`, `privilege set`, `privilege clear`) are appended to `audit.jsonl`, one JSON object per line. Home-scoped operations use the active home's log; global profile-registry mutations consistently use the built-in default home's log regardless of the profile being added, selected, or removed:
 
 ```json
 {"time_ms":1700000000000,"action":"run","server":"web","user":"ops","status":"ok","exit_code":0,"detail":"uptime"}
 ```
 
-`user` records the selected login account. `detail` for `run` is only the program name (not its arguments). Server names, users, paths, and details are redacted on a best-effort basis. Attempted `run`/`put`/`get` operations, including policy setup failures, are recorded with an error status. Read-only commands (`list`, `show`, `account list`, `account show`, `doctor`, `profile list`, `profile show`) are not audited. Audit writes are best-effort: a busy record lock is retried for 100 milliseconds and then that record is skipped without failing the operation. The file is owner-only on Unix (best-effort on Windows). The log is append-only but not tamper-evident — it has no integrity chain or signing, and anyone who can write the home can edit or delete entries. Treat `audit.jsonl` as sensitive.
+`user` records the selected login account. `detail` for `run` is only the program name (not its arguments); for `rename`, `server` is the old name and `detail` is the new name. Server names, users, paths, and details are redacted on a best-effort basis. Attempted `run`/`put`/`get` operations, including policy setup failures, are recorded with an error status. Read-only commands (`list`, `show`, `account list`, `account show`, `doctor`, `profile list`, `profile show`) are not audited. Audit writes are best-effort: a busy record lock is retried for 100 milliseconds and then that record is skipped without failing the operation. The file is owner-only on Unix (best-effort on Windows). The log is append-only but not tamper-evident — it has no integrity chain or signing, and anyone who can write the home can edit or delete entries. Treat `audit.jsonl` as sensitive.
 
 ## Output Redaction
 
 `run` stdout, stderr, and the echoed JSON command are passed through best-effort redaction that masks PEM private-key blocks, `keyword=value`/`keyword: value` assignments for common secret keywords, and bearer tokens. When loaded for an operation, the exact login password and configured privilege password are also redacted wherever they appear in those fields. Very short or common exact passwords can therefore over-redact unrelated output; secrecy takes priority over output fidelity. This does not understand every shell representation, and secrets split across lines may not be masked. Do not pass secrets inline.
 
-Copyable trust/run hints after registration, doctor host-trust hints, and privilege setup hints quote each argument and place positional values after `--`. They use PowerShell syntax on Windows and POSIX shell syntax on other operating systems. Keep the same `--home`/`--profile` selection and insert extra options before `--`. In Git Bash on Windows, adapt PowerShell quoting to POSIX quoting. Sensitive values in hints are replaced with `<redacted>`; replace those placeholders with the intended identifiers before executing a command, and never put passwords in arguments.
+Copyable trust/run hints after registration, doctor host-trust hints, and privilege setup hints retain the selected settings, quote each argument, and place positional values after `--`. They use PowerShell syntax on Windows and POSIX shell syntax on other operating systems. Insert extra options before `--`. In Git Bash on Windows, adapt PowerShell quoting to POSIX quoting. A copyable command is omitted when sensitive values, terminal control characters, or an unreproducible settings binding would make it unsafe or select the wrong target. Inspect the selected settings manually in that case, and never put passwords in arguments.
 
 ## Doctor
+
+Doctor host-key, credential and retry guidance retains home/profile/project and forced-policy/global selectors. Read-only lookup commands keep both project resources. An inherited server's trust/credential repair explicitly uses `--global` and explains the global change; automatic-project write protection remains in force. Backend-unavailable checks suggest a scoped retry for that server/login without treating unavailable entries as missing. Login/privilege method and target metadata remain; session-only recovery still uses environment variables.
+
+For an empty server list, the `setup` issue carries the same registration guidance as human `list` output. An empty inherited list offers a choice between registering globally and initializing a local list. `list --json` still returns `[]`.
+
+Server/account/privilege lookup errors carry typed targets and receive scoped recovery at the execution boundary, including policy preflight. Config/3, original causes and first-error/IO ordering remain, and outer SSH/other error kinds are not reclassified. Sensitive/control values or stale namespace bindings omit copyable commands rather than operating on masked targets. Diagnostic display performs no repair, approval or credential write. Public Rust structs/enums and existing JSON fields/types remain unchanged.
+
+`doctor <server> --user <registered-user>` requires an explicit server and inspects only that registered login's login/privilege credentials and SSH-agent needs. An unknown account fails with config/3 before backend-health, credential, agent or audit-writability probes. Common home, registry, config, policy, backend, audit and selected-server host-trust diagnostics remain; this does not connect over SSH or prove account-policy access. Broken config retains the existing recovery report. An explicit selection adds a masked `user` to JSON and human output. Omitting `--user` keeps the existing server/all-account scope. Rust callers constructing `DoctorArgs` must add `user: None`.
+
+
+`sshw doctor <name>` limits credential-entry checks, local host-approval checks and the decision to inspect the SSH agent to that registered server. It selects that exact name rather than the default; an unknown name returns config/3 before credential lookups, backend health and agent checks. Without a name, existing all-server behavior and JSON shape remain. Scoped JSON adds `server`; `credential_checks`, `missing_credentials` and `host_trust` contain the selected server's entries. Registry/config/policy/backend/audit/runtime diagnostics still describe the shared home. A broken config keeps doctor's existing recovery report, with no server-specific entries until the config can be validated. No mode tests remote SSH connectivity or remote key matching.
 
 ```bash
 sshw doctor
@@ -378,7 +552,7 @@ sshw doctor --json
 
 Missing privilege-password recovery keeps the saved login account, privilege method and target. Persistent backends suggest re-registration using the same --home/--profile; confirm the update or put --force before the suggested command's --. For redirected input also put --password-stdin before --. Windows hints use PowerShell quoting; other platforms use POSIX quoting. A session-only backend instead requires SSHW_PRIVILEGE_PASSWORD at execution because registration cannot persist it. Never put a password in command arguments.
 
-Trust/run hints after registration, doctor host-trust hints and privilege-setup hints quote each argument and place server/command values after --. Keep the same home/profile and insert extra options before --. In Windows Git Bash adapt the PowerShell quoting to POSIX quoting. Secret-looking identifiers are replaced with <redacted>; substitute the intended identifiers before running the command. Never put passwords in arguments.
+Registration, doctor and lookup recovery commands quote arguments, retain the selection and put positional targets after --. Insert extra options before --. In Windows Git Bash adapt PowerShell quoting to POSIX quoting. Sensitive or unrepresentable recovery targets omit copyable commands; inspect the original selection manually instead of executing a masked target. Never put passwords in arguments.
 
 Empty, whitespace-only or control-character privilege targets are rejected as config/3 during registration and v1/v2 configuration loading. Registration stops before confirmation or password input. For an invalid saved target, use doctor and the reported configuration path to repair it; preflight and execution also reject it. This validation does not test whether the remote account exists or sudoers permits it.
 
@@ -395,6 +569,19 @@ Privilege password lookup failures from `run --as-root` also show the server/log
 `privilege clear` succeeds without prompting or rewriting settings when a registered account already has no saved privilege configuration. JSON retains `action:"cleared"`, server/account fields, and adds `changed:false`/`change:"unchanged"`; a real clear reports `true`/`"removed"`. Unknown targets and invalid settings still fail, and lock/audit behavior is retained. Actual clears retain confirmation, secret cleanup, and partial-application diagnostics. This only clears saved local privilege settings; remote sudoers and existing elevation flags are unchanged.
 
 Lock and config/profile-registry persistence failures show the reported path, operation stage, masked underlying cause, and a recovery step in human and JSON errors. Check the reported path/parent permissions, file type, filesystem, or active lock holder as indicated. Existing exit codes, JSON causes, timeouts, concurrency checks and atomic writes remain unchanged. A parent-directory sync failure after publication explicitly says the state was published: inspect it before retrying; the original publication marker and credential cleanup decisions are retained.
+
+### Test a real connection
+
+```sh
+sshw test web
+sshw test web --user ops --json
+```
+
+`test` selects an explicitly named registered server/account, checks the active account policy, then resolves login credentials. The default login remains implicitly allowed; an enabled policy requires an exact `allow_accounts` rule for a non-default login. It performs DNS/TCP/SSH setup, verifies existing known_hosts approval and authenticates, without opening a remote command channel, transferring files or using sudo/su. Command/path rules do not apply to this login-only check. Invalid or missing forced policy fails before connecting.
+
+Unknown or changed host keys are never automatically approved; use the existing `trust` process. Passwords use the selected backend or session-only `SSHW_PASSWORD`; privilege secrets are not read. Connection/trust errors are ssh/5, login authentication/credential errors auth/4, and unknown targets config/3. Failures retain the JSON envelope. Success includes `connection_tested:true`, `host_key_verified:true`, `authenticated:true`, `command_executed:false`, server/user/host/port, algorithm/fingerprint and `duration_ms`. Duration covers connection/testing after credential lookup. Success confirms login at that moment, not remote filesystem permissions or sudoers.
+
+Settings, credentials and known_hosts are preserved; a `test` audit record is written. Existing 15-second connection setup and session authentication timeouts apply. Global `--timeout` retains its run/put/get remote-operation meaning; it does not configure a new test deadline. The default Rust `SshClient::test_connection` implementation returns unsupported and never falls back to executing a command. The native backend implements actual testing. `doctor` and `policy check*` remain local diagnostics.
 
 ## JSON Error Contract
 

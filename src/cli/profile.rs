@@ -6,7 +6,7 @@
 
 use super::{
     CommandOutput, ProfileAddArgs, ProfileArgs, ProfileCommand, ProfileDefaultArgs,
-    ProfileListArgs, ProfileRemoveArgs, ProfileShowArgs, ok,
+    ProfileListArgs, ProfileRemoveArgs, ProfileRenameArgs, ProfileShowArgs, ok,
 };
 use crate::error::ResultErrorKindExt;
 use crate::home::{ResolvedHome, generate_profile_id};
@@ -54,14 +54,80 @@ fn run_profile_inner(
         ProfileCommand::Show(a) => profile_show(a, &registry),
         ProfileCommand::Default(a) => profile_default(a, registry_path, &revision, &mut registry),
         ProfileCommand::Remove(a) => profile_remove(a, registry_path, &revision, &mut registry),
+        ProfileCommand::Rename(a) => profile_rename(a, registry_path, &revision, &mut registry),
     }
 }
 
 fn profile_command_mutates_registry(command: &ProfileCommand) -> bool {
     matches!(
         command,
-        ProfileCommand::Add(_) | ProfileCommand::Default(_) | ProfileCommand::Remove(_)
+        ProfileCommand::Add(_)
+            | ProfileCommand::Default(_)
+            | ProfileCommand::Remove(_)
+            | ProfileCommand::Rename(_)
     )
+}
+
+fn profile_rename(
+    args: ProfileRenameArgs,
+    registry_path: &Path,
+    revision: &RegistryRevision,
+    registry: &mut ProfileRegistry,
+) -> anyhow::Result<CommandOutput> {
+    validate_profile_name(&args.name)?;
+    validate_profile_name(&args.new_name)?;
+    let entry = registry
+        .profiles
+        .get(&args.name)
+        .cloned()
+        .ok_or_else(|| unknown_profile(&args.name))?;
+    let changed = args.name != args.new_name;
+    if changed && registry.profiles.contains_key(&args.new_name) {
+        return Err(anyhow::anyhow!(
+            "profile '{}' already exists; choose an unused name, existing profiles are not overwritten",
+            super::hints::redacted_argument(&args.new_name)
+        ));
+    }
+    let previous_default = registry.default.clone();
+    if changed {
+        registry.profiles.remove(&args.name);
+        registry
+            .profiles
+            .insert(args.new_name.clone(), entry.clone());
+        if registry.default.as_deref() == Some(args.name.as_str()) {
+            registry.default = Some(args.new_name.clone());
+        }
+        save_registry_if_unchanged(registry_path,registry,revision).map_err(|error| {
+            if crate::storage::write_was_published(&error) {
+                error.context(format!("profile rename was published as '{}', but save durability could not be confirmed; inspect `sshw profile list` before retrying or selecting the old name",super::hints::redacted_argument(&args.new_name)))
+            } else {error}
+        })?;
+    }
+    let default_change =
+        DefaultChange::between("profile", previous_default, registry.default.clone());
+    if args.json {
+        let mut output = json!({"ok":true,"action":"renamed","previous_name":redact_secrets(&args.name),"name":redact_secrets(&args.new_name),"id":redact_secrets(&entry.id),"home":redact_secrets(&entry.home.display().to_string()),"namespace_changed":false,"is_default":registry.default.as_deref()==Some(args.new_name.as_str()),"changed":changed,"change":if changed {"renamed"} else {"unchanged"}});
+        if let Some(change) = default_change {
+            output["default_change"] = serde_json::to_value(change.redacted())?;
+        }
+        return Ok(ok(format!("{output}\n")));
+    }
+    let mut message = if changed {
+        format!(
+            "profile renamed {} -> {} (home and credential namespace preserved)\n",
+            super::hints::redacted_argument(&args.name),
+            super::hints::redacted_argument(&args.new_name)
+        )
+    } else {
+        format!(
+            "profile {} unchanged\n",
+            super::hints::redacted_argument(&args.name)
+        )
+    };
+    if let Some(change) = default_change {
+        message.push_str(&change.human_message());
+    }
+    Ok(ok(message))
 }
 
 fn profile_add(
@@ -103,7 +169,7 @@ fn profile_add(
             home: home.clone(),
         },
     );
-    if registry.default.is_none() {
+    if registry.default.is_none() && before.profiles.is_empty() {
         registry.default = Some(args.name.clone());
     }
 
@@ -260,15 +326,47 @@ fn profile_default(
     revision: &RegistryRevision,
     registry: &mut ProfileRegistry,
 ) -> anyhow::Result<CommandOutput> {
+    if args.clear {
+        let previous = registry.default.take();
+        let changed = previous.is_some();
+        let default_change = DefaultChange::between("profile", previous, None);
+        if changed {
+            save_registry_if_unchanged(registry_path, registry, revision).map_err(|error| {
+                if crate::storage::write_was_published(&error) {
+                    error.context("default profile was cleared, but save durability could not be confirmed; inspect `sshw profile list` before retrying")
+                } else { error }
+            })?;
+        }
+        if args.json {
+            let mut output = json!({"ok":true,"action":"default","name":null,"changed":changed,
+                "change":if changed { "cleared" } else { "unchanged" }});
+            if let Some(change) = default_change {
+                output["default_change"] = serde_json::to_value(change.redacted())?;
+            }
+            return Ok(ok(format!("{output}\n")));
+        }
+        return Ok(ok(format!(
+            "{}; without an explicit home/profile selector, the built-in default home is used\n",
+            if changed {
+                "default profile cleared"
+            } else {
+                "no default profile configured (unchanged)"
+            }
+        )));
+    }
+    let name = args
+        .name
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("profile default requires a name or --clear"))?;
     let entry = registry
         .profiles
-        .get(&args.name)
-        .ok_or_else(|| unknown_profile(&args.name))?;
-    validate_profile_target(&args.name, &entry.home, &entry.id)?;
+        .get(name)
+        .ok_or_else(|| unknown_profile(name))?;
+    validate_profile_target(name, &entry.home, &entry.id)?;
 
-    let changed = registry.default.as_deref() != Some(args.name.as_str());
+    let changed = registry.default.as_deref() != Some(name);
     if changed {
-        registry.default = Some(args.name.clone());
+        registry.default = Some(name.to_string());
         save_registry_if_unchanged(registry_path, registry, revision)?;
     }
     if args.json {
@@ -279,9 +377,9 @@ fn profile_default(
         )));
     }
     Ok(ok(if changed {
-        format!("default profile set to {}\n", args.name)
+        format!("default profile set to {name}\n")
     } else {
-        format!("default profile already set to {} (unchanged)\n", args.name)
+        format!("default profile already set to {name} (unchanged)\n")
     }))
 }
 
@@ -292,16 +390,49 @@ fn profile_remove(
     registry: &mut ProfileRegistry,
 ) -> anyhow::Result<CommandOutput> {
     let previous_default = registry.default.clone();
-    if registry.profiles.remove(&args.name).is_none() {
+    if !registry.profiles.contains_key(&args.name) {
         return Err(unknown_profile(&args.name));
     }
+    if args.clear_default && args.switch_default.is_some() {
+        return Err(crate::error::app_error(
+            ErrorKind::Usage,
+            "--switch-default conflicts with --clear-default",
+        ));
+    }
+    let explicit_default = args.switch_default.is_some() || args.clear_default;
+    if explicit_default && registry.default.as_deref() != Some(args.name.as_str()) {
+        return Err(crate::error::app_error(
+            ErrorKind::Config,
+            "--switch-default and --clear-default are only for removing the current default profile; omit them to remove another profile",
+        ));
+    }
+    if let Some(replacement) = &args.switch_default {
+        if replacement == &args.name {
+            return Err(crate::error::app_error(
+                ErrorKind::Config,
+                "--switch-default must select a different registered profile",
+            ));
+        }
+        let entry = registry
+            .profiles
+            .get(replacement)
+            .ok_or_else(|| unknown_profile(replacement))?;
+        validate_profile_target(replacement, &entry.home, &entry.id)?;
+    }
+    registry.profiles.remove(&args.name);
     if registry.default.as_deref() == Some(args.name.as_str()) {
-        registry.default = registry.profiles.keys().next().cloned();
+        registry.default = if args.clear_default {
+            None
+        } else {
+            args.switch_default
+                .or_else(|| registry.profiles.keys().next().cloned())
+        };
     }
 
     let default_change =
         DefaultChange::between("profile", previous_default, registry.default.clone());
     let target_warning = default_change.as_ref().and_then(|_| {
+        if explicit_default { return None; }
         let name = registry.default.as_ref()?;
         let entry = registry.profiles.get(name)?;
         let error = inspect_profile_target(name, &entry.home, &entry.id).err()?;
@@ -319,9 +450,16 @@ fn profile_remove(
         Some(json!({"name":redact_secrets(name),"home":redact_secrets(&entry.home.display().to_string()),
             "message":message,"next_step":next_step}))
     });
-    save_registry_if_unchanged(registry_path, registry, revision)?;
+    save_registry_if_unchanged(registry_path, registry, revision).map_err(|error| {
+        if crate::storage::write_was_published(&error) {
+            error.context(format!(
+                "profile '{}' was removed, but save durability could not be confirmed; inspect `sshw profile list` for the saved default before retrying",
+                super::hints::redacted_argument(&args.name)
+            ))
+        } else { error }
+    })?;
     if args.json {
-        let mut output = json!({"ok":true,"action":"removed","name":args.name,"warning":"home and keyring entries left intact; re-adding requires credentials to be registered again"});
+        let mut output = json!({"ok":true,"action":"removed","name":redact_secrets(&args.name),"warning":"home and keyring entries left intact; re-adding requires credentials to be registered again"});
         if let Some(change) = default_change {
             output["default_change"] = serde_json::to_value(change.redacted())?;
         }
@@ -332,7 +470,7 @@ fn profile_remove(
     }
     let mut message = format!(
         "removed profile {} (home and keyring entries left intact; re-adding creates a fresh credential namespace)\n",
-        args.name
+        super::hints::redacted_argument(&args.name)
     );
     if let Some(change) = default_change {
         message.push_str(&change.human_message());
@@ -345,4 +483,138 @@ fn profile_remove(
         ));
     }
     Ok(ok(message))
+}
+
+#[cfg(test)]
+mod default_clear_tests {
+    use super::*;
+    use crate::profile::{ProfileEntry, save_registry};
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn profile_removal_selection_checks_revision_and_reports_published_state() {
+        for clear in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("profiles.json");
+            let registry = ProfileRegistry {
+                default: Some("old".into()),
+                profiles: ["old", "chosen"]
+                    .into_iter()
+                    .map(|name| {
+                        (
+                            name.into(),
+                            ProfileEntry {
+                                id: format!("p_{name}"),
+                                home: temp.path().join(name),
+                            },
+                        )
+                    })
+                    .collect(),
+                ..Default::default()
+            };
+            save_registry(&path, &registry).unwrap();
+            let (mut snapshot, revision) = load_registry_with_revision(&path).unwrap();
+            let mut external = registry.clone();
+            external.default = None;
+            save_registry(&path, &external).unwrap();
+            let args = || ProfileRemoveArgs {
+                name: "old".into(),
+                switch_default: (!clear).then(|| "chosen".into()),
+                clear_default: clear,
+                json: true,
+            };
+            let error = profile_remove(args(), &path, &revision, &mut snapshot).unwrap_err();
+            assert!(!crate::storage::write_was_published(&error));
+            assert_eq!(crate::profile::load_registry(&path).unwrap(), external);
+            save_registry(&path, &registry).unwrap();
+            let (mut snapshot, revision) = load_registry_with_revision(&path).unwrap();
+            crate::storage::fail_next_parent_sync();
+            let error = profile_remove(args(), &path, &revision, &mut snapshot).unwrap_err();
+            assert!(crate::storage::write_was_published(&error));
+            assert!(error.to_string().contains("was removed"));
+            assert!(error.to_string().contains("sshw profile list"));
+            let saved = crate::profile::load_registry(&path).unwrap();
+            assert!(!saved.profiles.contains_key("old"));
+            assert_eq!(saved.default.as_deref(), (!clear).then_some("chosen"));
+            assert_eq!(saved.profiles["chosen"], registry.profiles["chosen"]);
+            assert!(!registry.profiles["old"].home.exists());
+            assert!(!registry.profiles["chosen"].home.exists());
+        }
+    }
+
+    #[test]
+    fn profile_rename_checks_revision_and_describes_published_durability_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("profiles.json");
+        let entry = ProfileEntry {
+            id: "p_stable".into(),
+            home: temp.path().join("not-created"),
+        };
+        let registry = ProfileRegistry {
+            default: Some("old".into()),
+            profiles: BTreeMap::from([("old".into(), entry.clone())]),
+            ..Default::default()
+        };
+        save_registry(&path, &registry).unwrap();
+        let (mut snapshot, revision) = load_registry_with_revision(&path).unwrap();
+        let mut external = registry.clone();
+        external.default = None;
+        save_registry(&path, &external).unwrap();
+        let args = || ProfileRenameArgs {
+            name: "old".into(),
+            new_name: "new".into(),
+            json: true,
+        };
+        let error = profile_rename(args(), &path, &revision, &mut snapshot).unwrap_err();
+        assert!(!crate::storage::write_was_published(&error));
+        assert_eq!(crate::profile::load_registry(&path).unwrap(), external);
+        let (mut snapshot, revision) = load_registry_with_revision(&path).unwrap();
+        crate::storage::fail_next_parent_sync();
+        let error = profile_rename(args(), &path, &revision, &mut snapshot).unwrap_err();
+        assert!(crate::storage::write_was_published(&error));
+        assert!(error.to_string().contains("published as 'new'"));
+        let saved = crate::profile::load_registry(&path).unwrap();
+        assert_eq!(saved.profiles["new"], entry);
+        assert!(saved.default.is_none());
+        assert!(!saved.profiles.contains_key("old"));
+        assert!(!entry.home.exists());
+    }
+
+    #[test]
+    fn clear_preserves_ids_and_checks_cas_and_published_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("profiles.json");
+        let registry = ProfileRegistry {
+            default: Some("prod".into()),
+            profiles: BTreeMap::from([(
+                "prod".into(),
+                ProfileEntry {
+                    id: "p_prod".into(),
+                    home: temp.path().join("prod"),
+                },
+            )]),
+            ..Default::default()
+        };
+        save_registry(&path, &registry).unwrap();
+        let (mut snapshot, revision) = load_registry_with_revision(&path).unwrap();
+        let mut external = registry.clone();
+        external.profiles.get_mut("prod").unwrap().home = temp.path().join("external");
+        save_registry(&path, &external).unwrap();
+        let args = || ProfileDefaultArgs {
+            name: None,
+            clear: true,
+            json: true,
+        };
+        let error = profile_default(args(), &path, &revision, &mut snapshot).unwrap_err();
+        assert!(!crate::storage::write_was_published(&error));
+        assert_eq!(crate::profile::load_registry(&path).unwrap(), external);
+        let (mut snapshot, revision) = load_registry_with_revision(&path).unwrap();
+        crate::storage::fail_next_parent_sync();
+        let error = profile_default(args(), &path, &revision, &mut snapshot).unwrap_err();
+        assert!(crate::storage::write_was_published(&error));
+        assert!(error.to_string().contains("was cleared"));
+        let actual = crate::profile::load_registry(&path).unwrap();
+        assert!(actual.default.is_none());
+        assert_eq!(actual.profiles, external.profiles);
+    }
 }

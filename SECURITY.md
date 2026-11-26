@@ -20,6 +20,16 @@ Do not include real server passwords, private keys, passphrases, tokens, product
 - **Append-only audit log.** Mutating/active operations and attempted remote operations that fail during policy setup are recorded as JSONL in `audit.jsonl`, including the selected login `user`; home-scoped operations use the active home and global profile-registry mutations use the built-in default home. Cooperating `sshw` processes serialize each complete JSON record with an advisory file lock. Because audit is best-effort, a busy record lock is retried for 100 milliseconds and then the record is skipped.
 - **Output and audit redaction.** Best-effort masking of secret-looking strings.
 
+Endpoint edits: `endpoint --host/--port` changes only connection metadata after explicit confirmation (or --yes), preserving account/password/privilege references. It never reads secrets or moves host approvals. The changed destination must still pass the existing known_hosts verification before authentication; editing metadata does not authorize a new host key. Existing configuration locking, CAS and published-durability reporting apply.
+
+Scoped diagnostics: `doctor <server> --user <registered-login>` limits credential reads and SSH-agent probes to that login, while keeping common home/backend/audit/policy and host-trust diagnostics. Unknown accounts fail before probes. It does not connect, bypass policy, or authenticate.
+
+Download directory selection: `get --into <directory>` derives a single local filename from the decoded remote source and keeps the original remote policy checks. Invalid local components and Windows reserved/alternate-stream names are rejected. Existing staged owner-only download, no-clobber/explicit overwrite and failure preservation still apply. `policy check-get --into` shares resolution without filesystem creation, credentials or SSH; conditional argument validation precedes runtime setup.
+
+Deletion default selection: `remove` and `profile remove` accept `--switch-default <name>` or `--clear-default` only while removing the current default. Replacements are registered, distinct entries; an explicit profile replacement is locally validated before publication. Omitted options preserve the existing automatic selection. These options do not change remote accounts or files, credential namespaces, host approvals or other registrations. Profile removal still leaves its home and credentials intact; server removal keeps the existing scoped credential/account-grant cleanup and partial-application reporting.
+
+Hidden password prompts identify server/login and privilege method/target, applying secret-pattern masking to each identifier. They do not display password values, add secret arguments, or alter redirected stdin/authentication behavior. sudo's password requirements remain controlled by the server's sudoers settings.
+
 Credentials: password authentication and privilege escalation passwords store secrets only through the native OS credential store, or — opt-in — a session-only in-memory backend that never persists. At run time, the session-only backend reads login passwords from `SSHW_PASSWORD` and privilege passwords from `SSHW_PRIVILEGE_PASSWORD`, then removes both variables from this process environment. `add --password-stdin`, `account add --password-stdin`, and `privilege set --password-stdin` may read registration passwords from stdin and store them in the active credential backend; `sshw` intentionally does not provide a `--password <value>` argument. The session-only backend separates login and privilege purposes, but applies each purpose's single environment seed to whichever registered account the invocation selects, so it does not provide the per-account credential isolation of the native backend. SSH agent authentication stores no secret in `sshw`.
 
 ## Release Integrity And Provenance
@@ -38,7 +48,7 @@ Attestations establish where and how an artifact was built (repository, workflow
 
 `sshw doctor` reports the libssh2 and OpenSSL version/status that the current binary was built to use. This is diagnostic evidence for vulnerability triage, not a security guarantee and not a replacement for checksum or attestation verification. On Windows default builds, OpenSSL may be reported as not linked because libssh2 uses the Windows WinCNG backend.
 
-Config and profile registry relationships are validated fail-closed: a default server must exist, every server default user must reference a registered account, every account credential must belong to its exact home/purpose/server/user boundary or a non-colliding legacy server credential, and profile homes must be absolute. Config schema v1 is read as one default account without rewriting on read; the next successful mutation persists schema v2 without deleting the legacy credential. For recovery from a legacy relative-home registry, `doctor` can report the registry error and `profile remove <affected-name>` may remove only that exact entry when the remainder validates strictly. The recovery path never interprets a relative home against the current working directory; selection, list, show, default, and remote operations remain blocked until the registry is valid.
+Config and profile registry relationships are validated fail-closed: a default server must exist, every server default user must reference a registered account, every account credential must belong to its exact home/purpose/server/user boundary or a non-colliding legacy server credential, and profile homes must be absolute. Config schema v1 is read as one default account without rewriting on read; the next successful mutation persists schema v2. Legacy credentials remain until an operation replaces or removes them; `rename` copies them to the new name's credential boundary before saving. For recovery from a legacy relative-home registry, `doctor` can report the registry error and `profile remove <affected-name>` may remove only that exact entry when the remainder validates strictly. The recovery path never interprets a relative home against the current working directory; selection, list, show, default, and remote operations remain blocked until the registry is valid.
 
 ## Limitations (Not Guarantees)
 
@@ -80,7 +90,29 @@ sshw's own failures map to stable exit codes for agent consumption: `2` safety, 
 
 ## CLI configuration changes
 
+doctor·서버/계정/승격 lookup 복구는 실제 selected context를 보존합니다. 상속된 서버 설정의 trust/credential 쓰기는 명시 global임을 설명하고 자동 프로젝트 쓰기 차단을 우회하지 않습니다. 민감/control/stale binding에는 copy command를 생략하며 typed lookup은 다른 외부 오류 분류를 덮어쓰지 않습니다. trust 질문은 실제 endpoint·서버 설정 출처·config/known_hosts를 표시하고 값별 마스킹·제어문자 이스케이프를 적용합니다. readiness→fetch→사용자 확인→같은 지문 재검증/저장 순서와 취소/--yes 의미 유지, 새 credential 조회/자동 수리/승인 없음.
+
+`add` 주소 충돌은 기존 config/3과 저장/비밀 변경 전 거절을 유지하면서 계정·비밀·승격을 보존하는 scoped endpoint 안내를 먼저 제공합니다. `--replace`의 명시적 전체 교체 계약은 바꾸지 않습니다. 자동 project init은 최종 두 출처가 local이고 정책이 존재할 때만 미사용 global registry를 건너뛰고, 잠금 뒤 파일/모드 의존성을 다시 검사합니다. 정책 복사나 global 출처가 새로 필요해지면 실제 global을 해석하며 잘못된 global을 비활성 정책으로 바꾸지 않습니다. 명시 selector·기존 source isolation·CAS·부분 실패 보존 계약 유지.
+
+서버 등록의 trust/run 후속 안내와 빈 목록 등록 안내는 실제 settings 출처를 보존합니다. 프로필 namespace를 `--home`으로 바꾸지 않고, project-dir/명시 global/강제 policy도 필요한 후속에 유지합니다. 민감·제어 문자·재현 불가 binding에는 잘못된 대체 명령을 만들지 않습니다. 빈 inherited 목록은 기존 쓰기 차단을 우회하지 않고 글로벌 등록 또는 로컬 목록 초기화의 명시 선택만 안내합니다. 안내 생성은 credential/SSH/host approval 부작용이 없고, 목록의 JSON 배열·read-only 계약을 유지합니다.
+
+현재 폴더의 `.sshw`는 서버 목록과 권한을 독립적으로 선택합니다. 파일 누락/명시 글로벌 항목만 기본 프로필을 상속하고, 로컬 목록은 병합하거나 미등록 서버를 글로벌에서 찾지 않습니다. 명시적 home/profile/SSHW_HOME은 자동 발견을 건너뛰고 `--global`은 cwd·SSHW_HOME을 무시합니다. 상위 폴더는 찾지 않으며 잘못된 선택·필수 데이터는 fail-closed입니다. 로컬 정책은 글로벌 정책을 대체하며 권한을 더 넓힐 수 있으므로 신뢰하지 않는 프로젝트 정책을 보안 sandbox로 취급하지 마세요.
+
+프로젝트의 상속 항목 변경은 config/3으로 차단합니다. 글로벌 변경은 `--global`, 로컬 변경은 `project init`으로 대상을 명시해야 합니다. 로컬 삭제·이름 변경이 상속된 글로벌 계정 규칙을 바꿔야 하는 경우도 저장 전에 막습니다. 서버 출처가 credential backend/namespace/known_hosts를 결정하며 글로벌 서버 상속은 기존 namespace를 보존하고, 로컬 목록은 비밀·승인을 복사하지 않습니다. `project init`은 기존 글로벌 정책의 규칙·enabled 상태만 새 로컬 시작본에 복사합니다.
+
+프로젝트 출처는 `.project.lock`과 선택한 데이터의 기존 잠금·revision으로 재검사합니다. 초기화는 출처를 먼저 저장해 중간 실패 동안 필수 데이터 누락을 오류로 처리하며 기존 파일을 보존하는 재시도를 지원합니다. 파일 간 단일 transaction이나 동일 사용자 공격 방지는 아닙니다. 감사는 로컬 audit에 출처를 마스킹해 기록하며, 실제 credential/trust·정책 검사는 선택한 출처에서 그대로 수행합니다. 자세한 계약은 [프로젝트 설정](docs/reference.ko.md#현재-폴더의-프로젝트-설정)을 참고하세요.
+
+프로젝트 복구 명령은 절대 `--project-dir`과 셸 인용을 보존하고 민감/제어 문자/표현 불가능 경로에는 복사 가능한 명령을 생략합니다. `project init/status`는 저장된 enablement와 이번 `--policy` 강제·실제 적용을 구분합니다. 정책 손상이나 강제 시 파일 누락은 `blocked`/`enforced:null`이며 비활성으로 숨기지 않습니다. 로컬 활성화 안내는 명시적으로 실행해야 적용되고, 상속된 글로벌 정책은 기존처럼 쓰기를 막고 로컬 초기화만 안내합니다. status는 정책 관찰만 하며 비밀 조회·SSH·잠금·감사 쓰기를 하지 않습니다.
+
+Server/account removal also removes the matching `allow_accounts` grants, including from disabled policy files, while preserving unrelated grants and command/path rules. Present invalid policy files block the operation before config/credential changes. Config and policy are separate atomic saves under the home lock and revision checks; post-publication failures identify the applied removal and failed stage, and stale grants must be repaired before name reuse. Scoped `doctor <name>` only looks up that server's credential entries and local trust, while retaining home-wide validation and diagnostics; it never falls back to another server or connects to SSH.
+
+`password --privilege` preserves the configured sudo/su method, target and login authentication. It rotates only the selected account's privilege secret, using the login account for namespace ownership and the saved privilege target as backend username. Missing and passwordless configurations are rejected rather than changed implicitly. `show` reads only config metadata, including account/privilege references; it never retrieves secret values or checks remote access.
+
+`password` updates an existing password account's saved login credential without reading the old secret or changing the SSH account's remote password. It preserves other accounts, privilege settings, policy and host approval. New references are stored before config publication; pre-publication failures attempt rollback, post-publication durability failures retain both generations, and obsolete cleanup failures identify the applied account. Agent authentication requires an explicit separate method change. Shell completion only reads local metadata, uses literal AST data without evaluating expressions, and never reads credentials or executes the command being completed.
+
 Updating a server at the same host/port preserves other registered accounts and privilege metadata. Changing host/port requires explicit `--replace`, which resets the account set and cleans up stale secrets only after config publication. Policy CLI mutations preserve strict parsing, use the home lock and a revision check, and never put full command rules into audit detail. Upload permissions default to 600; explicit `put --mode` accepts only ordinary 000–777 permission bits.
+
+`rename` preserves the endpoint and host approval, rekeys saved login/privilege credentials within the selected home/profile, and moves account allowlist rules to the new alias. Existing destination servers and destination account rules are rejected. Config and policy are separate atomic saves under the home lock and revision checks: config is published first, so enforced policy denies the new name's non-default accounts until their rules follow. A failure after config publication reports the applied name and failed stage; it does not imply a two-file transaction or undo the rename.
 
 ## 추가 전송·출력 옵션의 경계
 
@@ -94,7 +126,23 @@ Updating a server at the same host/port preserves other registered accounts and 
 
 `policy check-put/check-get`은 로컬 사전 검사입니다. 실제 전송과 공통 검사의 순서·첫 실패를 공유하고, `check-put`은 접근 검사 뒤 로컬 일반 파일의 읽기 가능 여부를 확인하되 내용을 읽지 않습니다. 시점 검사이므로 전송 시 파일을 다시 열고 그 handle의 metadata를 검증하는 기존 경계를 대체하지 않습니다. SSH 인증, 원격 OS 권한과 POSIX rename 지원을 검증하지 않으며 `--yes`나 policy allow가 원격 권한을 부여하지 않습니다. 원자적 교체 실패의 SFTP status는 해당 protocol 오류에서만, cleanup 이전에 읽으며 transport 오류에 stale status를 적용하지 않습니다.
 
-## Native SSH 의존성의 알려진 보안 제한 (0.13.0)
+`put/get --progress`는 경로·비밀 없이 숫자와 단계만 stderr에 표시합니다. 데이터가 모두 이동한 시점은 완료 보장이 아니며 기존 원격 완료 검증·다운로드 staging 반영·atomic rename 뒤에만 성공을 표시합니다. 표시 실패는 전송을 중단하거나 재시도하지 않으며 기존 절대 timeout과 정책 검사는 유지됩니다. `default --clear`와 `profile default --clear`는 선택만 해제하고 자격 증명·권한·host trust를 바꾸지 않습니다. 서버 기본값 해제 뒤에는 명시적 서버가 필요하고, 프로필 해제는 기존 selector 우선순위와 별도 credential namespace를 유지합니다.
+
+정책 복구 `suggestions`는 허용 범위와 명령만 안내하며 자동으로 정책을 변경·활성화하지 않습니다. 프로그램/명령 prefix·경로 descendants의 범위를 확인한 뒤 직접 적용해야 합니다. 비밀 패턴·제어 문자와 무효 path는 복사 명령을 생략하며 같은 home/profile·값별 마스킹·셸 인용을 유지합니다. 계정 정책·첫 오류·safety·원격 OS 권한은 그대로입니다.
+
+`test`는 등록된 명시적 서버·선택 계정의 기존 정책·known_hosts·로그인 인증을 적용하는 네트워크 작업입니다. 알 수 없거나 바뀐 키를 자동 승인하거나 원격 명령 채널·전송·승격을 열지 않습니다. 저장소·신뢰 파일을 바꾸지 않고 감사 기록만 남깁니다. 서버의 로그인 감사나 인증 시도 제한에는 실제 접속이 기록될 수 있습니다. 기존 연결/인증 timeout을 사용하며 `doctor`·사전 검사에 네트워크 작업을 추가하지 않습니다. 아래 native 의존성의 보안 제한은 test에도 동일하게 적용됩니다.
+
+`account remove --switch-default`는 로컬 기본 로그인 선택과 기존 등록만 한 config 저장으로 교체합니다. 대체 계정은 이미 등록돼 있어야 하고 기본 계정으로서 기존 암묵적 policy 허용을 받습니다. 삭제 대상의 로그인/승격 credential·정확한 account grant만 정리하며 대체 계정이나 같은 승격 대상의 다른 credential은 유지합니다. 원격 계정 삭제·파일 변경·SSH 접속은 없습니다. config→policy→credential 순서와 저장 후 부분 적용·새 기본값 보고를 유지합니다.
+
+`profile rename`은 registry key/default 이름만 바꾸며 내부 id와 home을 유지합니다. credential namespace를 새로 만들거나 비밀을 읽고 이동하지 않으며, policy/host trust·home 내용도 그대로입니다. 기존 대상 이름을 덮어쓰지 않고 strict registry·잠금·revision·원자 저장·감사를 유지합니다. home의 현재 내용을 검사하지 않았으므로 rename 성공이 로그인/원격 권한 검증을 뜻하지 않습니다. 저장 후 내구성 확인 실패는 실제 저장된 새 이름을 안내합니다.
+
+## Native SSH 의존성 (0.16.0)
+
+0.16.0은 공식 `libssh2-sys 0.3.4`에 포함된 libssh2 `1.11.2_DEV` 소스([a210464](https://github.com/libssh2/libssh2/tree/a210464622240e589543ca848186decda225e3fa))를 사용합니다. crates.io 아카이브의 SHA-256은 `fce5a0b125f6aeac93b304b35f7f1e9f054aad29ddac57091928e41df3ccd233`입니다. 공개 아카이브에는 아래 0.3.3에서 빠졌던 [CVE-2026-66035 수정](https://github.com/libssh2/libssh2/commit/42e33d81577ed4b95d4b4f6f845e5ee8efe5eeb4)과 [CVE-2026-66033 수정](https://github.com/libssh2/libssh2/commit/a2ed82d40964bbc0d64cd717aa0a5a892117d2e6)이 들어 있습니다. 시스템 libssh2를 지정해 별도로 빌드하면 적용 범위는 실제 링크된 라이브러리에 따릅니다. `sshw doctor`로 현재 실행 파일이 사용하는 버전을 확인할 수 있습니다.
+
+이 소스는 SHA-1 기반 키 교환·호스트 서명·MAC과 DSA, 3DES 등 일부 오래된 알고리즘을 기본 비활성화합니다. 이런 알고리즘만 지원하는 서버는 연결 설정과 지원 알고리즘을 확인해야 합니다. 이 업데이트는 확인한 수정에 대한 설명이며 native 코드 전체의 안전을 보장하지 않습니다.
+
+## 0.13.0–0.15.x의 알려진 Native SSH 보안 제한
 
 0.13.0은 사용성 개선 릴리스입니다. Cargo 설치와 공식 실행 파일은 기존 공식 `ssh2`와 `libssh2-sys 0.3.3`을 사용하며, native SSH 보안 문제가 모두 해결됐다고 보장하지 않습니다. 새 자체 의존성 패키지는 도입하지 않습니다.
 

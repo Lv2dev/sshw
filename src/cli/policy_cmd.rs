@@ -6,8 +6,8 @@ use super::{
 use crate::error::{ResultErrorKindExt, app_error};
 use crate::output::{ErrorKind, redact_secrets};
 use crate::policy::{
-    AccountRule, Policy, PolicyExplanation, PolicyFile, load_policy_with_revision, resolve_policy,
-    save_policy_if_unchanged,
+    AccountRule, Policy, PolicyExplanation, PolicyFile, PolicyState, load_policy_with_revision,
+    resolve_policy, save_policy_if_unchanged,
 };
 use clap::{Args, Subcommand};
 use serde_json::json;
@@ -40,16 +40,21 @@ pub enum PolicyCommand {
     /// Explain run safety, account and policy checks without SSH or credentials.
     Check(PolicyCheckArgs),
     /// Check upload rules and local file readability, without SSH or credentials.
+    #[command(mut_arg("into", |arg| arg.hide(true)))]
     CheckPut(PolicyTransferCheckArgs),
     /// Check download path/account rules and local overwrite confirmation.
+    #[command(mut_arg("atomic", |arg| arg.hide(true)))]
     CheckGet(PolicyTransferCheckArgs),
 }
 
 #[derive(Debug, Args)]
 pub struct PolicyTransferCheckArgs {
     /// Same target order as put/get: [server] <source> <destination>.
-    #[arg(value_name = "TARGET", num_args = 2..=3, required = true)]
+    #[arg(value_name = "TARGET", num_args = 1..=3, required = true)]
     pub target: Vec<String>,
+    /// For check-get, use [server] <remote> and derive the filename inside this directory.
+    #[arg(long, value_name = "DIRECTORY")]
+    pub into: Option<std::path::PathBuf>,
     /// Registered login account (default: server default).
     #[arg(long)]
     pub user: Option<String>,
@@ -99,15 +104,35 @@ pub struct PolicyCheckArgs {
     pub no_password: bool,
 }
 
-pub(super) fn run_policy(args: PolicyArgs, ctx: &ExecContext<'_>) -> anyhow::Result<CommandOutput> {
+pub(super) fn missing_policy_hint(ctx: &ExecContext<'_>, global: bool) -> String {
+    if let Some(project) = &ctx.home.project
+        && project.policy == crate::project::ResourceSource::Global
+    {
+        let directory = project.root.parent().unwrap_or(&project.root);
+        let hint = crate::project::initialization_hint(directory, false, true);
+        return format!(
+            "the policy is inherited and read-only here. {hint}, or intentionally initialize the global policy with an explicit --global selection"
+        );
+    }
+    match super::policy_recovery::launcher(ctx, global) {
+        Some(prefix) => format!("create the policy file for these settings with `{prefix} policy init`, then review its allowlist"),
+        None => "use the original settings selection to initialize its policy file, then review the allowlist".into(),
+    }
+}
+
+pub(super) fn run_policy(
+    args: PolicyArgs,
+    ctx: &ExecContext<'_>,
+    global: bool,
+) -> anyhow::Result<CommandOutput> {
     if let PolicyCommand::Check(check) = args.command {
-        return check_run(check, args.json, ctx);
+        return check_run(check, args.json, ctx, global);
     }
     if let PolicyCommand::CheckPut(check) = args.command {
-        return check_transfer(check, true, args.json, ctx);
+        return check_transfer(check, true, args.json, ctx, global);
     }
     if let PolicyCommand::CheckGet(check) = args.command {
-        return check_transfer(check, false, args.json, ctx);
+        return check_transfer(check, false, args.json, ctx, global);
     }
     let action = match &args.command {
         PolicyCommand::Init => "init",
@@ -121,17 +146,28 @@ pub(super) fn run_policy(args: PolicyArgs, ctx: &ExecContext<'_>) -> anyhow::Res
         }
     };
     let mutating = action != "show";
+    if mutating {
+        crate::project::ensure_writable(ctx.home, false, true)?;
+    }
     let _lock = if mutating {
-        Some(
-            crate::storage::acquire_exclusive_lock(&ctx.home.root.join(".sshw.lock"))
-                .with_error_kind(ErrorKind::Policy)?,
-        )
+        crate::project::acquire_write_locks(ctx.home, false, true)
+            .with_error_kind(ErrorKind::Policy)?
     } else {
-        None
+        Vec::new()
     };
     let result = (|| {
-        let (existing, revision) =
-            load_policy_with_revision(&ctx.home.policy_path).with_error_kind(ErrorKind::Policy)?;
+        let (existing, revision) = load_policy_with_revision(&ctx.home.policy_path)
+            .map_err(|error| {
+                if mutating {
+                    error
+                } else {
+                    let message = format!(
+                        "policy enforcement: blocked (invalid or unreadable policy)\n{error}"
+                    );
+                    error.context(message)
+                }
+            })
+            .with_error_kind(ErrorKind::Policy)?;
         if action == "init" && existing.is_some() {
             return Err(app_error(
                 ErrorKind::Policy,
@@ -142,7 +178,10 @@ pub(super) fn run_policy(args: PolicyArgs, ctx: &ExecContext<'_>) -> anyhow::Res
         {
             return Err(app_error(
                 ErrorKind::Policy,
-                "policy file is missing; run 'sshw policy init' first",
+                format!(
+                    "policy file is missing\nnext: {}",
+                    missing_policy_hint(ctx, global)
+                ),
             ));
         }
         let present = existing.is_some();
@@ -172,9 +211,10 @@ pub(super) fn run_policy(args: PolicyArgs, ctx: &ExecContext<'_>) -> anyhow::Res
                 .with_error_kind(ErrorKind::Policy)?;
         }
         let file_present = present || mutating;
-        let enforced = file.enabled || ctx.policy_forced;
+        let policy_status =
+            PolicyState::from_file(file_present.then_some(&file), ctx.policy_forced);
         let mut value = json!({"ok":true,"action":action,"path":ctx.home.policy_path,
-            "present":file_present,"policy":file,"enforced":enforced,"forced":ctx.policy_forced});
+            "present":file_present,"policy":file,"enforced":policy_status.requested_enabled(),"forced":ctx.policy_forced,"policy_status":policy_status});
         if mutating {
             value["changed"] = json!(changed);
             value["change"] = json!(change);
@@ -188,32 +228,9 @@ pub(super) fn run_policy(args: PolicyArgs, ctx: &ExecContext<'_>) -> anyhow::Res
         } else {
             String::new()
         };
-        let saved_enabled = if file_present {
-            file.enabled.to_string()
-        } else {
-            "not configured".to_string()
-        };
-        let reason = if ctx.policy_forced {
-            "forced by --policy"
-        } else if !file_present {
-            "policy file missing"
-        } else if file.enabled {
-            "enabled in policy file"
-        } else {
-            "disabled in policy file"
-        };
-        let mut status = format!(
-            "policy file: {}\nsaved enabled: {saved_enabled}\npolicy enforcement: {} ({reason})\n",
-            if file_present { "present" } else { "missing" },
-            if enforced { "on" } else { "off" }
-        );
+        let mut status = policy_status.render();
         if !file_present {
-            status.push_str("next: using the same home/profile selection, run `sshw policy init` to create the policy file\n");
-            if ctx.policy_forced {
-                status.push_str(
-                    "--policy requires a policy file; operations fail closed until it exists\n",
-                );
-            }
+            status.push_str(&format!("next: {}\n", missing_policy_hint(ctx, global)));
         } else if ctx.policy_forced && !file.enabled {
             status.push_str("next: remove --policy from the invocation to use the saved disabled setting; keep the same home/profile selection\n");
         }
@@ -305,6 +322,7 @@ fn check_run(
     args: PolicyCheckArgs,
     json_output: bool,
     ctx: &ExecContext<'_>,
+    global: bool,
 ) -> anyhow::Result<CommandOutput> {
     let config = load_active_config(ctx.home)?;
     // Match run's loading and target-resolution order before evaluating checks.
@@ -342,6 +360,20 @@ fn check_run(
         .first()
         .map(|error| crate::output::classify_error(error).exit_code())
         .unwrap_or(0);
+    let errors: Vec<_> = errors
+        .into_iter()
+        .map(|error| {
+            super::lookup_recovery::attach(
+                super::policy_recovery::attach(error, ctx, global),
+                ctx,
+                global,
+            )
+        })
+        .collect();
+    let suggestions: Vec<_> = errors
+        .iter()
+        .flat_map(|error| crate::output::ErrorResponse::from_error(error).suggestions)
+        .collect();
     let reasons: Vec<_> = errors
         .iter()
         .map(|error| redact_secrets(&error.to_string()))
@@ -362,6 +394,9 @@ fn check_run(
     let mut checks = BTreeMap::from([("command", policy.explain_command(&command))]);
     add_account_explanation(&mut checks, &policy, &config, &name, Some(user));
     value["policy"] = policy_report(ctx, &policy, checks);
+    if !suggestions.is_empty() {
+        value["suggestions"] = serde_json::to_value(suggestions)?;
+    }
     redact_json(&mut value);
     let stdout = if json_output {
         format!("{value}\n")
@@ -392,6 +427,7 @@ fn check_transfer(
     upload: bool,
     json_output: bool,
     ctx: &ExecContext<'_>,
+    global: bool,
 ) -> anyhow::Result<CommandOutput> {
     use super::transfer;
     if !upload && args.atomic {
@@ -407,9 +443,11 @@ fn check_transfer(
     let (name, local, remote) = if upload {
         transfer::resolve_put_target(args.target, &config)?
     } else {
-        let (name, remote, local) = transfer::resolve_get_target(args.target, &config)?;
+        let (name, remote, local) =
+            transfer::resolve_get_target(args.target, args.into.as_deref(), &config)?;
         (name, local, remote)
     };
+    let mut local_destination_status = "not_checked";
     let access = if upload {
         transfer::check_put_access(
             &name,
@@ -425,10 +463,25 @@ fn check_transfer(
             &name,
             args.user.as_deref(),
             &remote.value,
-            &local,
-            args.yes,
             sandbox.as_ref(),
             &config,
+            || {
+                let result = crate::storage::check_download_destination(&local, args.yes);
+                local_destination_status = match &result {
+                    Ok(()) => "ready",
+                    Err(error)
+                        if error.chain().any(|cause| {
+                            cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                                error.kind() == std::io::ErrorKind::AlreadyExists
+                            })
+                        }) =>
+                    {
+                        "overwrite_confirmation_required"
+                    }
+                    Err(_) => "blocked",
+                };
+                result
+            },
         )
     };
     let access_allowed = access.is_ok();
@@ -454,6 +507,7 @@ fn check_transfer(
     });
     let local_file_ready = local_file_checked.then(|| validation.is_ok());
     let mut reasons = Vec::new();
+    let mut suggestions = Vec::new();
     let mut exit_code = 0;
     if let Err(error) = validation {
         let kind = crate::output::classify_error(&error);
@@ -461,7 +515,13 @@ fn check_transfer(
             return Err(error);
         }
         exit_code = kind.exit_code();
+        let error = super::lookup_recovery::attach(
+            super::policy_recovery::attach(error, ctx, global),
+            ctx,
+            global,
+        );
         let diagnostic = crate::output::ErrorResponse::from_error(&error);
+        suggestions = diagnostic.suggestions;
         let mut reason = diagnostic.error.message;
         // Each cause is already redacted and consecutive wrapper duplicates
         // are removed. A path diagnostic may also include its OS cause inline.
@@ -478,6 +538,9 @@ fn check_transfer(
         "server":name,"user":user,"local":local,"remote":remote.value,"reasons":reasons,
         "access_allowed":access_allowed,"local_file_checked":local_file_checked,"local_file_ready":local_file_ready,
         "connection_tested":false,"credentials_checked":false,"remote_permissions_checked":false});
+    if !upload {
+        value["local_destination_status"] = json!(local_destination_status);
+    }
     let mut checks = BTreeMap::from([(operation, policy.explain_path(&remote.value, upload))]);
     if upload
         && args.atomic
@@ -487,6 +550,9 @@ fn check_transfer(
     }
     add_account_explanation(&mut checks, &policy, &config, &name, user);
     value["policy"] = policy_report(ctx, &policy, checks);
+    if !suggestions.is_empty() {
+        value["suggestions"] = serde_json::to_value(suggestions)?;
+    }
     redact_json(&mut value);
     let stdout = if json_output {
         format!("{value}\n")
@@ -535,8 +601,12 @@ fn policy_report(
     policy: &Policy,
     checks: BTreeMap<&'static str, PolicyExplanation>,
 ) -> serde_json::Value {
-    json!({"path":ctx.home.policy_path,"enforced":matches!(policy, Policy::Enabled(_)),
-        "forced":ctx.policy_forced,"checks":checks})
+    let mut report = json!({"path":ctx.home.policy_path,"enforced":matches!(policy, Policy::Enabled(_)),
+        "forced":ctx.policy_forced,"checks":checks});
+    if ctx.home.project.is_some() {
+        report["settings_sources"] = crate::project::sources(ctx.home);
+    }
+    report
 }
 
 fn human_policy_report(value: &serde_json::Value) -> String {

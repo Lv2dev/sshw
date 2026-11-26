@@ -22,6 +22,29 @@ pub trait Prompter {
 
 pub(crate) struct TerminalPrompter;
 
+pub(super) fn login_password_prompt(server: &str, user: &str) -> String {
+    format!(
+        "SSH password for '{}/{}': ",
+        super::hints::redacted_argument(server),
+        super::hints::redacted_argument(user)
+    )
+}
+
+pub(super) fn privilege_password_prompt(
+    server: &str,
+    login_user: &str,
+    method: crate::config::PrivilegeMethod,
+    target: &str,
+) -> String {
+    format!(
+        "Privilege password for '{}/{}' ({} target: {}): ",
+        super::hints::redacted_argument(server),
+        super::hints::redacted_argument(login_user),
+        super::privilege::method_label(method),
+        super::hints::redacted_argument(target)
+    )
+}
+
 impl Prompter for TerminalPrompter {
     fn ensure_confirmation_available(&mut self, option: &str) -> anyhow::Result<()> {
         check_confirmation_terminal(io::stdin().is_terminal(), option)

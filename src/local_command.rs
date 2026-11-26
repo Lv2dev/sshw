@@ -11,6 +11,18 @@ pub(crate) fn redacted_argument(value: &str) -> String {
     }
 }
 
+pub(crate) fn display_value(value: &str) -> String {
+    let mut text = String::new();
+    for ch in redacted_argument(value).chars() {
+        if ch.is_control() {
+            text.extend(ch.escape_default());
+        } else {
+            text.push(ch);
+        }
+    }
+    text
+}
+
 pub(crate) fn quote_local_argument(value: &str) -> String {
     let value = redacted_argument(value);
     if cfg!(windows) {

@@ -297,6 +297,100 @@ pub struct PolicyStatus {
     pub enabled: bool,
 }
 
+/// File state and effective enforcement for the same observed policy snapshot.
+#[derive(Serialize)]
+pub(crate) struct PolicyState {
+    pub present: bool,
+    pub valid: bool,
+    pub saved_enabled: Option<bool>,
+    pub forced: bool,
+    pub enforced: Option<bool>,
+    pub state: &'static str,
+}
+
+impl PolicyState {
+    pub(crate) fn from_file(file: Option<&PolicyFile>, forced: bool) -> Self {
+        let saved_enabled = file.map(|file| file.enabled);
+        let enforced = match saved_enabled {
+            Some(saved) => Some(forced || saved),
+            None if forced => None,
+            None => Some(false),
+        };
+        Self {
+            present: file.is_some(),
+            valid: true,
+            saved_enabled,
+            forced,
+            enforced,
+            state: match enforced {
+                Some(true) => "on",
+                Some(false) => "off",
+                None => "blocked",
+            },
+        }
+    }
+
+    pub(crate) fn inspect(path: &Path, forced: bool) -> (Self, Option<anyhow::Error>) {
+        match load_policy_with_revision(path) {
+            Ok((file, _)) => {
+                let error = (forced && file.is_none()).then(|| missing_required_policy(path));
+                (Self::from_file(file.as_ref(), forced), error)
+            }
+            Err(error) => (
+                Self {
+                    present: true,
+                    valid: false,
+                    saved_enabled: None,
+                    forced,
+                    enforced: None,
+                    state: "blocked",
+                },
+                Some(error),
+            ),
+        }
+    }
+
+    // Keep the original boolean in older JSON fields. Consumers that need
+    // to distinguish blocked from on/off use the effective enforcement above.
+    pub(crate) fn requested_enabled(&self) -> bool {
+        self.forced || self.saved_enabled == Some(true)
+    }
+
+    pub(crate) fn render(&self) -> String {
+        let saved = match self.saved_enabled {
+            Some(true) => "true",
+            Some(false) => "false",
+            None if self.valid => "not configured",
+            None => "unknown (invalid or unreadable policy)",
+        };
+        let reason = if !self.valid {
+            "invalid or unreadable policy. Operations fail closed"
+        } else if self.forced && !self.present {
+            "--policy requires a policy file. Operations fail closed"
+        } else if self.forced {
+            "forced by --policy"
+        } else if !self.present {
+            "policy file missing"
+        } else if self.saved_enabled == Some(true) {
+            "enabled in policy file"
+        } else {
+            "disabled in policy file"
+        };
+        format!(
+            "policy file: {}\nsaved enabled: {saved}\npolicy enforcement: {} ({reason})\n",
+            if self.present { "present" } else { "missing" },
+            self.state
+        )
+    }
+}
+
+fn missing_required_policy(path: &Path) -> anyhow::Error {
+    anyhow::anyhow!(
+        "policy enforcement requested (--policy) but no policy file at {}",
+        path.display()
+    )
+}
+
 /// Resolve the enforcement state. `force_enable` is the `--policy` flag.
 ///
 /// Fail-closed rules:
@@ -309,10 +403,7 @@ pub struct PolicyStatus {
 pub fn resolve_policy(policy_path: &Path, force_enable: bool) -> Result<Policy> {
     let Some(contents) = read_optional_policy(policy_path)? else {
         if force_enable {
-            return Err(anyhow::anyhow!(
-                "policy enforcement requested (--policy) but no policy file at {}",
-                policy_path.display()
-            ));
+            return Err(missing_required_policy(policy_path));
         }
         return Ok(Policy::Disabled);
     };
@@ -332,29 +423,11 @@ pub fn resolve_policy(policy_path: &Path, force_enable: bool) -> Result<Policy> 
 
 /// Describe the policy file without enforcing or erroring, for `doctor`.
 pub fn describe_policy(policy_path: &Path, force_enable: bool) -> PolicyStatus {
-    match read_optional_policy(policy_path) {
-        Ok(None) => PolicyStatus {
-            present: false,
-            valid: true,
-            enabled: force_enable,
-        },
-        Ok(Some(contents)) => match parse_policy_file(policy_path, &contents) {
-            Ok(file) => PolicyStatus {
-                present: true,
-                valid: true,
-                enabled: force_enable || file.enabled,
-            },
-            Err(_) => PolicyStatus {
-                present: true,
-                valid: false,
-                enabled: force_enable,
-            },
-        },
-        Err(_) => PolicyStatus {
-            present: true,
-            valid: false,
-            enabled: force_enable,
-        },
+    let (state, _) = PolicyState::inspect(policy_path, force_enable);
+    PolicyStatus {
+        present: state.present,
+        valid: state.valid,
+        enabled: state.requested_enabled(),
     }
 }
 
@@ -443,6 +516,15 @@ fn contains_shell_metacharacters(command: &str) -> bool {
             ';' | '&' | '|' | '`' | '$' | '(' | ')' | '<' | '>' | '\n' | '\r'
         )
     })
+}
+
+pub(crate) fn command_rule_kind(value: &str) -> &'static str {
+    let value = value.trim();
+    if contains_shell_metacharacters(value) {
+        "exact"
+    } else {
+        command_matches_simple(value, value).unwrap_or("exact")
+    }
 }
 
 fn path_is_allowed(allowlist: &[String], path: &str) -> bool {

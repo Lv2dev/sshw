@@ -1,5 +1,6 @@
 //! Same-directory SFTP staging with an explicit POSIX atomic rename.
 use super::ssh2_client::{OperationDeadline, timeout_millis};
+use super::{TransferPhase, TransferProgress, TransferProgressCallback};
 use crate::error::{ResultErrorKindExt, app_error};
 use crate::output::{ErrorKind, redact_secrets};
 use anyhow::Context;
@@ -51,6 +52,7 @@ pub(super) fn upload<R: Read>(
     remote: &str,
     mode: u32,
     deadline: &OperationDeadline,
+    progress: &mut TransferProgressCallback<'_>,
 ) -> anyhow::Result<u64> {
     let parent = parent_path(remote)?;
     let mut stage = "prepare local temporary name";
@@ -133,9 +135,19 @@ pub(super) fn upload<R: Read>(
                     ));
                 }
                 written += part;
+                sent += part as u64;
+                progress(TransferProgress {
+                    bytes: sent,
+                    total: size,
+                    phase: TransferPhase::Data,
+                });
             }
-            sent += count as u64;
         }
+        progress(TransferProgress {
+            bytes: sent,
+            total: size,
+            phase: TransferPhase::Finalizing,
+        });
         stage = "verify temporary size";
         deadline.apply(session)?;
         if remote_file.stat()?.size != Some(size) {

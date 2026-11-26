@@ -45,7 +45,7 @@ sshw:v3:<encoded-namespace>:privilege:<encoded-server>:<encoded-user>:<generatio
 
 namespace, server, user는 base64url로 인코딩하며 credential을 갱신할 때마다 새 generation을 발급합니다. legacy v1 키(`sshw:<namespace>:<server>`, `sshw:<namespace>:privilege:<server>`)와 server 범위 v2 키는 active namespace, purpose, server가 일치하고 다른 account와 충돌하지 않을 때만 읽기 호환을 유지하며 신규 저장은 v3를 사용합니다.
 
-`servers.json` schema v2는 각 server 아래 `default_user`와 username-keyed `accounts` map을 저장합니다. schema v1도 계속 읽을 수 있으며 기존 단일 `user`/`auth`와 최상위 `privileges` map의 같은 server 항목을 메모리에서 default account로 해석합니다. v1 server 객체 안의 중첩 `privilege` 필드는 허용하지 않습니다. read-only 명령은 파일을 바꾸지 않고, 다음 config mutation이 성공하면 legacy credential 참조를 유지한 채 schema v2로 저장합니다.
+`servers.json` schema v2는 각 server 아래 `default_user`와 username-keyed `accounts` map을 저장합니다. schema v1도 계속 읽을 수 있으며 기존 단일 `user`/`auth`와 최상위 `privileges` map의 같은 server 항목을 메모리에서 default account로 해석합니다. v1 server 객체 안의 중첩 `privilege` 필드는 허용하지 않습니다. read-only 명령은 파일을 바꾸지 않고, 다음 config mutation이 성공하면 schema v2로 저장합니다. legacy credential 참조는 해당 항목을 교체·제거하는 작업 전까지 유지합니다. `rename`은 저장 전에 새 이름의 참조로 복사합니다.
 
 ## home 선택
 
@@ -54,8 +54,9 @@ namespace, server, user는 base64url로 인코딩하며 credential을 갱신할 
 1. `--home <path>` — 일회성/프로젝트 로컬 home.
 2. `SSHW_HOME` — 환경변수로 동일.
 3. `--profile <name>` — 등록된 profile(없으면 에러).
-4. registry의 default profile.
-5. 내장 default profile home(`<config_dir>/sshw/profiles/default`).
+4. 현재 폴더의 `.sshw`에서 서버·권한을 각각 선택(`--global`이면 건너뜀).
+5. 상속 항목에 사용할 registry의 default profile.
+6. 내장 default profile home(`<config_dir>/sshw/profiles/default`).
 
 `--home`과 `--profile`은 함께 쓸 수 없습니다(exit code 3). 명시적 `--profile`과 비어 있지 않은 `SSHW_HOME`도 충돌 오류를 반환합니다. profile을 선택하려면 환경변수를 해제하고, 환경변수 home을 쓰려면 `--profile`을 생략하세요. 한쪽이 다른 쪽을 조용히 가리지 않습니다.
 
@@ -66,6 +67,56 @@ sshw --home ./.sshw list
 SSHW_HOME=./.sshw sshw list
 sshw --profile prod run web "uptime"
 ```
+
+## 현재 폴더의 프로젝트 설정
+
+명시적 home/profile/환경변수 선택이 없으면 `<cwd>/.sshw`만 확인하며 상위 폴더는 찾지 않습니다. 서버 목록과 권한은 각각 전체 항목 단위로 선택합니다. 로컬 서버 목록은 글로벌과 병합하지 않으며 빈 목록이나 미등록 서버도 글로벌에서 다시 찾지 않습니다. 글로벌 출처는 registry의 기본 프로필이며, 없으면 내장 기본 home입니다.
+
+선택 사항인 `.sshw/project.json`에서 각 출처를 지정합니다.
+
+```json
+{"version":1,"servers":"global","policy":"local"}
+```
+
+| 모드 | 해당 항목의 선택 |
+| --- | --- |
+| `auto`(기본값) | 로컬 `servers.json` / `policy.json` 항목이 있으면 로컬, 없으면 글로벌 |
+| `local` | 로컬 파일 필수, 없으면 오류 |
+| `global` | 글로벌 사용, 사용하지 않는 로컬 데이터는 무시 |
+
+`project.json`이 없으면 두 항목 모두 `auto`입니다. 로컬 파일 형식은 기존과 같습니다. 잘못된 프로젝트 메타데이터·미지원 버전·알 수 없는 필드·잘못된 `.sshw` 경로·필수 로컬 파일 누락은 config/3입니다. 선택한 데이터가 손상되면 해당 config/policy 오류로 종료하며 글로벌로 넘어가지 않습니다. 두 항목이 모두 로컬이면 사용하지 않는 글로벌 config/registry는 읽지 않습니다.
+
+```bash
+sshw project init                            # 글로벌 서버, 글로벌 권한의 로컬 시작본
+sshw project init --servers-source local     # 처음에는 빈 별도 서버 목록
+sshw project init --policy-source global     # 글로벌 권한 상속을 명시
+sshw project init --servers-source auto --policy-source auto
+sshw project status --json
+sshw --global list --json
+sshw --project-dir /work/app list --json      # .sshw가 들어 있는 폴더
+```
+
+첫 초기화에서 기존 로컬 파일은 `auto`로 유지하며, 파일이 없으면 글로벌 서버·로컬 권한을 기본으로 선택합니다. 새 로컬 권한은 글로벌 규칙과 활성화 상태를 복사하고, 글로벌 권한 파일이 없으면 기본 비활성 정책으로 시작합니다. 서버 데이터와 비밀번호는 복사하지 않습니다. 새 로컬 서버 목록은 비어 있습니다. 반복 초기화는 기존 데이터를 보존하고, 출처가 같으면 manifest bytes/mtime도 유지합니다. 글로벌로 바꿔도 로컬 파일은 남기며 `project init`은 글로벌 설정을 쓰지 않습니다.
+
+자동 초기화(`--project-dir` 포함)는 글로벌 프로필을 찾기 전에 변경 후 출처 모드를 판단합니다. 둘 다 로컬이고 정책 파일이 이미 있으면 미사용 글로벌 registry/config는 읽지 않습니다. 기존 `auto` 파일, 로컬 파일 위에 처음 manifest 생성, 빈 로컬 서버 목록 생성도 포함합니다. 명시적 `--home`/`--profile`/`--global`·`SSHW_HOME` 선택 규칙은 그대로입니다. 글로벌 출처나 새 로컬 정책 복사는 실제 글로벌 기준 출처가 필요합니다. 프로젝트/데이터 잠금을 잡은 뒤 의존성을 다시 계산하고 파일·출처가 바뀌어 글로벌이 필요해졌으면 저장 전에 다시 해석합니다. 필요한 글로벌 설정이 잘못돼도 비활성 대체 정책을 만들지 않고 오류로 멈추며 기존 CAS/no-op/부분 적용 계약을 유지합니다.
+
+`--global`은 cwd와 `SSHW_HOME`을 무시합니다. `--project-dir`은 `SSHW_HOME`을 무시하며 일반 명령에서는 해당 폴더에 `.sshw`가 있어야 하고, `project init`은 새로 만들 수 있습니다. 두 옵션은 서로 또는 `--home`/`--profile`과 함께 쓰면 usage/9입니다. 기존 명시적 home/profile/환경변수는 자동 발견을 건너뜁니다. `profile` 관리는 항상 글로벌 registry를 사용합니다. `project init/status`는 프로젝트 폴더를 명시적으로 관리하며, 함께 지정한 home/profile은 글로벌 기준 출처가 됩니다.
+
+프로젝트에서 상속한 서버·권한은 읽기 전용입니다. add/remove/password/trust 또는 policy allow/enable 같은 변경은 비밀번호 조회나 해당 데이터 쓰기 전에 config/3으로 거절합니다. 글로벌 변경은 `--global`로 명시하고 로컬 변경은 해당 항목부터 초기화하세요. 로컬 이름 변경·삭제가 상속된 글로벌 계정 허용 규칙까지 바꿔야 한다면 config/비밀 변경 전에 막으므로 로컬 권한을 먼저 초기화해야 합니다. 로컬 정책은 글로벌을 대체해 더 넓은 권한을 허용할 수도 있으며 변경 불가능한 보안 경계가 아닙니다.
+
+자격 증명·백엔드·known_hosts는 서버 출처를 따릅니다. 상속 서버는 정확히 기존 글로벌 namespace와 승인을 사용하고, 로컬 서버는 ad-hoc `.sshw` namespace와 로컬 known_hosts를 사용해 글로벌 비밀·승인을 가져오지 않습니다. 프로젝트 작업 기록은 `.sshw/audit.jsonl`에 저장하며 마스킹한 `settings` 출처를 추가합니다. 자동완성·doctor·실행·정책 사전 검사는 같은 선택을 따릅니다. doctor는 `settings_sources`, 정책 검사는 `policy.settings_sources`, `project status`는 `sources`를 제공하며 status는 비밀번호 조회나 접속을 하지 않습니다. 로컬 정책 복구 명령은 절대 `--project-dir`을 포함하고, 상속 정책은 설명만 제공하며 복사해 실행할 grant 명령은 만들지 않습니다.
+
+프로젝트 변경은 `.project.lock`과 선택한 항목의 `.sshw.lock`을 일정한 순서로 잡고 출처를 재검사하며 기존 데이터 revision 검사도 유지합니다. 초기화는 명시적 출처를 먼저 저장하고 필수 데이터를 만들므로 중간에 실패해도 읽는 쪽은 오류로 멈춥니다. 여러 파일의 단일 transaction은 아닙니다. 공개 후 오류는 부분 적용 가능성을 안내하므로 `.sshw/project.json`을 확인하고 같은 초기화 옵션으로 재시도하세요. 기존 파일을 보존하며 다른 작업이 새로 만든 파일도 덮어쓰지 않습니다.
+
+초기화·상속 변경/계정 규칙 정리·상속 정책 복구 안내는 절대 경로를 셸에 맞게 인용한 `--project-dir`을 유지합니다. 선택한 `.sshw`가 아직 없는 경우와 출처 변경 후 status 안내도 같습니다. 경로가 민감하거나 제어 문자·표현할 수 없는 값을 포함하면 잘못된 마스킹 경로나 cwd를 가리키는 실행 명령을 만들지 않습니다. 초기화 일부 적용 오류는 manifest와 프로젝트 폴더를 표시하고 원래 selector/source 옵션 그대로 재시도하도록 안내해 명시적 글로벌 기준 출처를 보존합니다.
+
+프로젝트가 요구하는 로컬 파일이 없으면 config/3 오류에 해당 프로젝트의 `project init`과 `--servers-source local` 또는 `--policy-source local`을 안내합니다. 새 서버 목록은 비어 있습니다. 새 정책은 선택한 글로벌 정책을 복사하며, 글로벌 정책 파일이 없으면 비활성으로 시작합니다. `project status`에서 별도 home이나 profile을 기준으로 선택했다면 프로젝트 폴더에서 그 선택을 유지해 초기화하도록 안내합니다.
+
+`project init`과 `project status`의 기존 JSON object에 `policy_status`를 추가합니다. `present`, `valid`, `saved_enabled`, `forced`, `enforced`, `state`, `enable_command`, `next_step`, `message`를 제공합니다. 파일이 없거나 잘못됐으면 `saved_enabled:null`입니다. 정상적인 적용 상태는 `state:on/off`이며, 손상/읽기 불가 또는 `--policy`가 요구한 파일 누락은 `blocked`와 `enforced:null`로 표시해 단순 비활성 상태로 오인하지 않게 합니다. 강제하지 않은 파일 누락은 `off`·`enforced:false`입니다. `forced`는 이번 명령에만 적용하며 저장된 활성화 값을 바꾸지 않습니다. 일반 출력도 같은 구분을 표시합니다.
+
+비활성인 쓰기 가능한 로컬 정책은 허용 규칙 검토 뒤 실행할 해당 프로젝트의 `enable_command`를 제공합니다. 직접 실행해야 변경되며 status/init이 자동 활성화하지 않습니다. 상속된 글로벌 정책은 로컬 초기화 안내를 제공해 기존 쓰기 차단을 유지합니다. 잘못된 정책에는 활성화 명령 없이 수정 방법을 안내합니다. status는 차단 상태도 `ok:true`인 관찰 진단이므로 소비자는 `policy_status.state/valid`를 확인하세요. 선택한 정책 메타데이터만 읽고 비밀번호·SSH·잠금·감사 쓰기를 하지 않으며 사용하지 않는 서버 데이터는 열거하거나 검사하지 않습니다.
+
+공개 Rust 구조체를 직접 구성하면 `Cli.global: false`, `Cli.project_dir: None`, `ResolvedHome.project: None`을 추가하세요. 생성자는 이미 초기화합니다. `Command::Project`, `ProjectArgs`, `ProjectCommand`, `ProjectInitArgs`, `ProjectStatusArgs`, `project::{ProjectSettings,ResourceMode,ResourceSource,ProjectContext}`가 추가됩니다. `cli::resolve_runtime_at`으로 출처를 명시적으로 해석하며, 기존 `execute(config_path, ...)` facade는 전달한 home을 그대로 사용해 cwd 자동 발견을 하지 않습니다. 기존 데이터 schema와 자격 증명 키는 바뀌지 않습니다.
 
 ## profile 관리
 
@@ -78,6 +129,7 @@ sshw profile list --json
 sshw profile show prod
 sshw profile show prod --json
 sshw profile default prod
+sshw profile rename prod production
 sshw profile remove prod                  # registry 항목만 제거. home 디렉터리와 credential은 보존
 ```
 
@@ -95,13 +147,43 @@ sshw profile remove prod                  # registry 항목만 제거. home 디�
 
 registry는 엄격하게 검증합니다. 이전 릴리스가 상대경로 profile home을 저장한 경우 일반 선택/list/show/default 작업은 fail-closed합니다. `sshw doctor`는 `registry_valid: false`와 조치 가능한 `registry_message`를 보고합니다. 유일한 복구 예외인 `sshw profile remove <문제-profile>`은 그 항목을 제거한 뒤 나머지 registry가 완전히 유효할 때만 성공하며, 상대경로를 현재 작업 디렉터리 기준으로 해석하거나 자동 이동하지 않습니다.
 
+`sshw default --clear`는 등록된 서버·계정·비밀번호·정책·호스트 승인을 유지하고 기본 서버 선택만 해제합니다. 해제 뒤에는 `run/put/get`에 서버명을 명시해야 합니다. `sshw profile default --clear`는 프로필 등록·home·credential namespace를 유지하고 레지스트리의 기본 선택만 해제합니다. 명시한 `--home`, `SSHW_HOME`, `--profile`의 우선순위는 그대로이며, selector가 없으면 내장 기본 home을 사용합니다. 두 명령 모두 이름과 `--clear`를 함께 줄 수 없습니다.
+
+기본 서버가 없으면 config/3 오류가 선택한 설정의 `list`와 등록된 이름을 넣어 실행할 `default` 예시를 보여줍니다. 상속한 글로벌 목록의 기본값을 바꾸는 예시에는 `--global`이 명시됩니다. 목록이 비어 있으면 `list`와 같은 서버 등록 방법을 안내합니다.
+
+해제는 해당 저장소의 잠금·revision 검사·원자적 저장·감사를 따르며, 이미 해제돼 있거나 파일이 없으면 설정 파일을 만들거나 다시 쓰지 않습니다. JSON은 기존 `action:"default"`에 `server:null` 또는 `name:null`, `changed`, `change:"cleared"|"unchanged"`를 표시하고 실제 전환 시 `default_change`를 추가합니다. 저장 후 내구성 확인 실패는 적용됐을 수 있음을 오류에 알립니다. 기존 대상이 남아 있으면 `add --force`나 새 대상 등록으로 기본값이 되살아나지 않습니다. 목록이 완전히 빈 상태에서 첫 등록은 기존처럼 자동 기본값이 됩니다. 해제 뒤 명시적으로 다시 설정하려면 `sshw default web`, `sshw profile default prod`를 사용하세요. `account default`에는 해제 기능이 없고 기본 로그인 계정은 계속 필요합니다. Rust 직접 구성은 `DefaultArgs.clear: false`, `ProfileDefaultArgs { name: Some(name), clear: false, ... }`를 반영하세요.
+
+`profile rename <old> <new> [--json]`는 등록 프로필의 이름만 바꿉니다. home 경로와 내부 id(credential namespace)를 유지하므로 저장된 로그인·승격 비밀번호를 다시 등록할 필요가 없습니다. 기본 프로필이었다면 기본 선택도 새 이름을 따라가고, 해제된 기본값이나 다른 프로필은 그대로 유지됩니다. 기존 이름은 더 이상 선택할 수 없으므로 스크립트의 `--profile` 이름은 갱신하세요. 같은 이름은 저장하지 않는 no-op이고 기존 대상 이름은 덮어쓰지 않습니다.
+
+registry 잠금·revision 검사·원자적 저장·감사를 유지합니다. home/config 내용이나 비밀번호 저장소를 읽지 않고 SSH에 연결하지 않으므로, home 내용이 손상된 상태에서도 이름을 바꿀 수 있습니다. registry 자체는 기존 strict 검증을 통과해야 합니다. JSON은 `action:"renamed"`, `previous_name`, `name`, `id`, `home`, `namespace_changed:false`, `is_default`, `changed`와 `change:"renamed"|"unchanged"`, 필요 시 `default_change`를 제공합니다. 저장 후 내구성 확인 실패는 config/3으로 실제 저장된 새 이름과 `profile list` 확인을 안내합니다. 다른 profile 명령과 같이 추가 서버 `mutation` 객체를 만들지 않습니다.
+
+`remove`와 `profile remove`에서 현재 기본 항목을 삭제할 때 `--switch-default <name>`으로 등록된 다른 항목을 지정하거나 `--clear-default`로 기본 선택을 해제할 수 있습니다. 두 옵션은 함께 쓸 수 없으며 기본값이 아닌 항목 삭제에는 사용할 수 없습니다. 미지정하면 기존처럼 남은 이름 중 첫 항목을 기본값으로 선택합니다. 자기 자신·미등록 대체 대상은 확인/저장 전에 거절하며, 명시한 대체 프로필의 home/로컬 config도 `profile default`와 동일하게 검사합니다. 손상된 삭제 대상의 기존 복구 경로는 유지합니다.
+
+```sh
+sshw remove web --switch-default staging
+sshw remove web --clear-default --yes --json
+sshw profile remove prod --switch-default staging
+sshw profile remove prod --clear-default --json
+```
+
+서버 삭제 확인창에 명시한 전환/해제를 표시합니다. 서버 선택 해제 후에는 명령에 서버명을 지정하고, 프로필 선택 해제 후에는 기존 selector 우선순위에 따라 내장 home을 사용합니다. 서버는 삭제 대상의 credential/계정 허용 규칙을 정리하고 나머지를 유지합니다. 프로필은 registry 등록만 제거하고 home·credential은 그대로 둡니다. 기존 잠금·revision·원자적 저장·감사 계약을 따르며 JSON `default_change`에는 실제 전환을 표시합니다. 서버 저장 후 정책/비밀 정리 실패에도 변경된 기본값을 알리고, 프로필 저장 후 내구성 확인 실패에는 저장된 목록을 확인하도록 안내합니다. Rust `RemoveArgs`와 `ProfileRemoveArgs` 직접 구성에는 `switch_default: None`, `clear_default: false`를 추가하세요.
+
 ## 비밀번호 인증
+
+숨김 입력을 사용하는 `add`, `account add`, `password`, `privilege set`은 `SSH password for 'web/ops':`처럼 실제 서버·선택한 로그인 계정을 표시합니다. 승격 비밀번호는 `Privilege password for 'web/ops' (su target: root):`처럼 sudo/su 방식과 대상을 함께 표시합니다. 각 값에는 기존 비밀 패턴 마스킹을 개별 적용하며 비밀번호 자체를 표시하지 않습니다. `--password-stdin`은 새 프롬프트 없이 기존 stdin 입력 동작을 유지합니다. sudo가 요구하는 비밀번호는 서버의 sudoers 설정을 따릅니다.
+
 
 ```bash
 sshw add server-alpha --host 192.0.2.10 --port 2222 --user deploy
 ```
 
 비밀번호 인증이 기본값입니다. `sshw`는 숨김 입력으로 비밀번호를 받아 활성 credential backend의 home namespace 키로 저장합니다.
+
+서버에서 바꾼 비밀번호를 다시 저장하려면 `sshw password <name> [--user <등록-user>] [--privilege] [--password-stdin] [--json]`을 사용하세요. 기본 동작은 기본 로그인 계정 또는 `--user`로 선택한 기존 비밀번호 인증 계정의 로그인 비밀번호 갱신입니다. SSH-agent 계정의 로그인 비밀번호 갱신은 입력 전에 거절하며 인증 방식을 바꾸려면 `account add --auth password`로 명시합니다. 새 비밀번호는 숨김 입력으로 받고 `--password-stdin`을 명시할 때만 stdin을 읽습니다. 별도 확인창은 없으며 원격 비밀번호·주소·기본값·다른 계정·승격 방식과 대상·정책·호스트 승인은 바꾸지 않습니다. 등록할 때와 같은 home/profile을 사용하세요.
+
+`password --privilege`는 선택한 로그인 계정의 저장된 승격 비밀번호만 갱신합니다. 기존 sudo/su 방식과 승격 대상은 유지하며 `--user`는 계속 로그인 계정을 뜻합니다. credential key는 로그인 계정에 속하고 backend username은 저장된 승격 대상입니다. SSH-agent 로그인도 비밀번호 승격 설정이 있으면 사용할 수 있습니다. 승격 미설정·무비밀번호 sudo는 입력 전에 거절하므로 설정을 바꾸려면 `privilege set`에서 명시하세요. 승격 비밀번호는 비어 있지 않은 단일 줄이어야 하며 비밀번호 값을 argv로 받는 옵션은 없습니다.
+
+새 계정별 credential 참조를 만들고 home 잠금·revision 검사로 설정을 원자적으로 저장한 뒤 선택한 목적의 이전 비밀을 정리합니다. 기존 비밀이 누락돼 있어도 복구할 수 있습니다. 설정 공개 전 실패는 새 항목 정리를 시도하고 원래 설정을 유지합니다. 공개 뒤 내구성 확인 실패는 두 세대를 보존하고 `mutation.config_applied:true`, `failed_stage:"config_save"`를 표시합니다. 이전 항목 정리 실패는 auth/4와 `failed_stage:"credential_cleanup"`입니다. 두 경우 모두 서버와 계정을 알리며 action은 로그인에서 `password_updated`, 승격에서 `privilege_password_updated`입니다. 성공 JSON은 `purpose`(`login`/`privilege`)를 추가하고 승격 갱신은 `target_user` 및 session-only의 `SSHW_PRIVILEGE_PASSWORD` 안내를 제공합니다. 성공 JSON은 같은 action과 `server`, `user`, `changed:true`, `change:"updated"`를 가지며 session-only에서는 영구 저장되지 않는다는 경고가 붙습니다. 같은 비밀번호도 참조를 갱신하며 이전 비밀번호를 조회·비교하지 않습니다.
 
 등록 시 빈 호스트·공백만 있는 호스트·호스트의 제어 문자·포트 `0`은 확인 질문이나 비밀번호 입력 전에 `config`/종료 코드 `3`으로 거부합니다. 포트 범위는 `1..65535`입니다. v1/v2 설정 로딩에도 같은 검사를 적용하며, `doctor`는 잘못된 설정의 서버 이름과 원인을 표시합니다. IPv6를 포함한 호스트 입력값은 그대로 유지하고 DNS 조회나 연결 검사는 하지 않습니다. 잘못 저장된 주소는 안내된 `servers.json` 경로에서 수정하세요.
 
@@ -128,6 +210,14 @@ agent auth는 비밀을 저장하지 않고 활성 SSH agent를 사용합니다.
 `add/account add`로 agent 서버·계정을 재등록할 때도 확인 또는 `--force`가 필요합니다. 최종 전체 설정이 같으면 저장을 생략해 원본 형식·bytes/mtime를 유지하고 일반 출력의 `(unchanged)`와 JSON `changed:false`/`change:"unchanged"`를 표시합니다. 실제 변경은 `true`와 `added/updated`이며 기존 action/대상 필드는 유지합니다. endpoint·기본값·계정·교체 결과도 전체 설정에 포함해 비교합니다. 비밀번호 등록은 credential을 재발급하므로 계속 실제 변경으로 처리합니다. 검증·잠금·감사 및 실제 변경의 동시 수정/atomic 저장·비밀 정리를 유지합니다.
 
 `run`·`put`·`get`의 agent 인증 실패는 선택한 로그인 사용자·host/port·마스킹한 native 원인과 점검 방법을 표시합니다. 같은 home/profile과 실행 환경에서 `sshw doctor`를 실행하고 agent 연결·로드된 키 및 서버의 해당 계정/키 허용을 확인하세요. agent 연결 불가와 키 부재는 원인이 다를 수 있습니다. auth/4·JSON causes와 host key 확인 후 인증 순서를 유지하며 agent 시작·키 로드·비밀번호 fallback을 자동 실행하지 않습니다.
+
+## 서버 등록 후속 안내
+
+새 서버 또는 `--replace` 등록의 일반 `add` 출력은 같은 설정을 쓰는 trust와 예시 `hostname` 실행을 `next`/`then`으로 안내합니다. ad-hoc home(`SSHW_HOME` 포함)은 절대 `--home`, 프로젝트는 절대 `--project-dir`을 사용합니다. 등록 프로필은 폴더를 ad-hoc home으로 바꾸지 않고 검증된 namespace의 `--profile`을 유지합니다. 명시적 `--global` 등록은 기본값이 이름 있는 프로필이거나 `SSHW_HOME`이 있어도 그대로 `--global`을 사용하고, 내장 기본 선택도 cwd에 가려지지 않게 `--global`을 명시합니다. 이번 명령의 강제 `--policy`도 후속 명령에 유지합니다.
+
+selector와 서버명은 로컬 셸에 맞게 인용합니다. 경로·이름이 민감하거나 제어 문자를 포함하거나 namespace 연결을 재현할 수 없다면 마스킹된 다른 대상을 가리키는 명령 없이 원래 선택을 유지하도록 안내합니다. 프로필과 비어 있지 않은 `SSHW_HOME`의 기존 충돌은 그대로입니다. 안내 생성은 메타데이터만 읽고 비밀번호 조회·키 승인·SSH 실행을 하지 않습니다. trust/run은 사용자가 직접 실행해야 하며 기존 지문 확인·안전 검사·정책을 따릅니다.
+
+상속한 글로벌 서버 목록이 비었으면 `--global` 등록, 또는 `--servers-source local` 초기화 뒤 같은 `--project-dir`로 등록하는 두 방법을 안내합니다. 자동 변경이 아닌 선택지입니다. 로컬/명시 home의 빈 목록은 해당 목록에 등록할 명령을 안내합니다. 인용된 host/login-user 자리표시자를 실제 값으로 바꾸세요. 검색 일치 없음 안내도 `--filter`를 뺄 때 선택 출처를 유지합니다. 목록 조회는 home 생성·변경 잠금·감사 기록을 하지 않습니다. JSON 성공은 `[]`를 포함한 기존 배열이고 add의 기존 JSON 필드/형식과 종료 코드도 유지합니다.
 
 ## 서버 account 관리
 
@@ -158,6 +248,10 @@ sshw get server-alpha /var/log/app.log ./app.log --user deploy
 ```
 
 password account는 server와 username마다 독립 credential을 저장합니다. account 갱신은 해당 login credential만 rotation하고 account별 privilege 설정은 보존합니다. non-default account 제거는 config에서 먼저 제거한 뒤 해당 login/privilege credential을 삭제합니다. default account는 다른 등록 account를 default로 지정하기 전에는 제거할 수 없습니다. 하나의 endpoint에 속한 모든 account는 같은 host/port host-key 경계를 공유하므로 `trust`는 server-only로 유지됩니다.
+
+기본 로그인 등록을 정리할 때는 `sshw account remove web old-user --switch-default deploy`로 다른 등록 계정을 기본값으로 지정하면서 기존 등록을 삭제할 수 있습니다. **서버 OS의 계정이나 파일을 지우는 명령이 아닙니다.** 현재 기본 로그인 삭제에만 이 옵션을 사용할 수 있으며 대체 계정은 이미 등록돼 있고 삭제 대상과 달라야 합니다. 마지막 계정을 제거하려면 서버 등록의 `remove`를 사용하세요. 옵션을 생략하면 기존 기본 계정 삭제 제한을 유지합니다.
+
+확인창에 삭제 대상과 새 기본 로그인을 함께 표시하고 `--yes`로 비대화형 확인합니다. 기본 교체와 계정 제거는 하나의 config 저장에 반영한 뒤 삭제 대상의 계정 허용 규칙·로그인/승격 credential만 정리합니다. 대체 계정과 다른 계정·권한 설정, 전역 기본 서버, host trust를 유지합니다. 정책에서 기본 로그인은 기존처럼 암묵적으로 허용됩니다. 성공 JSON과 저장 후 부분 적용 오류의 `default_change`는 `resource:"account"`, `previous`, `current`를 포함합니다. 기존 config_save/policy_update/credential_cleanup 실패·정리·복구 계약을 그대로 적용하며 이름 재사용 전 실제 저장 상태를 확인하세요. Rust `AccountRemoveArgs` 직접 구성에는 `switch_default: None`을 추가하세요.
 
 ## Credential 백엔드
 
@@ -198,9 +292,19 @@ sshw run web "id -un" --user ops --as-root
 
 이후 `--as-root`는 저장된 설정에 따라 `sudo -n`을 사용하며 privilege 비밀번호를 입력·저장·조회하지 않습니다. 일반 실행은 계속 로그인 계정을 사용합니다. `privilege set --no-password`는 `--method su`, `--password-stdin`과 함께 쓸 수 없습니다. 다시 비밀번호 방식으로 바꾸려면 set에서 `--no-password`를 생략하세요. 기존 설정 변경에는 확인 또는 `--force`가 필요하며, 이전 비밀번호는 설정 저장이 성공한 뒤에만 정리합니다. doctor와 삭제 명령은 존재하지 않는 비밀번호 항목을 조회·삭제하지 않습니다. 실제 sudo 권한은 서버에서 허용해야 하며, 거부되면 비밀번호 방식으로 재시도하지 않고 기존 원격 실패 상태를 반환합니다.
 
+`endpoint <name> --host <host> --port <port>`는 등록된 서버의 주소와 포트만 편집합니다. 두 옵션 중 하나 이상 필요하며 생략한 값은 유지합니다. 전체 계정·기본 로그인·승격 방식/대상·credential 참조·기본 서버·정책·known_hosts 파일은 보존합니다. `add --replace`의 기존 교체 계약도 유지합니다. 실제 변경만 이전/새 endpoint 확인을 요구하고 `--yes`로 비대화형 확인합니다. 같은 값은 확인·파일 재저장·비밀 조회 없는 no-op입니다.
+
+`add`가 `--replace` 없는 주소 충돌을 발견하면 config/3 오류에서 바뀐 host/port만 포함한 `endpoint` 명령을 먼저 안내합니다. 선택한 home/profile/project/global·강제 정책을 유지하고 값을 셸 인용하며 민감/표현 불가 대상에는 복사 명령을 생략합니다. 충돌은 확인·비밀번호 입력·비밀 변경 전에 거절합니다. 안내된 편집도 기존 endpoint 확인 절차가 필요하며 자동 변경이나 호스트 승인은 하지 않습니다.
+
+JSON `action:"endpoint_updated"`는 이전/현재 host·port와 changed/change, credentials_changed:false, host_key_verified:false를 표시합니다. 조회나 SSH 접속 없이 설정만 저장하며, 실행/연결 테스트는 변경한 endpoint에 기존 fail-closed 호스트키 검증을 적용합니다. 새 주소에 기존 승인을 복사하거나 무조건 신뢰하지 않습니다. 기존 잠금/CAS/원자적 저장을 유지하고 저장 공개 후 내구성 확인 실패에는 mutation.config_applied와 action:endpoint_updated, failed_stage:config_save를 안내합니다. 같은 설정 선택으로 show를 확인한 뒤 재시도하세요. 감사 action은 endpoint이며 요청한 host/port를 개별 마스킹합니다. Rust에는 EndpointArgs와 Command::Endpoint가 추가됩니다.
+
 ## Host Trust Flow
 
+승인 질문은 별명·실제 host:port(IPv6는 대괄호)·선택한 서버 설정 출처·절대 config/known_hosts 경로를 표시합니다. 민감 패턴은 값별로 마스킹하고 터미널 제어 문자는 이스케이프합니다. 확인 가능 여부 검사는 접속 전, 취소는 승인 저장 없이 종료하며 가져온 동일 지문을 기존 저장/재검증 경로에 전달합니다. `--yes`와 성공 JSON 필드/타입은 그대로입니다. 출처 표시는 비밀번호를 조회하거나 키를 승인하지 않습니다.
+
 Host key 검증은 fail-closed이며, 알 수 없거나 변경된 key는 조용히 허용하지 않습니다. 신뢰한 key는 활성 home의 `known_hosts`에 저장됩니다.
+
+`run`, `put`, `get`, `test`에서 미승인 키를 만나면 선택한 설정과 실제 서버 별명이 들어간 `trust` 명령을 표시합니다. 기본 서버를 사용한 경우에도 그 별명을 넣습니다. 글로벌 서버를 상속했다면 글로벌 승인임을 설명하고 명시적 `--global` 명령을 표시합니다. 승인 전에는 신뢰할 수 있는 경로에서 지문을 확인하세요. 기존 승인 키가 바뀌면 실제로 검증한 `known_hosts` 파일을 표시하고 서버 관리자에게 변경과 새 지문을 확인하도록 안내합니다. 둘 다 ssh/5와 기존 JSON 오류 형식을 유지합니다.
 
 ```bash
 sshw trust server-alpha
@@ -215,26 +319,45 @@ sshw trust server-alpha --yes
 
 ```bash
 sshw add <name> --host <host> [--port <port>] --user <user> [--auth password|agent] [--password-stdin] [--force] [--replace] [--json]
-sshw list [--json]
+sshw list [--filter <text>] [--json]
 sshw show <name> [--json]
-sshw default [<name>] [--json]
+sshw rename <name> <new_name> [--json]
+sshw endpoint <name> [--host <host>] [--port <port>] [--yes] [--json]
+sshw test <name> [--user <registered-user>] [--json]
+sshw password <name> [--user <registered-user>] [--privilege] [--password-stdin] [--json]
+sshw completions powershell
+sshw default [<name> | --clear] [--json]
 sshw trust <name> [--yes] [--json]
 sshw run [<name>] "<command>" [--user <registered-user>] [--json|--stream] [--yes] [--as-root [--no-password]]
-sshw put [<name>] <local> <remote> [--user <registered-user>] [--atomic] [--mode <octal>] [--json] [--yes]
-sshw get [<name>] <remote> <local> [--user <registered-user>] [--json] [--yes]
-sshw remove <name> [--yes] [--json]
-sshw doctor [--json]
+sshw put [<name>] <local> <remote> [--user <registered-user>] [--atomic] [--mode <octal>] [--progress] [--json] [--yes]
+sshw get [<name>] <remote> <local> [--user <registered-user>] [--progress] [--json] [--yes]
+sshw get [<name>] <remote> --into <directory> [--user <registered-user>] [--progress] [--json] [--yes]
+sshw remove <name> [--switch-default <name> | --clear-default] [--yes] [--json]
+sshw doctor [<name>] [--user <registered-user>] [--json]
 sshw account add <name> <user> [--auth password|agent] [--password-stdin] [--force] [--json]
 sshw account list <name> [--json]
 sshw account show <name> <user> [--json]
 sshw account default <name> <user> [--json]
-sshw account remove <name> <user> [--yes] [--json]
+sshw account remove <name> <user> [--switch-default <registered-user>] [--yes] [--json]
 sshw privilege <set|show|clear> ... [--json]
-sshw profile <add|list|show|default|remove> ... [--json]
+sshw profile remove <name> [--switch-default <name> | --clear-default] [--json]
+sshw profile <add|list|show|default|remove|rename> ... [--json]
 sshw policy <init|show|enable|disable|allow|remove|check> ... [--json]
 ```
 
-`add`, `account add`, `profile add`는 `--force`로 갱신을 비대화형 승인합니다. 같은 host/port의 서버를 갱신하면 다른 계정과 해당 계정의 privilege 설정을 보존하고 선택한 login credential만 갱신합니다. host/port 변경은 `--replace`가 필요하며 전체 계정·privilege 설정을 초기화하고 오래된 credential을 정리합니다. 이전 endpoint를 유지하려면 새 서버 이름을 쓰세요. `--force`만으로 endpoint 교체를 승인하지 않습니다.
+`add`, `account add`, `profile add`는 `--force`로 갱신을 비대화형 승인합니다. 같은 host/port의 서버를 갱신하면 다른 계정과 해당 계정의 privilege 설정을 보존하고 선택한 login credential만 갱신합니다. 주소만 편집하려면 `endpoint`를 사용하세요. `add`를 통한 주소 교체는 `--replace`가 필요하며 전체 계정·privilege 설정을 초기화하고 오래된 credential을 정리합니다. 이전 endpoint를 유지하려면 새 서버 이름을 쓰세요. `--force`만으로 endpoint 교체를 승인하지 않습니다.
+
+`show`는 주소·기본 서버/로그인 계정과 모든 등록 계정의 인증 방식·승격 방식/대상·승격 비밀번호 사용 여부를 한 번에 표시합니다. 기본 로그인 계정에는 `*`가 붙습니다. 설정만 읽으며 credential 항목·SSH·정책·호스트 키 파일을 검사하지 않습니다. JSON의 기존 최상위 필드는 유지하고 `account list --json`과 같은 정렬된 `accounts` 배열을 추가합니다. credential 참조는 메타데이터이며 비밀 값은 포함하지 않습니다. `list --json`은 그대로입니다.
+
+`remove`는 해당 서버의 `allow_accounts` 항목을 미등록 계정의 항목까지 모두 정리합니다. `account remove`는 정확히 일치하는 서버/계정 항목만 제거합니다. 정책 활성 여부와 관계없이 적용하며 다른 계정·명령·경로 규칙은 유지합니다. 정책이 없거나 legacy 정책/일치 항목이 없으면 정책 파일을 다시 쓰지 않습니다. 미등록 대상·기본 계정 삭제 제한·확인 거절 순서는 유지합니다. 존재하는 정책이 잘못됐으면 설정·비밀번호 변경 전에 policy/7로 중단합니다.
+
+삭제는 home 잠금과 config/policy revision 검사 후 설정→정책 순서로 저장하며, 정책 저장이 실패해도 이전 자격 증명 정리는 시도합니다. 두 파일은 별도 원자적 저장입니다. 성공 JSON은 `policy_changed`, `policy_rules_removed`를 추가하고 일반 출력은 정리한 규칙 수가 있을 때 표시합니다. 설정 공개 뒤 실패는 `mutation.config_applied:true`, `action:"removed"`, 서버/계정과 해당 `default_change`를 알립니다. `failed_stage`는 `config_save`(config/3), `policy_update`(policy/7), `credential_cleanup`(auth/4)이며 설정 내구성 확인 실패는 정책·비밀을 보존합니다. 같은 home/profile에서 실제 상태를 확인하고 남은 규칙을 policy 명령으로 정리한 뒤 이름을 재사용하세요. 이미 없는 대상을 다시 삭제해도 남은 규칙은 정리되지 않습니다.
+
+`rename <name> <new_name>`은 확인창이나 SSH 접속 없이 로컬 서버 별명을 바꿉니다. host/port·계정·기본 로그인·승격 방식과 대상·서버 키 승인을 유지하며, 기본 서버였다면 새 이름이 기본값이 됩니다. 저장된 로그인·승격 비밀번호는 새 이름의 계정별 참조로 복사하고 저장 후 이전 항목을 정리합니다. 비밀번호 저장소에서 기존 항목을 읽고 새 항목을 저장할 수 있어야 합니다. session_only는 실행 시 비밀번호 환경변수가 필요하며 비밀번호를 영구 저장하지 않습니다.
+
+기존 이름의 계정 허용 규칙도 정책 활성 여부와 관계없이 함께 옮깁니다. 새 이름의 서버나 `allow_accounts` 참조가 이미 있으면 덮어쓰거나 기존 권한을 물려받지 않고 거절합니다. 다른 허용 규칙·프로필·home은 바꾸지 않습니다. 같은 이름을 지정하면 서버를 검증하고 일반 변경 잠금·감사를 적용하되 비밀 조회·정책 읽기·파일 저장을 생략해 원본 bytes/mtime·v1 형식을 유지합니다.
+
+설정과 정책은 home 잠금·revision 검사를 적용한 별도 원자적 파일 저장입니다. 설정을 먼저 저장하며, 정책을 강제 적용하는 실행에서는 규칙이 따라오기 전까지 새 이름의 비기본 계정이 허용되지 않습니다. 설정 공개 전 실패는 원래 이름·비밀번호를 유지하고 임시 복사본 정리를 시도합니다. 공개 후 실패는 `mutation.config_applied:true`, `action:"renamed"`, 저장된 `server`, `failed_stage`(`config_save`, `policy_update`, `credential_cleanup`)와 해당 `default_change`를 알립니다. 같은 home/profile에서 저장된 이름과 정책을 확인하고 이전 이름으로 무작정 재시도하지 마세요. 성공 JSON에는 `previous_server`, `server`, `changed`, `change`(`renamed`/`unchanged`), `policy_changed`가 있습니다.
 
 `add`·`account add`는 확인 입력 전에 `--auth agent --password-stdin` 충돌을 config/3으로 안내합니다. 기존 설정·대상·endpoint 교체 검증의 우선순위는 유지합니다. 유효한 갱신의 확인 또는 `--force`, 비밀번호 입력과 credential 정리는 그대로입니다.
 
@@ -247,6 +370,15 @@ sshw policy <init|show|enable|disable|allow|remove|check> ... [--json]
 `run`/`put`/`get`에서 이름을 생략하면 설정된 기본 서버를 사용합니다. `--user`를 생략하면 해당 server의 default account를 사용합니다.
 
 ## 업로드 보호·실시간 출력·전송 사전 검사
+
+`put/get --progress`는 stderr에 전송 바이트·퍼센트·전체 작업 시간 기준 평균 속도를 표시합니다. 기본은 꺼져 있고 `--json`과 함께 사용해도 stdout JSON은 바뀌지 않습니다. 터미널은 같은 줄을 갱신하고, 파일·파이프에서는 줄 단위로 제한해 기록합니다. 경로나 비밀은 진행 표시에 포함하지 않습니다. 일반 SCP와 `put --atomic` 모두 지원하며 빈 파일도 완료를 표시합니다.
+
+데이터가 모두 이동해도 원격 SCP 종료 검증·SFTP rename 또는 로컬 다운로드 반영 전까지 최대 99%와 완료 확인 중 상태를 표시합니다. 검증 뒤에만 `100% ... complete`를 표시하고 실패 시 완료 미확정으로 끝냅니다. 표시 쓰기 실패는 전송 결과를 바꾸지 않습니다. 기존 전체 timeout·완료 검사·다운로드 staging·atomic upload 계약은 유지되며 취소·재시도·재개 기능은 추가하지 않습니다. Rust `PutArgs/GetArgs` 직접 구성에는 `progress: false`를 추가하세요. 기존 `SshClient` 메서드는 유지하며 새 progress 메서드의 기본 구현은 성공 완료 이벤트만 전달합니다. `Ssh2Client`는 실제 바이트별 이벤트를 전달합니다. 라이브러리 callback은 빠르게 반환해야 하며 timeout을 연장하지 않습니다.
+
+```sh
+sshw put web ./archive.tgz /tmp/archive.tgz --progress
+sshw get web /tmp/archive.tgz ./archive.tgz --progress --json
+```
 
 일반 `put/get`의 SCP 실패는 원격 파일 열기·데이터 전송·응답/EOF·채널 종료·완료 확인 중 실제 실패 단계와 로그인 계정, endpoint, local/remote 경로, 마스킹한 native 원인을 표시합니다. 원격 경로와 로그인 계정의 읽기/쓰기 권한, 부모 디렉터리, 서버 SCP 지원 등을 확인하세요. SCP 라이브러리의 일반 오류만으로 파일 부재와 권한 거부를 구분할 수는 없습니다. 중간 업로드 실패는 원격 목적지가 변경됐을 수 있으므로 상태를 확인한 뒤 재시도하세요. 기존 오류 타입·코드와 JSON 원인, timeout 및 SCP 완료 확인을 유지하며 다운로드는 검증된 staging을 최종 반영하기 전까지 기존 로컬 파일을 보존합니다. 자동 권한 변경·승격·추가 접속·재시도는 수행하지 않습니다. `--atomic`의 단계별 상세 진단과 Git Bash/MSYS 경로 안내도 유지합니다.
 
@@ -263,9 +395,20 @@ sshw run web "./long-build" --stream
 
 `run --stream`은 완성된 줄을 비밀 마스킹 후 실행 중에 출력합니다. 데이터가 여러 번에 나뉘어 도착해도 UTF8·비밀·PEM 블록을 유지해서 처리하고, 개행 없는 줄은 종료까지 기다립니다. 알려진 비밀 자체가 여러 줄이면 보수적으로 버퍼링합니다. 일반 실행과 sudo를 지원하며 JSON·su PTY 조합은 거부합니다. 실패하면 완료 미확정 안내와 함께 비밀을 마스킹한 실제 원인을 표시합니다. 기존16MiB 상한과 exit code는 유지하고 이미 출력한 내용은 실패 시 반복하지 않습니다. 일반 실행과 sudo는 기본 출력·JSON·스트리밍 모두 채널 오류 후 SSH 정리 대기를 짧게 제한합니다. 이것이 원격 프로세스의 종료를 확인했다는 뜻은 아닙니다.
 
-`policy check-put/check-get`은 실제 전송과 같은 인자 순서·`--user`·`--yes`를 사용합니다. 공통 검사는 실제 전송과 같은 순서로 첫 실패를 알려주며, `check-put --atomic`은 임시 파일 디렉터리 정책도 검사합니다. 접근 검사를 통과하면 `put`(`--atomic` 포함)과 `check-put` 모두 업로드 파일을 읽기 전용으로 열어 읽을 수 있는 일반 파일인지 확인하고 내용은 읽지 않습니다. 실제 `put`은 계정 비밀번호 조회 전에 검사하므로 인증 정보가 없어도 잘못된 원본은 먼저 io/6으로 알려줍니다. JSON의 `access_allowed`는 접근 검사, `local_file_checked`·`local_file_ready`는 파일 검사 여부·결과를 구분하며 `allowed`는 평가한 로컬 검사 전체의 결과입니다. 실제 전송은 파일을 다시 열고 해당 handle로 검증·전송하므로 사전 검사가 이후 상태까지 보장하지 않습니다. 사전 검사는 SSH·credential·원격 OS 권한·서버 확장을 확인하지 않습니다. `--yes`는 확인 옵션일 뿐 원격 권한을 부여하지 않습니다.
+`policy check-put/check-get`은 실제 전송과 같은 인자 순서와 `--user`, `--yes`를 사용합니다. 공통 검사는 실제 전송과 같은 순서로 첫 실패를 알려주며 `check-put --atomic`은 임시 파일 디렉터리 정책도 검사합니다. 접근 검사를 통과하면 `put`과 `check-put`은 업로드 원본을 읽기 전용으로 열어 읽을 수 있는 일반 파일인지 확인합니다. 실제 `put`도 비밀번호 조회 전에 원본을 검사하므로 잘못된 원본을 먼저 io/6으로 알려줍니다. JSON의 `local_file_checked`와 `local_file_ready`는 업로드 원본의 검사 여부와 결과를 나타냅니다. `allowed`는 평가한 전체 로컬 검사의 결과입니다. 사전 검사는 검사 시점의 결과이며 SSH 인증, 원격 파일 권한, 서버 확장 기능은 검사 범위 밖입니다.
 
-`get`의 로컬 목적지에는 파일 경로를 지정하세요. 실제 실행과 `policy check-get` 모두 기존 디렉터리 목적지와 잘못된 로컬 부모 경로를 연결 전에 거부하고 해당 경로를 표시합니다. `--yes`는 파일 교체 확인이며 디렉터리를 파일 목적지로 바꾸지 않습니다. 없는 부모 디렉터리는 실제 다운로드 때만 생성합니다. 사전 검사는 파일을 만들거나 로컬 쓰기 권한을 검증하지 않습니다. `--yes`로 목적지 심볼릭 링크를 교체할 때는 링크가 가리키는 원본을 덮어쓰지 않습니다. 임시 파일 쓰기와 최종 반영 전에 목적지를 다시 검사하며, 반영 전 실패하면 기존 목적지를 보존하고 임시 파일을 정리합니다.
+`get`의 로컬 목적지에는 파일 경로를 지정하세요. 기존 디렉터리나 잘못된 로컬 부모 경로는 접속 전에 거절됩니다. 기존 파일이나 심볼릭 링크를 교체하려면 `--yes`가 필요하며, 대상이 사라진 깨진 링크도 여기에 포함됩니다. 확인 후에는 링크 자체를 교체하고 링크가 가리키는 대상은 그대로 둡니다. 사전 검사는 경로 형태와 덮어쓰기 확인을 검사하며 로컬 쓰기 권한은 검사 범위 밖입니다. 없는 부모 폴더는 실제 다운로드 때 만듭니다. 임시 파일 쓰기와 최종 반영 전에 목적지를 다시 검사하며, 반영 전에 실패하면 기존 목적지를 보존하고 임시 파일을 정리합니다.
+
+`policy check-get --json`의 `local_destination_status`는 앞선 검사에서 멈추면 `not_checked`, 경로와 덮어쓰기 검사를 통과하면 `ready`, 파일이나 링크 교체에 `--yes`가 필요하면 `overwrite_confirmation_required`, 상위 폴더가 깨진 링크인 경우 등 그 밖의 목적지 오류는 `blocked`입니다. 목적지가 `ready`여도 뒤이은 계정 정책 검사에서 거절될 수 있습니다. 전체 결과는 `allowed`와 `reasons`에서 확인하세요. `--yes`는 로컬 파일 교체를 확인하는 옵션이며 원격 권한을 부여하지 않습니다. 전송 완료 시 일반 출력과 JSON 모두 각 경로의 민감값을 마스킹합니다.
+
+`get [server] <remote> --into <directory>`는 위치 인자의 `<local>` 대신 로컬 폴더와 원격 파일명으로 저장 경로를 계산합니다. 기본 서버를 사용할 때는 `get <remote> --into .`처럼 씁니다. 원격 경로는 기존 `remote:` 디코드와 정책 검사 대상 그대로 유지합니다. POSIX 경로는 `/`, 명시적인 Windows drive/UNC 경로는 양쪽 구분자로 마지막 파일명을 찾습니다. 빈 파일명·`.`/`..`·제어 문자·로컬에서 단일 파일명으로 표현할 수 없는 값(Windows 예약 장치명/ADS/끝 공백·점 등)은 usage/9로 거절하므로 다른 로컬 파일명을 명시하세요. 임의 파일명 변경이나 폴더 밖 경로 결합은 하지 않습니다.
+
+```sh
+sshw get web /var/log/app.log --into ./downloads --progress
+sshw policy check-get web /var/log/app.log --into ./downloads --json
+```
+
+`policy check-get --into`도 동일한 최종 로컬 경로와 덮어쓰기/부모 검사 결과를 보여 주며 폴더를 생성하거나 비밀을 읽거나 접속하지 않습니다. 빠진 폴더는 실제 다운로드에서만 기존 staging 경로로 생성합니다. 최종 파일이 있으면 기존 `--yes`가 필요하고, 실패 시 원자적 저장·기존 파일 보존·경쟁 생성 시 덮어쓰기 차단을 유지합니다. 파일명 지정 방식과 `--into`의 인자 수가 맞지 않거나 `check-put --into`를 쓰면 runtime 초기화 전에 usage/9로 거절합니다. 감사는 기존처럼 원격 원본을, JSON `local`은 실제 최종 파일을 표시합니다. Rust `GetArgs`와 policy transfer check 직접 구성은 `into: None`을 추가하세요. `Cli::try_parse_from` 뒤 인자 수 조건을 사전 검사하려면 `Cli::validate_usage()`를 호출하세요. 실행 진입점도 자동 검사합니다.
 
 ## Windows 셸 경로
 
@@ -321,7 +464,7 @@ sshw policy show --json
 
 `init`은 비활성 빈 정책을 만들며 기존 파일은 덮어쓰지 않습니다. `allow`는 항목만 추가하고, `remove`는 정확히 일치하는 항목만 제거합니다. 다른 규칙이 남아 있으면 계속 허용될 수 있습니다. `enable`/`disable`은 저장된 정책 활성 설정을 바꿉니다. 수정 결과는 추가됨·이미 있음·삭제됨·항목 없음·변경 없음을 구분하고 JSON에 `changed`와 `change`(`created`, `added`, `already_present`, `removed`, `not_found`, `updated`, `unchanged`)를 표시합니다. 변경 없는 요청도 성공하며 파일 저장을 생략합니다. 변경 명령의 home 잠금과 audit을 유지하고 실제 내용 변경에는 revision 검사와 원자적 저장을 사용하며, 명령 전체를 audit detail에 복사하지 않습니다. 기존 v1 정책은 계속 읽을 수 있고 실제 내용이 바뀔 때 v2로 저장됩니다.
 
-정책 관리 출력은 파일 존재 여부·저장된 `enabled`·현재 호출의 적용 상태를 구분합니다. JSON에는 `present`·`enforced`와 `--policy` 사용 여부인 `forced`가 담깁니다. 파일이 없으면 미설정으로 표시하고 같은 home/profile의 `sshw policy init`을 안내합니다. 파일 없는 상태의 강제 적용은 기존처럼 fail-closed입니다. `disable`은 저장 설정을 바꾸며 `--policy`를 전달한 호출에는 계속 정책이 강제 적용됩니다. 저장된 비활성 설정을 사용하려면 같은 home/profile을 유지하면서 해당 옵션을 제거하세요.
+정책 관리 출력은 파일 존재 여부, 저장된 `enabled`, 현재 호출의 적용 상태를 구분합니다. `policy show`, `doctor`, `project status`는 같은 `policy_status` 필드를 사용합니다. `policy_status.state`는 `on`, `off`, `blocked`이고, `policy_status.enforced`는 실제 적용 여부를 나타내며 차단된 경우 `null`입니다. 기존 최상위 `enforced`와 `policy_enabled` 불리언은 호환성을 위해 적용 요청 여부를 계속 나타냅니다. `--policy`가 요구한 파일이 없으면 같은 설정 선택을 유지한 초기화 방법을 안내합니다. 상속 정책은 사용자가 초기화 대상을 선택해야 합니다. 잘못됐거나 읽을 수 없는 파일을 `policy show`로 열면 `blocked` 오류와 종료 코드 7이 표시됩니다. `disable`은 저장 설정을 바꾸며 유효한 정책 파일이 있는 호출에는 `--policy`로 계속 강제 적용할 수 있습니다.
 
 `check`·`check-put`·`check-get`은 human 출력과 JSON의 `policy` 객체(`path`, `enforced`, `forced`, `checks`)에 정책 적용 상태와 매칭 규칙을 표시합니다. 각 판정에는 `allowed`·`reason`이 있고 규칙에 매칭됐다면 `matched_rule`·`match_type`(`program`, `exact`, `prefix`, `path`, `account`)도 있습니다. 파일 순서상 처음 매칭된 규칙을 표시하며, 정책 비활성·기본 계정의 암묵 허용·쉘 구문의 정확한 전체 명령 규칙 요구·규칙 불일치·상위 경로 탐색을 구분합니다. 원자적 업로드는 부모 경로 규칙을 `atomic_parent`로 별도 설명합니다. 실제 검사와 같은 정책 snapshot과 matcher를 사용하고 설명의 비밀도 마스킹합니다. 이 정책 판정은 safety·계정 존재·로컬 파일 준비와 독립적이며, 전체 결과는 기존 `allowed`·`reasons`·종료 코드로 판단합니다. 로컬 검사는 credential·SSH·sudoers를 검증하지 않습니다.
 
@@ -353,13 +496,33 @@ policy는 fail-closed입니다. `--policy`인데 파일이 없으면 에러이�
 
 ## Audit Log
 
-변경/실행 작업(`add`, `remove`, `trust`, `default`, `account add`, `account default`, `account remove`, `profile add`, `profile default`, `profile remove`, `run`, `put`, `get`, `privilege set`, `privilege clear`)은 `audit.jsonl`에 줄당 JSON 객체로 append됩니다. home 범위 작업은 active home의 로그를 사용하고, 전역 profile registry 변경은 추가·선택·제거 대상과 무관하게 내장 default home의 로그에 일관되게 기록됩니다.
+변경/실행 작업(`add`, `rename`, `password`, `remove`, `trust`, `default`, `account add`, `account default`, `account remove`, `profile add`, `profile default`, `profile remove`, `run`, `put`, `get`, `privilege set`, `privilege clear`)은 `audit.jsonl`에 줄당 JSON 객체로 append됩니다. home 범위 작업은 active home의 로그를 사용하고, 전역 profile registry 변경은 추가·선택·제거 대상과 무관하게 내장 default home의 로그에 일관되게 기록됩니다.
 
 ```json
 {"time_ms":1700000000000,"action":"run","server":"web","user":"ops","status":"ok","exit_code":0,"detail":"uptime"}
 ```
 
-`user`는 선택된 login account를 기록합니다. `run`의 `detail`은 인자가 아닌 프로그램 이름만 기록합니다. 서버명·user·경로·detail은 best-effort로 redaction됩니다. 시도한 `run`/`put`/`get`의 policy 준비가 실패한 경우도 error 상태로 기록합니다. read-only 명령(`list`, `show`, `account list`, `account show`, `doctor`, `profile list`, `profile show`)은 기록하지 않습니다. audit 쓰기는 best-effort입니다. record lock이 바쁘면 100밀리초 동안 재시도한 뒤 해당 레코드를 생략하며 작업 자체는 실패시키지 않습니다. 파일은 Unix에서 owner-only(Windows는 best-effort)입니다. append-only이지만 tamper-evident가 아닙니다 — 무결성 체인이나 서명이 없고, home을 쓸 수 있는 누구나 항목을 수정·삭제할 수 있습니다. `audit.jsonl`은 민감 파일로 취급하세요.
+`user`는 선택된 login account를 기록합니다. `run`의 `detail`은 인자가 아닌 프로그램 이름만 기록합니다. `rename`은 `server`에 이전 이름, `detail`에 새 이름을 기록합니다. 서버명·user·경로·detail은 best-effort로 redaction됩니다. 시도한 `run`/`put`/`get`의 policy 준비가 실패한 경우도 error 상태로 기록합니다. read-only 명령(`list`, `show`, `account list`, `account show`, `doctor`, `profile list`, `profile show`)은 기록하지 않습니다. audit 쓰기는 best-effort입니다. record lock이 바쁘면 100밀리초 동안 재시도한 뒤 해당 레코드를 생략하며 작업 자체는 실패시키지 않습니다. 파일은 Unix에서 owner-only(Windows는 best-effort)입니다. append-only이지만 tamper-evident가 아닙니다 — 무결성 체인이나 서명이 없고, home을 쓸 수 있는 누구나 항목을 수정·삭제할 수 있습니다. `audit.jsonl`은 민감 파일로 취급하세요.
+
+### 차단된 권한의 복구 안내
+
+`run/put/get/test`와 `policy check/check-put/check-get`의 실제 정책 차단에는 `suggestions`가 추가됩니다. 각 항목은 `kind`(`account`, `command`, `put`, `get`), 복사 가능한 `command` 또는 null, 허용 범위를 설명하는 `scope`입니다. 실행 오류에서는 JSON envelope 최상위, 사전 검사에서는 기존 `ok:true`·`allowed:false` 결과에 포함됩니다. 기존 첫 오류·종료 코드·reasons·정책 판단은 유지하며 일반 출력에도 범위와 다음 명령을 표시합니다.
+
+허용은 제안 명령을 직접 실행한 뒤에만 적용됩니다. 규칙을 자동 추가·활성화하거나 정책을 끄지 않습니다. 프로그램 규칙은 인자·하위 프로세스, 끝의 `*`는 prefix, 완전한 명령은 exact 범위를 설명합니다. 경로 규칙은 지정 경로와 하위 경로를 포함하며 파일 하나에만 국한되지 않습니다. atomic 업로드의 임시 파일을 위해 부모 경로 허용이 필요할 수도 있습니다. 서버 OS 권한이나 symlink 처리가 바뀌는 것은 아닙니다.
+
+제안은 선택한 home, profile 또는 프로젝트 경로와 `--policy` 사용 여부를 유지합니다. 명시적 글로벌 호출과 내장 기본 home의 제안에는 `--global`이 들어가므로 프로젝트 폴더에서 복사해도 글로벌 정책을 대상으로 합니다. 상속된 프로젝트 정책은 읽기 전용이며 쓰기 대상을 선택하도록 안내합니다. 선택을 재현할 수 없거나 값에 비밀 패턴·제어 문자가 있으면 복사 명령을 생략합니다. 루트만 지정한 경로, 부모로 이동하는 경로, 표현할 수 없는 경로도 수동 확인을 안내합니다. 민감한 원격 명령을 policy에 저장하지 마세요. 각 값을 마스킹한 뒤 PowerShell/POSIX 셸 인용과 `--` 경계를 적용합니다. Safety 차단, 로컬 IO, 미등록 계정, 손상·누락 정책에는 부적절한 허용 명령을 제안하지 않습니다. Rust `ErrorResponse` 직접 구성은 `suggestions: Vec::new()`를 추가하세요.
+
+## PowerShell 자동완성
+
+```powershell
+sshw completions powershell | Out-String | Invoke-Expression
+```
+
+현재 세션에 native Tab 자동완성을 등록합니다. 새 세션에서도 쓰려면 PowerShell 프로필에 이 줄을 직접 추가하세요. [PowerShell 공식 자동완성 API](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/register-argumentcompleter)가 제공하는 AST와 커서에서 literal 인자만 읽고 식을 실행하지 않습니다. 명령·옵션·열거값은 CLI 정의를 따릅니다. 등록 서버·로그인 계정은 cwd `.sshw`, `--global`·`--project-dir`과 커서 앞의 명시적 `--home`/`--profile`, `SSHW_HOME`을 실행과 같은 우선순위로 따르고 프로필 이름은 전역 registry에서 찾습니다. 선택이 잘못되거나 충돌하면 다른 home으로 넘어가지 않고 메타데이터 제안을 생략합니다. home/설정이 잘못돼도 등록 스크립트 출력은 사용할 수 있습니다.
+
+로컬 메타데이터만 읽고 비밀번호 조회·SSH·변경 잠금·감사 기록은 수행하지 않습니다. 공백·따옴표·셸 문자가 있는 이름은 인용해 삽입하고 비밀 마스킹 패턴의 이름은 제안에서 제외합니다. 식으로 전달한 인자는 자동완성을 위해 실행하지 않습니다. PowerShell은 `--` 뒤에서 native completer를 호출하지 않으므로 해당 인자와 `-`로 시작하는 별명은 직접 입력하세요. 현재는 PowerShell을 지원하며 Windows 회귀에서 PowerShell 5.1과 7을 검사합니다. 스크립트 출력만으로 설치하거나 프로필을 편집하지 않습니다.
+
+목록 검색 `list --filter <text>`는 설정된 이름이나 호스트의 literal 부분 일치를 대소문자 구분 없이 찾습니다. 이름 정렬·기본값 표시와 JSON 배열 형식은 유지합니다. 빈 문자열은 전체, 일치 없음은 빈 배열 또는 일반 안내이며 옵션을 생략하면 전체 목록입니다. SSH나 비밀번호 저장소를 조회하지 않습니다.
 
 ## 출력 redaction
 
@@ -370,6 +533,17 @@ policy는 fail-closed입니다. `--policy`인데 파일이 없으면 에러이�
 `run`의 stdout/stderr/JSON에 echo된 command는 best-effort redaction을 거칩니다. PEM 개인키 블록, 흔한 비밀 keyword의 `keyword=value`/`keyword: value`, bearer 토큰을 마스킹합니다. 작업을 위해 읽은 정확한 login 비밀번호와 설정된 privilege 비밀번호가 이 필드에 그대로 나타나면 추가로 마스킹합니다. 매우 짧거나 흔한 비밀번호는 관련 없는 출력까지 과도하게 마스킹할 수 있으며, 이 경우 출력 충실도보다 비밀 보호를 우선합니다. 모든 쉘 표현을 이해하지는 못하고 여러 줄에 걸친 비밀은 마스킹되지 않을 수 있으므로 비밀을 인라인으로 넘기지 마세요.
 
 ## Doctor
+
+doctor의 호스트 키·자격 증명·재시도 안내는 선택한 home/profile/project와 강제 정책·명시 global을 유지합니다. 조회는 프로젝트의 두 출처를 그대로 읽고, 상속한 서버의 trust/비밀번호 복구는 글로벌 변경임을 설명하며 명시적 `--global`을 사용합니다. 자동 프로젝트의 상속 쓰기 차단은 그대로입니다. 조회 불가는 부재로 단정하지 않고 그 서버/로그인의 scoped doctor 재시도를 안내합니다. 로그인/승격 방식·대상 메타데이터와 session-only 환경변수 복구는 유지합니다.
+
+서버 목록이 비어 있으면 `setup` 항목은 일반 `list` 출력과 같은 등록 방법을 안내합니다. 글로벌 목록이 비어 있고 이를 상속 중이면 글로벌 등록과 로컬 목록 초기화를 구분해 보여줍니다. `list --json`의 빈 배열 `[]` 형식은 그대로입니다.
+
+서버·계정·승격 lookup 오류는 대상을 타입으로 보존하고 실행 경계에서 선택한 설정의 복구 명령을 추가합니다. 정책 사전 검사에도 적용하며 config/3·원래 causes·첫 오류/IO 순서를 보존하고 외부 SSH 등 다른 오류 분류를 바꾸지 않습니다. 민감·제어 문자 값이나 재현할 수 없는 namespace에는 마스킹된 대상을 실행하는 명령을 생략합니다. 진단 출력만으로 수리·승인·비밀 저장을 하지 않으며 공개 Rust 구조체/enum·기존 JSON 필드/타입도 유지합니다.
+
+`doctor <server> --user <registered-user>`는 서버명을 필수로 받고 그 서버에 등록된 로그인 하나의 login/privilege credential과 해당 계정의 SSH-agent 필요 여부만 검사합니다. 미등록 계정은 backend health·비밀번호·agent·감사 쓰기 검사 전에 config/3 오류로 종료합니다. home·registry·config·policy·backend 상태·audit·해당 서버 host trust 공통 검사는 유지하며 SSH 연결이나 계정 허용 정책 통과를 검증하지 않습니다. 설정 손상 시에는 기존 doctor 복구 진단을 유지합니다. JSON에 명시한 `user`만 추가하고 일반 출력에도 계정을 표시하며 각 값은 마스킹합니다. `--user`를 생략하면 기존 서버별/전체 계정 진단 범위 그대로입니다. Rust `DoctorArgs` 직접 구성에는 `user: None`을 추가하세요.
+
+
+`sshw doctor <name>`은 정확히 지정한 등록 서버의 credential 항목·로컬 호스트 승인과 SSH agent 필요 여부만 검사합니다. 기본 서버로 대체하지 않으며 미등록 이름은 credential 조회·backend health·agent 검사 전에 config/3으로 거절합니다. 이름을 생략하면 기존 전체 검사와 JSON 형태를 유지합니다. 지정한 경우 JSON은 `server`를 추가하고 `credential_checks`, `missing_credentials`, `host_trust`에는 해당 서버 항목만 담습니다. registry/config/policy/backend/audit/runtime 등 home 공통 진단은 계속 표시합니다. 설정이 손상되면 기존 doctor 복구 보고를 유지하며 검증 가능한 서버별 항목은 비웁니다. 어느 모드도 실제 SSH 연결이나 원격 키 일치를 검사하지 않습니다.
 
 설정 파일을 읽거나 JSON·형식을 검사하다 실패하면 파일 경로와 원인을 각각 마스킹하고 해당 파일의 접근 권한·UTF-8·구문/지원 필드 점검을 안내합니다. 민감 패턴이 있는 경로 때문에 오류 원인까지 잘리지 않으며, 진단 과정에서 파일을 초기화하거나 형식 검사를 완화하지 않습니다.
 
@@ -393,6 +567,19 @@ sshw doctor --json
 ```
 
 `doctor`는 해석된 home과 선택 경위, registry/config/known_hosts/policy/audit 경로, registry 유효성과 진단(`registry_valid`, `registry_message`), config 파일 존재 여부, 운영체제, 연결된 libssh2 및 OpenSSL 버전/상태, credential namespace, policy present/valid/enabled, audit 쓰기 가능 여부, credential backend 상태, 그리고 누락된 login credential을 `server/user` 항목으로 보고하는 `missing_credentials`를 제공합니다. 손상된 registry도 `doctor` 실행을 막지 않으며, 명시적 home이 이미 해석되지 않았다면 내장 default home에서 registry 오류를 진단합니다. Windows 기본 빌드에서는 libssh2가 OpenSSL 대신 WinCNG를 사용하므로 `openssl_version`이 `not linked (Windows WinCNG backend)`로 표시될 수 있습니다.
+
+### 실제 접속 확인
+
+```sh
+sshw test web
+sshw test web --user ops --json
+```
+
+`test`는 명시한 등록 서버와 계정을 선택하고, 활성 정책의 계정 허용 검사를 거친 뒤 로그인 자격 증명을 조회합니다. 기본 로그인은 기존처럼 암묵적으로 허용되며, 정책을 켰을 때 비기본 계정에는 정확한 `allow_accounts` 규칙이 필요합니다. DNS/TCP/SSH handshake·기존 known_hosts 검증·로그인 인증을 수행하고 원격 명령 채널, 전송, sudo/su는 실행하지 않습니다. 명령·경로 허용 규칙은 이 로그인 검사에 사용하지 않습니다. 정책 파일이 잘못됐거나 강제 정책이 없으면 접속 전에 실패합니다.
+
+알 수 없거나 바뀐 호스트 키를 자동 승인하지 않습니다. 기존 `trust` 절차로 확인하고 승인하세요. 비밀번호는 기존 저장소 또는 session_only의 `SSHW_PASSWORD`를 사용하며 승격 비밀번호는 조회하지 않습니다. 연결/신뢰 실패는 ssh/5, 로그인 인증·비밀번호 조회 실패는 auth/4, 미등록 대상은 config/3입니다. JSON 실패는 기존 envelope, 성공은 `connection_tested:true`, `host_key_verified:true`, `authenticated:true`, `command_executed:false`, server/user/host/port, 알고리즘·지문과 `duration_ms`를 제공합니다. 시간이란 자격 증명 조회 뒤 접속·검사 시간이며, 실행 시점의 로그인 가능 여부만 뜻합니다. 서버 권한이나 sudoers를 검증하지 않습니다.
+
+설정·비밀·known_hosts를 변경하지 않고 `test` 감사 기록만 남깁니다. 기존 연결 15초와 인증 시 세션 timeout을 사용합니다. 전역 `--timeout`은 기존 run/put/get의 원격 작업 기한이며 test에 새 기한을 설정하는 옵션은 아닙니다. Rust `SshClient::test_connection`은 기본적으로 미지원 오류를 반환하며 명령 실행으로 대체하지 않습니다. native backend는 실제 접속을 지원합니다. 기존 `doctor`와 `policy check*`는 계속 로컬 검사입니다.
 
 ## JSON 오류 계약
 

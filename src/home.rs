@@ -252,6 +252,8 @@ pub struct ResolvedHome {
     pub namespace: CredentialNamespace,
     /// Human-readable description of how this home was selected (for `doctor`).
     pub description: String,
+    /// Present only when cwd project resources were selected automatically.
+    pub project: Option<crate::project::ProjectContext>,
 }
 
 impl ResolvedHome {
@@ -263,6 +265,7 @@ impl ResolvedHome {
             audit_path: root.join("audit.jsonl"),
             namespace,
             description,
+            project: None,
             root,
         }
     }
@@ -294,6 +297,7 @@ impl ResolvedHome {
             audit_path: root.join("audit.jsonl"),
             namespace,
             description: format!("ad-hoc home {}", root.display()),
+            project: None,
             root,
         }
     }
