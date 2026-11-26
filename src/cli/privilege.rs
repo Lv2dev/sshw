@@ -89,7 +89,12 @@ where
             prompter.password_stdin().with_error_kind(ErrorKind::Auth)?
         } else {
             prompter
-                .password("Privilege password: ")
+                .password(&super::prompt::privilege_password_prompt(
+                    &args.name,
+                    &login_user,
+                    privilege.method,
+                    &privilege.user,
+                ))
                 .with_error_kind(ErrorKind::Auth)?
         });
         validate_privilege_password(&password)?;
@@ -325,13 +330,10 @@ fn authentication_label(no_password: bool) -> &'static str {
 }
 
 pub(super) fn missing_privilege(server: &str, login_user: &str) -> anyhow::Error {
-    let command = super::hints::privilege_set(server, login_user, PrivilegeMethod::Sudo, None);
-    app_error(
-        ErrorKind::Config,
-        format!(
-            "privilege configuration missing for account '{server}/{login_user}'\nusing the same home/profile selection, run `{command}` first"
-        ),
-    )
+    super::lookup_recovery::error(super::lookup_recovery::Lookup::Privilege {
+        server: server.into(),
+        user: login_user.into(),
+    })
 }
 
 pub(super) fn method_label(method: PrivilegeMethod) -> &'static str {

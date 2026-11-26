@@ -186,16 +186,17 @@ mod persistence_tests {
 }
 
 #[derive(Debug)]
-pub(crate) struct CredentialCleanupError {
+pub(crate) struct SavedMutationError {
     pub(crate) mutation: ConfigMutationOutput,
     source: anyhow::Error,
 }
 
-impl fmt::Display for CredentialCleanupError {
+impl fmt::Display for SavedMutationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "configuration changes saved; credential cleanup failed for server '{}'",
+            "configuration changes saved; {} failed for server '{}'",
+            self.mutation.failed_stage.replace('_', " "),
             redact_secrets(&self.mutation.server)
         )?;
         if let Some(account) = &self.mutation.account {
@@ -217,7 +218,7 @@ impl fmt::Display for CredentialCleanupError {
     }
 }
 
-impl std::error::Error for CredentialCleanupError {
+impl std::error::Error for SavedMutationError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(self.source.as_ref())
     }
@@ -230,19 +231,28 @@ pub(crate) fn credential_cleanup_error(
     account: Option<&str>,
     default_change: Option<DefaultChange>,
 ) -> anyhow::Error {
-    classified_error(
+    saved_mutation_error(
         ErrorKind::Auth,
-        anyhow::Error::new(CredentialCleanupError {
-            mutation: ConfigMutationOutput {
-                config_applied: true,
-                failed_stage: "credential_cleanup",
-                action,
-                server: server.to_owned(),
-                account: account.map(str::to_owned),
-                default_change,
-            },
-            source,
-        }),
+        source,
+        ConfigMutationOutput {
+            config_applied: true,
+            failed_stage: "credential_cleanup",
+            action,
+            server: server.to_owned(),
+            account: account.map(str::to_owned),
+            default_change,
+        },
+    )
+}
+
+pub(crate) fn saved_mutation_error(
+    kind: ErrorKind,
+    source: anyhow::Error,
+    mutation: ConfigMutationOutput,
+) -> anyhow::Error {
+    classified_error(
+        kind,
+        anyhow::Error::new(SavedMutationError { mutation, source }),
     )
 }
 

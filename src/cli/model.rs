@@ -19,7 +19,7 @@ const AFTER_LONG_HELP: &str = r#"SECURITY MODEL:
     SSHW_PRIVILEGE_PASSWORD. There is intentionally no `--password <value>`.
   - SSH host keys are verified fail-closed: an unknown or changed key is never
     accepted silently. Approve a host with `sshw trust <name>` before `run`/
-    `put`/`get` can connect.
+    `put`/`get`/`test` can authenticate.
   - The policy allowlist and the safety rails gate dangerous commands and
     writes; both fail closed. A non-default `--user` also requires an exact
     policy v2 allow_accounts entry when policy is enabled. Policy enforcement
@@ -29,7 +29,12 @@ const AFTER_LONG_HELP: &str = r#"SECURITY MODEL:
 HOME SELECTION:
   Use `--home`, `SSHW_HOME`, or `--profile <name>` to select a home.
   An explicit --profile conflicts with SSHW_HOME; unset SSHW_HOME first.
-  Otherwise the registry default profile or app default is used.
+  Otherwise cwd .sshw independently selects local/global servers and policy.
+  Missing local resources inherit the registry default profile or app default.
+  Local server lists do not merge with global lists; parent folders are not searched.
+  Inherited settings are read-only: use --global or project init to select writes.
+  --global ignores cwd and SSHW_HOME; --project-dir explicitly selects a project.
+  Inspect sources with project status or doctor. project init starts local policy.
 
 EXIT CODES (stable; sshw's own operational failures):
   0  success
@@ -48,8 +53,8 @@ EXIT CODES (stable; sshw's own operational failures):
   su prompt/auth failure maps to auth (exit 4) before completion.
 
 JSON OUTPUT:
-  `--json` is accepted by: add, list, show, trust, run, put, get, remove,
-  doctor, default, all account/profile/policy subcommands, and privilege
+  `--json` is accepted by: add, list, show, rename, endpoint, trust, run, put, get, remove,
+  doctor, default, password, test, all account/profile/policy/project subcommands, and privilege
   set/show/clear. A completed run uses command_succeeded for remote success.
   Success (single object) carries `"ok":true`, e.g.:
     run:      {"ok":true,"server":"web","user":"ops","command":"uptime","exit_status":0,...}
@@ -80,6 +85,14 @@ EXAMPLES:
   sshw add web --host 192.0.2.10 --port 22 --user deploy   # password auth (prompts)
   secret-read web | sshw add web --host 192.0.2.10 --port 22 --user deploy --password-stdin
   sshw trust web                                           # approve the host key
+  sshw test web --user deploy                              # verify trust and login, no remote command
+  sshw rename web production                               # keep accounts, passwords and trust
+  sshw endpoint web --port 10022                            # keep accounts; verify the destination key
+  sshw password web                                        # update the saved login password
+  sshw password web --privilege                            # keep the privilege method and target
+  sshw list --filter prod                                  # match a name or host
+  sshw doctor web --json                                   # diagnose one registered server
+  sshw completions powershell                              # print the Tab completion script
   sshw run web "uptime" --json                             # run a command, JSON out
   sshw account add web ops --auth agent                    # register another login user
   sshw run web "whoami" --user ops                         # select a registered account
@@ -107,6 +120,12 @@ pub struct Cli {
     /// SSHW_HOME; unset SSHW_HOME to select a profile explicitly.
     #[arg(long, global = true, value_name = "NAME")]
     pub profile: Option<String>,
+    /// Use the registry-default/built-in settings, ignoring cwd .sshw and SSHW_HOME.
+    #[arg(long, global = true, conflicts_with_all = ["home", "profile", "project_dir"])]
+    pub global: bool,
+    /// Select a project directory explicitly; it must contain .sshw. Overrides SSHW_HOME.
+    #[arg(long,global=true,value_name="PATH",conflicts_with_all=["home","profile"])]
+    pub project_dir: Option<PathBuf>,
     /// Force policy.json enforcement for this invocation. Enforcement is also
     /// on automatically when policy.json sets `enabled: true`. Fails closed if
     /// requested but the file is missing; an invalid policy file always fails
@@ -129,21 +148,31 @@ pub enum Command {
     Add(AddArgs),
     /// List configured servers (credential keys shown, secrets never).
     List(ListArgs),
-    /// Show one server's configuration (no secrets).
+    /// Show a server, all login accounts and their privilege settings (no secrets).
     Show(ShowArgs),
-    /// Show or set the default server used when a name is omitted.
+    /// Rename a server and preserve its accounts, credentials, default and account policy.
+    Rename(RenameArgs),
+    /// Change only a server's host/port, preserving accounts, passwords and privilege settings.
+    Endpoint(EndpointArgs),
+    /// Update an existing account's saved login or privilege password.
+    Password(PasswordArgs),
+    /// Print a shell completion script (load it in your shell to enable Tab completion).
+    Completions(CompletionsArgs),
+    /// Show, set or clear the default server used when a name is omitted.
     Default(DefaultArgs),
     /// Approve a server's SSH host key into known_hosts (required before connecting).
     Trust(TrustArgs),
+    /// Verify the host key and authenticate, without running a remote command.
+    Test(TestArgs),
     /// Run a remote command over SSH and return its output.
     Run(RunArgs),
     /// Upload a local file to a server over SCP.
     Put(PutArgs),
     /// Download a remote file from a server over SCP.
     Get(GetArgs),
-    /// Remove a server, its stored credential, and any privilege metadata.
+    /// Remove a server, its credentials, privilege metadata and account allowlist entries.
     Remove(RemoveArgs),
-    /// Report the resolved home, paths, native library, and credential health.
+    /// Diagnose local settings and credentials, optionally for one registered server.
     Doctor(DoctorArgs),
     /// Manage command/path/account allowlists and explain local execution checks.
     Policy(super::policy_cmd::PolicyArgs),
@@ -153,6 +182,8 @@ pub enum Command {
     Account(AccountArgs),
     /// Manage named sshw profiles (each maps a name to a home directory).
     Profile(ProfileArgs),
+    /// Initialize or inspect this directory's .sshw server/policy selection.
+    Project(ProjectArgs),
 }
 
 impl Command {
@@ -160,8 +191,17 @@ impl Command {
         match self {
             Self::List(args) => args.json,
             Self::Show(args) => args.json,
+            Self::Rename(args) => args.json,
+            Self::Endpoint(args) => args.json,
+            Self::Password(args) => args.json,
+            Self::Completions(_) => false,
+            Self::Project(args) => match &args.command {
+                ProjectCommand::Init(args) => args.json,
+                ProjectCommand::Status(args) => args.json,
+            },
             Self::Run(args) => args.json,
             Self::Doctor(args) => args.json,
+            Self::Test(args) => args.json,
             Self::Policy(args) => args.json,
             Self::Profile(args) => match &args.command {
                 ProfileCommand::List(a) => a.json,
@@ -169,6 +209,7 @@ impl Command {
                 ProfileCommand::Add(a) => a.json,
                 ProfileCommand::Default(a) => a.json,
                 ProfileCommand::Remove(a) => a.json,
+                ProfileCommand::Rename(a) => a.json,
             },
             Self::Privilege(args) => match &args.command {
                 PrivilegeCommand::Show(a) => a.json,
@@ -192,6 +233,61 @@ impl Command {
     }
 }
 
+impl Cli {
+    /// Validate transfer argument counts that depend on --into, before runtime setup.
+    pub fn validate_usage(&self) -> Result<(), clap::Error> {
+        use clap::CommandFactory;
+        if matches!(&self.command, Command::Doctor(args) if args.user.is_some() && args.name.is_none())
+        {
+            return Err(Self::command().error(
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "doctor --user requires a server name",
+            ));
+        }
+        let (target, into, upload) = match &self.command {
+            Command::Get(args) => (&args.target, &args.into, false),
+            Command::Policy(args) => match &args.command {
+                super::policy_cmd::PolicyCommand::CheckGet(args) => {
+                    if args.atomic {
+                        return Err(Self::command().error(
+                            clap::error::ErrorKind::InvalidValue,
+                            "--atomic is only supported by check-put",
+                        ));
+                    }
+                    (&args.target, &args.into, false)
+                }
+                super::policy_cmd::PolicyCommand::CheckPut(args) => {
+                    (&args.target, &args.into, true)
+                }
+                _ => return Ok(()),
+            },
+            _ => return Ok(()),
+        };
+        let message = if upload && into.is_some() {
+            Some("--into is only supported by get and policy check-get")
+        } else if into
+            .as_ref()
+            .is_some_and(|path| path.as_os_str().is_empty())
+        {
+            Some("--into directory cannot be empty")
+        } else if into.is_some() && !(1..=2).contains(&target.len()) {
+            Some("with --into, TARGET must be [server] <remote>; omit the local filename")
+        } else if into.is_none() && !(2..=3).contains(&target.len()) {
+            Some(
+                "TARGET must be [server] <source> <destination>; for get, use --into <directory> instead of the local filename",
+            )
+        } else {
+            None
+        };
+        match message {
+            Some(message) => {
+                Err(Self::command().error(clap::error::ErrorKind::WrongNumberOfValues, message))
+            }
+            None => Ok(()),
+        }
+    }
+}
+
 #[derive(Debug, Args)]
 pub struct AccountArgs {
     #[command(subcommand)]
@@ -208,7 +304,8 @@ pub enum AccountCommand {
     Show(AccountShowArgs),
     /// Set the account used when `--user` is omitted.
     Default(AccountDefaultArgs),
-    /// Remove a non-default login account and its credentials.
+    /// Remove a saved login account, its credentials and account allowlist entries.
+    /// Removing the default requires --switch-default with another registered login.
     Remove(AccountRemoveArgs),
 }
 
@@ -269,6 +366,9 @@ pub struct AccountRemoveArgs {
     pub name: String,
     /// Registered remote SSH username to remove.
     pub user: String,
+    /// When removing the default login, select this different registered account in the same save.
+    #[arg(long, value_name = "USER")]
+    pub switch_default: Option<String>,
     /// Confirm removal non-interactively.
     #[arg(long)]
     pub yes: bool,
@@ -373,7 +473,9 @@ pub enum ProfileCommand {
     List(ProfileListArgs),
     /// Show one profile's id and home path.
     Show(ProfileShowArgs),
-    /// Set the default profile used when neither --home nor --profile is given.
+    /// Rename a profile, preserving its home, credential namespace and default selection.
+    Rename(ProfileRenameArgs),
+    /// Set or clear the default profile used when no explicit selector is given.
     Default(ProfileDefaultArgs),
     /// Remove a profile registry entry (leaves its home dir and credentials intact).
     Remove(ProfileRemoveArgs),
@@ -409,8 +511,12 @@ pub struct ProfileShowArgs {
 
 #[derive(Debug, Args)]
 pub struct ProfileDefaultArgs {
-    /// Profile name to make the default.
-    pub name: String,
+    /// Profile name to make the default; mutually exclusive with --clear.
+    #[arg(required_unless_present = "clear", conflicts_with = "clear")]
+    pub name: Option<String>,
+    /// Clear the default profile; without an explicit selector use the built-in home.
+    #[arg(long)]
+    pub clear: bool,
     /// Emit JSON.
     #[arg(long)]
     pub json: bool,
@@ -420,6 +526,23 @@ pub struct ProfileDefaultArgs {
 pub struct ProfileRemoveArgs {
     /// Profile name to remove from the registry.
     pub name: String,
+    /// When removing the default, select another registered profile instead of the first name.
+    #[arg(long, conflicts_with = "clear_default", value_name = "NAME")]
+    pub switch_default: Option<String>,
+    /// When removing the default, clear its selection and use the built-in home.
+    #[arg(long)]
+    pub clear_default: bool,
+    /// Emit JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ProfileRenameArgs {
+    /// Registered profile name to rename.
+    pub name: String,
+    /// New unused profile name.
+    pub new_name: String,
     /// Emit JSON.
     #[arg(long)]
     pub json: bool,
@@ -448,8 +571,8 @@ pub struct AddArgs {
     #[arg(long)]
     pub force: bool,
     /// Replace the whole server, removing its other accounts and privilege
-    /// settings. Required when changing host or port. Without this flag,
-    /// updating the same endpoint preserves other accounts and privileges.
+    /// settings. Required for address changes through add; use endpoint for
+    /// an address-only edit that preserves accounts and privilege settings.
     #[arg(long)]
     pub replace: bool,
     /// Read the password from stdin once instead of a hidden prompt. Password
@@ -471,6 +594,9 @@ pub enum AuthArg {
 
 #[derive(Debug, Args)]
 pub struct ListArgs {
+    /// Case-insensitive literal substring of the server name or host.
+    #[arg(long, value_name = "TEXT")]
+    pub filter: Option<String>,
     /// Emit a JSON array instead of human text.
     #[arg(long)]
     pub json: bool,
@@ -489,19 +615,124 @@ pub struct ShowArgs {
 pub struct DefaultArgs {
     /// Server name to set as default; omit to print the current default.
     pub name: Option<String>,
+    /// Clear the default server, requiring an explicit server for remote operations.
+    #[arg(long, conflicts_with = "name")]
+    pub clear: bool,
     /// Emit JSON.
     #[arg(long)]
     pub json: bool,
 }
 
 #[derive(Debug, Args)]
+pub struct RenameArgs {
+    /// Existing server name.
+    pub name: String,
+    /// New, unused server name (existing servers and account policy names are not overwritten).
+    pub new_name: String,
+    /// Emit JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct EndpointArgs {
+    /// Registered server to update.
+    pub name: String,
+    /// New hostname or IP address; omit to keep the current host.
+    #[arg(long, required_unless_present = "port")]
+    pub host: Option<String>,
+    /// New SSH port; omit to keep the current port.
+    #[arg(long, required_unless_present = "host")]
+    pub port: Option<u16>,
+    /// Confirm changing the endpoint without prompting.
+    #[arg(long)]
+    pub yes: bool,
+    /// Emit JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ProjectArgs {
+    #[command(subcommand)]
+    pub command: ProjectCommand,
+}
+#[derive(Debug, Subcommand)]
+pub enum ProjectCommand {
+    /// Initialize resource sources and show policy enforcement; new local policy preserves global enablement.
+    Init(ProjectInitArgs),
+    /// Show project sources, paths and saved/current policy enforcement without secrets or SSH.
+    Status(ProjectStatusArgs),
+}
+#[derive(Debug, Args)]
+pub struct ProjectInitArgs {
+    /// Server list source. First init defaults to global; local starts with an empty list.
+    #[arg(long = "servers-source", id = "servers_source", value_enum)]
+    pub servers: Option<crate::project::ResourceMode>,
+    /// Policy source. First init defaults to local and preserves global rules as the starting point.
+    #[arg(long = "policy-source", id = "policy_source", value_enum)]
+    pub policy: Option<crate::project::ResourceMode>,
+    #[arg(long)]
+    pub json: bool,
+}
+#[derive(Debug, Args)]
+pub struct ProjectStatusArgs {
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct PasswordArgs {
+    /// Existing server name.
+    pub name: String,
+    /// Registered login account (default: the server's default login).
+    #[arg(long)]
+    pub user: Option<String>,
+    /// Update the saved privilege password, preserving the configured sudo/su method and target.
+    #[arg(long)]
+    pub privilege: bool,
+    /// Read the new password from stdin instead of a hidden prompt.
+    #[arg(long)]
+    pub password_stdin: bool,
+    /// Emit JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct CompletionsArgs {
+    #[arg(value_enum)]
+    pub shell: CompletionShell,
+    /// Internal data-only completion request on stdin; never executes the command being completed.
+    #[arg(long, hide = true)]
+    pub query: bool,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum CompletionShell {
+    Powershell,
+}
+
+#[derive(Debug, Args)]
 pub struct TrustArgs {
-    /// Server whose host key to fetch, display, and approve into known_hosts.
+    /// Server whose endpoint, settings source and fingerprint to display before approving its host key.
     pub name: String,
     /// Skip the interactive fingerprint confirmation (still re-verifies before writing).
     #[arg(long)]
     pub yes: bool,
     /// Emit JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct TestArgs {
+    /// Registered server to connect to; always explicit.
+    pub name: String,
+    /// Registered login account (default: the server's default account).
+    #[arg(long, value_name = "USER")]
+    pub user: Option<String>,
+    /// Emit JSON instead of human text.
     #[arg(long)]
     pub json: bool,
 }
@@ -563,6 +794,9 @@ pub struct PutArgs {
     /// Confirm writes to system paths non-interactively.
     #[arg(long)]
     pub yes: bool,
+    /// Show transfer bytes, percentage and average speed on stderr, including with --json.
+    #[arg(long)]
+    pub progress: bool,
     /// Emit JSON.
     #[arg(long)]
     pub json: bool,
@@ -584,14 +818,22 @@ pub struct GetArgs {
     /// Grammar: `[server] <remote> <local>`. With two values the default server
     /// is used; with three, the first is the server name. In Git Bash/MSYS,
     /// write an absolute remote path as `remote:/path` to prevent conversion.
-    #[arg(value_name = "TARGET", num_args = 2..=3, required = true)]
+    /// With --into, use [server] <remote>; keep the source filename in that directory.
+    #[arg(value_name = "TARGET", num_args = 1..=3, required = true)]
     pub target: Vec<String>,
+    /// Download into this local directory using the remote source's filename.
+    /// Replaces the positional local filename; existing overwrite protection still applies.
+    #[arg(long, value_name = "DIRECTORY")]
+    pub into: Option<PathBuf>,
     /// Use this registered login account instead of the server default.
     #[arg(long, value_name = "USER")]
     pub user: Option<String>,
     /// Confirm overwriting an existing local file non-interactively.
     #[arg(long)]
     pub yes: bool,
+    /// Show transfer bytes, percentage and average speed on stderr, including with --json.
+    #[arg(long)]
+    pub progress: bool,
     /// Emit JSON.
     #[arg(long)]
     pub json: bool,
@@ -601,6 +843,12 @@ pub struct GetArgs {
 pub struct RemoveArgs {
     /// Server name to remove.
     pub name: String,
+    /// When removing the default, select another registered server instead of the first name.
+    #[arg(long, conflicts_with = "clear_default", value_name = "NAME")]
+    pub switch_default: Option<String>,
+    /// When removing the default, leave no default server selected.
+    #[arg(long)]
+    pub clear_default: bool,
     /// Confirm removal non-interactively.
     #[arg(long)]
     pub yes: bool,
@@ -611,6 +859,11 @@ pub struct RemoveArgs {
 
 #[derive(Debug, Args)]
 pub struct DoctorArgs {
+    /// Limit server-specific checks to this registered server; keep home-wide diagnostics.
+    pub name: Option<String>,
+    /// Check only this registered login and its privilege credentials; requires a server name.
+    #[arg(long, requires = "name", value_name = "USER")]
+    pub user: Option<String>,
     /// Emit JSON instead of human text.
     #[arg(long)]
     pub json: bool,
@@ -620,6 +873,52 @@ pub struct DoctorArgs {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn check_get_atomic_is_rejected_by_early_usage_validation() {
+        use clap::Parser;
+        for target in [
+            vec!["source", "destination"],
+            vec!["web", "source", "destination"],
+        ] {
+            let mut args = vec!["sshw", "policy", "check-get"];
+            args.extend(target);
+            args.push("--atomic");
+            let cli = Cli::try_parse_from(args).unwrap();
+            let error = cli.validate_usage().unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("--atomic is only supported by check-put")
+            );
+        }
+        assert!(
+            Cli::try_parse_from([
+                "sshw",
+                "policy",
+                "check-put",
+                "source",
+                "destination",
+                "--atomic"
+            ])
+            .unwrap()
+            .validate_usage()
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "sshw",
+                "policy",
+                "check-get",
+                "source",
+                "--into",
+                "downloads"
+            ])
+            .unwrap()
+            .validate_usage()
+            .is_ok()
+        );
+    }
 
     /// `sshw --help` must be self-sufficient for an agent: it has to carry the
     /// security model, the stable exit-code table, the `--json` envelope, and
@@ -636,8 +935,8 @@ mod tests {
             "EXIT CODES",
             "sshw trust",
             "JSON OUTPUT:",
-            "`--json` is accepted by: add, list, show, trust, run, put, get, remove,",
-            "doctor, default, all account/profile/policy subcommands, and privilege",
+            "`--json` is accepted by: add, list, show, rename, endpoint, trust, run, put, get, remove,",
+            "doctor, default, password, test, all account/profile/policy/project subcommands, and privilege",
             "set/show/clear. A completed run uses command_succeeded for remote success.",
             "sshw account add web ops --auth agent",
             "An explicit --profile conflicts with SSHW_HOME",

@@ -12,6 +12,431 @@ use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::path::Path;
 
+mod scoped_doctor {
+    use super::*;
+    use std::cell::RefCell;
+
+    #[test]
+    fn doctor_user_limits_secret_and_agent_queries_and_preserves_common_diagnostics() {
+        for json_output in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("servers.json");
+            let mut config = fixture(&path, "web");
+            config.servers.get_mut("web").unwrap().accounts.insert(
+                "agent".into(),
+                AccountConfig {
+                    auth: AuthConfig::Agent,
+                    privilege: None,
+                },
+            );
+            save_config(&path, &config).unwrap();
+            let snapshot = std::fs::read(&path).unwrap();
+            for user in ["deploy", "agent"] {
+                let store = ScopedStore {
+                    available: true,
+                    ..Default::default()
+                };
+                let ssh = AgentProbe(Cell::new(0));
+                let mut args = vec!["sshw", "doctor", "web", "--user", user];
+                if json_output {
+                    args.push("--json");
+                }
+                let output = execute(
+                    Cli::try_parse_from(args).unwrap(),
+                    &path,
+                    &store,
+                    &ssh,
+                    &mut NoPrompts,
+                )
+                .unwrap();
+                assert_eq!(output.exit_code, 0);
+                assert_eq!(store.health.get(), 1);
+                assert_eq!(
+                    store.reads.borrow().len(),
+                    if user == "deploy" { 2 } else { 0 }
+                );
+                assert_eq!(ssh.0.get(), usize::from(user == "agent"));
+                if user == "deploy" {
+                    let reads = store.reads.borrow();
+                    assert_eq!(reads[0].0, CredentialPurpose::Login);
+                    assert_eq!(reads[0].2, "deploy");
+                    assert_eq!(reads[1].0, CredentialPurpose::Privilege);
+                    assert_eq!(reads[1].2, "root");
+                }
+                if json_output {
+                    let body: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+                    assert_eq!(body["server"], "web");
+                    assert_eq!(body["user"], user);
+                    assert_eq!(body["local_checks_passed"], true);
+                    assert_eq!(body["connection_tested"], false);
+                    assert_eq!(body["host_trust"].as_array().unwrap().len(), 1);
+                    assert!(
+                        body["credential_checks"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .all(|c| c["user"] == user)
+                    );
+                } else {
+                    assert!(
+                        output
+                            .stdout
+                            .starts_with(&format!("user: {user}\nserver: web\n"))
+                    );
+                }
+            }
+            std::fs::write(temp.path().join("policy.json"), "invalid policy").unwrap();
+            let store = ScopedStore::default();
+            let ssh = AgentProbe(Cell::new(0));
+            let output = execute(
+                Cli::try_parse_from(["sshw", "doctor", "web", "--user", "deploy", "--json"])
+                    .unwrap(),
+                &path,
+                &store,
+                &ssh,
+                &mut NoPrompts,
+            )
+            .unwrap();
+            let body: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+            assert_eq!(body["local_checks_passed"], false);
+            assert!(
+                body["issues"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|i| i["kind"] == "policy")
+            );
+            assert!(
+                body["issues"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|i| i["kind"] == "credentials")
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), snapshot);
+            assert!(!temp.path().join("audit.jsonl").exists());
+        }
+    }
+
+    #[test]
+    fn doctor_user_unknown_account_stops_before_probes_and_broken_config_stays_diagnosable() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("servers.json");
+        fixture(&path, "web");
+        let store = ScopedStore::default();
+        let ssh = AgentProbe(Cell::new(0));
+        for user in ["missing", "token=account-marker"] {
+            let output = execute_for_runtime(
+                Cli::try_parse_from(["sshw", "doctor", "web", "--user", user, "--json"]).unwrap(),
+                &path,
+                &store,
+                &ssh,
+                &mut NoPrompts,
+            );
+            assert_eq!(output.exit_code, 3);
+            assert!(!output.stdout.contains("account-marker"));
+        }
+        assert_eq!(store.health.get(), 0);
+        assert!(store.reads.borrow().is_empty());
+        assert_eq!(ssh.0.get(), 0);
+        assert!(!temp.path().join("audit.jsonl").exists());
+        assert!(Cli::try_parse_from(["sshw", "doctor", "--user", "deploy"]).is_err());
+        std::fs::write(&path, "invalid config").unwrap();
+        let output = execute(
+            Cli::try_parse_from([
+                "sshw",
+                "doctor",
+                "web",
+                "--user",
+                "token=account-marker",
+                "--json",
+            ])
+            .unwrap(),
+            &path,
+            &store,
+            &ssh,
+            &mut NoPrompts,
+        )
+        .unwrap();
+        let body: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+        assert_eq!(body["config_valid"], false);
+        assert_eq!(body["user"], "<redacted>");
+        assert!(!output.stdout.contains("account-marker"));
+        assert!(store.reads.borrow().is_empty());
+        assert_eq!(ssh.0.get(), 0);
+    }
+
+    #[derive(Default)]
+    struct ScopedStore {
+        reads: RefCell<Vec<(CredentialPurpose, String, String)>>,
+        health: Cell<usize>,
+        available: bool,
+    }
+    impl CredentialStore for ScopedStore {
+        fn set_password(&self, _: &str, _: &str, _: &str) -> anyhow::Result<()> {
+            panic!("doctor must not store passwords")
+        }
+        fn delete_password(&self, _: &str, _: &str) -> anyhow::Result<()> {
+            panic!("doctor must not delete passwords")
+        }
+        fn get_password(&self, _: &str, _: &str) -> anyhow::Result<String> {
+            unreachable!()
+        }
+        fn get_password_for(
+            &self,
+            purpose: CredentialPurpose,
+            key: &str,
+            user: &str,
+        ) -> anyhow::Result<String> {
+            self.reads
+                .borrow_mut()
+                .push((purpose, key.into(), user.into()));
+            Ok("fixture-secret".into())
+        }
+        fn health_check(&self) -> anyhow::Result<CredentialStoreHealth> {
+            self.health.set(self.health.get() + 1);
+            Ok(CredentialStoreHealth {
+                backend: "fixture".into(),
+                available: self.available,
+                message: "fixture health".into(),
+            })
+        }
+    }
+    struct AgentProbe(Cell<usize>);
+    impl SshClient for AgentProbe {
+        fn host_key(&self, s: &ServerConfig) -> anyhow::Result<HostKeyInfo> {
+            NoNetwork.host_key(s)
+        }
+        fn trust_host(&self, n: &str, s: &ServerConfig, f: &str) -> anyhow::Result<HostKeyInfo> {
+            NoNetwork.trust_host(n, s, f)
+        }
+        fn run(&self, t: &SshTarget<'_>, a: &AuthMaterial, c: &str) -> anyhow::Result<RunResult> {
+            NoNetwork.run(t, a, c)
+        }
+        fn put(
+            &self,
+            t: &SshTarget<'_>,
+            a: &AuthMaterial,
+            l: &Path,
+            r: &str,
+        ) -> anyhow::Result<TransferResult> {
+            NoNetwork.put(t, a, l, r)
+        }
+        fn get(
+            &self,
+            t: &SshTarget<'_>,
+            a: &AuthMaterial,
+            r: &str,
+            l: &Path,
+            y: bool,
+        ) -> anyhow::Result<TransferResult> {
+            NoNetwork.get(t, a, r, l, y)
+        }
+        fn agent_identity_count(&self) -> anyhow::Result<Option<usize>> {
+            self.0.set(self.0.get() + 1);
+            Ok(Some(1))
+        }
+    }
+    fn fixture(path: &Path, name: &str) -> SshwConfig {
+        config(path, "example.test", 2222, name, "deploy");
+        let home = ResolvedHome::from_config_path(path);
+        let mut file = load_config(path).unwrap();
+        file.servers
+            .get_mut(name)
+            .unwrap()
+            .accounts
+            .get_mut("deploy")
+            .unwrap()
+            .privilege = Some(PrivilegeConfig {
+            method: PrivilegeMethod::Su,
+            user: "root".into(),
+            credential: Some(home.namespace.new_account_credential_key(
+                CredentialPurpose::Privilege,
+                name,
+                "deploy",
+            )),
+            no_password: false,
+        });
+        let mut other = ServerConfig::single_account("other.test", 22, "agent", AuthConfig::Agent);
+        other.accounts.insert(
+            "ops".into(),
+            AccountConfig {
+                auth: AuthConfig::Password {
+                    credential: home.namespace.new_account_credential_key(
+                        CredentialPurpose::Login,
+                        "other",
+                        "ops",
+                    ),
+                },
+                privilege: None,
+            },
+        );
+        file.servers.insert("other".into(), other);
+        file.default = Some("other".into());
+        save_config(path, &file).unwrap();
+        std::fs::write(
+            home.known_hosts_path,
+            format!("[example.test]:2222 {KEY}\n"),
+        )
+        .unwrap();
+        file
+    }
+
+    #[test]
+    fn named_doctor_queries_only_selected_credentials_hosts_and_agent_need_without_default_fallback()
+     {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("servers.json");
+        let config = fixture(&path, "web");
+        let before = std::fs::read(&path).unwrap();
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let store = ScopedStore {
+            available: true,
+            ..Default::default()
+        };
+        let ssh = AgentProbe(Cell::new(0));
+        let output = execute(
+            Cli::try_parse_from(["sshw", "doctor", "web", "--json"]).unwrap(),
+            &path,
+            &store,
+            &ssh,
+            &mut NoPrompts,
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+        assert_eq!(value["server"], "web");
+        assert_eq!(value["connection_tested"], false);
+        assert_eq!(value["local_checks_passed"], true);
+        assert_eq!(value["host_trust"].as_array().unwrap().len(), 1);
+        assert_eq!(value["host_trust"][0]["server"], "web");
+        assert_eq!(value["host_trust"][0]["entry_present"], true);
+        assert_eq!(value["credential_checks"].as_array().unwrap().len(), 2);
+        assert_eq!(ssh.0.get(), 0);
+        assert_eq!(store.health.get(), 1);
+        let account = &config.servers["web"].accounts["deploy"];
+        let AuthConfig::Password { credential: login } = &account.auth else {
+            panic!()
+        };
+        let privilege = account.privilege.as_ref().unwrap();
+        assert_eq!(
+            *store.reads.borrow(),
+            vec![
+                (CredentialPurpose::Login, login.clone(), "deploy".into()),
+                (
+                    CredentialPurpose::Privilege,
+                    privilege.credential.clone().unwrap(),
+                    "root".into()
+                )
+            ]
+        );
+        store.reads.borrow_mut().clear();
+        let output = execute(
+            Cli::try_parse_from(["sshw", "doctor", "--json"]).unwrap(),
+            &path,
+            &store,
+            &ssh,
+            &mut NoPrompts,
+        )
+        .unwrap();
+        let all: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+        assert!(all.get("server").is_none());
+        assert_eq!(all["host_trust"].as_array().unwrap().len(), 2);
+        assert_eq!(store.reads.borrow().len(), 3);
+        assert_eq!(ssh.0.get(), 1);
+        assert_eq!(all["local_checks_passed"], false);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            modified
+        );
+    }
+
+    #[test]
+    fn unknown_doctor_target_stops_before_backend_health_credentials_and_agent_queries() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("servers.json");
+        fixture(&path, "web");
+        let store = ScopedStore::default();
+        let ssh = AgentProbe(Cell::new(0));
+        for name in ["missing", "token=missing-marker"] {
+            for json in [false, true] {
+                let mut args = vec!["sshw", "doctor", name];
+                if json {
+                    args.push("--json");
+                }
+                let output = execute_for_runtime(
+                    Cli::try_parse_from(args).unwrap(),
+                    &path,
+                    &store,
+                    &ssh,
+                    &mut NoPrompts,
+                );
+                assert_eq!(output.exit_code, 3);
+                let text = format!("{}{}", output.stdout, output.stderr);
+                assert!(text.contains("unknown server"));
+                assert!(!text.contains("missing-marker"));
+            }
+        }
+        assert_eq!(store.health.get(), 0);
+        assert!(store.reads.borrow().is_empty());
+        assert_eq!(ssh.0.get(), 0);
+        assert!(!temp.path().join("audit.jsonl").exists());
+    }
+
+    #[test]
+    fn scoped_doctor_keeps_home_errors_config_recovery_and_identifier_redaction() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("servers.json");
+        fixture(&path, "token=server-marker");
+        let store = ScopedStore::default();
+        let ssh = AgentProbe(Cell::new(0));
+        std::fs::write(temp.path().join("policy.json"), "invalid policy").unwrap();
+        for json in [false, true] {
+            let mut args = vec!["sshw", "doctor", "token=server-marker"];
+            if json {
+                args.push("--json");
+            }
+            let output = execute(
+                Cli::try_parse_from(args).unwrap(),
+                &path,
+                &store,
+                &ssh,
+                &mut NoPrompts,
+            )
+            .unwrap();
+            assert!(!output.stdout.contains("server-marker"));
+            assert!(!output.stdout.contains("fixture-secret"));
+            if json {
+                let value: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+                assert_eq!(value["server"], "<redacted>");
+                assert_eq!(value["local_checks_passed"], false);
+                let issues = value["issues"].as_array().unwrap();
+                assert!(issues.iter().any(|i| i["kind"] == "policy"));
+                assert!(issues.iter().any(|i| i["kind"] == "credentials"));
+            } else {
+                assert!(output.stdout.starts_with("server: <redacted>\n"));
+            }
+        }
+        store.reads.borrow_mut().clear();
+        std::fs::write(&path, "invalid config").unwrap();
+        let output = execute(
+            Cli::try_parse_from(["sshw", "doctor", "web", "--json"]).unwrap(),
+            &path,
+            &store,
+            &ssh,
+            &mut NoPrompts,
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+        assert_eq!(value["config_valid"], false);
+        assert_eq!(value["server"], "web");
+        assert!(value["credential_checks"].as_array().unwrap().is_empty());
+        assert!(value["host_trust"].as_array().unwrap().is_empty());
+        assert!(store.reads.borrow().is_empty());
+        assert_eq!(ssh.0.get(), 0);
+    }
+}
+
 const KEY: &str =
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB9zU1OEQ2tzYhrXq4/DEjvRNvKv6cU4Xar6gghj1p7D";
 
@@ -151,13 +576,18 @@ fn server_selection_recovery_is_shared_quoted_and_masked_before_any_external_acc
                     text.contains("only registered servers can be selected")
                         && text.contains("same home/profile")
                 );
-                assert!(text.contains("sshw list") && text.contains("sshw add --host"));
                 assert!(
-                    text.contains("<host>")
-                        && text.contains("<login-user>")
-                        && text.contains("--auth agent")
-                        && text.contains("--password-stdin")
+                    text.contains("sshw --home=") && text.contains(" list`"),
+                    "{text}"
                 );
+                if !missing.starts_with("password=") {
+                    assert!(
+                        text.contains("<host>")
+                            && text.contains("<login-user>")
+                            && text.contains("--auth agent")
+                            && text.contains("--password-stdin")
+                    );
+                }
                 let message = if machine {
                     let body: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
                     assert_eq!(body["error"]["kind"], "config");
@@ -172,7 +602,8 @@ fn server_selection_recovery_is_shared_quoted_and_masked_before_any_external_acc
                 if missing.starts_with("password=") {
                     assert!(message.contains("<redacted>"));
                     assert!(!text.contains("server-marker"));
-                    assert!(message.contains("-- '<redacted>'"));
+                    assert!(message.contains("copyable command is omitted"));
+                    assert!(!message.contains(" add --host "));
                 } else if missing.starts_with('-') {
                     let quoted = if cfg!(windows) {
                         "-- '-stage''s $literal'"
@@ -433,13 +864,16 @@ fn registration_validation_profile_keeps_target_validation_force_and_real_change
     std::fs::remove_file(target.join("servers.json")).unwrap();
     registry.default = None;
     sshw::profile::save_registry(&registry_path, &registry).unwrap();
+    let cleared_bytes = std::fs::read(&registry_path).unwrap();
     let output = call(true);
     let body: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
     assert_eq!(output.exit_code, 0);
-    assert_eq!(body["changed"], true);
-    assert_eq!(body["change"], "updated");
+    // Re-registering an unchanged profile must preserve an explicitly cleared default.
+    assert_eq!(body["changed"], false);
+    assert_eq!(body["change"], "unchanged");
     let saved = sshw::profile::load_registry(&registry_path).unwrap();
-    assert_eq!(saved.default.as_deref(), Some("repeat"));
+    assert!(saved.default.is_none());
+    assert_eq!(std::fs::read(&registry_path).unwrap(), cleared_bytes);
     assert_eq!(saved.profiles["repeat"].id, original_id);
     assert_eq!(store.reads.get(), 0);
 }
@@ -513,11 +947,11 @@ fn account_selection_unknown_account_guides_recovery_without_secret_or_network_a
             assert_eq!(output.exit_code, 3, "{output:?}");
             let message = format!("{}{}", output.stdout, output.stderr);
             assert!(message.contains("unknown account 'web/ops'"), "{message}");
-            assert!(message.contains("sshw account list -- 'web'"), "{message}");
             assert!(
-                message.contains("sshw account add -- 'web' 'ops'"),
+                message.contains("sshw --home=") && message.contains(" account list -- 'web'"),
                 "{message}"
             );
+            assert!(message.contains(" account add -- 'web' 'ops'"), "{message}");
             assert!(
                 message.contains("registered login account")
                     && message.contains("same home/profile"),
@@ -575,8 +1009,9 @@ fn account_selection_recovery_quotes_arguments_and_masks_sensitive_values() {
                     !message.contains("server-marker") && !message.contains("user-marker"),
                     "{message}"
                 );
-                assert!(message.contains("sshw account list -- '<redacted>'"));
-                assert!(message.contains("sshw account add -- '<redacted>' '<redacted>'"));
+                assert!(message.contains("copyable command is omitted"));
+                assert!(!message.contains(" account list -- "));
+                assert!(!message.contains(" account add -- "));
             } else {
                 assert!(
                     message.contains(if cfg!(windows) {
@@ -1535,7 +1970,7 @@ fn empty_diagnostics_doctor_distinguishes_typed_absence_from_unavailable_lookups
                             check["next_step"]
                                 .as_str()
                                 .unwrap()
-                                .contains("rerun sshw doctor")
+                                .contains(" doctor --user=")
                         );
                         assert!(
                             !check["next_step"]
@@ -2081,12 +2516,27 @@ fn policy_management_reports_file_saved_and_forced_state_without_mutation() {
                 );
                 assert_eq!(output.exit_code, 0, "{output:?}");
                 let enforced = enabled.unwrap_or(false) || forced;
+                let blocked = enabled.is_none() && forced;
+                let state = if blocked {
+                    "blocked"
+                } else if enforced {
+                    "on"
+                } else {
+                    "off"
+                };
                 if json {
                     let value: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
                     assert_eq!(value["present"], enabled.is_some());
                     assert_eq!(value["policy"]["enabled"], enabled.unwrap_or(false));
                     assert_eq!(value["enforced"], enforced);
                     assert_eq!(value["forced"], forced);
+                    let status = &value["policy_status"];
+                    assert_eq!(status["state"], state);
+                    assert_eq!(status["saved_enabled"], serde_json::json!(enabled));
+                    assert_eq!(
+                        status["enforced"],
+                        serde_json::json!((!blocked).then_some(enforced))
+                    );
                 } else {
                     assert!(
                         output.stdout.contains(if enabled.is_some() {
@@ -2103,16 +2553,19 @@ fn policy_management_reports_file_saved_and_forced_state_without_mutation() {
                                 .map(|v| v.to_string())
                                 .unwrap_or_else(|| "not configured".into())
                         )));
-                    assert!(output.stdout.contains(if enforced {
-                        "policy enforcement: on"
-                    } else {
-                        "policy enforcement: off"
-                    }));
-                    assert_eq!(output.stdout.contains("forced by --policy"), forced);
+                    assert!(
+                        output
+                            .stdout
+                            .contains(&format!("policy enforcement: {state}"))
+                    );
+                    assert_eq!(
+                        output.stdout.contains("forced by --policy"),
+                        forced && !blocked
+                    );
                     if enabled.is_none() {
                         assert!(
-                            output.stdout.contains("sshw policy init")
-                                && output.stdout.contains("same home/profile")
+                            output.stdout.contains("sshw --home=")
+                                && output.stdout.contains(" policy init")
                         );
                     }
                 }

@@ -11,7 +11,7 @@ use crate::config::{
 use crate::credentials::CredentialStore;
 use crate::error::{ResultErrorKindExt, app_error, credential_cleanup_error};
 use crate::home::{CredentialNamespace, CredentialPurpose, validate_server_name};
-use crate::output::{ErrorKind, redact_secrets};
+use crate::output::{DefaultChange, ErrorKind, redact_secrets};
 use serde_json::{Value, json};
 use std::path::Path;
 
@@ -61,7 +61,9 @@ where
                 prompter.password_stdin().with_error_kind(ErrorKind::Auth)?
             } else {
                 prompter
-                    .password("SSH password: ")
+                    .password(&super::prompt::login_password_prompt(
+                        &args.name, &args.user,
+                    ))
                     .with_error_kind(ErrorKind::Auth)?
             };
             if password.is_empty() {
@@ -253,6 +255,7 @@ pub(super) fn default_account(
 pub(super) fn remove_account<C, P>(
     args: AccountRemoveArgs,
     config_path: &Path,
+    policy_path: &Path,
     revision: &ConfigRevision,
     credentials: &C,
     prompter: &mut P,
@@ -263,12 +266,13 @@ where
     P: Prompter,
 {
     let server = get_server(config, &args.name)?;
-    if server.default_user == args.user {
+    if server.default_user == args.user && args.switch_default.is_none() {
         return Err(app_error(
             ErrorKind::Config,
             format!(
-                "cannot remove default account '{}/{}'; set another default account first",
-                args.name, args.user
+                "cannot remove default account '{}/{}'; set another default account first or pass --switch-default <registered-user>",
+                super::hints::redacted_argument(&args.name),
+                super::hints::redacted_argument(&args.user)
             ),
         ));
     }
@@ -276,10 +280,45 @@ where
         .account(&args.user)
         .cloned()
         .ok_or_else(|| unknown_account(&args.name, &args.user))?;
+    let default_change = if let Some(replacement) = args.switch_default.as_deref() {
+        if replacement == args.user {
+            return Err(app_error(
+                ErrorKind::Config,
+                "--switch-default must select a different registered login account",
+            ));
+        }
+        if !server.accounts.contains_key(replacement) {
+            return Err(unknown_account(&args.name, replacement));
+        }
+        if server.default_user != args.user {
+            return Err(app_error(
+                ErrorKind::Config,
+                "--switch-default is only for removing the current default login account; omit it to remove a non-default account",
+            ));
+        }
+        DefaultChange::between(
+            "account",
+            Some(server.default_user.clone()),
+            Some(replacement.into()),
+        )
+    } else {
+        None
+    };
+    let switch_notice = default_change
+        .as_ref()
+        .map(|change| {
+            format!(
+                " and switch default login to '{}'",
+                super::hints::redacted_argument(
+                    change.current.as_deref().expect("replacement exists")
+                )
+            )
+        })
+        .unwrap_or_default();
     if !args.yes
         && !prompter
             .confirm(&format!(
-                "remove account '{}/{}'? [y/N] ",
+                "remove account '{}/{}'{switch_notice}? [y/N] ",
                 super::hints::redacted_argument(&args.name),
                 super::hints::redacted_argument(&args.user)
             ))
@@ -288,13 +327,21 @@ where
         return Err(app_error(ErrorKind::Config, "account removal cancelled"));
     }
 
-    config
+    let policy =
+        super::removal_policy::RemovalPolicy::prepare(policy_path, &args.name, Some(&args.user))?;
+    policy.verify_unchanged()?;
+    let server = config
         .servers
         .get_mut(&args.name)
-        .expect("server validated above")
-        .accounts
-        .remove(&args.user);
-    save_config_if_unchanged(config_path, config, revision).with_error_kind(ErrorKind::Config)?;
+        .expect("server validated above");
+    if let Some(replacement) = args.switch_default {
+        server.default_user = replacement;
+    }
+    server.accounts.remove(&args.user);
+    save_config_if_unchanged(config_path, config, revision)
+        .with_error_kind(ErrorKind::Config)
+        .map_err(|error| policy.config_error(error, default_change.clone()))?;
+    let policy_result = policy.save();
 
     let mut cleanup_error = None;
     if let AuthConfig::Password { credential } = &account.auth
@@ -313,29 +360,40 @@ where
     {
         cleanup_error.get_or_insert(err);
     }
-    if let Some(err) = cleanup_error {
-        return Err(credential_cleanup_error(
-            err,
-            "removed",
-            &args.name,
-            Some(&args.user),
-            None,
-        ));
-    }
+    policy.finish(policy_result, cleanup_error, default_change.clone())?;
 
     if args.json {
-        let output = json!({
+        let mut output = json!({
             "ok": true,
             "action": "removed",
-            "server": args.name,
-            "user": args.user,
+            "server": redact_secrets(&args.name),
+            "user": redact_secrets(&args.user),
+            "policy_changed": policy.rules_removed > 0,
+            "policy_rules_removed": policy.rules_removed,
         });
+        if let Some(change) = default_change {
+            output["default_change"] = serde_json::to_value(change.redacted())?;
+        }
         return Ok(ok(format!("{}\n", serde_json::to_string(&output)?)));
     }
-    Ok(ok(format!("account removed {}/{}\n", args.name, args.user)))
+    let mut message = format!(
+        "account removed {}/{}\n",
+        super::hints::redacted_argument(&args.name),
+        super::hints::redacted_argument(&args.user)
+    );
+    if let Some(change) = default_change {
+        message.push_str(&change.human_message());
+    }
+    if policy.rules_removed > 0 {
+        message.push_str(&format!(
+            "account policy: removed {} rule(s)\n",
+            policy.rules_removed
+        ));
+    }
+    Ok(ok(message))
 }
 
-fn account_json(user: &str, account: &AccountConfig, is_default: bool) -> Value {
+pub(super) fn account_json(user: &str, account: &AccountConfig, is_default: bool) -> Value {
     let auth = match &account.auth {
         AuthConfig::Password { credential } => json!({
             "type": "password",
@@ -359,14 +417,14 @@ fn account_json(user: &str, account: &AccountConfig, is_default: bool) -> Value 
     })
 }
 
-fn auth_label(auth: &AuthConfig) -> &'static str {
+pub(super) fn auth_label(auth: &AuthConfig) -> &'static str {
     match auth {
         AuthConfig::Password { .. } => "password",
         AuthConfig::Agent => "agent",
     }
 }
 
-fn privilege_label(account: &AccountConfig) -> String {
+pub(super) fn privilege_label(account: &AccountConfig) -> String {
     let Some(privilege) = &account.privilege else {
         return "none".into();
     };
@@ -390,19 +448,10 @@ fn privilege_label(account: &AccountConfig) -> String {
 }
 
 pub(super) fn unknown_account(server: &str, user: &str) -> anyhow::Error {
-    let target = format!(
-        "{}/{}",
-        super::hints::redacted_argument(server),
-        super::hints::redacted_argument(user)
-    );
-    let list = super::hints::account_list(server);
-    let add = super::hints::account_add(server, user);
-    app_error(
-        ErrorKind::Config,
-        format!(
-            "unknown account '{target}'\nnext: using the same home/profile selection, run `{list}` to see registered login accounts. Account selection requires a registered login account; it does not override the SSH username\nif a new login is needed, register it first with `{add}`. Password auth is the default; insert --auth agent before -- to use SSH-agent auth, or --password-stdin before -- for redirected password input. Never put passwords in arguments"
-        ),
-    )
+    super::lookup_recovery::error(super::lookup_recovery::Lookup::Account {
+        server: server.into(),
+        user: user.into(),
+    })
 }
 
 #[cfg(test)]
@@ -554,12 +603,14 @@ mod tests {
 
         let err = remove_account(
             AccountRemoveArgs {
+                switch_default: None,
                 name: "web".to_string(),
                 user: "ops".to_string(),
                 yes: true,
                 json: false,
             },
             &config_path,
+            &temp.path().join("policy.json"),
             &ConfigRevision::missing(),
             &store,
             &mut prompter,

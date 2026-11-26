@@ -8,6 +8,7 @@ mod local_command;
 pub mod output;
 pub mod policy;
 pub mod profile;
+pub mod project;
 pub mod safety;
 pub mod sandbox;
 pub mod ssh;

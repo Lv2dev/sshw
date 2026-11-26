@@ -3,8 +3,8 @@
 //! These operate on the per-home `SshwConfig`: add/list/show/default/trust/remove.
 
 use super::{
-    AddArgs, AuthArg, CommandOutput, DefaultArgs, ListArgs, Prompter, RemoveArgs, ShowArgs,
-    TrustArgs, get_server, no_default_server_error, ok, unknown_server,
+    AddArgs, AuthArg, CommandOutput, DefaultArgs, ExecContext, ListArgs, Prompter, RemoveArgs,
+    ShowArgs, TrustArgs, get_server, no_default_server_error, ok, unknown_server,
 };
 use crate::config::{
     AccountConfig, AuthConfig, ConfigRevision, ServerConfig, SshwConfig, save_config_if_unchanged,
@@ -12,7 +12,8 @@ use crate::config::{
 };
 use crate::credentials::CredentialStore;
 use crate::error::{ResultErrorKindExt, app_error, credential_cleanup_error};
-use crate::home::{CredentialNamespace, CredentialPurpose, validate_server_name};
+use crate::home::{CredentialPurpose, validate_server_name};
+use crate::local_command::display_value as trust_display;
 use crate::output::{DefaultChange, ErrorKind, ServerOutput, redact_secrets};
 use crate::ssh::SshClient;
 use serde_json::json;
@@ -20,9 +21,9 @@ use std::path::Path;
 
 pub(super) fn add_server<C, P>(
     args: AddArgs,
-    config_path: &Path,
     revision: &ConfigRevision,
-    namespace: &CredentialNamespace,
+    ctx: &ExecContext<'_>,
+    global_selection: bool,
     credentials: &C,
     prompter: &mut P,
     config: &mut SshwConfig,
@@ -31,6 +32,8 @@ where
     C: CredentialStore,
     P: Prompter,
 {
+    let config_path = &ctx.home.config_path;
+    let namespace = &ctx.home.namespace;
     validate_server_name(&args.name).with_error_kind(ErrorKind::Config)?;
     validate_account_user(&args.user).with_error_kind(ErrorKind::Config)?;
     validate_server_endpoint(&args.name, &args.host, args.port)
@@ -65,7 +68,16 @@ where
     {
         return Err(app_error(
             ErrorKind::Config,
-            "changing a server's host or port requires --replace (removes its accounts and privilege settings); use a new server name to keep the existing configuration",
+            format!(
+                "{}. Changing a server address through add requires --replace, which removes its existing accounts and privilege settings; use it only for a full replacement. Use a new server name to keep the old endpoint available",
+                super::hints::endpoint_update(
+                    ctx,
+                    global_selection,
+                    &args.name,
+                    (previous.host != args.host).then_some(args.host.as_str()),
+                    (previous.port != args.port).then_some(args.port)
+                )
+            ),
         ));
     }
     super::check_registration_auth(args.auth, args.password_stdin)?;
@@ -103,7 +115,9 @@ where
                 prompter.password_stdin().with_error_kind(ErrorKind::Auth)?
             } else {
                 prompter
-                    .password("SSH password: ")
+                    .password(&super::prompt::login_password_prompt(
+                        &args.name, &args.user,
+                    ))
                     .with_error_kind(ErrorKind::Auth)?
             };
             if password.is_empty() {
@@ -142,7 +156,7 @@ where
         .filter(|entry| !retained_credentials.contains(entry));
     config.servers.insert(args.name.clone(), new_server);
 
-    if config.default.is_none() {
+    if config.default.is_none() && before.servers.is_empty() {
         config.default = Some(args.name.clone());
     }
 
@@ -184,7 +198,7 @@ where
         let mut output = json!({
             "ok": true,
             "action": action,
-            "server": args.name,
+            "server": redact_secrets(&args.name),
             "user": redact_secrets(&config.servers[&args.name].default_user),
             "changed": changed,
             "change": if changed { action } else { "unchanged" },
@@ -202,18 +216,21 @@ where
     }
 
     let mut message = if changed {
-        format!("{action} {}\n", args.name)
+        format!("{action} {}\n", super::hints::redacted_argument(&args.name))
     } else {
-        format!("server {} (unchanged)\n", args.name)
+        format!(
+            "server {} (unchanged)\n",
+            super::hints::redacted_argument(&args.name)
+        )
     };
     if let Some(change) = default_change {
         message.push_str(&change.human_message());
     }
     if previous_server.is_none() || args.replace {
-        message.push_str(&format!(
-            "next: {}\nthen: {}\n",
-            super::hints::trust(&args.name),
-            super::hints::run(&args.name, "hostname")
+        message.push_str(&super::hints::registration_followups(
+            ctx,
+            global_selection,
+            &args.name,
         ));
     }
     if let Some(warning) = warning {
@@ -222,17 +239,32 @@ where
     Ok(ok(message))
 }
 
-pub(super) fn list_servers(args: ListArgs, config: &SshwConfig) -> anyhow::Result<CommandOutput> {
-    let servers = server_outputs(config);
+pub(super) fn list_servers(
+    args: ListArgs,
+    config: &SshwConfig,
+    ctx: &ExecContext<'_>,
+    global_selection: bool,
+) -> anyhow::Result<CommandOutput> {
+    let filter = args.filter.as_ref().map(|text| text.to_lowercase());
+    let mut servers = server_outputs(config);
+    if let Some(filter) = &filter {
+        servers.retain(|server| {
+            // Match the configured values, before display redaction.
+            let original = &config.servers[&server.name];
+            server.name.to_lowercase().contains(filter)
+                || original.host.to_lowercase().contains(filter)
+        });
+    }
     if args.json {
         return Ok(ok(format!("{}\n", serde_json::to_string(&servers)?)));
     }
 
     if servers.is_empty() {
-        return Ok(ok(
-            "no servers registered; start with: sshw add web --host <host> --user <user>\n"
-                .to_string(),
-        ));
+        if args.filter.is_some() && !config.servers.is_empty() {
+            return Ok(ok(super::hints::no_matching_servers(ctx, global_selection)));
+        }
+        let (summary, guidance) = super::hints::empty_server_list(ctx, global_selection);
+        return Ok(ok(format!("{summary}\n{guidance}\n")));
     }
 
     let mut stdout = String::new();
@@ -265,19 +297,50 @@ pub(super) fn show_server(args: ShowArgs, config: &SshwConfig) -> anyhow::Result
         let mut value = serde_json::to_value(&output)?;
         if let Some(map) = value.as_object_mut() {
             map.insert("ok".to_string(), serde_json::Value::Bool(true));
+            map.insert(
+                "accounts".to_string(),
+                serde_json::to_value(
+                    server
+                        .accounts
+                        .iter()
+                        .map(|(user, account)| {
+                            super::account::account_json(
+                                user,
+                                account,
+                                user == &server.default_user,
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                )?,
+            );
         }
         return Ok(ok(format!("{}\n", serde_json::to_string(&value)?)));
     }
 
-    Ok(ok(format!(
-        "{}\n  host: {}\n  port: {}\n  user: {}\n  auth: {}\n  accounts: {}\n",
-        output.name,
-        output.host,
+    let mut message = format!(
+        "{}\n  host: {}\n  port: {}\n  user: {}\n  auth: {}\n  default: {}\n  accounts: {}\n",
+        super::hints::redacted_argument(&output.name),
+        super::hints::redacted_argument(&output.host),
         output.port,
-        output.user,
+        super::hints::redacted_argument(&output.user),
         auth_label(&output.auth),
+        output.is_default,
         output.account_count,
-    )))
+    );
+    for (user, account) in &server.accounts {
+        let marker = if user == &server.default_user {
+            "*"
+        } else {
+            " "
+        };
+        message.push_str(&format!(
+            "    {marker} {} auth={} privilege={}\n",
+            super::hints::redacted_argument(user),
+            super::account::auth_label(&account.auth),
+            super::account::privilege_label(account),
+        ));
+    }
+    Ok(ok(message))
 }
 
 pub(super) fn default_server(
@@ -286,11 +349,41 @@ pub(super) fn default_server(
     revision: &ConfigRevision,
     config: &mut SshwConfig,
 ) -> anyhow::Result<CommandOutput> {
+    if args.clear {
+        let previous = config.default.take();
+        let changed = previous.is_some();
+        let default_change = DefaultChange::between("server", previous, None);
+        if changed {
+            save_config_if_unchanged(config_path, config, revision)
+                .with_error_kind(ErrorKind::Config)
+                .map_err(|error| {
+                    if crate::storage::write_was_published(&error) {
+                        error.context("default server was cleared, but save durability could not be confirmed; inspect `sshw default` before retrying")
+                    } else { error }
+                })?;
+        }
+        if args.json {
+            let mut output = json!({"ok":true,"action":"default","server":null,"changed":changed,
+                "change":if changed { "cleared" } else { "unchanged" }});
+            if let Some(change) = default_change {
+                output["default_change"] = serde_json::to_value(change.redacted())?;
+            }
+            return Ok(ok(format!("{output}\n")));
+        }
+        return Ok(ok(format!(
+            "{}; specify the server explicitly for run/put/get\n",
+            if changed {
+                "default server cleared"
+            } else {
+                "no default server configured (unchanged)"
+            }
+        )));
+    }
     let Some(name) = args.name else {
         let name = config
             .default
             .as_ref()
-            .ok_or_else(no_default_server_error)?;
+            .ok_or_else(|| no_default_server_error(config))?;
         if args.json {
             return Ok(ok(format!("{}\n", json!({"ok":true,"server":name}))));
         }
@@ -326,6 +419,8 @@ pub(super) fn trust_server<S, P>(
     ssh: &S,
     prompter: &mut P,
     config: &SshwConfig,
+    ctx: &ExecContext<'_>,
+    global_selection: bool,
 ) -> anyhow::Result<CommandOutput>
 where
     S: SshClient,
@@ -338,11 +433,30 @@ where
             .with_error_kind(ErrorKind::Config)?;
     }
     let host_key = ssh.host_key(server).with_error_kind(ErrorKind::Ssh)?;
+    let host = trust_display(&server.host);
+    let endpoint = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{}", server.port)
+    } else {
+        format!("{host}:{}", server.port)
+    };
+    let source = if let Some(project) = &ctx.home.project {
+        if project.servers == crate::project::ResourceSource::Local {
+            "project local".into()
+        } else {
+            "inherited global".into()
+        }
+    } else if global_selection {
+        format!("global ({})", trust_display(&ctx.home.description))
+    } else {
+        trust_display(&ctx.home.description)
+    };
     let prompt = format!(
-        "trust {} {} {}? [y/N] ",
-        super::hints::redacted_argument(&args.name),
-        host_key.algorithm,
-        host_key.fingerprint_sha256
+        "trust {} at {endpoint}\nserver settings: {source}\nconfig: {}\nknown_hosts: {}\nhost key: {} {}\napprove this host key? [y/N] ",
+        trust_display(&args.name),
+        trust_path(&ctx.home.config_path),
+        trust_path(&ctx.home.known_hosts_path),
+        trust_display(&host_key.algorithm),
+        trust_display(&host_key.fingerprint_sha256)
     );
     if !args.yes
         && !prompter
@@ -358,22 +472,30 @@ where
     if args.json {
         let output = json!({
             "ok": true,
-            "server": args.name,
-            "algorithm": trusted.algorithm,
-            "fingerprint_sha256": trusted.fingerprint_sha256,
+            "server": redact_secrets(&args.name),
+            "algorithm": redact_secrets(&trusted.algorithm),
+            "fingerprint_sha256": redact_secrets(&trusted.fingerprint_sha256),
         });
         return Ok(ok(format!("{}\n", serde_json::to_string(&output)?)));
     }
 
     Ok(ok(format!(
         "trusted {} {} {}\n",
-        args.name, trusted.algorithm, trusted.fingerprint_sha256
+        trust_display(&args.name),
+        trust_display(&trusted.algorithm),
+        trust_display(&trusted.fingerprint_sha256)
     )))
+}
+
+fn trust_path(path: &Path) -> String {
+    let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    trust_display(&path.display().to_string())
 }
 
 pub(super) fn remove_server<C, P>(
     args: RemoveArgs,
     config_path: &Path,
+    policy_path: &Path,
     revision: &ConfigRevision,
     credentials: &C,
     prompter: &mut P,
@@ -384,10 +506,42 @@ where
     P: Prompter,
 {
     let server = get_server(config, &args.name)?.clone();
+    let explicit_default = args.switch_default.is_some() || args.clear_default;
+    if explicit_default && config.default.as_deref() != Some(args.name.as_str()) {
+        return Err(app_error(
+            ErrorKind::Config,
+            "--switch-default and --clear-default are only for removing the current default server; omit them to remove another server",
+        ));
+    }
+    if args.clear_default && args.switch_default.is_some() {
+        return Err(app_error(
+            ErrorKind::Usage,
+            "--switch-default conflicts with --clear-default",
+        ));
+    }
+    if let Some(replacement) = &args.switch_default {
+        if replacement == &args.name {
+            return Err(app_error(
+                ErrorKind::Config,
+                "--switch-default must select a different registered server",
+            ));
+        }
+        get_server(config, replacement)?;
+    }
+    let notice = if let Some(replacement) = &args.switch_default {
+        format!(
+            " and switch default server to '{}'",
+            super::hints::redacted_argument(replacement)
+        )
+    } else if args.clear_default {
+        " and clear the default server selection".into()
+    } else {
+        String::new()
+    };
     if !args.yes
         && !prompter
             .confirm(&format!(
-                "remove server '{}'? [y/N] ",
+                "remove server '{}'{notice}? [y/N] ",
                 super::hints::redacted_argument(&args.name)
             ))
             .with_error_kind(ErrorKind::Config)?
@@ -396,34 +550,38 @@ where
     }
 
     let previous_default = config.default.clone();
+    let policy = super::removal_policy::RemovalPolicy::prepare(policy_path, &args.name, None)?;
+    policy.verify_unchanged()?;
     config.servers.remove(&args.name);
     if config.default.as_deref() == Some(args.name.as_str()) {
-        config.default = config.servers.keys().next().cloned();
+        config.default = if args.clear_default {
+            None
+        } else {
+            args.switch_default
+                .or_else(|| config.servers.keys().next().cloned())
+        };
     }
 
-    save_config_if_unchanged(config_path, config, revision).with_error_kind(ErrorKind::Config)?;
     let default_change = DefaultChange::between("server", previous_default, config.default.clone());
+    save_config_if_unchanged(config_path, config, revision)
+        .with_error_kind(ErrorKind::Config)
+        .map_err(|error| policy.config_error(error, default_change.clone()))?;
+    let policy_result = policy.save();
     let mut cleanup_error = None;
     for (purpose, credential, user) in stored_credentials(&server) {
         if let Err(err) = credentials.delete_password_for(purpose, &credential, &user) {
             cleanup_error.get_or_insert(err);
         }
     }
-    if let Some(err) = cleanup_error {
-        return Err(credential_cleanup_error(
-            err,
-            "removed",
-            &args.name,
-            None,
-            default_change,
-        ));
-    }
+    policy.finish(policy_result, cleanup_error, default_change.clone())?;
 
     if args.json {
         let mut output = json!({
             "ok": true,
             "action": "removed",
-            "server": args.name,
+            "server": redact_secrets(&args.name),
+            "policy_changed": policy.rules_removed > 0,
+            "policy_rules_removed": policy.rules_removed,
         });
         if let Some(change) = default_change {
             output["default_change"] = serde_json::to_value(change.redacted())?;
@@ -431,7 +589,13 @@ where
         return Ok(ok(format!("{}\n", serde_json::to_string(&output)?)));
     }
 
-    let mut message = format!("removed {}\n", args.name);
+    let mut message = format!("removed {}\n", super::hints::redacted_argument(&args.name));
+    if policy.rules_removed > 0 {
+        message.push_str(&format!(
+            "account policy: removed {} rule(s)\n",
+            policy.rules_removed
+        ));
+    }
     if let Some(change) = default_change {
         message.push_str(&change.human_message());
     }
@@ -479,9 +643,56 @@ mod tests {
     use super::*;
     use crate::config::{PrivilegeConfig, PrivilegeMethod};
     use crate::credentials::CredentialStoreHealth;
+    use crate::home::{CredentialNamespace, ResolvedHome};
+    use clap::Parser;
     use std::cell::RefCell;
     use std::collections::BTreeMap;
     use std::fs;
+
+    #[test]
+    fn trust_display_masks_sensitive_values_and_escapes_terminal_controls() {
+        assert_eq!(trust_display("token=marker"), "<redacted>");
+        let text = trust_display("project\nknown_hosts:\t\u{1b}[31m");
+        assert!(!text.chars().any(char::is_control));
+        assert!(text.contains("\\n") && text.contains("\\t"));
+        assert_eq!(trust_display("2001:db8::10"), "2001:db8::10");
+    }
+
+    #[test]
+    fn default_clear_checks_cas_and_reports_post_publication_durability() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("servers.json");
+        let mut config = SshwConfig {
+            default: Some("web".into()),
+            ..Default::default()
+        };
+        config.servers.insert(
+            "web".into(),
+            ServerConfig::single_account("192.0.2.10", 22, "deploy", AuthConfig::Agent),
+        );
+        crate::config::save_config(&path, &config).unwrap();
+        let (mut snapshot, revision) = crate::config::load_config_with_revision(&path).unwrap();
+        config.servers.get_mut("web").unwrap().port = 2222;
+        crate::config::save_config(&path, &config).unwrap();
+        let args = || match super::super::Cli::try_parse_from(["sshw", "default", "--clear"])
+            .unwrap()
+            .command
+        {
+            super::super::Command::Default(args) => args,
+            _ => unreachable!(),
+        };
+        let error = default_server(args(), &path, &revision, &mut snapshot).unwrap_err();
+        assert!(!crate::storage::write_was_published(&error));
+        assert_eq!(crate::config::load_config(&path).unwrap(), config);
+        let (mut snapshot, revision) = crate::config::load_config_with_revision(&path).unwrap();
+        crate::storage::fail_next_parent_sync();
+        let error = default_server(args(), &path, &revision, &mut snapshot).unwrap_err();
+        assert!(crate::storage::write_was_published(&error));
+        assert!(error.to_string().contains("was cleared"));
+        let actual = crate::config::load_config(&path).unwrap();
+        assert!(actual.default.is_none());
+        assert_eq!(actual.servers, config.servers);
+    }
 
     #[derive(Default)]
     struct RecordingStore {
@@ -585,11 +796,14 @@ mod tests {
 
         let err = remove_server(
             RemoveArgs {
+                switch_default: None,
+                clear_default: false,
                 name: "web".to_string(),
                 yes: true,
                 json: false,
             },
             &config_path,
+            &temp.path().join("policy.json"),
             &ConfigRevision::missing(),
             &store,
             &mut prompter,
@@ -627,9 +841,17 @@ mod tests {
                 password_stdin: false,
                 json: false,
             },
-            &config_path,
             &ConfigRevision::missing(),
-            &namespace,
+            &ExecContext {
+                home: &ResolvedHome {
+                    namespace: namespace.clone(),
+                    ..ResolvedHome::from_config_path(&config_path)
+                },
+                registry_path: &temp.path().join("profiles.json"),
+                policy_forced: false,
+                audit: &crate::audit::NoopAudit,
+            },
+            false,
             &store,
             &mut prompter,
             &mut config,
@@ -681,9 +903,17 @@ mod tests {
                 password_stdin: false,
                 json: false,
             },
-            &config_path,
             &ConfigRevision::missing(),
-            &namespace,
+            &ExecContext {
+                home: &ResolvedHome {
+                    namespace: namespace.clone(),
+                    ..ResolvedHome::from_config_path(&config_path)
+                },
+                registry_path: &temp.path().join("profiles.json"),
+                policy_forced: false,
+                audit: &crate::audit::NoopAudit,
+            },
+            false,
             &store,
             &mut prompter,
             &mut config,
@@ -732,9 +962,17 @@ mod tests {
                 password_stdin: false,
                 json: false,
             },
-            &config_path,
             &ConfigRevision::missing(),
-            &namespace,
+            &ExecContext {
+                home: &ResolvedHome {
+                    namespace: namespace.clone(),
+                    ..ResolvedHome::from_config_path(&config_path)
+                },
+                registry_path: &temp.path().join("profiles.json"),
+                policy_forced: false,
+                audit: &crate::audit::NoopAudit,
+            },
+            false,
             &store,
             &mut prompter,
             &mut config,

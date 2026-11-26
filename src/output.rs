@@ -47,10 +47,19 @@ pub const REMOTE_NONZERO_EXIT_CODE: i32 = 8;
 pub struct ErrorResponse {
     pub ok: bool,
     pub error: ErrorBody,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub suggestions: Vec<PolicySuggestion>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub partial_output: Option<PartialOutput>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mutation: Option<ConfigMutationOutput>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PolicySuggestion {
+    pub kind: &'static str,
+    pub command: Option<String>,
+    pub scope: String,
 }
 
 /// A persisted default selection changed as a consequence of a mutation.
@@ -99,7 +108,7 @@ impl DefaultChange {
     }
 }
 
-/// The configuration was saved, but cleanup of obsolete credentials failed.
+/// Configuration was published, but durability confirmation or a follow-up stage failed.
 #[derive(Debug, Clone, Serialize)]
 pub struct ConfigMutationOutput {
     pub config_applied: bool,
@@ -147,9 +156,16 @@ impl ErrorResponse {
         }
         Self {
             ok: false,
+            suggestions: err
+                .chain()
+                .find_map(|cause| {
+                    cause.downcast_ref::<crate::cli::policy_recovery::RecoveryError>()
+                })
+                .map(|recovery| recovery.suggestions.clone())
+                .unwrap_or_default(),
             mutation: err
                 .chain()
-                .find_map(|cause| cause.downcast_ref::<crate::error::CredentialCleanupError>())
+                .find_map(|cause| cause.downcast_ref::<crate::error::SavedMutationError>())
                 .map(|cleanup| cleanup.mutation.redacted()),
             partial_output: err
                 .chain()

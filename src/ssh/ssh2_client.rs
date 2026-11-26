@@ -1,5 +1,8 @@
-use super::known_hosts::read_known_hosts_file;
-use super::{HostKeyInfo, PartialRunError, RunResult, SshClient, SshTarget, TransferResult};
+use super::known_hosts::{HostTrustError, HostTrustFailure, read_known_hosts_file};
+use super::{
+    HostKeyInfo, PartialRunError, RunResult, SshClient, SshTarget, TransferPhase, TransferProgress,
+    TransferProgressCallback, TransferResult, UploadOptions,
+};
 use crate::config::ServerConfig;
 use crate::credentials::AuthMaterial;
 use crate::error::{
@@ -71,6 +74,7 @@ impl Ssh2Client {
         local: &Path,
         remote: &str,
         mode: Option<u32>,
+        progress: &mut TransferProgressCallback<'_>,
     ) -> anyhow::Result<TransferResult> {
         if mode.is_some_and(|mode| mode > 0o777) {
             return Err(app_error(
@@ -122,6 +126,11 @@ impl Ssh2Client {
         // length so a file that grows mid-transfer never writes past the
         // declared size, and fail closed below if fewer bytes were sent (the
         // file shrank), so a truncated upload is never reported as a success.
+        progress(TransferProgress {
+            bytes: 0,
+            total: metadata.len(),
+            phase: TransferPhase::Data,
+        });
         let copied = diagnostic.step(
             copy_file_with_deadline(
                 &mut local_file,
@@ -129,6 +138,7 @@ impl Ssh2Client {
                 metadata.len(),
                 &session,
                 &deadline,
+                progress,
             ),
             "send file data",
         )?;
@@ -142,7 +152,17 @@ impl Ssh2Client {
                 "send file data",
             );
         }
+        progress(TransferProgress {
+            bytes: copied,
+            total: metadata.len(),
+            phase: TransferPhase::Finalizing,
+        });
         complete_scp_transfer(&session, &mut remote_file, &deadline, &diagnostic)?;
+        progress(TransferProgress {
+            bytes: copied,
+            total: metadata.len(),
+            phase: TransferPhase::Complete,
+        });
 
         Ok(TransferResult {
             bytes: copied,
@@ -197,6 +217,21 @@ impl Ssh2Client {
 }
 
 impl SshClient for Ssh2Client {
+    fn test_connection(
+        &self,
+        target: &SshTarget<'_>,
+        auth: &AuthMaterial,
+    ) -> anyhow::Result<HostKeyInfo> {
+        let session = connect_verified_authenticated(
+            target.server,
+            target.user,
+            auth,
+            self.connect_timeout,
+            self.op_timeout,
+            &self.resolved_known_hosts_path()?,
+        )?;
+        host_key_info(&session).with_error_kind(ErrorKind::Ssh)
+    }
     fn agent_identity_count(&self) -> anyhow::Result<Option<usize>> {
         let session = Session::new()?;
         let mut agent = session.agent()?;
@@ -314,7 +349,7 @@ impl SshClient for Ssh2Client {
         local: &Path,
         remote: &str,
     ) -> anyhow::Result<TransferResult> {
-        self.put_inner(target, auth, local, remote, None)
+        self.put_inner(target, auth, local, remote, None, &mut |_| {})
     }
 
     fn put_with_mode(
@@ -325,7 +360,7 @@ impl SshClient for Ssh2Client {
         remote: &str,
         mode: u32,
     ) -> anyhow::Result<TransferResult> {
-        self.put_inner(target, auth, local, remote, Some(mode))
+        self.put_inner(target, auth, local, remote, Some(mode), &mut |_| {})
     }
 
     fn put_atomic(
@@ -335,6 +370,59 @@ impl SshClient for Ssh2Client {
         local: &Path,
         remote: &str,
         mode: Option<u32>,
+    ) -> anyhow::Result<TransferResult> {
+        self.put_atomic_inner(target, auth, local, remote, mode, &mut |_| {})
+    }
+
+    fn get(
+        &self,
+        target: &SshTarget<'_>,
+        auth: &AuthMaterial,
+        remote: &str,
+        local: &Path,
+        overwrite: bool,
+    ) -> anyhow::Result<TransferResult> {
+        self.get_inner(target, auth, remote, local, overwrite, &mut |_| {})
+    }
+
+    fn put_with_progress(
+        &self,
+        target: &SshTarget<'_>,
+        auth: &AuthMaterial,
+        local: &Path,
+        remote: &str,
+        options: UploadOptions,
+        progress: &mut TransferProgressCallback<'_>,
+    ) -> anyhow::Result<TransferResult> {
+        if options.atomic {
+            self.put_atomic_inner(target, auth, local, remote, options.mode, progress)
+        } else {
+            self.put_inner(target, auth, local, remote, options.mode, progress)
+        }
+    }
+
+    fn get_with_progress(
+        &self,
+        target: &SshTarget<'_>,
+        auth: &AuthMaterial,
+        remote: &str,
+        local: &Path,
+        overwrite: bool,
+        progress: &mut TransferProgressCallback<'_>,
+    ) -> anyhow::Result<TransferResult> {
+        self.get_inner(target, auth, remote, local, overwrite, progress)
+    }
+}
+
+impl Ssh2Client {
+    fn put_atomic_inner(
+        &self,
+        target: &SshTarget<'_>,
+        auth: &AuthMaterial,
+        local: &Path,
+        remote: &str,
+        mode: Option<u32>,
+        progress: &mut TransferProgressCallback<'_>,
     ) -> anyhow::Result<TransferResult> {
         if mode.is_some_and(|mode| mode > 0o777) {
             return Err(app_error(
@@ -353,6 +441,11 @@ impl SshClient for Ssh2Client {
             &self.resolved_known_hosts_path()?,
         )?;
         let deadline = OperationDeadline::new(self.op_timeout);
+        progress(TransferProgress {
+            bytes: 0,
+            total: metadata.len(),
+            phase: TransferPhase::Data,
+        });
         let bytes = super::atomic_upload::upload(
             &session,
             &mut file,
@@ -360,7 +453,13 @@ impl SshClient for Ssh2Client {
             remote,
             mode.unwrap_or(0o600),
             &deadline,
+            progress,
         )?;
+        progress(TransferProgress {
+            bytes,
+            total: metadata.len(),
+            phase: TransferPhase::Complete,
+        });
         Ok(TransferResult {
             bytes,
             source: local.display().to_string(),
@@ -368,13 +467,14 @@ impl SshClient for Ssh2Client {
         })
     }
 
-    fn get(
+    fn get_inner(
         &self,
         target: &SshTarget<'_>,
         auth: &AuthMaterial,
         remote: &str,
         local: &Path,
         overwrite: bool,
+        progress: &mut TransferProgressCallback<'_>,
     ) -> anyhow::Result<TransferResult> {
         crate::storage::check_download_destination(local, overwrite)?;
         let known_hosts = self.resolved_known_hosts_path()?;
@@ -394,8 +494,19 @@ impl SshClient for Ssh2Client {
 
         // Stage locally first. The final path stays untouched until both the
         // announced size and the remote SCP channel completion are verified.
+        progress(TransferProgress {
+            bytes: 0,
+            total: stat.size(),
+            phase: TransferPhase::Data,
+        });
         let staged = {
-            let mut reader = DeadlineReader::new(&mut remote_file, &session, &deadline);
+            let reader = DeadlineReader::new(&mut remote_file, &session, &deadline);
+            let mut reader = ProgressReader {
+                inner: reader,
+                bytes: 0,
+                total: stat.size(),
+                progress,
+            };
             diagnostic.step(
                 crate::storage::stage_stream_owner_only(
                     local,
@@ -407,6 +518,11 @@ impl SshClient for Ssh2Client {
             )?
         };
 
+        progress(TransferProgress {
+            bytes: stat.size(),
+            total: stat.size(),
+            phase: TransferPhase::Finalizing,
+        });
         let bytes = persist_after_scp_completion(staged, || {
             // `ssh2::Session::scp_recv` caps reads at the announced file size,
             // hiding SCP's trailing status byte. Acknowledge the completed file
@@ -415,15 +531,17 @@ impl SshClient for Ssh2Client {
             complete_scp_transfer(&session, &mut remote_file, &deadline, &diagnostic)
         })?;
 
+        progress(TransferProgress {
+            bytes,
+            total: stat.size(),
+            phase: TransferPhase::Complete,
+        });
         Ok(TransferResult {
             bytes,
             source: remote.to_string(),
             destination: local.display().to_string(),
         })
     }
-}
-
-impl Ssh2Client {
     fn run_inner(
         &self,
         target: &SshTarget<'_>,
@@ -1101,12 +1219,35 @@ impl<R: Read> Read for DeadlineReader<'_, R> {
     }
 }
 
+struct ProgressReader<'a, R> {
+    inner: R,
+    bytes: u64,
+    total: u64,
+    progress: &'a mut TransferProgressCallback<'a>,
+}
+
+impl<R: Read> Read for ProgressReader<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let count = self.inner.read(buffer)?;
+        if count > 0 {
+            self.bytes += count as u64;
+            (self.progress)(TransferProgress {
+                bytes: self.bytes,
+                total: self.total,
+                phase: TransferPhase::Data,
+            });
+        }
+        Ok(count)
+    }
+}
+
 fn copy_file_with_deadline(
     local: &mut fs::File,
     remote: &mut ssh2::Channel,
     expected: u64,
     session: &Session,
     deadline: &OperationDeadline,
+    progress: &mut TransferProgressCallback<'_>,
 ) -> anyhow::Result<u64> {
     let mut copied = 0u64;
     let mut buffer = [0u8; 32 * 1024];
@@ -1139,8 +1280,13 @@ fn copy_file_with_deadline(
                 ));
             }
             written += count;
+            copied += count as u64;
+            progress(TransferProgress {
+                bytes: copied,
+                total: expected,
+                phase: TransferPhase::Data,
+            });
         }
-        copied += read as u64;
     }
 
     Ok(copied)
@@ -1500,7 +1646,7 @@ fn verify_known_host(
         .host_key()
         .ok_or_else(|| anyhow::anyhow!("server did not provide a host key"))?;
     if !known_hosts_path.exists() {
-        return Err(unknown_host_key_error(server));
+        return Err(HostTrustError::new(server, HostTrustFailure::Unapproved).into());
     }
 
     let mut known_hosts = session.known_hosts()?;
@@ -1509,6 +1655,7 @@ fn verify_known_host(
     known_host_verification_result(
         known_hosts.check_port(&server.host, server.port, key),
         server,
+        known_hosts_path,
     )
 }
 
@@ -1524,15 +1671,18 @@ fn write_known_hosts_file(known_hosts: &ssh2::KnownHosts, path: &Path) -> anyhow
 fn known_host_verification_result(
     result: CheckResult,
     server: &ServerConfig,
+    known_hosts_path: &Path,
 ) -> anyhow::Result<()> {
     match result {
         CheckResult::Match => Ok(()),
-        CheckResult::NotFound => Err(unknown_host_key_error(server)),
-        CheckResult::Mismatch => Err(anyhow::anyhow!(
-            "host key verification failed for {}:{}; trusted key changed",
-            server.host,
-            server.port
-        )),
+        CheckResult::NotFound => {
+            Err(HostTrustError::new(server, HostTrustFailure::Unapproved).into())
+        }
+        CheckResult::Mismatch => Err(HostTrustError::new(
+            server,
+            HostTrustFailure::Changed(known_hosts_path.to_path_buf()),
+        )
+        .into()),
         CheckResult::Failure => Err(anyhow::anyhow!(
             "host key verification failed for {}:{}",
             server.host,
@@ -1653,14 +1803,6 @@ fn known_host_name(host: &str, port: u16) -> String {
 
 fn known_host_comment(_server_name: &str) -> &'static str {
     "sshw"
-}
-
-fn unknown_host_key_error(server: &ServerConfig) -> anyhow::Error {
-    anyhow::anyhow!(
-        "host key for {}:{} is not trusted; run `sshw trust <name>` first",
-        server.host,
-        server.port
-    )
 }
 
 #[cfg(test)]
@@ -2614,35 +2756,58 @@ example.test ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB9zU1OEQ2tzYhrXq4/DEjvRNvKv6cU
     fn known_host_verification_accepts_match() {
         let server = server_config();
 
-        super::known_host_verification_result(CheckResult::Match, &server).unwrap();
+        super::known_host_verification_result(
+            CheckResult::Match,
+            &server,
+            std::path::Path::new("known_hosts"),
+        )
+        .unwrap();
     }
 
     #[test]
     fn known_host_verification_rejects_not_found() {
         let server = server_config();
 
-        let err =
-            super::known_host_verification_result(CheckResult::NotFound, &server).unwrap_err();
+        let err = super::known_host_verification_result(
+            CheckResult::NotFound,
+            &server,
+            std::path::Path::new("known_hosts"),
+        )
+        .unwrap_err();
 
         assert!(err.to_string().contains("not trusted"));
-        assert!(err.to_string().contains("sshw trust"));
+        let failure = err.downcast_ref::<super::HostTrustError>().unwrap();
+        assert!(matches!(
+            failure.failure,
+            super::HostTrustFailure::Unapproved
+        ));
     }
 
     #[test]
     fn known_host_verification_rejects_mismatch() {
         let server = server_config();
 
-        let err =
-            super::known_host_verification_result(CheckResult::Mismatch, &server).unwrap_err();
+        let file = std::path::Path::new("selected/known_hosts");
+        let err = super::known_host_verification_result(CheckResult::Mismatch, &server, file)
+            .unwrap_err();
 
         assert!(err.to_string().contains("trusted key changed"));
+        assert!(matches!(
+            &err.downcast_ref::<super::HostTrustError>().unwrap().failure,
+            super::HostTrustFailure::Changed(path) if path == file
+        ));
     }
 
     #[test]
     fn known_host_verification_rejects_failure() {
         let server = server_config();
 
-        let err = super::known_host_verification_result(CheckResult::Failure, &server).unwrap_err();
+        let err = super::known_host_verification_result(
+            CheckResult::Failure,
+            &server,
+            std::path::Path::new("known_hosts"),
+        )
+        .unwrap_err();
 
         assert!(err.to_string().contains("host key verification failed"));
     }

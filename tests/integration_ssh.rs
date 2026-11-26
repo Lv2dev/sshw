@@ -23,6 +23,7 @@ use sshw::credentials::{AuthMaterial, CredentialStore};
 use sshw::home::{CredentialPurpose, ResolvedHome};
 use sshw::ssh::ssh2_client::Ssh2Client;
 use sshw::ssh::{SshClient, SshTarget};
+use sshw::ssh::{TransferPhase, TransferProgress, UploadOptions};
 use std::fs;
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
@@ -36,6 +37,398 @@ const TEST_PASSWORD: &str = "sshw-integration-password";
 const ROOT_PASSWORD: &str = "root-integration-password";
 
 struct NoopPrompter;
+
+#[test]
+#[ignore = "requires local loopback sshd and ssh-agent"]
+fn project_sources_apply_independent_policy_and_isolate_local_host_trust_on_real_ssh() {
+    use sshw::cli::{ExecContext, execute_for_runtime_with, resolve_runtime_at};
+    use sshw::project::{ProjectSettings, ResourceMode};
+    let srv = TestServer::start();
+    srv.trust();
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().join("base");
+    let global = sshw::home::builtin_default_home(&base);
+    let cwd = temp.path().join("work");
+    let local = ResolvedHome::ad_hoc(&cwd.join(".sshw"), "project".into());
+    for (home, name, allowed) in [
+        (&global, "global", "printf global"),
+        (&local, "local", "printf local"),
+    ] {
+        save_config(
+            &home.config_path,
+            &SshwConfig {
+                default: Some(name.into()),
+                servers: std::collections::BTreeMap::from([(name.into(), srv.server())]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        fs::write(
+            &home.policy_path,
+            serde_json::json!({"enabled":true,"allow_commands":[allowed]}).to_string(),
+        )
+        .unwrap();
+    }
+    fs::copy(&srv.known_hosts, &global.known_hosts_path).unwrap();
+    let global_trust = fs::read(&global.known_hosts_path).unwrap();
+    let call = |tail: &[&str]| {
+        let cli = Cli::try_parse_from(std::iter::once("sshw").chain(tail.iter().copied())).unwrap();
+        let (home, registry) = resolve_runtime_at(&cli, &base, None, &cwd).unwrap();
+        let client = Ssh2Client::default().with_known_hosts(home.known_hosts_path.clone());
+        execute_for_runtime_with(
+            cli,
+            &ExecContext {
+                home: &home,
+                registry_path: &registry,
+                policy_forced: false,
+                audit: &sshw::audit::NoopAudit,
+            },
+            &SessionOnlyStore::new(),
+            &client,
+            &mut NoopPrompter,
+        )
+    };
+    for servers in [ResourceMode::Global, ResourceMode::Local] {
+        for policy in [ResourceMode::Local, ResourceMode::Global] {
+            fs::write(
+                local.root.join("project.json"),
+                serde_json::to_string(&ProjectSettings {
+                    version: 1,
+                    servers,
+                    policy,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            let name = if servers == ResourceMode::Local {
+                "local"
+            } else {
+                "global"
+            };
+            if servers == ResourceMode::Local && !local.known_hosts_path.exists() {
+                assert_eq!(call(&["test", name, "--json"]).exit_code, 5);
+                assert_eq!(call(&["trust", name, "--yes", "--json"]).exit_code, 0);
+            }
+            let command = if policy == ResourceMode::Local {
+                "printf local"
+            } else {
+                "printf global"
+            };
+            let denied = if policy == ResourceMode::Local {
+                "printf global"
+            } else {
+                "printf local"
+            };
+            let output = call(&["run", command, "--json"]);
+            assert_eq!(output.exit_code, 0, "{output:?}");
+            let body: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+            assert_eq!(body["stdout"], command.strip_prefix("printf ").unwrap());
+            assert_eq!(call(&["run", denied, "--json"]).exit_code, 7);
+            let missing = if name == "local" { "global" } else { "local" };
+            assert_eq!(call(&["test", missing, "--json"]).exit_code, 3);
+            assert_eq!(fs::read(&global.known_hosts_path).unwrap(), global_trust);
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires local loopback sshd and ssh-agent"]
+fn host_trust_errors_guide_the_selected_scope_for_all_remote_commands() {
+    use sshw::audit::NoopAudit;
+    use sshw::cli::{ExecContext, execute_for_runtime_with, resolve_runtime_at};
+
+    let srv = TestServer::start();
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().join("base");
+    let project = temp.path().join("project");
+    let local = ResolvedHome::ad_hoc(&project.join(".sshw"), "project".into());
+    let global = sshw::home::builtin_default_home(&base);
+    let alias = "web's project";
+    let config = SshwConfig {
+        default: Some(alias.into()),
+        servers: std::collections::BTreeMap::from([(alias.into(), srv.server())]),
+        ..Default::default()
+    };
+    for home in [&local, &global] {
+        save_config(&home.config_path, &config).unwrap();
+        fs::write(&home.policy_path, r#"{"enabled":false}"#).unwrap();
+    }
+    let source = temp.path().join("upload");
+    let remote = temp.path().join("remote");
+    let destination = temp.path().join("download");
+    fs::write(&source, "upload content").unwrap();
+    let call = |args: &[&str]| {
+        let cli = Cli::try_parse_from(std::iter::once("sshw").chain(args.iter().copied())).unwrap();
+        let (home, registry) = resolve_runtime_at(&cli, &base, None, &project).unwrap();
+        let ssh = Ssh2Client::default().with_known_hosts(home.known_hosts_path.clone());
+        let result = execute_for_runtime_with(
+            cli,
+            &ExecContext {
+                home: &home,
+                registry_path: &registry,
+                policy_forced: false,
+                audit: &NoopAudit,
+            },
+            &SessionOnlyStore::new(),
+            &ssh,
+            &mut NoopPrompter,
+        );
+        assert_eq!(result.exit_code, 5, "{result:?}");
+        let body: serde_json::Value = serde_json::from_str(&result.stdout).unwrap();
+        assert_eq!(body["error"]["kind"], "ssh");
+        body["error"]["message"].as_str().unwrap().to_owned()
+    };
+
+    let manifest = local.root.join("project.json");
+    for (scope, selector) in [("local", "--project-dir="), ("global", "--global")] {
+        fs::write(
+            &manifest,
+            format!(r#"{{"version":1,"servers":"{scope}","policy":"local"}}"#),
+        )
+        .unwrap();
+        for command in [
+            vec!["run", "printf test", "--json"],
+            vec![
+                "put",
+                source.to_str().unwrap(),
+                remote.to_str().unwrap(),
+                "--json",
+            ],
+            vec![
+                "get",
+                remote.to_str().unwrap(),
+                destination.to_str().unwrap(),
+                "--json",
+            ],
+            vec!["test", alias, "--json"],
+        ] {
+            let message = call(&command);
+            assert!(message.contains("not trusted"), "{message}");
+            assert!(message.contains(selector), "{message}");
+            assert!(
+                message.contains(" trust -- 'web'\"'\"'s project'"),
+                "{message}"
+            );
+            assert_eq!(
+                message.contains("intentionally targets global"),
+                scope == "global",
+                "{message}"
+            );
+            assert!(
+                !message.contains("<name>") && !message.contains("--yes"),
+                "{message}"
+            );
+        }
+        assert!(!local.known_hosts_path.exists() && !global.known_hosts_path.exists());
+        assert!(!remote.exists() && !destination.exists());
+    }
+
+    // Verify that mismatch guidance uses the file actually checked by the client.
+    let other = TestServer::start();
+    other.trust();
+    fs::copy(&other.known_hosts, &global.known_hosts_path).unwrap();
+    clone_known_host_entry_to_port(&global.known_hosts_path, other.port, srv.port);
+    let before = fs::read(&global.known_hosts_path).unwrap();
+    let message = call(&["test", alias, "--json"]);
+    assert!(message.contains("trusted key changed"), "{message}");
+    assert!(
+        message.contains(global.known_hosts_path.to_str().unwrap()),
+        "{message}"
+    );
+    assert!(message.contains("server administrator"), "{message}");
+    assert!(
+        !message.contains("sshw trust") && !message.contains("--yes"),
+        "{message}"
+    );
+    assert_eq!(fs::read(&global.known_hosts_path).unwrap(), before);
+    assert!(!local.known_hosts_path.exists());
+}
+
+#[test]
+#[ignore = "requires local loopback sshd and ssh-agent"]
+fn endpoint_edit_keeps_accounts_and_requires_trust_at_the_new_address() {
+    let old = TestServer::start();
+    let new = TestServer::start();
+    old.trust();
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    let home = ResolvedHome::from_config_path(&path);
+    let server = old.server();
+    let original = server.clone();
+    let mut config = SshwConfig {
+        default: Some("test".into()),
+        ..Default::default()
+    };
+    config.servers.insert("test".into(), server);
+    save_config(&path, &config).unwrap();
+    fs::copy(&old.known_hosts, &home.known_hosts_path).unwrap();
+    let trusted = fs::read(&home.known_hosts_path).unwrap();
+    let client = Ssh2Client::default().with_known_hosts(home.known_hosts_path.clone());
+    let store = SessionOnlyStore::new();
+    let new_port = new.server().port.to_string();
+    execute(
+        Cli::try_parse_from(["sshw", "endpoint", "test", "--port", &new_port, "--yes"]).unwrap(),
+        &path,
+        &store,
+        &client,
+        &mut NoopPrompter,
+    )
+    .unwrap();
+    let saved = sshw::config::load_config(&path).unwrap();
+    assert_eq!(saved.servers["test"].accounts, original.accounts);
+    assert_eq!(saved.servers["test"].default_user, original.default_user);
+    assert_eq!(fs::read(&home.known_hosts_path).unwrap(), trusted);
+    let error = execute(
+        Cli::try_parse_from(["sshw", "test", "test"]).unwrap(),
+        &path,
+        &store,
+        &client,
+        &mut NoopPrompter,
+    )
+    .unwrap_err();
+    assert_eq!(
+        sshw::output::classify_error(&error),
+        sshw::output::ErrorKind::Ssh
+    );
+    execute(
+        Cli::try_parse_from(["sshw", "trust", "test", "--yes"]).unwrap(),
+        &path,
+        &store,
+        &client,
+        &mut NoopPrompter,
+    )
+    .unwrap();
+    execute(
+        Cli::try_parse_from(["sshw", "test", "test"]).unwrap(),
+        &path,
+        &store,
+        &client,
+        &mut NoopPrompter,
+    )
+    .unwrap();
+}
+
+#[test]
+#[ignore = "requires local loopback sshd and ssh-agent"]
+fn get_into_derives_real_filename_keeps_overwrite_guards_and_atomic_private_download() {
+    let srv = TestServer::start();
+    srv.trust();
+    let client = srv.client();
+    let work = tempfile::tempdir().unwrap();
+    let remote = work.path().join("source.log");
+    let home = work.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let path = home.join("servers.json");
+    let mut config = SshwConfig {
+        default: Some("test".into()),
+        ..Default::default()
+    };
+    config.servers.insert("test".into(), srv.server());
+    save_config(&path, &config).unwrap();
+    fs::copy(&srv.known_hosts, home.join("known_hosts")).unwrap();
+    let into = work.path().join("missing downloads");
+    let destination = into.join("source.log");
+    let store = SessionOnlyStore::new();
+    let call = |args: Vec<&str>| {
+        execute(
+            Cli::try_parse_from(args).unwrap(),
+            &path,
+            &store,
+            &client,
+            &mut NoopPrompter,
+        )
+    };
+    fs::write(&remote, b"first content").unwrap();
+    let before = fs::read(&path).unwrap();
+    let preflight = call(vec![
+        "sshw",
+        "policy",
+        "check-get",
+        "test",
+        remote.to_str().unwrap(),
+        "--into",
+        into.to_str().unwrap(),
+        "--json",
+    ])
+    .unwrap();
+    let body: serde_json::Value = serde_json::from_str(&preflight.stdout).unwrap();
+    assert_eq!(body["allowed"], true);
+    assert_eq!(body["local"], destination.to_str().unwrap());
+    assert!(!into.exists());
+    let output = call(vec![
+        "sshw",
+        "get",
+        remote.to_str().unwrap(),
+        "--into",
+        into.to_str().unwrap(),
+        "--progress",
+        "--json",
+    ])
+    .unwrap();
+    let body: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+    assert_eq!(body["local"], destination.to_str().unwrap());
+    assert_eq!(fs::read(&destination).unwrap(), b"first content");
+    assert_eq!(
+        fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    fs::write(&remote, b"replacement content").unwrap();
+    let error = call(vec![
+        "sshw",
+        "get",
+        "test",
+        remote.to_str().unwrap(),
+        "--into",
+        into.to_str().unwrap(),
+    ])
+    .unwrap_err();
+    assert_eq!(
+        sshw::output::classify_error(&error),
+        sshw::output::ErrorKind::Io
+    );
+    assert_eq!(fs::read(&destination).unwrap(), b"first content");
+    call(vec![
+        "sshw",
+        "get",
+        "test",
+        remote.to_str().unwrap(),
+        "--into",
+        into.to_str().unwrap(),
+        "--yes",
+    ])
+    .unwrap();
+    assert_eq!(fs::read(&destination).unwrap(), b"replacement content");
+    fs::write(&remote, b"").unwrap();
+    call(vec![
+        "sshw",
+        "get",
+        "test",
+        remote.to_str().unwrap(),
+        "--into",
+        into.to_str().unwrap(),
+        "--yes",
+        "--progress",
+    ])
+    .unwrap();
+    assert_eq!(fs::metadata(&destination).unwrap().len(), 0);
+    fs::write(&destination, b"keep after remote error").unwrap();
+    fs::remove_file(&remote).unwrap();
+    assert!(
+        call(vec![
+            "sshw",
+            "get",
+            "test",
+            remote.to_str().unwrap(),
+            "--into",
+            into.to_str().unwrap(),
+            "--yes"
+        ])
+        .is_err()
+    );
+    assert_eq!(fs::read(&destination).unwrap(), b"keep after remote error");
+    assert_eq!(fs::read(&path).unwrap(), before);
+    assert_eq!(fs::read_dir(&into).unwrap().count(), 1);
+}
 
 impl Prompter for NoopPrompter {
     fn confirm(&mut self, _prompt: &str) -> anyhow::Result<bool> {
@@ -422,6 +815,363 @@ fn docker_privileged_config(
     (config, login_credential, privilege_credential)
 }
 
+#[test]
+#[ignore = "requires Docker password SSH fixture"]
+fn renamed_password_server_keeps_login_privilege_and_host_approval() {
+    let Some(srv) = DockerPasswordServer::start() else {
+        return;
+    };
+    srv.trust();
+    for (method, privilege_password) in [
+        (PrivilegeMethod::Sudo, TEST_PASSWORD),
+        (PrivilegeMethod::Su, ROOT_PASSWORD),
+    ] {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = ResolvedHome::ad_hoc(temp.path(), "rename integration fixture".into());
+        let (config, login, privilege) = docker_privileged_config(&home.config_path, &srv, method);
+        save_config(&home.config_path, &config).unwrap();
+        fs::copy(&srv.known_hosts, &home.known_hosts_path).unwrap();
+        let trusted = fs::read(&home.known_hosts_path).unwrap();
+        fs::write(&home.policy_path, serde_json::json!({"version":2,"enabled":true,"allow_commands":["id"],"allow_accounts":[{"server":"docker-password","user":TEST_USER}]}).to_string()).unwrap();
+        let store = SessionOnlyStore::new();
+        store
+            .set_password_for(CredentialPurpose::Login, &login, TEST_USER, TEST_PASSWORD)
+            .unwrap();
+        store
+            .set_password_for(
+                CredentialPurpose::Privilege,
+                &privilege,
+                "root",
+                privilege_password,
+            )
+            .unwrap();
+        let client = Ssh2Client::default().with_known_hosts(home.known_hosts_path.clone());
+        let renamed = execute(
+            Cli::try_parse_from([
+                "sshw",
+                "rename",
+                "docker-password",
+                "renamed-password",
+                "--json",
+            ])
+            .unwrap(),
+            &home.config_path,
+            &store,
+            &client,
+            &mut NoopPrompter,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&renamed.stdout).unwrap()["policy_changed"],
+            true
+        );
+        assert_eq!(fs::read(&home.known_hosts_path).unwrap(), trusted);
+        assert!(
+            store
+                .get_password_for(CredentialPurpose::Login, &login, TEST_USER)
+                .is_err()
+        );
+        assert!(
+            store
+                .get_password_for(CredentialPurpose::Privilege, &privilege, "root")
+                .is_err()
+        );
+        let output = execute(
+            Cli::try_parse_from(["sshw", "run", "id -u", "--as-root", "--json"]).unwrap(),
+            &home.config_path,
+            &store,
+            &client,
+            &mut NoopPrompter,
+        )
+        .unwrap();
+        let output: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+        assert_eq!(output["server"], "renamed-password");
+        assert_eq!(output["exit_status"], 0, "{method:?}: {output}");
+        assert_eq!(output["stdout"].as_str().unwrap().trim(), "0");
+        assert_eq!(fs::read(&home.known_hosts_path).unwrap(), trusted);
+    }
+}
+
+#[test]
+#[ignore = "requires Docker password SSH fixture"]
+fn profile_rename_retains_real_login_and_sudo_su_secrets_and_host_approval() {
+    use sshw::cli::{ExecContext, execute_with};
+    use sshw::profile::{
+        ProfileEntry, ProfileRegistry, load_registry, resolve_home_with_registry, save_registry,
+    };
+    use std::collections::BTreeMap;
+    let Some(srv) = DockerPasswordServer::start() else {
+        return;
+    };
+    srv.trust();
+    for (method, privilege_password) in [
+        (PrivilegeMethod::Sudo, TEST_PASSWORD),
+        (PrivilegeMethod::Su, ROOT_PASSWORD),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let registry_path = temp.path().join("profiles.json");
+        let home = ResolvedHome::profile(
+            temp.path().join("home"),
+            "p_stable_profile",
+            "old profile".into(),
+        );
+        fs::create_dir(&home.root).unwrap();
+        let (mut config, _, _) = docker_privileged_config(&home.config_path, &srv, method);
+        let login = home.namespace.new_account_credential_key(
+            CredentialPurpose::Login,
+            "docker-password",
+            TEST_USER,
+        );
+        let privilege = home.namespace.new_account_credential_key(
+            CredentialPurpose::Privilege,
+            "docker-password",
+            TEST_USER,
+        );
+        let account = config
+            .servers
+            .get_mut("docker-password")
+            .unwrap()
+            .accounts
+            .get_mut(TEST_USER)
+            .unwrap();
+        account.auth = AuthConfig::Password {
+            credential: login.clone(),
+        };
+        account.privilege.as_mut().unwrap().credential = Some(privilege.clone());
+        save_config(&home.config_path, &config).unwrap();
+        fs::copy(&srv.known_hosts, &home.known_hosts_path).unwrap();
+        fs::write(
+            &home.policy_path,
+            r#"{"enabled":true,"allow_commands":["id"]}"#,
+        )
+        .unwrap();
+        let paths = [&home.config_path, &home.known_hosts_path, &home.policy_path];
+        let snapshots: Vec<_> = paths.iter().map(|path| fs::read(path).unwrap()).collect();
+        save_registry(
+            &registry_path,
+            &ProfileRegistry {
+                default: Some("old".into()),
+                profiles: BTreeMap::from([(
+                    "old".into(),
+                    ProfileEntry {
+                        id: "p_stable_profile".into(),
+                        home: home.root.clone(),
+                    },
+                )]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let store = SessionOnlyStore::new();
+        store
+            .set_password_for(CredentialPurpose::Login, &login, TEST_USER, TEST_PASSWORD)
+            .unwrap();
+        store
+            .set_password_for(
+                CredentialPurpose::Privilege,
+                &privilege,
+                "root",
+                privilege_password,
+            )
+            .unwrap();
+        let client = Ssh2Client::default().with_known_hosts(home.known_hosts_path.clone());
+        let audit = sshw::audit::NoopAudit;
+        let ctx = ExecContext {
+            home: &home,
+            registry_path: &registry_path,
+            policy_forced: false,
+            audit: &audit,
+        };
+        execute_with(
+            Cli::try_parse_from(["sshw", "test", "docker-password"]).unwrap(),
+            &ctx,
+            &store,
+            &client,
+            &mut NoopPrompter,
+        )
+        .unwrap();
+        let renamed = execute_with(
+            Cli::try_parse_from(["sshw", "profile", "rename", "old", "renamed", "--json"]).unwrap(),
+            &ctx,
+            &store,
+            &client,
+            &mut NoopPrompter,
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&renamed.stdout).unwrap();
+        assert_eq!(value["namespace_changed"], false);
+        assert_eq!(value["default_change"]["current"], "renamed");
+        let registry = load_registry(&registry_path).unwrap();
+        let resolved =
+            resolve_home_with_registry(None, None, Some("renamed"), &registry, temp.path())
+                .unwrap();
+        assert_eq!(resolved.namespace, home.namespace);
+        assert!(
+            resolve_home_with_registry(None, None, Some("old"), &registry, temp.path()).is_err()
+        );
+        let ctx = ExecContext {
+            home: &resolved,
+            ..ctx
+        };
+        let output = execute_with(
+            Cli::try_parse_from(["sshw", "run", "id -u", "--as-root", "--json"]).unwrap(),
+            &ctx,
+            &store,
+            &client,
+            &mut NoopPrompter,
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+        assert_eq!(value["stdout"].as_str().unwrap().trim(), "0");
+        assert_eq!(
+            store
+                .get_password_for(CredentialPurpose::Login, &login, TEST_USER)
+                .unwrap(),
+            TEST_PASSWORD
+        );
+        assert_eq!(
+            store
+                .get_password_for(CredentialPurpose::Privilege, &privilege, "root")
+                .unwrap(),
+            privilege_password
+        );
+        for (path, snapshot) in paths.iter().zip(snapshots) {
+            assert_eq!(fs::read(path).unwrap(), snapshot);
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires Docker password SSH fixture"]
+fn account_switch_default_preserves_replacement_credentials_and_remote_accounts() {
+    use sshw::config::AccountConfig;
+    let Some(srv) = DockerPasswordServer::start() else {
+        return;
+    };
+    srv.trust();
+    let temp = tempfile::tempdir().unwrap();
+    let home = ResolvedHome::ad_hoc(temp.path(), "fixture".into());
+    let (mut config, _, _) = docker_privileged_config(&home.config_path, &srv, PrivilegeMethod::Su);
+    let old_login = home.namespace.new_account_credential_key(
+        CredentialPurpose::Login,
+        "docker-password",
+        "root",
+    );
+    let old_privilege = home.namespace.new_account_credential_key(
+        CredentialPurpose::Privilege,
+        "docker-password",
+        "root",
+    );
+    let login = home.namespace.new_account_credential_key(
+        CredentialPurpose::Login,
+        "docker-password",
+        TEST_USER,
+    );
+    let privilege = home.namespace.new_account_credential_key(
+        CredentialPurpose::Privilege,
+        "docker-password",
+        TEST_USER,
+    );
+    let server = config.servers.get_mut("docker-password").unwrap();
+    let account = server.accounts.get_mut(TEST_USER).unwrap();
+    account.auth = AuthConfig::Password {
+        credential: login.clone(),
+    };
+    account.privilege.as_mut().unwrap().credential = Some(privilege.clone());
+    server.accounts.insert(
+        "root".into(),
+        AccountConfig {
+            auth: AuthConfig::Password {
+                credential: old_login.clone(),
+            },
+            privilege: Some(PrivilegeConfig {
+                method: PrivilegeMethod::Su,
+                user: "root".into(),
+                credential: Some(old_privilege.clone()),
+                no_password: false,
+            }),
+        },
+    );
+    server.default_user = "root".into();
+    save_config(&home.config_path, &config).unwrap();
+    fs::copy(&srv.known_hosts, &home.known_hosts_path).unwrap();
+    let trusted = fs::read(&home.known_hosts_path).unwrap();
+    fs::write(&home.policy_path,serde_json::json!({"version":2,"enabled":true,"allow_commands":["id"],"allow_accounts":[{"server":"docker-password","user":"root"},{"server":"docker-password","user":TEST_USER}]}).to_string()).unwrap();
+    let store = SessionOnlyStore::new();
+    for (purpose, key, user, password) in [
+        (CredentialPurpose::Login, &old_login, "root", ROOT_PASSWORD),
+        (
+            CredentialPurpose::Privilege,
+            &old_privilege,
+            "root",
+            ROOT_PASSWORD,
+        ),
+        (CredentialPurpose::Login, &login, TEST_USER, TEST_PASSWORD),
+        (
+            CredentialPurpose::Privilege,
+            &privilege,
+            "root",
+            ROOT_PASSWORD,
+        ),
+    ] {
+        store
+            .set_password_for(purpose, key, user, password)
+            .unwrap();
+    }
+    let client = Ssh2Client::default().with_known_hosts(home.known_hosts_path.clone());
+    let output = execute(
+        Cli::try_parse_from([
+            "sshw",
+            "account",
+            "remove",
+            "docker-password",
+            "root",
+            "--switch-default",
+            TEST_USER,
+            "--yes",
+            "--json",
+        ])
+        .unwrap(),
+        &home.config_path,
+        &store,
+        &client,
+        &mut NoopPrompter,
+    )
+    .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+    assert_eq!(value["default_change"]["current"], TEST_USER);
+    assert!(
+        store
+            .get_password_for(CredentialPurpose::Login, &old_login, "root")
+            .is_err()
+    );
+    assert!(
+        store
+            .get_password_for(CredentialPurpose::Privilege, &old_privilege, "root")
+            .is_err()
+    );
+    execute(
+        Cli::try_parse_from(["sshw", "test", "docker-password"]).unwrap(),
+        &home.config_path,
+        &store,
+        &client,
+        &mut NoopPrompter,
+    )
+    .unwrap();
+    // The remote root account still exists; only its local sshw registration was removed.
+    let output = execute(
+        Cli::try_parse_from(["sshw", "run", "id -u", "--as-root", "--json"]).unwrap(),
+        &home.config_path,
+        &store,
+        &client,
+        &mut NoopPrompter,
+    )
+    .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+    assert_eq!(value["stdout"].as_str().unwrap().trim(), "0");
+    assert_eq!(fs::read(&home.known_hosts_path).unwrap(), trusted);
+}
+
 fn docker_available() -> bool {
     Command::new("docker")
         .args(["version", "--format", "{{.Server.Version}}"])
@@ -429,6 +1179,186 @@ fn docker_available() -> bool {
         .stderr(Stdio::null())
         .status()
         .is_ok_and(|status| status.success())
+}
+
+#[test]
+#[ignore = "requires Docker password SSH fixture"]
+fn updated_saved_password_authenticates_without_changing_privilege_or_host_approval() {
+    let Some(srv) = DockerPasswordServer::start() else {
+        return;
+    };
+    srv.trust();
+    let temp = tempfile::tempdir().unwrap();
+    let home = ResolvedHome::ad_hoc(temp.path(), "password integration fixture".into());
+    let (config, old, privilege) =
+        docker_privileged_config(&home.config_path, &srv, PrivilegeMethod::Sudo);
+    save_config(&home.config_path, &config).unwrap();
+    fs::copy(&srv.known_hosts, &home.known_hosts_path).unwrap();
+    let trusted = fs::read(&home.known_hosts_path).unwrap();
+    let store = SessionOnlyStore::new();
+    store
+        .set_password_for(
+            CredentialPurpose::Login,
+            &old,
+            TEST_USER,
+            "outdated-fixture-password",
+        )
+        .unwrap();
+    store
+        .set_password_for(
+            CredentialPurpose::Privilege,
+            &privilege,
+            "root",
+            TEST_PASSWORD,
+        )
+        .unwrap();
+    struct PasswordInput;
+    impl Prompter for PasswordInput {
+        fn confirm(&mut self, _: &str) -> anyhow::Result<bool> {
+            panic!("explicit password update must not confirm")
+        }
+        fn password(&mut self, _: &str) -> anyhow::Result<String> {
+            Ok(TEST_PASSWORD.into())
+        }
+        fn password_stdin(&mut self) -> anyhow::Result<String> {
+            panic!("this fixture exercises hidden password input")
+        }
+    }
+    let client = Ssh2Client::default().with_known_hosts(home.known_hosts_path.clone());
+    execute(
+        Cli::try_parse_from(["sshw", "password", "docker-password", "--json"]).unwrap(),
+        &home.config_path,
+        &store,
+        &client,
+        &mut PasswordInput,
+    )
+    .unwrap();
+    assert!(
+        store
+            .get_password_for(CredentialPurpose::Login, &old, TEST_USER)
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .get_password_for(CredentialPurpose::Privilege, &privilege, "root")
+            .unwrap(),
+        TEST_PASSWORD
+    );
+    let output = execute(
+        Cli::try_parse_from(["sshw", "run", "id -u", "--as-root", "--json"]).unwrap(),
+        &home.config_path,
+        &store,
+        &client,
+        &mut NoopPrompter,
+    )
+    .unwrap();
+    let output: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+    assert_eq!(output["exit_status"], 0);
+    assert_eq!(output["stdout"].as_str().unwrap().trim(), "0");
+    assert_eq!(fs::read(&home.known_hosts_path).unwrap(), trusted);
+}
+
+#[test]
+#[ignore = "requires Docker password SSH fixture"]
+fn privilege_password_update_preserves_sudo_and_su_and_authenticates_with_the_new_secret() {
+    let Some(srv) = DockerPasswordServer::start() else {
+        return;
+    };
+    srv.trust();
+    struct PrivilegeInput(&'static str);
+    impl Prompter for PrivilegeInput {
+        fn confirm(&mut self, _: &str) -> anyhow::Result<bool> {
+            panic!("explicit password update must not confirm")
+        }
+        fn password(&mut self, _: &str) -> anyhow::Result<String> {
+            Ok(self.0.into())
+        }
+        fn password_stdin(&mut self) -> anyhow::Result<String> {
+            panic!("this fixture uses hidden input")
+        }
+    }
+    for (method, password) in [
+        (PrivilegeMethod::Sudo, TEST_PASSWORD),
+        (PrivilegeMethod::Su, ROOT_PASSWORD),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let home = ResolvedHome::ad_hoc(temp.path(), "privilege password fixture".into());
+        let (config, login, old) = docker_privileged_config(&home.config_path, &srv, method);
+        save_config(&home.config_path, &config).unwrap();
+        fs::copy(&srv.known_hosts, &home.known_hosts_path).unwrap();
+        let trusted = fs::read(&home.known_hosts_path).unwrap();
+        let store = SessionOnlyStore::new();
+        store
+            .set_password_for(CredentialPurpose::Login, &login, TEST_USER, TEST_PASSWORD)
+            .unwrap();
+        store
+            .set_password_for(
+                CredentialPurpose::Privilege,
+                &old,
+                "root",
+                "outdated-privilege-fixture",
+            )
+            .unwrap();
+        let client = Ssh2Client::default().with_known_hosts(home.known_hosts_path.clone());
+        let output = execute(
+            Cli::try_parse_from([
+                "sshw",
+                "password",
+                "docker-password",
+                "--privilege",
+                "--json",
+            ])
+            .unwrap(),
+            &home.config_path,
+            &store,
+            &client,
+            &mut PrivilegeInput(password),
+        )
+        .unwrap();
+        let output: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+        assert_eq!(output["action"], "privilege_password_updated");
+        assert_eq!(output["target_user"], "root");
+        assert!(
+            store
+                .get_password_for(CredentialPurpose::Privilege, &old, "root")
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .get_password_for(CredentialPurpose::Login, &login, TEST_USER)
+                .unwrap(),
+            TEST_PASSWORD
+        );
+        let shown = execute(
+            Cli::try_parse_from(["sshw", "show", "docker-password", "--json"]).unwrap(),
+            &home.config_path,
+            &store,
+            &client,
+            &mut NoopPrompter,
+        )
+        .unwrap();
+        let shown: serde_json::Value = serde_json::from_str(&shown.stdout).unwrap();
+        assert_eq!(
+            shown["accounts"][0]["privilege"]["method"],
+            if method == PrivilegeMethod::Sudo {
+                "sudo"
+            } else {
+                "su"
+            }
+        );
+        let output = execute(
+            Cli::try_parse_from(["sshw", "run", "id -u", "--as-root", "--json"]).unwrap(),
+            &home.config_path,
+            &store,
+            &client,
+            &mut NoopPrompter,
+        )
+        .unwrap();
+        let output: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+        assert_eq!(output["exit_status"], 0, "{method:?}: {output}");
+        assert_eq!(output["stdout"].as_str().unwrap().trim(), "0");
+        assert_eq!(fs::read(&home.known_hosts_path).unwrap(), trusted);
+    }
 }
 
 fn docker_required() -> bool {
@@ -691,6 +1621,124 @@ fn run_authenticates_with_password_against_real_sshd() {
 
     assert_eq!(result.exit_status, 0);
     assert_eq!(result.stdout, "password-ok");
+}
+
+#[test]
+#[ignore = "spawns a real sshd; run with --ignored --test-threads=1"]
+fn connection_test_verifies_agent_trust_and_login_without_opening_an_exec_channel() {
+    let work = tempfile::tempdir().unwrap();
+    let marker = work.path().join("exec-was-opened");
+    let srv = TestServer::start_with_force_command_script(&format!(
+        "#!/bin/sh\nprintf exec > '{}'\nexit 1\n",
+        marker.display()
+    ));
+    let client = srv.client();
+    let server = srv.server();
+    let target = default_target(&server);
+    let error = client
+        .test_connection(&target, &AuthMaterial::Agent)
+        .unwrap_err();
+    assert_eq!(
+        sshw::output::classify_error(&error),
+        sshw::output::ErrorKind::Ssh
+    );
+    assert!(!srv.known_hosts.exists());
+    srv.trust();
+    let before = fs::read(&srv.known_hosts).unwrap();
+    let key = client
+        .test_connection(&target, &AuthMaterial::Agent)
+        .unwrap();
+    assert_eq!(
+        key.fingerprint_sha256,
+        client.host_key(&server).unwrap().fingerprint_sha256
+    );
+    assert!(!marker.exists());
+    assert_eq!(fs::read(&srv.known_hosts).unwrap(), before);
+    let home = work.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let mut config = SshwConfig {
+        default: None,
+        credential_backend: sshw::config::CredentialBackend::SessionOnly,
+        ..Default::default()
+    };
+    config.servers.insert("test".into(), server.clone());
+    save_config(&home.join("servers.json"), &config).unwrap();
+    fs::copy(&srv.known_hosts, home.join("known_hosts")).unwrap();
+    fs::write(home.join("policy.json"), r#"{"enabled":true}"#).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sshw"))
+        .env("SSHW_HOME", &home)
+        .args(["test", "test", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["authenticated"], true);
+    assert_eq!(json["host_key_verified"], true);
+    assert_eq!(json["command_executed"], false);
+    assert!(!marker.exists());
+    // Prove the fixture would detect an accidental exec request.
+    assert!(client.run(&target, &AuthMaterial::Agent, "true").is_ok());
+    assert_eq!(fs::read(marker).unwrap(), b"exec");
+}
+
+#[test]
+#[ignore = "requires Docker password SSH fixture"]
+fn connection_test_authenticates_saved_password_and_reports_auth_failures_without_exec() {
+    let Some(srv) = DockerPasswordServer::start() else {
+        return;
+    };
+    srv.trust();
+    let server = srv.server();
+    let target = default_target(&server);
+    let client = srv.client();
+    let before = fs::read(&srv.known_hosts).unwrap();
+    let error = client
+        .test_connection(
+            &target,
+            &AuthMaterial::Password("wrong-connection-test-password".into()),
+        )
+        .unwrap_err();
+    assert_eq!(
+        sshw::output::classify_error(&error),
+        sshw::output::ErrorKind::Auth
+    );
+    client
+        .test_connection(&target, &AuthMaterial::Password(TEST_PASSWORD.into()))
+        .unwrap();
+    assert_eq!(fs::read(&srv.known_hosts).unwrap(), before);
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join("servers.json");
+    let (mut config, _, _) = docker_privileged_config(&path, &srv, PrivilegeMethod::Su);
+    config.credential_backend = sshw::config::CredentialBackend::SessionOnly;
+    save_config(&path, &config).unwrap();
+    fs::copy(&srv.known_hosts, home.path().join("known_hosts")).unwrap();
+    for (password, exit) in [("wrong-connection-test-password", 4), (TEST_PASSWORD, 0)] {
+        let output = Command::new(env!("CARGO_BIN_EXE_sshw"))
+            .env("SSHW_HOME", home.path())
+            .env("SSHW_PASSWORD", password)
+            .env_remove("SSHW_PRIVILEGE_PASSWORD")
+            .args(["test", "docker-password", "--json"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(exit),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(!String::from_utf8_lossy(&output.stdout).contains(password));
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        if exit == 0 {
+            assert_eq!(json["command_executed"], false);
+            assert_eq!(json["authenticated"], true);
+        } else {
+            assert_eq!(json["error"]["kind"], "auth");
+        }
+    }
 }
 
 #[test]
@@ -1051,6 +2099,165 @@ fn put_then_get_roundtrip() {
 
 #[test]
 #[ignore = "spawns a real sshd; run with --ignored --test-threads=1"]
+fn transfer_progress_tracks_real_bytes_and_cli_keeps_json_separate() {
+    let srv = TestServer::start();
+    srv.trust();
+    let client = srv.client();
+    let server = srv.server();
+    let target = default_target(&server);
+    let work = tempfile::tempdir().unwrap();
+    let source = work.path().join("source.bin");
+    let destination = work.path().join("download.bin");
+    let remote = work.path().join("remote.bin");
+    let remote = remote.to_str().unwrap();
+    let assert_events = |events: &[TransferProgress], size| {
+        assert_eq!(events.first().unwrap().bytes, 0);
+        assert_eq!(events.first().unwrap().phase, TransferPhase::Data);
+        assert!(
+            events
+                .iter()
+                .all(|event| event.total == size && event.bytes <= size)
+        );
+        assert!(events.windows(2).all(|pair| pair[0].bytes <= pair[1].bytes));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.phase == TransferPhase::Complete)
+                .count(),
+            1
+        );
+        assert_eq!(events.last().unwrap().phase, TransferPhase::Complete);
+        assert_eq!(events.last().unwrap().bytes, size);
+        assert!(
+            events
+                .iter()
+                .any(|event| event.phase == TransferPhase::Finalizing)
+        );
+        if size > 0 {
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event.bytes > 0 && event.bytes < size)
+            );
+        }
+    };
+    for size in [0, 256 * 1024] {
+        let payload = vec![42u8; size];
+        fs::write(&source, &payload).unwrap();
+        for atomic in [false, true] {
+            let mut events = Vec::new();
+            client
+                .put_with_progress(
+                    &target,
+                    &AuthMaterial::Agent,
+                    &source,
+                    remote,
+                    UploadOptions {
+                        atomic,
+                        mode: Some(0o640),
+                    },
+                    &mut |event| {
+                        if event.phase == TransferPhase::Complete {
+                            assert_eq!(fs::read(remote).unwrap(), payload);
+                        }
+                        events.push(event);
+                    },
+                )
+                .unwrap();
+            assert_events(&events, size as u64);
+            assert_eq!(
+                fs::metadata(remote).unwrap().permissions().mode() & 0o777,
+                0o640
+            );
+            events.clear();
+            client
+                .get_with_progress(
+                    &target,
+                    &AuthMaterial::Agent,
+                    remote,
+                    &destination,
+                    true,
+                    &mut |event| {
+                        if event.phase == TransferPhase::Complete {
+                            assert_eq!(fs::read(&destination).unwrap(), payload);
+                        }
+                        events.push(event);
+                    },
+                )
+                .unwrap();
+            assert_events(&events, size as u64);
+        }
+    }
+    let home = work.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let mut config = SshwConfig {
+        default: Some("test".into()),
+        credential_backend: sshw::config::CredentialBackend::SessionOnly,
+        ..Default::default()
+    };
+    config.servers.insert("test".into(), server);
+    save_config(&home.join("servers.json"), &config).unwrap();
+    fs::copy(&srv.known_hosts, home.join("known_hosts")).unwrap();
+    for atomic in [false, true] {
+        let mut args = vec![
+            "put",
+            source.to_str().unwrap(),
+            remote,
+            "--json",
+            "--progress",
+            "--mode",
+            "640",
+        ];
+        if atomic {
+            args.push("--atomic");
+        }
+        let output = Command::new(env!("CARGO_BIN_EXE_sshw"))
+            .env("SSHW_HOME", &home)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(json["bytes"], 256 * 1024);
+        let progress = String::from_utf8(output.stderr).unwrap();
+        assert!(progress.contains("100%"));
+        assert!(progress.ends_with("complete\n"));
+        assert!(!progress.contains('\r'));
+        assert!(!progress.contains(remote));
+    }
+    for flag in [false, true] {
+        let mut args = vec![
+            "get",
+            remote,
+            destination.to_str().unwrap(),
+            "--yes",
+            "--json",
+        ];
+        if flag {
+            args.push("--progress");
+        }
+        let output = Command::new(env!("CARGO_BIN_EXE_sshw"))
+            .env("SSHW_HOME", &home)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(json["bytes"], 256 * 1024);
+        if flag {
+            assert!(String::from_utf8_lossy(&output.stderr).contains("100%"));
+        } else {
+            assert!(output.stderr.is_empty());
+        }
+    }
+}
+
+#[test]
+#[ignore = "spawns a real sshd; run with --ignored --test-threads=1"]
 fn get_validates_local_paths_and_preserves_symlink_targets() {
     use std::os::unix::fs::symlink;
     let srv = TestServer::start();
@@ -1063,9 +2270,15 @@ fn get_validates_local_paths_and_preserves_symlink_targets() {
     fs::create_dir(&directory).unwrap();
     let parent_file = work.path().join("parent-file");
     fs::write(&parent_file, b"ORIGINAL").unwrap();
+    let dangling_parent = work.path().join("dangling-parent");
+    symlink(work.path().join("missing-parent"), &dangling_parent).unwrap();
     // No host trust yet: direct library calls must reject local path errors
     // before connecting and before any remote download could start.
-    for destination in [&directory, &parent_file.join("child")] {
+    for destination in [
+        &directory,
+        &parent_file.join("child"),
+        &dangling_parent.join("nested/child"),
+    ] {
         for overwrite in [false, true] {
             let error = client
                 .get(
@@ -1086,6 +2299,31 @@ fn get_validates_local_paths_and_preserves_symlink_targets() {
             );
         }
     }
+    let missing = work.path().join("missing-target");
+    let mut destinations = Vec::new();
+    for (index, target) in [&parent_file, &directory, &missing].iter().enumerate() {
+        let destination = work.path().join(format!("link-{index}"));
+        symlink(target, &destination).unwrap();
+        let error = client
+            .get(
+                &default_target(&server),
+                &AuthMaterial::Agent,
+                source.to_str().unwrap(),
+                &destination,
+                false,
+            )
+            .unwrap_err();
+        assert_eq!(
+            sshw::output::classify_error(&error),
+            sshw::output::ErrorKind::Io
+        );
+        assert!(
+            error.to_string().contains("pass --yes to overwrite"),
+            "{error:#}"
+        );
+        assert_eq!(fs::read_link(&destination).unwrap(), **target);
+        destinations.push(destination);
+    }
     srv.trust();
     let nested = work.path().join("missing/parents/download");
     client
@@ -1098,10 +2336,7 @@ fn get_validates_local_paths_and_preserves_symlink_targets() {
         )
         .unwrap();
     assert_eq!(fs::read(&nested).unwrap(), b"DATA");
-    let missing = work.path().join("missing-target");
-    for (index, target) in [&parent_file, &directory, &missing].iter().enumerate() {
-        let destination = work.path().join(format!("link-{index}"));
-        symlink(target, &destination).unwrap();
+    for destination in destinations {
         client
             .get(
                 &default_target(&server),
@@ -1253,15 +2488,30 @@ fn atomic_upload_never_falls_back_when_server_disables_posix_rename() {
     let remote = work.path().join("remote");
     fs::write(&source, b"replacement").unwrap();
     fs::write(&remote, b"original").unwrap();
+    let mut events = Vec::new();
     let error = client
-        .put_atomic(
+        .put_with_progress(
             &default_target(&server),
             &AuthMaterial::Agent,
             &source,
             remote.to_str().unwrap(),
-            None,
+            UploadOptions {
+                atomic: true,
+                mode: None,
+            },
+            &mut |event| events.push(event),
         )
         .unwrap_err();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.phase == TransferPhase::Finalizing)
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.phase == TransferPhase::Complete)
+    );
     assert!(format!("{error:#}").contains("no non-atomic fallback"));
     assert!(error.to_string().contains("OP_UNSUPPORTED"), "{error:#}");
     assert_eq!(fs::read(&remote).unwrap(), b"original");
@@ -1759,18 +3009,60 @@ exit 1
     );
 
     fs::remove_file(&destination).unwrap();
+    let mut events = Vec::new();
     let err = srv
         .client()
-        .get(
+        .get_with_progress(
             &target,
             &AuthMaterial::Agent,
             "/ignored",
             &destination,
             false,
+            &mut |event| events.push(event),
         )
         .unwrap_err();
     assert!(err.to_string().contains("status 1"), "error was: {err:#}");
     assert!(!destination.exists());
+    assert!(
+        events
+            .iter()
+            .any(|event| event.phase == TransferPhase::Finalizing)
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.phase == TransferPhase::Complete)
+    );
+    let home = local_dir.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let mut config = SshwConfig {
+        default: Some("test".into()),
+        credential_backend: sshw::config::CredentialBackend::SessionOnly,
+        ..Default::default()
+    };
+    config.servers.insert("test".into(), server.clone());
+    save_config(&home.join("servers.json"), &config).unwrap();
+    fs::copy(&srv.known_hosts, home.join("known_hosts")).unwrap();
+    fs::write(&destination, "ORIGINAL").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sshw"))
+        .env("SSHW_HOME", &home)
+        .args([
+            "get",
+            "/ignored",
+            destination.to_str().unwrap(),
+            "--yes",
+            "--progress",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(5));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["ok"], false);
+    let progress = String::from_utf8(output.stderr).unwrap();
+    assert!(progress.contains("failed"));
+    assert!(!progress.contains("100%"));
+    assert_eq!(fs::read(&destination).unwrap(), b"ORIGINAL");
 }
 
 #[test]
@@ -1825,10 +3117,23 @@ fn put_rejects_remote_scp_sink_nonzero_exit_status() {
     let src = work.path().join("src.bin");
     fs::write(&src, b"payload for /dev/full\n").expect("write src");
 
+    let mut events = Vec::new();
     let err = client
-        .put(&target, &AuthMaterial::Agent, &src, "/dev/full")
+        .put_with_progress(
+            &target,
+            &AuthMaterial::Agent,
+            &src,
+            "/dev/full",
+            UploadOptions::default(),
+            &mut |event| events.push(event),
+        )
         .expect_err("remote scp sink failure must fail closed");
 
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.phase == TransferPhase::Complete)
+    );
     let message = format!("{err:#}");
     assert!(
         message.contains("remote scp exited with status"),

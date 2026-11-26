@@ -267,7 +267,7 @@ impl StagedStreamWrite {
                 let tempfile::PersistError { error, file } = err;
                 let already_exists = !overwrite
                     && (error.kind() == std::io::ErrorKind::AlreadyExists
-                        || destination.try_exists().is_ok_and(|exists| exists));
+                        || fs::symlink_metadata(&destination).is_ok());
                 drop(file);
                 if already_exists {
                     return Err(already_exists_error(&destination));
@@ -298,35 +298,48 @@ pub fn stage_stream_owner_only(
 /// claim that future writes will succeed. Directory classification inspects
 /// the final entry itself: publishing replaces a symlink, not its target.
 pub(crate) fn check_download_destination(path: &Path, overwrite: bool) -> Result<()> {
-    let exists = path
-        .try_exists()
-        .map_err(|error| download_path_error(path, "inspect path", error))?;
-    if exists {
-        let metadata = fs::symlink_metadata(path)
-            .map_err(|error| download_path_error(path, "inspect path", error))?;
-        if metadata.is_dir() {
-            return Err(app_error(
-                ErrorKind::Io,
-                format!(
-                    "local download destination is a directory: {}; specify a file path",
-                    path.display()
-                ),
-            ));
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.is_dir() {
+                return Err(app_error(
+                    ErrorKind::Io,
+                    format!(
+                        "local download destination is a directory: {}; specify a file path",
+                        path.display()
+                    ),
+                ));
+            }
+            if !overwrite {
+                return Err(already_exists_error(path));
+            }
+            return Ok(());
         }
-        if !overwrite {
-            return Err(already_exists_error(path));
-        }
-        return Ok(());
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(download_path_error(path, "inspect path", error)),
     }
 
-    // Windows may report a child of an existing file as NotFound rather than
-    // NotADirectory. Check the nearest existing parent while allowing missing
-    // directories to be created later by the actual download.
+    // Walk missing parents without treating a dangling link as an absent
+    // directory. A link to an existing directory is a valid parent.
     let mut parent = parent_directory(path);
     loop {
-        match fs::metadata(parent) {
-            Ok(metadata) if metadata.is_dir() => return Ok(()),
-            Ok(_) => {
+        match fs::symlink_metadata(parent) {
+            Ok(metadata) => {
+                let is_dir = if metadata.file_type().is_symlink() {
+                    fs::metadata(parent)
+                        .map_err(|error| {
+                            download_path_error(
+                                path,
+                                &format!("resolve parent link {}", parent.display()),
+                                error,
+                            )
+                        })?
+                        .is_dir()
+                } else {
+                    metadata.is_dir()
+                };
+                if is_dir {
+                    return Ok(());
+                }
                 return Err(app_error(
                     ErrorKind::Io,
                     format!(
@@ -434,13 +447,12 @@ pub(crate) fn fail_next_parent_sync() {
 }
 
 fn already_exists_error(path: &Path) -> anyhow::Error {
-    app_error(
-        ErrorKind::Io,
-        format!(
-            "local file already exists: {}; pass --yes to overwrite",
-            path.display()
-        ),
-    )
+    let message = format!(
+        "local file already exists: {}; pass --yes to overwrite",
+        path.display()
+    );
+    let error = std::io::Error::new(std::io::ErrorKind::AlreadyExists, message);
+    classified_error(ErrorKind::Io, error.into())
 }
 
 fn incomplete_transfer_error(expected: u64, actual: u64) -> anyhow::Error {
@@ -746,6 +758,15 @@ mod stream_tests {
         for (index, target) in [&file, &directory, &missing].iter().enumerate() {
             let destination = dir.path().join(format!("link-{index}"));
             symlink(target, &destination).unwrap();
+            let error =
+                write_stream_owner_only_atomic(&destination, &mut UnreadableFixture, false, None)
+                    .unwrap_err();
+            assert!(
+                error.to_string().contains("pass --yes to overwrite"),
+                "{error:#}"
+            );
+            assert_eq!(fs::read_link(&destination).unwrap(), **target);
+            assert_eq!(count_temp_files(dir.path()), 0);
             let mut source = &b"DATA"[..];
             write_stream_owner_only_atomic(&destination, &mut source, true, Some(4)).unwrap();
             assert!(

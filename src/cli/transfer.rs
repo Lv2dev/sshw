@@ -1,5 +1,6 @@
 //! File transfer subcommand handlers.
 
+use super::transfer_progress::ProgressDisplay;
 use super::{
     CommandOutput, GetArgs, PutArgs, get_server, ok, resolve_auth, resolve_target_server,
     select_account, split_target,
@@ -7,10 +8,11 @@ use super::{
 use crate::config::{AccountConfig, ServerConfig, SshwConfig};
 use crate::credentials::CredentialStore;
 use crate::error::{ResultErrorKindExt, app_error};
+use crate::local_command::display_value;
 use crate::output::{ErrorKind, classify_error, redact_secrets};
 use crate::safety::{SafetyDecision, classify_remote_write_path};
 use crate::sandbox::{Sandbox, SandboxDecision};
-use crate::ssh::{SshClient, SshTarget};
+use crate::ssh::{SshClient, SshTarget, UploadOptions};
 use serde_json::json;
 use std::path::PathBuf;
 
@@ -40,6 +42,7 @@ where
         mode,
         atomic,
         yes,
+        progress,
         json,
     } = args;
     let (server_name, local, remote) = resolve_put_target(target, config)?;
@@ -56,8 +59,18 @@ where
     check_put_source(&local)?;
     let auth = resolve_auth(&server_name, account, login_user, credentials)?;
     let ssh_target = SshTarget::new(server, login_user);
+    let mut display = progress.then(|| ProgressDisplay::stderr("upload"));
     let result = with_msys_remote_path_hint(
-        if atomic {
+        if let Some(display) = display.as_mut() {
+            ssh.put_with_progress(
+                &ssh_target,
+                &auth,
+                &local,
+                &remote.value,
+                UploadOptions { mode, atomic },
+                &mut |event| display.update(event),
+            )
+        } else if atomic {
             ssh.put_atomic(&ssh_target, &auth, &local, &remote.value, mode)
         } else {
             match mode {
@@ -68,7 +81,11 @@ where
         .with_error_kind(ErrorKind::Ssh),
         &remote.value,
         windows_msys_argument_conversion_active() && !remote.explicit_literal,
-    )?;
+    );
+    if let Some(display) = display.as_mut() {
+        display.finish(result.is_ok());
+    }
+    let result = result?;
     if json {
         let output = json!({
             "ok": true,
@@ -83,7 +100,9 @@ where
 
     Ok(ok(format!(
         "uploaded {} bytes from {} to {}\n",
-        result.bytes, result.source, result.destination
+        result.bytes,
+        display_value(&result.source),
+        display_value(&result.destination)
     )))
 }
 
@@ -100,29 +119,46 @@ where
 {
     let GetArgs {
         target,
+        into,
         user,
         yes,
+        progress,
         json,
     } = args;
-    let (server_name, remote, local) = resolve_get_target(target, config)?;
+    let (server_name, remote, local) = resolve_get_target(target, into.as_deref(), config)?;
 
     let (server, login_user, account) = check_get_access(
         &server_name,
         user.as_deref(),
         &remote.value,
-        &local,
-        yes,
         sandbox,
         config,
+        || crate::storage::check_download_destination(&local, yes),
     )?;
     let auth = resolve_auth(&server_name, account, login_user, credentials)?;
     let ssh_target = SshTarget::new(server, login_user);
+    let mut display = progress.then(|| ProgressDisplay::stderr("download"));
     let result = with_msys_remote_path_hint(
-        ssh.get(&ssh_target, &auth, &remote.value, &local, yes)
-            .with_error_kind(ErrorKind::Ssh),
+        if let Some(display) = display.as_mut() {
+            ssh.get_with_progress(
+                &ssh_target,
+                &auth,
+                &remote.value,
+                &local,
+                yes,
+                &mut |event| display.update(event),
+            )
+        } else {
+            ssh.get(&ssh_target, &auth, &remote.value, &local, yes)
+        }
+        .with_error_kind(ErrorKind::Ssh),
         &remote.value,
         windows_msys_argument_conversion_active() && !remote.explicit_literal,
-    )?;
+    );
+    if let Some(display) = display.as_mut() {
+        display.finish(result.is_ok());
+    }
+    let result = result?;
     if json {
         let output = json!({
             "ok": true,
@@ -137,7 +173,9 @@ where
 
     Ok(ok(format!(
         "downloaded {} bytes from {} to {}\n",
-        result.bytes, result.source, result.destination
+        result.bytes,
+        display_value(&result.source),
+        display_value(&result.destination)
     )))
 }
 
@@ -166,14 +204,13 @@ pub(super) fn check_get_access<'a>(
     name: &str,
     user: Option<&str>,
     remote: &str,
-    local: &std::path::Path,
-    yes: bool,
     sandbox: &dyn Sandbox,
     config: &'a SshwConfig,
+    check_destination: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<(&'a ServerConfig, &'a str, &'a AccountConfig)> {
     let server = get_server(config, name)?;
     check_get_path(remote, sandbox)?;
-    crate::storage::check_download_destination(local, yes)?;
+    check_destination()?;
     checked_account(name, user, server, sandbox)
 }
 
@@ -187,7 +224,10 @@ fn checked_account<'a>(
     if let SandboxDecision::Deny { reason } =
         sandbox.check_account(name, user, user == server.default_user)
     {
-        return Err(app_error(ErrorKind::Policy, reason));
+        return Err(super::policy_recovery::denial(
+            reason,
+            super::policy_recovery::Rule::Account(name.into(), user.into()),
+        ));
     }
     Ok((server, user, account))
 }
@@ -202,16 +242,25 @@ fn check_put_path(
         return Err(app_error(ErrorKind::Safety, reason));
     }
     if let SandboxDecision::Deny { reason } = sandbox.check_put(remote) {
-        return Err(app_error(ErrorKind::Policy, reason));
+        return Err(super::policy_recovery::denial(
+            reason,
+            super::policy_recovery::Rule::Path {
+                value: remote.into(),
+                upload: true,
+            },
+        ));
     }
     if atomic {
         let parent = crate::ssh::atomic_upload::parent_path(remote)?;
         if let SandboxDecision::Deny { reason } = sandbox.check_put(parent) {
-            return Err(app_error(
-                ErrorKind::Policy,
+            return Err(super::policy_recovery::denial(
                 format!(
                     "atomic upload needs parent-directory permission for its temporary file: {reason}"
                 ),
+                super::policy_recovery::Rule::Path {
+                    value: parent.into(),
+                    upload: true,
+                },
             ));
         }
     }
@@ -220,7 +269,13 @@ fn check_put_path(
 
 fn check_get_path(remote: &str, sandbox: &dyn Sandbox) -> anyhow::Result<()> {
     if let SandboxDecision::Deny { reason } = sandbox.check_get(remote) {
-        return Err(app_error(ErrorKind::Policy, reason));
+        return Err(super::policy_recovery::denial(
+            reason,
+            super::policy_recovery::Rule::Path {
+                value: remote.into(),
+                upload: false,
+            },
+        ));
     }
     Ok(())
 }
@@ -240,15 +295,73 @@ pub(super) fn resolve_put_target(
 
 pub(super) fn resolve_get_target(
     target: Vec<String>,
+    into: Option<&std::path::Path>,
     config: &SshwConfig,
 ) -> anyhow::Result<(String, RemotePath, PathBuf)> {
     // target is `[name] <remote> <local>`.
-    let (name, rest) = split_target(&target, 2)
-        .ok_or_else(|| app_error(ErrorKind::Config, "get expects [name] <remote> <local>"))?;
+    let (name, rest) =
+        split_target(&target, if into.is_some() { 1 } else { 2 }).ok_or_else(|| {
+            app_error(
+                ErrorKind::Usage,
+                "get expects [name] <remote> <local>, or [name] <remote> --into <directory>",
+            )
+        })?;
     let server = resolve_target_server(name, config)?;
     let remote = decode_transfer_remote_path(&rest[0], "get")?;
-    let local = decode_transfer_local_path(&rest[1], "get")?;
+    let local = if let Some(directory) = into {
+        directory.join(download_file_name(&remote.value)?)
+    } else {
+        decode_transfer_local_path(&rest[1], "get")?
+    };
     Ok((server, remote, local))
+}
+
+fn download_file_name(remote: &str) -> anyhow::Result<&str> {
+    // Interpret explicit drive/UNC paths as Windows paths even on Unix clients.
+    // Other remote paths use POSIX separators, preserving literal backslashes.
+    let name = if is_windows_drive_absolute(remote) || remote.starts_with(r"\\") {
+        remote.rsplit(['/', '\\']).next().unwrap_or_default()
+    } else {
+        remote.rsplit('/').next().unwrap_or_default()
+    };
+    let mut components = std::path::Path::new(name).components();
+    let safe_component = matches!(components.next(), Some(std::path::Component::Normal(_)))
+        && components.next().is_none();
+    if !safe_component || name.chars().any(char::is_control) || !valid_local_file_name(name) {
+        return Err(app_error(
+            ErrorKind::Usage,
+            "cannot derive a local filename for --into from this remote path; use a regular remote file path or specify the local filename explicitly",
+        ));
+    }
+    Ok(name)
+}
+
+#[cfg(not(windows))]
+fn valid_local_file_name(_: &str) -> bool {
+    true
+}
+
+#[cfg(windows)]
+fn valid_local_file_name(name: &str) -> bool {
+    if name.ends_with(['.', ' ']) || name.contains(['<', '>', ':', '"', '/', '\\', '|', '?', '*']) {
+        return false;
+    }
+    let stem = name
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    !matches!(
+        stem.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CLOCK$" | "CONIN$" | "CONOUT$"
+    ) && !["COM", "LPT"].iter().any(|prefix| {
+        stem.strip_prefix(prefix).is_some_and(|suffix| {
+            matches!(
+                suffix,
+                "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+            )
+        })
+    })
 }
 
 pub(super) fn policy_remote_path(path: &str) -> anyhow::Result<String> {
@@ -456,4 +569,51 @@ mod tests {
             assert!(!decoded.explicit_literal);
         }
     }
+}
+#[test]
+fn into_filename_preserves_platform_names_without_allowing_local_path_components() {
+    for (remote, expected) in [
+        ("/var/log/app.log", "app.log"),
+        (r"C:\logs\app.log", "app.log"),
+        (r"\\server\share\app.log", "app.log"),
+        ("../parent/app.log", "app.log"),
+        ("/logs/개발 'log.txt", "개발 'log.txt"),
+    ] {
+        assert_eq!(download_file_name(remote).unwrap(), expected);
+    }
+    for remote in [
+        "/",
+        ".",
+        "..",
+        "/logs/.",
+        "/logs/..",
+        "/logs/",
+        "/logs/bad\nname",
+        "/logs/bad\0name",
+        r"C:\logs\",
+    ] {
+        assert_eq!(
+            classify_error(&download_file_name(remote).unwrap_err()),
+            ErrorKind::Usage,
+            "{remote:?}"
+        );
+    }
+    #[cfg(windows)]
+    for remote in [
+        "/logs/NUL",
+        "/logs/con.txt",
+        "/logs/COM1",
+        "/logs/LPT³.log",
+        "/logs/file:stream",
+        "/logs/trailing.",
+        "/logs/trailing ",
+        r"/logs/file\name",
+    ] {
+        assert!(download_file_name(remote).is_err(), "{remote:?}");
+    }
+    #[cfg(not(windows))]
+    assert_eq!(
+        download_file_name(r"/logs/file\name").unwrap(),
+        r"file\name"
+    );
 }

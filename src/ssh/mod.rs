@@ -55,6 +55,30 @@ pub struct TransferResult {
     pub destination: String,
 }
 
+/// Data has been copied, but remote completion/local publication may still fail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferPhase {
+    Data,
+    Finalizing,
+    Complete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransferProgress {
+    pub bytes: u64,
+    pub total: u64,
+    pub phase: TransferPhase,
+}
+
+/// Observation only: callbacks must be quick and cannot cancel or extend deadlines.
+pub type TransferProgressCallback<'a> = dyn FnMut(TransferProgress) + 'a;
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UploadOptions {
+    pub mode: Option<u32>,
+    pub atomic: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct HostKeyInfo {
     pub algorithm: String,
@@ -74,6 +98,17 @@ impl<'a> SshTarget<'a> {
 }
 
 pub trait SshClient {
+    /// Verify the existing host approval and authenticate; never open a command channel.
+    fn test_connection(
+        &self,
+        target: &SshTarget<'_>,
+        auth: &AuthMaterial,
+    ) -> anyhow::Result<HostKeyInfo> {
+        let _ = (target, auth);
+        Err(anyhow::anyhow!(
+            "connection testing is unsupported by this SSH backend"
+        ))
+    }
     /// Inspect the local agent only. None means this backend cannot probe it.
     fn agent_identity_count(&self) -> anyhow::Result<Option<usize>> {
         Ok(None)
@@ -192,4 +227,47 @@ pub trait SshClient {
         local: &Path,
         overwrite: bool,
     ) -> anyhow::Result<TransferResult>;
+
+    /// Legacy backends report only verified completion; native SCP/SFTP report live bytes.
+    fn put_with_progress(
+        &self,
+        target: &SshTarget<'_>,
+        auth: &AuthMaterial,
+        local: &Path,
+        remote: &str,
+        options: UploadOptions,
+        progress: &mut TransferProgressCallback<'_>,
+    ) -> anyhow::Result<TransferResult> {
+        let result = if options.atomic {
+            self.put_atomic(target, auth, local, remote, options.mode)
+        } else if let Some(mode) = options.mode {
+            self.put_with_mode(target, auth, local, remote, mode)
+        } else {
+            self.put(target, auth, local, remote)
+        }?;
+        progress(TransferProgress {
+            bytes: result.bytes,
+            total: result.bytes,
+            phase: TransferPhase::Complete,
+        });
+        Ok(result)
+    }
+
+    fn get_with_progress(
+        &self,
+        target: &SshTarget<'_>,
+        auth: &AuthMaterial,
+        remote: &str,
+        local: &Path,
+        overwrite: bool,
+        progress: &mut TransferProgressCallback<'_>,
+    ) -> anyhow::Result<TransferResult> {
+        let result = self.get(target, auth, remote, local, overwrite)?;
+        progress(TransferProgress {
+            bytes: result.bytes,
+            total: result.bytes,
+            phase: TransferPhase::Complete,
+        });
+        Ok(result)
+    }
 }

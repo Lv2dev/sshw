@@ -53,11 +53,28 @@ impl AuditSink for NoopAudit {
 /// secrets passed inline.
 pub struct FileAuditSink {
     path: PathBuf,
+    settings: Option<serde_json::Value>,
 }
 
 impl FileAuditSink {
     pub fn new(path: PathBuf) -> Self {
-        Self { path }
+        Self {
+            path,
+            settings: None,
+        }
+    }
+    pub fn with_settings(mut self, mut settings: serde_json::Value) -> Self {
+        fn mask(value: &mut serde_json::Value) {
+            match value {
+                serde_json::Value::String(text) => *text = redact_secrets(text),
+                serde_json::Value::Array(items) => items.iter_mut().for_each(mask),
+                serde_json::Value::Object(items) => items.values_mut().for_each(mask),
+                _ => {}
+            }
+        }
+        mask(&mut settings);
+        self.settings = Some(settings);
+        self
     }
 }
 
@@ -73,6 +90,8 @@ struct AuditLine<'a> {
     exit_code: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
     detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    settings: Option<&'a serde_json::Value>,
 }
 
 impl AuditSink for FileAuditSink {
@@ -89,6 +108,7 @@ impl AuditSink for FileAuditSink {
             status: record.status.as_str(),
             exit_code: record.exit_code,
             detail: record.detail.as_deref().map(redact_secrets),
+            settings: self.settings.as_ref(),
         };
         let json = serde_json::to_string(&line)?;
 

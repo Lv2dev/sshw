@@ -90,6 +90,10 @@ Enter the **SSH login password** when asked. The characters will not appear on s
 
 Registration does not test whether you can log in. You will check the connection in the next steps. If your server uses a port other than 22, add its port number, for example `--port 2222`.
 
+The printed `next`/`then` commands keep the settings home, profile or project you selected. Use those commands when registering with `--home`, `--profile`, `--project-dir` or `SSHW_HOME`; registration with `--global` keeps that selection too. Host approval and command execution still require you to run the next steps yourself.
+
+To change an existing server's address while keeping its accounts, use `sshw endpoint web --host 192.0.2.20`. If `add` detects an address change, it prints an `endpoint` command for the same settings selection. `add --replace` is for a full replacement that resets accounts and privilege settings.
+
 To log in with an SSH key, use the command below instead. Your SSH Agent must already have the key loaded, and the server must accept it for `deploy`:
 
 ```sh
@@ -108,6 +112,8 @@ sshw trust web
 
 This step checks that you are connecting to the intended server. Compare the fingerprint on screen with one from your server administrator or another trusted source. Approve it only when they match.
 
+The approval question shows the actual address/port, selected server settings and the config/known_hosts paths. Check these too when several projects use the same server nickname.
+
 sshw saves the approved key. If the server's key changes later, it refuses the connection.
 
 ### 3. Run a harmless command
@@ -123,18 +129,52 @@ Keep the **whole command you want to run on the server inside quotes**. If you g
 
 ## Everyday commands
 
+Use `sshw endpoint web --host 192.0.2.20 --port 10022` to change only the saved address and port while preserving all accounts, passwords and privilege settings. Confirm the displayed change, or pass `--yes`. The destination still needs normal host-key verification; existing approvals are not copied to it.
+
+Use `sshw doctor web --user ops` to diagnose one registered login and its privilege credentials. Download with `sshw get web /var/log/app.log --into .` to keep the remote filename inside a local directory; an existing file still requires `--yes` to overwrite.
+
+Doctor and server/account lookup recovery commands retain the selected home/profile/project. If a repair would change inherited server settings, the message explicitly identifies the global action. Copying guidance does not approve a host or change credentials by itself.
+
+`doctor` and `list` give the same registration guidance for an empty server list. `run`, `put`, `get`, and `test` identify the selected settings and server in the approval command when a host key is missing. For a changed key, verify the new fingerprint with the server administrator before updating the reported `known_hosts` file.
+
+When removing a default server, use `sshw remove web --switch-default staging` to choose its replacement, or `--clear-default` to require explicit server names afterward. The same options work with `sshw profile remove prod`; clearing a profile default returns to the built-in home when no explicit selector is given. Hidden password prompts identify the server, login account and, for privilege passwords, the sudo/su method and target.
+
+Rename a profile with `sshw profile rename old new` while keeping saved passwords. To replace a default login and remove its old sshw registration together, use `sshw account remove web old-user --switch-default deploy`; server OS accounts and files stay intact.
+
+Use `sshw test web --user ops` to verify host approval and login without running a remote command. A policy denial now includes a suggested `policy allow` command and its scope; review it before applying the grant.
+
+Add `--progress` to `put/get` to see transferred bytes, percentage and speed. To require a server name each time, clear the default with `sshw default --clear`. `sshw profile default --clear` returns to the built-in home when no explicit selector is given. Registered settings stay available.
+
 These examples use the server name `web`. The commands that run on the server assume Linux/Unix. On another system, choose commands that work in the server's shell.
 
 | Task | Command |
 | --- | --- |
 | List registered servers | `sshw list` |
 | Inspect a server | `sshw show web` |
+| Rename a server | `sshw rename web production` |
+| Find servers by name or host | `sshw list --filter prod` |
+| Update a saved login password | `sshw password web` |
+| Update a saved sudo/su password | `sshw password web --privilege` |
 | Run a command | `sshw run web "uptime"` |
 | Follow output as it arrives | `sshw run web "journalctl -n 20" --stream` |
 | Upload a file | `sshw put web ./report.txt /tmp/report.txt` |
 | Download a file | `sshw get web /tmp/report.txt ./downloaded-report.txt` |
 | Upload an executable | `sshw put web ./app /srv/app/app --mode 755` |
 | Replace a file after the upload completes | `sshw put web ./app /srv/app/app --atomic --mode 755` |
+
+`rename` keeps the server's accounts, passwords, privilege settings and host approval. Its default selection and account policy rules follow the new name. The destination must be unused; an identical name makes no changes. Use the same `--home` or `--profile` you used when registering the server.
+
+`list --filter` matches a literal substring of the name or host, ignoring case. To save a new login password after changing it on the server, use `password web`; add `--user ops` to choose another registered password account. It asks only for the new password with hidden input and preserves your other settings. SSH-agent accounts keep using the agent; change their authentication method explicitly with `account add` if needed.
+
+For PowerShell Tab completion, run this once in the current session, or add the line to your PowerShell profile:
+
+```powershell
+sshw completions powershell | Out-String | Invoke-Expression
+```
+
+Tab suggests commands, options and registered server/account/profile names from the selected home. The script does not edit your profile or connect to a server. See the [completion reference](docs/reference.md#powershell-completion) for quoting and shell limitations.
+
+`show web` displays every registered account, marks the default login with `*`, and includes each account's authentication and sudo/su target. To update only a saved privilege password, use `password web --privilege`; `--user ops` selects the login account whose privilege settings you want to keep. The saved method and target stay unchanged. Passwordless sudo stays passwordless; change that setting explicitly with `privilege set` when needed.
 
 For `put`, give **the file on your PC, then its destination on the server**. For `get`, give **the file on the server, then its destination on your PC**.
 
@@ -192,15 +232,27 @@ See [privilege settings](docs/reference.md#privileged-commands) for saved passwo
 
 You can start with the default settings. Run `sshw doctor` to see where they are stored.
 
-To keep a separate server list for a project, choose a settings folder. These examples use `.sshw` in the current folder. **Use the same `--home` on every command.**
+Run this in the project folder to use global servers with project permissions:
 
 ```sh
-sshw --home ./.sshw add web --host 192.0.2.10 --user deploy
-sshw --home ./.sshw trust web
-sshw --home ./.sshw run web "hostname"
+sshw project init
+sshw project status
+sshw policy allow command hostname
+sshw policy enable
+sshw run web "hostname"
 ```
 
-Commands using this folder have their own server list, approved server keys, passwords, policy and activity log. A folder named `.sshw` is not selected automatically.
+The current folder's `.sshw` is selected automatically. Server lists and permissions are selected independently: a local file takes precedence; a missing file or an explicit global selection uses global settings. Parent folders are not searched. `project init` copies the current global policy as the starting point and preserves its enabled state; it does not copy passwords.
+
+`project init` and `project status` show the saved policy setting and whether enforcement is on, off or blocked. A disabled local policy includes an enable command for that exact project; review the allowlist before running it. `--policy` forces enforcement only for that invocation and does not change the saved setting. Initialization and recovery commands retain the selected project directory when run from another folder.
+
+When both selected resources are local and the local policy already exists, `project init` works without reading unused global profiles. Creating a missing local policy still requires its global starting point; an invalid required global setting fails without replacing it with a disabled policy.
+
+To keep a separate server list too, run `sshw project init --servers-source local`. It starts empty, and only that local list is searched. Register accounts with `sshw add` and approve their host keys with `sshw trust`.
+
+If the inherited global list is empty, `sshw list` offers two choices: register globally with `--global`, or initialize a local server list and register there. Replace the host/login-user placeholders in the displayed command; neither choice runs automatically.
+
+Inherited settings are read-only in project mode. Use `sshw --global add ...` for an intentional global edit, or initialize the local resource first. `--home`, `--profile` and `SSHW_HOME` bypass automatic project selection. Use `sshw --global list` to inspect global servers or `sshw --project-dir <folder> list` to select a project from another folder. See [project settings](docs/reference.md#current-directory-project-settings) for file formats and source choices.
 
 You can also register a folder under a name and select it with `--profile prod`. Named profiles and `--home` do not share passwords, even for the same folder. Keep using the method you chose during setup. See [profile setup](docs/reference.md#managing-profiles).
 
@@ -223,6 +275,8 @@ See [JSON and exit codes](docs/reference.md#json-error-contract) for other comma
 ## Troubleshooting
 
 If you get an error, try `sshw doctor`. It checks settings and passwords on your PC and suggests what to do next. It does not try connecting to the server.
+
+Use `sshw doctor web` to focus the server checks on `web`. Home-wide problems, such as an invalid policy or unavailable credential backend, are still reported. Removing a server or login account also clears its matching account allowlist entries, so a later registration does not inherit those old entries.
 
 If the failing command used `--home` or `--profile`, use the same option for doctor.
 
@@ -353,6 +407,10 @@ sshw add web --host 192.0.2.10 --user deploy
 
 등록을 마쳐도 아직 로그인이 되는지 확인한 것은 아닙니다. 실제 접속은 다음 단계에서 확인합니다. 서버가 기본 포트 22를 쓰지 않는다면 `--port 2222`처럼 포트 번호도 붙이세요.
 
+등록 뒤 표시되는 `next`/`then` 명령은 선택한 설정 home·프로필·프로젝트를 유지합니다. `--home`·`--profile`·`--project-dir`·`SSHW_HOME`으로 등록했다면 해당 안내 명령을 사용하세요. `--global` 등록도 그대로 유지하며, 호스트 승인과 명령 실행은 다음 단계를 직접 실행해야 진행됩니다.
+
+기존 서버의 계정을 유지하면서 주소만 바꾸려면 `sshw endpoint web --host 192.0.2.20`을 사용하세요. `add`에서 주소 변경을 발견하면 같은 설정을 쓰는 `endpoint` 명령을 안내합니다. `add --replace`는 계정·승격 설정을 초기화하는 전체 교체용입니다.
+
 SSH 키로 로그인하려면 위 명령 대신 아래 명령을 사용하세요. SSH Agent에 키가 등록되어 있고, 서버에서도 그 키로 `deploy`에 로그인할 수 있어야 합니다.
 
 ```sh
@@ -371,6 +429,8 @@ sshw trust web
 
 접속하려는 서버가 맞는지 확인하는 단계입니다. 화면에 나온 지문을 서버 관리자 등 신뢰할 수 있는 경로에서 받은 지문과 비교하세요. 일치할 때만 승인하세요.
 
+승인 질문에는 실제 주소·포트, 선택한 서버 설정 출처와 config/known_hosts 경로가 표시됩니다. 여러 프로젝트에서 같은 별명을 쓴다면 이 정보도 함께 확인하세요.
+
 승인한 키는 저장됩니다. 이후 서버의 키가 바뀌면 sshw가 접속을 거부합니다.
 
 ### 3. 간단한 명령 실행
@@ -386,18 +446,52 @@ sshw run web "whoami"
 
 ## 자주 쓰는 명령
 
+`sshw endpoint web --host 192.0.2.20 --port 10022`는 계정·비밀번호·승격 설정을 보존하고 주소·포트만 바꿉니다. 표시된 변경을 확인하거나 `--yes`를 사용하세요. 기존 호스트 승인을 새 주소로 복사하지 않으며, 변경한 주소에도 기존 호스트키 검증을 적용합니다.
+
+`sshw doctor web --user ops`로 등록된 로그인 계정 하나와 그 계정의 승격 비밀번호를 진단합니다. `sshw get web /var/log/app.log --into .`은 로컬 폴더 안에 원래 파일명으로 저장합니다. 기존 파일을 덮어쓰려면 이전처럼 `--yes`가 필요합니다.
+
+doctor와 서버·계정 조회 오류의 복구 명령도 선택한 home/profile/project를 유지합니다. 상속한 서버 설정을 고쳐야 한다면 글로벌 변경임을 명시합니다. 안내만으로 호스트를 승인하거나 비밀번호를 바꾸지는 않습니다.
+
+빈 서버 목록은 `doctor`와 `list`에서 같은 등록 방법을 안내합니다. `run`, `put`, `get`, `test`에서 호스트 키가 미승인 상태면 선택한 설정과 서버 별명이 들어간 승인 명령을 표시합니다. 키가 바뀌었다면 서버 관리자에게 새 지문을 확인한 뒤 표시된 `known_hosts` 파일을 갱신하세요.
+
+기본 서버를 삭제할 때 `sshw remove web --switch-default staging`으로 다음 기본 서버를 지정하거나 `--clear-default`로 기본 선택을 해제하세요. `sshw profile remove prod`에도 같은 옵션을 사용할 수 있고, 프로필 기본값을 해제하면 명시한 selector가 없을 때 내장 home을 사용합니다. 숨김 비밀번호 입력창에는 서버·로그인 계정과 sudo/su 방식·대상을 표시합니다.
+
+`sshw profile rename old new`로 저장된 비밀번호를 유지하며 프로필 이름을 바꿀 수 있습니다. 기본 로그인을 교체하고 기존 sshw 등록을 정리하려면 `sshw account remove web old-user --switch-default deploy`를 사용하세요. 서버의 실제 계정과 파일은 유지됩니다.
+
+`sshw test web --user ops`로 호스트 승인과 실제 로그인을 확인할 수 있습니다. 원격 명령은 실행하지 않습니다. 정책에 막히면 필요한 `policy allow` 명령과 허용 범위를 안내하므로, 범위를 확인한 뒤 직접 적용하세요.
+
+`put/get`에 `--progress`를 붙이면 전송량·퍼센트·속도가 보입니다. 매번 서버명을 지정하려면 `sshw default --clear`로 기본 서버를 해제하세요. `sshw profile default --clear`는 명시한 selector가 없을 때 내장 기본 home을 사용하도록 돌립니다. 등록한 설정은 유지됩니다.
+
 아래 예시는 등록한 서버 이름을 `web`이라고 가정합니다. 서버에서 실행하는 명령은 Linux/Unix 기준입니다. 다른 서버에서는 해당 서버의 셸에서 사용할 수 있는 명령으로 바꾸세요.
 
 | 할 일 | 명령 |
 | --- | --- |
 | 등록 서버 목록 보기 | `sshw list` |
 | 서버 설정 보기 | `sshw show web` |
+| 서버 이름 바꾸기 | `sshw rename web production` |
+| 이름이나 호스트로 서버 찾기 | `sshw list --filter prod` |
+| 저장한 로그인 비밀번호 갱신 | `sshw password web` |
+| 저장한 sudo/su 비밀번호 갱신 | `sshw password web --privilege` |
 | 원격 명령 실행 | `sshw run web "uptime"` |
 | 실행 중 출력 보기 | `sshw run web "journalctl -n 20" --stream` |
 | 파일 올리기 | `sshw put web ./report.txt /tmp/report.txt` |
 | 파일 내려받기 | `sshw get web /tmp/report.txt ./downloaded-report.txt` |
 | 실행 파일 올리기 | `sshw put web ./app /srv/app/app --mode 755` |
 | 업로드가 끝난 뒤 한 번에 파일 교체 | `sshw put web ./app /srv/app/app --atomic --mode 755` |
+
+`rename`은 계정·비밀번호·권한 상승 설정과 승인한 서버 키를 유지합니다. 기본 서버 지정과 계정별 허용 규칙도 새 이름을 따릅니다. 새 이름은 사용 중이지 않아야 하며, 같은 이름으로 바꾸면 변경 없이 끝납니다. 등록할 때 사용한 `--home`이나 `--profile`이 있다면 동일하게 지정하세요.
+
+`list --filter`는 이름이나 호스트의 일부가 일치하는 서버를 대소문자 구분 없이 찾습니다. 서버에서 바꾼 비밀번호를 sshw에 다시 저장하려면 `password web`을 사용하세요. 다른 등록 계정은 `--user ops`로 선택합니다. 새 비밀번호만 숨김 입력으로 받고 다른 설정은 유지합니다. SSH-agent 계정의 인증 방식을 바꾸려면 `account add`에서 명시적으로 선택하세요.
+
+PowerShell에서 Tab 자동완성을 켜려면 현재 세션에서 아래 명령을 한 번 실행하세요. 매번 사용하려면 PowerShell 프로필에 이 줄을 추가하면 됩니다.
+
+```powershell
+sshw completions powershell | Out-String | Invoke-Expression
+```
+
+선택한 home의 등록 서버·계정과 프로필 이름, 명령·옵션을 제안합니다. 스크립트가 프로필을 편집하거나 서버에 접속하지는 않습니다. 인용과 셸 제약은 [자동완성 참조](docs/reference.ko.md#powershell-자동완성)를 확인하세요.
+
+`show web`은 전체 등록 계정과 계정별 인증 방식·sudo/su 대상을 보여 주며, 기본 로그인 계정을 `*`로 표시합니다. 저장한 권한 상승 비밀번호만 바꾸려면 `password web --privilege`를 쓰세요. `--user ops`로 로그인 계정을 선택하며 기존 승격 방식과 대상은 유지합니다. 무비밀번호 sudo 설정을 비밀번호 방식으로 바꾸려면 `privilege set`에서 명시적으로 변경하세요.
 
 `put`에는 **내 PC의 파일, 서버의 저장 경로** 순서로 적습니다. `get`은 **서버의 파일, 내 PC의 저장 경로** 순서입니다.
 
@@ -455,15 +549,27 @@ sudo 설정을 저장하는 다른 방법과 su 사용법은 [권한 설정 안�
 
 처음에는 기본 설정을 그대로 사용해도 됩니다. 설정이 어디에 저장되는지 궁금하면 `sshw doctor`를 실행하세요.
 
-프로젝트마다 서버 목록을 따로 관리하고 싶다면 설정 폴더를 지정하세요. 아래 예시는 현재 폴더의 `.sshw`를 사용합니다. **모든 명령에 같은 `--home`을 붙여야 합니다.**
+프로젝트 폴더에서 다음 명령을 실행하면 글로벌 서버 목록을 쓰면서 권한을 프로젝트별로 관리할 수 있습니다.
 
 ```sh
-sshw --home ./.sshw add web --host 192.0.2.10 --user deploy
-sshw --home ./.sshw trust web
-sshw --home ./.sshw run web "hostname"
+sshw project init
+sshw project status
+sshw policy allow command hostname
+sshw policy enable
+sshw run web "hostname"
 ```
 
-이 폴더를 선택한 명령은 서버 목록, 승인한 서버 키, 비밀번호, 허용 규칙, 작업 기록을 따로 사용합니다. `.sshw` 폴더가 있다는 이유만으로 자동 선택되지는 않습니다.
+현재 폴더의 `.sshw`를 자동으로 사용합니다. 서버 목록과 권한은 각각 선택하며, 로컬 파일이 있으면 로컬을, 없거나 글로벌 사용으로 지정하면 글로벌 설정을 따릅니다. 상위 폴더는 찾지 않습니다. `project init`은 글로벌 권한을 시작본으로 복사하며 활성화 상태를 유지하고, 비밀번호는 복사하지 않습니다.
+
+`project init`과 `project status`는 저장된 정책 활성화 값과 실제 적용 상태(on/off/blocked)를 표시합니다. 비활성 로컬 정책에는 그 프로젝트를 대상으로 한 활성화 명령을 안내하므로 허용 규칙을 검토한 뒤 직접 실행하세요. `--policy`는 이번 명령에서만 강제하며 저장된 값을 바꾸지 않습니다. 다른 폴더에서 실행해도 초기화·복구 안내는 지정한 프로젝트 경로를 유지합니다.
+
+서버·권한을 모두 로컬로 선택하고 로컬 정책이 이미 있으면 `project init`은 사용하지 않는 글로벌 프로필을 읽지 않고 동작합니다. 새 로컬 정책을 만들어야 한다면 여전히 글로벌 시작본이 필요하며, 필요한 글로벌 설정이 잘못돼도 임의로 비활성 정책을 만들지 않습니다.
+
+서버 목록도 따로 쓰려면 `sshw project init --servers-source local`을 실행하세요. 빈 로컬 목록으로 시작하며 그 목록 안에서만 서버를 찾습니다. `sshw add`로 계정을 등록하고 `sshw trust`로 호스트 키를 승인하세요.
+
+상속한 글로벌 목록이 비어 있으면 `sshw list`가 `--global`로 등록하는 방법과 로컬 목록을 초기화해 등록하는 방법을 각각 안내합니다. 표시된 명령의 host/login-user 자리표시자를 실제 값으로 바꾸세요. 안내만으로 등록이나 초기화를 실행하지 않습니다.
+
+프로젝트에서 상속 중인 설정은 읽기 전용입니다. 글로벌을 바꾸려면 `sshw --global add ...`처럼 명시하고, 로컬을 바꾸려면 해당 항목을 먼저 초기화하세요. `--home`·`--profile`·`SSHW_HOME`은 프로젝트 자동 선택을 건너뜁니다. `sshw --global list`로 글로벌 목록을 확인하거나 다른 폴더에서 `sshw --project-dir <폴더> list`로 프로젝트를 선택할 수 있습니다. 파일 형식과 출처 지정은 [프로젝트 설정 참조](docs/reference.ko.md#현재-폴더의-프로젝트-설정)를 참고하세요.
 
 설정 폴더에 이름을 붙여 `--profile prod`로 선택할 수도 있습니다. 다만 `--home`과 이름으로 등록한 프로필은 비밀번호를 서로 공유하지 않습니다. 등록할 때 선택한 방식을 계속 사용하세요. [프로필 등록 방법](docs/reference.ko.md#profile-관리)에 자세히 설명되어 있습니다.
 
@@ -487,14 +593,16 @@ sshw --home ./.sshw run web "hostname"
 
 오류가 나면 `sshw doctor`를 실행해 보세요. PC에 저장한 설정과 비밀번호를 확인하고 다음에 할 일을 알려 줍니다. 서버 접속까지 시험하는 명령은 아닙니다.
 
+`sshw doctor web`으로 서버 관련 검사를 `web`에 한정할 수 있습니다. 잘못된 정책이나 비밀번호 저장소 접근 문제처럼 home 전체에 영향을 주는 진단은 함께 표시합니다. 서버나 로그인 계정을 삭제하면 연결된 계정 허용 규칙도 정리하므로 나중에 같은 이름을 등록해도 그 규칙이 따라오지 않습니다.
+
 오류가 난 명령에 `--home`이나 `--profile`을 썼다면 doctor에도 같은 옵션을 붙이세요.
 
 | 상황 | 먼저 할 일 |
 | --- | --- |
 | `sshw` 명령을 찾지 못함 | `PATH`를 확인하거나 압축을 푼 실행 파일의 전체 경로로 실행하세요. |
 | 서버·계정이 등록되지 않았다고 나옴 | 같은 설정 위치에서 `sshw list`·`sshw account list web`을 확인하세요. |
-| 모르는 호스트 키라고 나옴 | `sshw trust web`으로 지문을 별도 경로와 비교한 뒤 승인하세요. |
-| 호스트 키가 바뀌었다고 나옴 | 서버 관리자에게 변경이 맞는지 확인한 뒤 신뢰 설정을 갱신하세요. |
+| 모르는 호스트 키라고 나옴 | 오류에 표시된 `trust` 명령을 실행하고 지문을 신뢰할 수 있는 경로에서 확인한 뒤 승인하세요. |
+| 호스트 키가 바뀌었다고 나옴 | 서버 관리자에게 변경과 새 지문을 확인한 뒤 오류에 표시된 `known_hosts` 파일을 갱신하세요. |
 | 비밀번호나 SSH 키로 로그인하지 못함 | `sshw doctor`를 실행하고 계정·비밀번호·키를 확인하세요. 서버가 그 로그인 방식을 허용하는지도 확인해야 합니다. |
 | 확인이 필요하다고 나옴 | 작업을 검토한 뒤 승인된 실행에는 `--yes`, 등록 갱신에는 `--force`를 사용하세요. |
 | 정책에 의해 거부됨 | `sshw policy check web "uptime"`으로 해당 명령의 규칙을 확인하세요. |

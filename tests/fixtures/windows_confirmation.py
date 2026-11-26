@@ -153,11 +153,12 @@ def console_regression(binary):
             # An affirmative confirmation must hand off to hidden password input normally.
             checked(kernel.SetConsoleMode(input_handle, 1))
             prompts = screen().count("[y/N]")
-            passwords = screen().count("SSH password:")
+            password_prompt = "SSH password for 'probe/tester':"
+            passwords = screen().count(password_prompt)
             registration = start([])
             wait_for(lambda: screen().count("[y/N]") > prompts, "password registration confirmation")
             type_reply("y\r")
-            wait_for(lambda: screen().count("SSH password:") > passwords and mode() == 1,
+            wait_for(lambda: screen().count(password_prompt) > passwords and mode() == 1,
                      "hidden password input after confirmation")
             secret = "consoleonlyfixture"
             type_reply(secret + "\r")
