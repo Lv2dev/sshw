@@ -34,6 +34,9 @@ Register-ArgumentCompleter -Native -CommandName sshw, sshw.exe -ScriptBlock {
         $encoded = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($request))
         $executable = Get-Command -Name $commandAst.GetCommandName() -CommandType Application -ErrorAction Stop | Select-Object -First 1
         $PSNativeCommandUseErrorActionPreference = $false
+        # The pipe carries only base64 ASCII. Keep the caller's native input
+        # encoding out of the request (it can add a BOM or encode as UTF-16).
+        $OutputEncoding = [System.Text.Encoding]::ASCII
         $result = $encoded | & $executable.Path completions powershell --query 2>$null
         if ($LASTEXITCODE -ne 0) { return }
         foreach ($item in ($result | ConvertFrom-Json)) {

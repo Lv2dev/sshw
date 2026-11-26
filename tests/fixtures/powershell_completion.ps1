@@ -15,10 +15,22 @@ function Complete([string]$Tail, [string]$Expected) {
     $matches = TabExpansion2 -inputScript $line -cursorColumn $line.Length
     if ($global:LASTEXITCODE -ne 37) { throw 'completion changed LASTEXITCODE' }
     $match = $matches.CompletionMatches | Where-Object ListItemText -EQ $Expected | Select-Object -First 1
-    if (!$match) { throw "missing completion for [$Tail]: expected [$Expected], got [$($matches.CompletionMatches.ListItemText -join ', ')]" }
+    if (!$match) {
+        $recentErrors = ($Error | Select-Object -First 2 | ForEach-Object { $_.Exception.Message }) -join ' | '
+        throw "missing completion for [$Tail]: expected [$Expected], got [$($matches.CompletionMatches.ListItemText -join ', ')] (input code page $($OutputEncoding.CodePage), recent errors: $recentErrors)"
+    }
     return @{ Line = $line; Match = $match; Result = $matches }
 }
 $null = Complete 'pa' 'password'
+$originalEncoding = $OutputEncoding
+try {
+    foreach ($encoding in @([Text.UTF8Encoding]::new($true), [Text.Encoding]::Unicode)) {
+        $OutputEncoding = $encoding
+        $null = Complete 'pa' 'password'
+        if ($OutputEncoding -ne $encoding) { throw 'completion changed the native input encoding' }
+    }
+}
+finally { $OutputEncoding = $originalEncoding }
 $null = Complete 'endp' 'endpoint'
 $null = Complete 'endpoint pr' 'prod'
 $null = Complete 'endpoint prod --po' '--port'
