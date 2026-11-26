@@ -18,7 +18,7 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 
 ### 수정
 
-- PowerShell 자동완성 요청은 현재 세션의 입력 인코딩을 유지하면서 ASCII로 보냅니다. UTF-16이나 BOM이 포함된 인코딩을 사용하는 세션에서도 동작합니다.
+- PowerShell 자동완성 요청은 현재 세션의 입력 인코딩을 유지하면서 ASCII로 보내고, Windows 런타임이 붙이는 선행 UTF-8 BOM도 처리합니다.
 
 - 다운로드 경로의 상위 폴더가 깨진 링크인 경우 사전 검사와 실제 다운로드 모두 접속 전에 차단합니다. 정상 폴더 링크와 새로 만들 수 있는 경로는 허용합니다.
 - 업로드·다운로드 완료 메시지에서 로컬과 원격 경로의 민감값을 각각 마스킹합니다.

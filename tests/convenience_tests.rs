@@ -400,14 +400,12 @@ fn completion_script_is_available_without_a_valid_home_or_config_and_queries_are
             .contains("Register-ArgumentCompleter -Native")
     );
     let encoded = STANDARD.encode(json!({"words":[],"word":"pa"}).to_string());
-    let output = run(
-        &missing,
-        &["completions", "powershell", "--query"],
-        &encoded,
-    );
-    assert!(output.status.success());
-    let values: Vec<Value> = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(values[0]["value"], "password");
+    for input in [encoded.clone(), format!("\u{feff}{encoded}\r\n")] {
+        let output = run(&missing, &["completions", "powershell", "--query"], &input);
+        assert!(output.status.success(), "{output:?}");
+        let values: Vec<Value> = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(values[0]["value"], "password");
+    }
     assert!(!missing.exists());
     for input in ["not base64".to_owned(), "x".repeat(65537)] {
         assert!(

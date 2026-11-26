@@ -45,7 +45,10 @@ pub(super) fn run(args: &CompletionsArgs) -> anyhow::Result<CommandOutput> {
         encoded.len() <= MAX_REQUEST as usize,
         "completion request is too large"
     );
-    let request: Request = serde_json::from_slice(&STANDARD.decode(encoded.trim())?)?;
+    // Some Windows PowerShell hosts prefix native pipeline input with a
+    // UTF-8 BOM even when the completion script requests ASCII.
+    let payload = encoded.strip_prefix('\u{feff}').unwrap_or(&encoded).trim();
+    let request: Request = serde_json::from_slice(&STANDARD.decode(payload)?)?;
     let base = sshw_base_dir()?;
     let env_home = std::env::var_os("SSHW_HOME").filter(|value| !value.is_empty());
     Ok(ok(format!(
