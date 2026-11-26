@@ -13,6 +13,8 @@ Stable exit codes and the `--json` envelope are treated as the public contract.
 ### 보안
 
 - 공식 `libssh2-sys`를 0.3.4로 올려 이전 배포에 빠졌던 CVE-2026-66035와 CVE-2026-66033 수정본을 포함합니다. 내장 libssh2가 오래된 SHA-1 기반 알고리즘, DSA, 3DES를 기본 비활성화하므로 해당 알고리즘만 지원하는 서버는 연결 설정을 점검해야 합니다. [보안 문서](SECURITY.md)에 적용 범위를 정리했습니다.
+- `rustix` 잠금 버전을 1.1.6으로 올려 [RUSTSEC-2026-0486](https://rustsec.org/advisories/RUSTSEC-2026-0486.html) 수정본을 포함합니다.
+- `libz-sys` 잠금 버전을 1.1.33으로 올려 [RUSTSEC-2026-0418](https://rustsec.org/advisories/RUSTSEC-2026-0418.html)과 [RUSTSEC-2026-0544](https://rustsec.org/advisories/RUSTSEC-2026-0544.html) 수정본을 포함합니다.
 
 ### 수정
 
